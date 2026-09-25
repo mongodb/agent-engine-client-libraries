@@ -1,0 +1,6 @@
+.agentengine/
+.agentic/
+.env.*
+.devcontainer/
+docker-compose.yml
+.dockerignore

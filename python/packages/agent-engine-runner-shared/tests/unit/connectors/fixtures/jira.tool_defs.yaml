@@ -1,0 +1,33 @@
+# Reduced Jira Data Center comment operations from the OpenAPI connector POC.
+# The endpoint is deliberately replaced with a reserved test domain.
+source:
+  name: jiradc
+  base_url: https://jira.example/rest
+auth:
+  type: bearer
+  env: JIRA_TOKEN
+tools:
+  - name: jiradc_getComments
+    description: Returns comments for an issue.
+    method: GET
+    path: /api/2/issue/{issueIdOrKey}/comment
+    params:
+      path: [issueIdOrKey]
+    inputSchema:
+      type: object
+      properties:
+        issueIdOrKey: {type: string}
+      required: [issueIdOrKey]
+  - name: jiradc_addComment
+    description: Adds a comment to an issue.
+    method: POST
+    path: /api/2/issue/{issueIdOrKey}/comment
+    params:
+      path: [issueIdOrKey]
+      body: [body]
+    inputSchema:
+      type: object
+      properties:
+        issueIdOrKey: {type: string}
+        body: {type: string}
+      required: [issueIdOrKey, body]

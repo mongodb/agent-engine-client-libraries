@@ -1,0 +1,22 @@
+loaders:
+  - type: python
+    search_path: [.]
+    modules:
+      - agent_engine_sdk_memory.memory
+      - agent_engine_sdk_memory.protocol
+      - agent_engine_sdk_memory.errors
+      - agent_engine_sdk_memory.models
+
+processors:
+  - type: filter
+    # Only document public members (no underscore prefix).
+    skip_empty_modules: true
+  - type: smart
+  - type: crossref
+
+renderer:
+  type: markdown
+  render_module_header: false
+  descriptive_class_title: false
+  render_toc: true
+  toc_maxdepth: 3

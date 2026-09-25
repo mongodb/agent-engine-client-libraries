@@ -1,0 +1,35 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+# The import package keeps its pre-rename name (only the distribution was
+# renamed), so hatchling cannot infer it from the project name.
+[tool.hatch.build.targets.wheel]
+only-include = ["agent_engine_sdk", "README.md", "LICENSE"]
+
+[project]
+name = "agent-engine-sdk"
+version = "0.11.1"
+description = "Core protocols and models for Atlas Agent Engine"
+readme = "README.md"
+license = {text = "Apache-2.0"}
+requires-python = ">=3.11"
+dependencies = [
+    "pydantic>=2.13.5",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=9.1.1",
+    "pytest-asyncio>=0.24.0",
+]
+
+[tool.pyright]
+pythonVersion = "3.11"
+pythonPlatform = "All"
+include = ["agent_engine_sdk"]
+strict = ["agent_engine_sdk"]
+typeCheckingMode = "strict"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

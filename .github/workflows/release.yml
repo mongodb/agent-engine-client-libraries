@@ -1,0 +1,322 @@
+#
+# SDK package release. Tests first, then one publish job per package in
+# dependency order. A failed job skips its dependents. The skip-if-exists
+# check only bites against a persistent registry — the loopback rehearsal
+# registries start empty in each job, so a rehearsal run always publishes
+# everything. needs: still serializes the chain so it matches the real-publish
+# graph and dependents are skipped on failure; it does not order uploads in
+# rehearsal. JavaScript still uses build-first for the local workspace build.
+# Python and JavaScript chains run in parallel after tests.
+#
+# Every run rehearses against loopback registries unless it is explicitly told
+# otherwise, and the resolve-mode job is the only place that decision is made.
+# Repository variables control the mode and default to publishing disabled with
+# dry run enabled. Publishing for real therefore takes two deliberate flips:
+# enable publishing, then turn off the dry run.
+#
+# resolve-mode also verifies the npm publish token against the real registry on
+# every run, independent of the mock/real toggle, so a missing or revoked token
+# fails before any test or publish job starts.
+#
+name: SDK release
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+concurrency:
+  group: sdk-release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  NPM_REGISTRY_URL: https://registry.npmjs.org
+  PYPI_UPLOAD_URL: https://upload.pypi.org/legacy/
+  PYPI_INDEX_URL: https://pypi.org
+
+jobs:
+  resolve-mode:
+    name: resolve-mode
+    runs-on: ubuntu-latest
+    outputs:
+      start-mock: ${{ steps.mode.outputs.start-mock }}
+      dry-run: ${{ steps.mode.outputs.dry-run }}
+      npm-registry: ${{ steps.mode.outputs.npm-registry }}
+      pypi-upload-url: ${{ steps.mode.outputs.pypi-upload-url }}
+      pypi-index-url: ${{ steps.mode.outputs.pypi-index-url }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Resolve publish mode
+        id: mode
+        env:
+          SDK_PUBLISH_ENABLED: ${{ vars.SDK_PUBLISH_ENABLED || 'false' }}
+          SDK_PUBLISH_DRY_RUN: ${{ vars.SDK_PUBLISH_DRY_RUN || 'true' }}
+        run: node ./scripts/resolve-release-mode.mjs
+
+      - name: Verify npm credentials
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_PUBLISH_TOKEN }}
+        run: |
+          set -euo pipefail
+          npmrc="$(mktemp)"
+          trap 'rm -f "$npmrc"' EXIT
+          umask 077
+          host="${NPM_REGISTRY_URL#https://}"
+          host="${host#http://}"
+          printf '//%s/:_authToken=%s\n' "${host%/}" "$NPM_TOKEN" > "$npmrc"
+          user="$(NPM_CONFIG_USERCONFIG="$npmrc" npm whoami --registry "$NPM_REGISTRY_URL")"
+          echo "npm credentials verified for ${user}"
+
+  test-python:
+    name: test-python
+    needs: [resolve-mode]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: astral-sh/setup-uv@ae62891fec2bb8e7d6c99fc78c9fec3a63790f8d # v10.0.0
+        with:
+          version: "0.10.2"
+          python-version: "3.11"
+          enable-cache: true
+          cache-dependency-glob: "python/**/pyproject.toml"
+
+      - name: Run Python SDK tests
+        id: sdk-tests
+        continue-on-error: true
+        run: ./scripts/run-sdk-tests.sh --python
+
+      - name: Require passing tests for real publishing
+        if: >-
+          needs.resolve-mode.outputs.start-mock != 'true' &&
+          steps.sdk-tests.outcome != 'success'
+        run: exit 1
+
+  test-javascript:
+    name: test-javascript
+    needs: [resolve-mode]
+    runs-on: ubuntu-latest
+    services:
+      mongodb:
+        image: mongo:7.0@sha256:9854f7139445d766a9523571d6f047530c45547460ffcf8259eb2bf4264632ca
+        ports:
+          - 27017:27017
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: javascript/package-lock.json
+
+      - name: Run JavaScript SDK tests
+        id: sdk-tests
+        continue-on-error: true
+        env:
+          TEST_MONGO_URI: mongodb://127.0.0.1:27017
+        run: ./scripts/run-sdk-tests.sh --javascript
+
+      - name: Require passing tests for real publishing
+        if: >-
+          needs.resolve-mode.outputs.start-mock != 'true' &&
+          steps.sdk-tests.outcome != 'success'
+        run: exit 1
+
+  publish-python-core:
+    name: publish-python / agent-engine-sdk
+    needs: [resolve-mode, test-python, test-javascript]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@ae62891fec2bb8e7d6c99fc78c9fec3a63790f8d # v10.0.0
+        with:
+          version: "0.10.2"
+          python-version: "3.11"
+          enable-cache: true
+          cache-dependency-glob: "python/**/pyproject.toml"
+      - uses: ./.github/actions/publish-python-package
+        with:
+          start-mock: ${{ needs.resolve-mode.outputs.start-mock }}
+          dry-run: ${{ needs.resolve-mode.outputs.dry-run }}
+          upload-url: ${{ needs.resolve-mode.outputs.pypi-upload-url }}
+          index-url: ${{ needs.resolve-mode.outputs.pypi-index-url }}
+          pypi-token: ${{ secrets.PYPI_API_TOKEN }}
+          name: agent-engine-sdk
+          directory: agent-engine-sdk
+
+  publish-python-memory:
+    name: publish-python / agent-engine-sdk-memory
+    # Mirrors the real-publish graph; rehearsal registries are per-job and empty.
+    needs: [resolve-mode, publish-python-core]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@ae62891fec2bb8e7d6c99fc78c9fec3a63790f8d # v10.0.0
+        with:
+          version: "0.10.2"
+          python-version: "3.11"
+          enable-cache: true
+          cache-dependency-glob: "python/**/pyproject.toml"
+      - uses: ./.github/actions/publish-python-package
+        with:
+          start-mock: ${{ needs.resolve-mode.outputs.start-mock }}
+          dry-run: ${{ needs.resolve-mode.outputs.dry-run }}
+          upload-url: ${{ needs.resolve-mode.outputs.pypi-upload-url }}
+          index-url: ${{ needs.resolve-mode.outputs.pypi-index-url }}
+          pypi-token: ${{ secrets.PYPI_API_TOKEN }}
+          name: agent-engine-sdk-memory
+          directory: agent-engine-sdk-memory
+
+  publish-python-runner-shared:
+    name: publish-python / agent-engine-runner-shared
+    needs: [resolve-mode, publish-python-memory]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@ae62891fec2bb8e7d6c99fc78c9fec3a63790f8d # v10.0.0
+        with:
+          version: "0.10.2"
+          python-version: "3.11"
+          enable-cache: true
+          cache-dependency-glob: "python/**/pyproject.toml"
+      - uses: ./.github/actions/publish-python-package
+        with:
+          start-mock: ${{ needs.resolve-mode.outputs.start-mock }}
+          dry-run: ${{ needs.resolve-mode.outputs.dry-run }}
+          upload-url: ${{ needs.resolve-mode.outputs.pypi-upload-url }}
+          index-url: ${{ needs.resolve-mode.outputs.pypi-index-url }}
+          pypi-token: ${{ secrets.PYPI_API_TOKEN }}
+          name: agent-engine-runner-shared
+          directory: agent-engine-runner-shared
+
+  publish-python-langgraph:
+    name: publish-python / agent-engine-sdk-langgraph
+    needs: [resolve-mode, publish-python-runner-shared]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@ae62891fec2bb8e7d6c99fc78c9fec3a63790f8d # v10.0.0
+        with:
+          version: "0.10.2"
+          python-version: "3.11"
+          enable-cache: true
+          cache-dependency-glob: "python/**/pyproject.toml"
+      - uses: ./.github/actions/publish-python-package
+        with:
+          start-mock: ${{ needs.resolve-mode.outputs.start-mock }}
+          dry-run: ${{ needs.resolve-mode.outputs.dry-run }}
+          upload-url: ${{ needs.resolve-mode.outputs.pypi-upload-url }}
+          index-url: ${{ needs.resolve-mode.outputs.pypi-index-url }}
+          pypi-token: ${{ secrets.PYPI_API_TOKEN }}
+          name: agent-engine-sdk-langgraph
+          directory: agent-engine-sdk-langgraph
+
+  publish-python-adk:
+    name: publish-python / agent-engine-sdk-adk
+    needs: [resolve-mode, publish-python-runner-shared]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@ae62891fec2bb8e7d6c99fc78c9fec3a63790f8d # v10.0.0
+        with:
+          version: "0.10.2"
+          python-version: "3.11"
+          enable-cache: true
+          cache-dependency-glob: "python/**/pyproject.toml"
+      - uses: ./.github/actions/publish-python-package
+        with:
+          start-mock: ${{ needs.resolve-mode.outputs.start-mock }}
+          dry-run: ${{ needs.resolve-mode.outputs.dry-run }}
+          upload-url: ${{ needs.resolve-mode.outputs.pypi-upload-url }}
+          index-url: ${{ needs.resolve-mode.outputs.pypi-index-url }}
+          pypi-token: ${{ secrets.PYPI_API_TOKEN }}
+          name: agent-engine-sdk-adk
+          directory: agent-engine-sdk-adk
+
+  publish-js-core:
+    name: publish-javascript / agent-engine-sdk-ts
+    needs: [resolve-mode, test-python, test-javascript]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: javascript/package-lock.json
+      - uses: ./.github/actions/publish-javascript-package
+        with:
+          start-mock: ${{ needs.resolve-mode.outputs.start-mock }}
+          dry-run: ${{ needs.resolve-mode.outputs.dry-run }}
+          registry-url: ${{ needs.resolve-mode.outputs.npm-registry }}
+          npm-token: ${{ secrets.NPM_PUBLISH_TOKEN }}
+          name: "@mongodb-js/agent-engine-sdk"
+          directory: agent-engine-sdk
+
+  publish-js-memory:
+    name: publish-javascript / agent-engine-sdk-memory-ts
+    needs: [resolve-mode, publish-js-core]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: javascript/package-lock.json
+      - uses: ./.github/actions/publish-javascript-package
+        with:
+          start-mock: ${{ needs.resolve-mode.outputs.start-mock }}
+          dry-run: ${{ needs.resolve-mode.outputs.dry-run }}
+          registry-url: ${{ needs.resolve-mode.outputs.npm-registry }}
+          npm-token: ${{ secrets.NPM_PUBLISH_TOKEN }}
+          name: "@mongodb-js/agent-engine-sdk-memory"
+          directory: agent-engine-memory
+          build-first: "@mongodb-js/agent-engine-sdk"
+
+  publish-js-runner-shared:
+    name: publish-javascript / agent-engine-runner-shared
+    needs: [resolve-mode, publish-js-memory]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: javascript/package-lock.json
+      - uses: ./.github/actions/publish-javascript-package
+        with:
+          start-mock: ${{ needs.resolve-mode.outputs.start-mock }}
+          dry-run: ${{ needs.resolve-mode.outputs.dry-run }}
+          registry-url: ${{ needs.resolve-mode.outputs.npm-registry }}
+          npm-token: ${{ secrets.NPM_PUBLISH_TOKEN }}
+          name: "@mongodb-js/agent-engine-runner-shared"
+          directory: agent-engine-runner-shared
+          build-first: "@mongodb-js/agent-engine-sdk,@mongodb-js/agent-engine-sdk-memory"
+
+  publish-js-langgraph:
+    name: publish-javascript / agent-engine-sdk-langgraph-ts
+    needs: [resolve-mode, publish-js-runner-shared]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: javascript/package-lock.json
+      - uses: ./.github/actions/publish-javascript-package
+        with:
+          start-mock: ${{ needs.resolve-mode.outputs.start-mock }}
+          dry-run: ${{ needs.resolve-mode.outputs.dry-run }}
+          registry-url: ${{ needs.resolve-mode.outputs.npm-registry }}
+          npm-token: ${{ secrets.NPM_PUBLISH_TOKEN }}
+          name: "@mongodb-js/agent-engine-sdk-langgraph"
+          directory: agent-engine-sdk-langgraph
+          build-first: "@mongodb-js/agent-engine-sdk,@mongodb-js/agent-engine-sdk-memory,@mongodb-js/agent-engine-runner-shared"

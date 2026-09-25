@@ -1,0 +1,7 @@
+.agentengine/
+.agentic/
+.env.*
+.devcontainer/
+# Locally built agentic CLI. A 37 MB copy was committed here once; nothing
+# reads it, and every source archive uploaded by `agentic build` carried it.
+/agentic

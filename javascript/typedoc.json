@@ -1,0 +1,38 @@
+{
+  "$schema": "https://typedoc.org/schema.json",
+  "name": "Agent Engine TypeScript SDK",
+  "plugin": [
+    "typedoc-plugin-markdown"
+  ],
+  "entryPoints": [
+    "packages/agent-engine-sdk/src/index.ts",
+    "packages/agent-engine-memory/src/index.ts",
+    "packages/agent-engine-runner-shared/src/index.ts",
+    "packages/agent-engine-sdk-langgraph/src/index.ts"
+  ],
+  "out": "docs/api",
+  "readme": "none",
+  "outputFileStrategy": "modules",
+  "useHTMLAnchors": true,
+  "anchorPrefix": "api-",
+  "hideGenerator": true,
+  "disableSources": true,
+  "excludeInternal": true,
+  "skipErrorChecking": true,
+  "hidePageHeader": true,
+  "hideBreadcrumbs": true,
+  "useCodeBlocks": true,
+  "expandObjects": false,
+  "parametersFormat": "table",
+  "interfacePropertiesFormat": "table",
+  "classPropertiesFormat": "table",
+  "typeAliasPropertiesFormat": "table",
+  "enumMembersFormat": "table",
+  "propertyMembersFormat": "table",
+  "typeDeclarationFormat": "table",
+  "tableColumnSettings": {
+    "leftAlignHeaders": true,
+    "hideSources": true
+  },
+  "excludeExternals": true
+}

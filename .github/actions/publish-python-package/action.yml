@@ -1,0 +1,54 @@
+name: publish-python-package
+description: Build and publish one Python SDK package. Skips if the version is already on the registry.
+
+inputs:
+  name:
+    description: Distribution name (e.g. agent-engine-sdk)
+    required: true
+  directory:
+    description: Directory under python/packages/
+    required: true
+  upload-url:
+    description: Endpoint distributions are uploaded to; unused when start-mock is true (the mock script's echoed URL wins)
+    required: false
+    default: ""
+  index-url:
+    description: PEP 503 index queried for the skip-if-exists check; real PyPI serves this from a different host than uploads
+    required: false
+    default: ""
+  pypi-token:
+    description: API token used when publishing to a real index
+    required: false
+    default: ""
+  start-mock:
+    description: Start a loopback pypiserver before publishing
+    required: false
+    default: "true"
+  dry-run:
+    description: Build and validate without uploading
+    required: false
+    default: "false"
+
+runs:
+  using: composite
+  steps:
+    - name: Start mock PyPI
+      id: mock-pypi
+      if: ${{ inputs.start-mock == 'true' }}
+      shell: bash
+      run: |
+        out="$(./scripts/start-mock-registries.sh --pypi)"
+        echo "$out"
+        echo "url=$(printf '%s\n' "$out" | sed -n 's/^PYPI_REPOSITORY_URL=//p')" >> "$GITHUB_OUTPUT"
+
+    - name: Publish package
+      shell: bash
+      env:
+        PYPI_REPOSITORY_URL: ${{ steps.mock-pypi.outputs.url || inputs.upload-url }}
+        PYPI_INDEX_URL: ${{ steps.mock-pypi.outputs.url || inputs.index-url }}
+        DISTRIBUTION_NAME: ${{ inputs.name }}
+        PACKAGE_DIRECTORY: ${{ inputs.directory }}
+        DRY_RUN: ${{ inputs.dry-run }}
+        UV_PUBLISH_USERNAME: ${{ inputs.start-mock == 'true' && 'ci' || '__token__' }}
+        UV_PUBLISH_PASSWORD: ${{ inputs.start-mock == 'true' && 'ci' || inputs.pypi-token }}
+      run: ./scripts/publish-python-package.sh --name "$DISTRIBUTION_NAME" --directory "$PACKAGE_DIRECTORY"

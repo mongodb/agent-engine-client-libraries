@@ -1,0 +1,1656 @@
+{
+  "schema_version": 1,
+  "source_index": "https://api.apis.guru/v2/list.json",
+  "source_index_retrieved_at": "2026-09-15",
+  "compile_timeout_seconds": 30,
+  "aggregate_minimum": 9512,
+  "declared_operations": 10059,
+  "apis": [
+    {
+      "name": "GitHub",
+      "id": "github-com",
+      "provider": "github.com",
+      "version": "1.1.4",
+      "url": "https://api.apis.guru/v2/specs/github.com/1.1.4/openapi.json",
+      "sha256": "efebc34c41a39d98ed218e09590e14281a3549fa3ca8bc14361eb81fb52cbe44",
+      "auth_shapes": [
+        "none_declared"
+      ],
+      "declared": 845,
+      "minimum": 843,
+      "auth": {
+        "presentation": "none"
+      }
+    },
+    {
+      "name": "Stripe",
+      "id": "stripe-com",
+      "provider": "stripe.com",
+      "version": "2022-11-15",
+      "url": "https://api.apis.guru/v2/specs/stripe.com/2022-11-15/openapi.json",
+      "sha256": "76e10a2395402ad46f157a39a6bfc6b2843e07251d769fdfbe7042b749d881f2",
+      "auth_shapes": [
+        "http_basic",
+        "http_bearer"
+      ],
+      "declared": 446,
+      "minimum": 399,
+      "auth": {
+        "presentation": "bearer"
+      }
+    },
+    {
+      "name": "Slack",
+      "id": "slack-com",
+      "provider": "slack.com",
+      "version": "1.7.0",
+      "url": "https://api.apis.guru/v2/specs/slack.com/1.7.0/openapi.json",
+      "sha256": "a623a38a3be7e3b6bc47e74401b509d4e044025b4ce8eefe611034c7bca1077a",
+      "auth_shapes": [
+        "oauth2"
+      ],
+      "declared": 174,
+      "minimum": 174,
+      "auth": {
+        "presentation": "bearer"
+      }
+    },
+    {
+      "name": "Twilio",
+      "id": "twilio-com-api",
+      "provider": "twilio.com:api",
+      "version": "1.42.0",
+      "url": "https://api.apis.guru/v2/specs/twilio.com/api/1.42.0/openapi.json",
+      "sha256": "da7415f66ddf68ca230abda171c15ad08e32c290045f9865f6a4460b0adc58aa",
+      "auth_shapes": [
+        "http_basic"
+      ],
+      "declared": 199,
+      "minimum": 160,
+      "auth": {
+        "presentation": "basic"
+      }
+    },
+    {
+      "name": "DigitalOcean",
+      "id": "digitalocean-com",
+      "provider": "digitalocean.com",
+      "version": "2.0",
+      "url": "https://api.apis.guru/v2/specs/digitalocean.com/2.0/openapi.json",
+      "sha256": "21c7fd1ddfb7476410fe75934acb74be59e0747b27361a0e67da7f396ef861c5",
+      "auth_shapes": [
+        "http_bearer"
+      ],
+      "declared": 290,
+      "minimum": 289,
+      "auth": {
+        "presentation": "bearer"
+      }
+    },
+    {
+      "name": "Box",
+      "id": "box-com",
+      "provider": "box.com",
+      "version": "2.0.0",
+      "url": "https://api.apis.guru/v2/specs/box.com/2.0.0/openapi.json",
+      "sha256": "d377227c5cf71625eb9d7567dd096ba2507568712c5e3fb5691b5d13c11e6a58",
+      "auth_shapes": [
+        "oauth2"
+      ],
+      "declared": 260,
+      "minimum": 220,
+      "auth": {
+        "presentation": "bearer"
+      }
+    },
+    {
+      "name": "Spotify",
+      "id": "spotify-com",
+      "provider": "spotify.com",
+      "version": "1.0.0",
+      "url": "https://api.apis.guru/v2/specs/spotify.com/1.0.0/openapi.json",
+      "sha256": "3a652300be23d23f2efc67b03738851be4f99949b05f0fc7f465504dee075594",
+      "auth_shapes": [
+        "oauth2"
+      ],
+      "declared": 88,
+      "minimum": 88,
+      "auth": {
+        "presentation": "bearer"
+      }
+    },
+    {
+      "name": "Square",
+      "id": "squareup-com",
+      "provider": "squareup.com",
+      "version": "2.0",
+      "url": "https://api.apis.guru/v2/specs/squareup.com/2.0/openapi.json",
+      "sha256": "1001c992f9e5f68f71356390c160044a555afd036d0b6c5509f5ab492ad56c43",
+      "auth_shapes": [
+        "api_key_header",
+        "oauth2"
+      ],
+      "declared": 200,
+      "minimum": 198,
+      "auth": {
+        "presentation": "bearer"
+      }
+    },
+    {
+      "name": "Asana",
+      "id": "asana-com",
+      "provider": "asana.com",
+      "version": "1.0",
+      "url": "https://api.apis.guru/v2/specs/asana.com/1.0/openapi.json",
+      "sha256": "40c1c94d476c897f707c2974a3aeedee1d0b8a6eab8b7654819c0effa0f8ffa6",
+      "auth_shapes": [
+        "http_bearer",
+        "oauth2"
+      ],
+      "declared": 167,
+      "minimum": 166,
+      "auth": {
+        "presentation": "bearer"
+      }
+    },
+    {
+      "name": "Hetzner Cloud",
+      "id": "hetzner-cloud",
+      "provider": "hetzner.cloud",
+      "version": "1.0.0",
+      "url": "https://api.apis.guru/v2/specs/hetzner.cloud/1.0.0/openapi.json",
+      "sha256": "31312e25858be13253b4bf8c49f4b77e2330b74580c910cae625f8b4e242dab3",
+      "auth_shapes": [
+        "none_declared"
+      ],
+      "declared": 144,
+      "minimum": 144,
+      "auth": {
+        "presentation": "bearer"
+      }
+    },
+    {
+      "name": "OpenAI",
+      "id": "openai-com",
+      "provider": "openai.com",
+      "version": "1.2.0",
+      "url": "https://api.apis.guru/v2/specs/openai.com/1.2.0/openapi.json",
+      "sha256": "8ab0b2055010705b1c6f8462e742b325afaef3617503d35f6b2a67dac241517f",
+      "auth_shapes": [
+        "none_declared"
+      ],
+      "declared": 28,
+      "minimum": 23,
+      "auth": {
+        "presentation": "bearer"
+      }
+    },
+    {
+      "name": "Notion",
+      "id": "notion-com",
+      "provider": "notion.com",
+      "version": "1.0.0",
+      "url": "https://api.apis.guru/v2/specs/notion.com/1.0.0/openapi.json",
+      "sha256": "6df5889eac35a3f4eb99115eac7dd9b28b9d6040c664a742368ef7b68d45d983",
+      "auth_shapes": [
+        "none_declared"
+      ],
+      "declared": 13,
+      "minimum": 12,
+      "auth": {
+        "presentation": "bearer"
+      }
+    },
+    {
+      "name": "SendGrid",
+      "id": "sendgrid-com",
+      "provider": "sendgrid.com",
+      "version": "1.0.0",
+      "url": "https://api.apis.guru/v2/specs/sendgrid.com/1.0.0/openapi.json",
+      "sha256": "80aaf7926007ffa486bf9d2d5d8b1337ec8a361d465a0f17dbe784258f8b2a1f",
+      "auth_shapes": [
+        "api_key_header"
+      ],
+      "declared": 334,
+      "minimum": 321,
+      "auth": {
+        "presentation": "header_api_key"
+      }
+    },
+    {
+      "name": "Atlassian Jira",
+      "id": "atlassian-com-jira",
+      "provider": "atlassian.com:jira",
+      "version": "1001.0.0-SNAPSHOT",
+      "url": "https://api.apis.guru/v2/specs/atlassian.com/jira/1001.0.0-SNAPSHOT/openapi.json",
+      "sha256": "866a6ae6a8d5b292a7b2477f6e1fa95bffbf133c4f848b28dac8989a0c6e309a",
+      "auth_shapes": [
+        "http_basic",
+        "oauth2"
+      ],
+      "declared": 487,
+      "minimum": 477,
+      "auth": {
+        "presentation": "bearer"
+      }
+    },
+    {
+      "name": "Vercel",
+      "id": "vercel-com",
+      "provider": "vercel.com",
+      "version": "0.0.1",
+      "url": "https://api.apis.guru/v2/specs/vercel.com/0.0.1/openapi.json",
+      "sha256": "0f92aad225ff03a997b1127e7692ba2ad30a8560797945146bcc47139ca6491b",
+      "auth_shapes": [
+        "http_bearer",
+        "oauth2"
+      ],
+      "declared": 113,
+      "minimum": 103,
+      "auth": {
+        "presentation": "bearer"
+      }
+    },
+    {
+      "name": "Zoom",
+      "id": "zoom-us",
+      "provider": "zoom.us",
+      "version": "2.0.0",
+      "url": "https://api.apis.guru/v2/specs/zoom.us/2.0.0/openapi.json",
+      "sha256": "cdfd27047bb0e4f7038135605d9aa4e72eeb17d86f2195b5f92f09f76191ce18",
+      "auth_shapes": [
+        "api_key_header",
+        "oauth2"
+      ],
+      "declared": 373,
+      "minimum": 369,
+      "auth": {
+        "presentation": "bearer"
+      }
+    },
+    {
+      "name": "Bitbucket",
+      "id": "bitbucket-org",
+      "provider": "bitbucket.org",
+      "version": "2.0",
+      "url": "https://api.apis.guru/v2/specs/bitbucket.org/2.0/openapi.json",
+      "sha256": "f41a6949a8b64b022f53c0791ef599768c5b45a5ed48dc6e7057ea04594759d7",
+      "auth_shapes": [
+        "api_key_header",
+        "http_basic",
+        "oauth2"
+      ],
+      "declared": 303,
+      "minimum": 287,
+      "auth": {
+        "presentation": "bearer"
+      }
+    },
+    {
+      "name": "Trello",
+      "id": "trello-com",
+      "provider": "trello.com",
+      "version": "1.0",
+      "url": "https://api.apis.guru/v2/specs/trello.com/1.0/openapi.json",
+      "sha256": "a95a221416a14321bbac3a570dbabaff9ebb83c8707021a9d0496921a856f0b4",
+      "auth_shapes": [
+        "api_key_query"
+      ],
+      "declared": 324,
+      "minimum": 314,
+      "auth": {
+        "presentation": "bearer"
+      }
+    },
+    {
+      "name": "ClickUp",
+      "id": "clickup-com",
+      "provider": "clickup.com",
+      "version": "1.0.0",
+      "url": "https://api.apis.guru/v2/specs/clickup.com/1.0.0/openapi.json",
+      "sha256": "62e8866b8bf9147759442557b8457409582dad98967ee1377a8c400334d7156a",
+      "auth_shapes": [
+        "none_declared"
+      ],
+      "declared": 2,
+      "minimum": 2,
+      "auth": {
+        "presentation": "bearer"
+      }
+    },
+    {
+      "name": "Plaid",
+      "id": "plaid-com",
+      "provider": "plaid.com",
+      "version": "2020-09-14_1.334.0",
+      "url": "https://api.apis.guru/v2/specs/plaid.com/2020-09-14_1.334.0/openapi.json",
+      "sha256": "bfdec4219280386904cf210814f4aa4e7ee98ca60b24d5a3c92a2ea87f3c23dd",
+      "auth_shapes": [
+        "api_key_header"
+      ],
+      "declared": 198,
+      "minimum": 195,
+      "auth": {
+        "presentation": "compound_headers",
+        "credential_count": 2
+      }
+    },
+    {
+      "name": "Adyen Checkout",
+      "id": "adyen-com-checkoutservice",
+      "provider": "adyen.com:CheckoutService",
+      "version": "70",
+      "url": "https://api.apis.guru/v2/specs/adyen.com/CheckoutService/70/openapi.json",
+      "sha256": "8b1a8042d8d63c3176ca378ace46d6e4b45dbc89d633b7c504a8deb678949489",
+      "auth_shapes": [
+        "api_key_header",
+        "http_basic"
+      ],
+      "declared": 24,
+      "minimum": 24,
+      "auth": {
+        "presentation": "header_api_key"
+      }
+    },
+    {
+      "name": "Telnyx",
+      "id": "telnyx-com",
+      "provider": "telnyx.com",
+      "version": "2.0.0",
+      "url": "https://api.apis.guru/v2/specs/telnyx.com/2.0.0/openapi.json",
+      "sha256": "6def51a3e68326861eef2054f9df2f568ff961e813adcc0409f7afc33d0f01d4",
+      "auth_shapes": [
+        "http_bearer"
+      ],
+      "declared": 361,
+      "minimum": 350,
+      "auth": {
+        "presentation": "bearer"
+      }
+    },
+    {
+      "name": "ElevenLabs",
+      "id": "elevenlabs-io",
+      "provider": "elevenlabs.io",
+      "version": "1.0",
+      "url": "https://api.apis.guru/v2/specs/elevenlabs.io/1.0/openapi.json",
+      "sha256": "beafed07a89c0d1ffdf5f2308d6da8e86a11f090a868c13fe44cd9ade22757f3",
+      "auth_shapes": [
+        "none_declared"
+      ],
+      "declared": 19,
+      "minimum": 17,
+      "auth": {
+        "presentation": "header_api_key"
+      }
+    },
+    {
+      "name": "Pinecone",
+      "id": "pinecone-io",
+      "provider": "pinecone.io",
+      "version": "20230401.1",
+      "url": "https://api.apis.guru/v2/specs/pinecone.io/20230401.1/openapi.json",
+      "sha256": "d9707c42cf0fe868aadbeaab5c8ec7b0378d3b6657cc3507292ac4d23fd88423",
+      "auth_shapes": [
+        "api_key_header"
+      ],
+      "declared": 15,
+      "minimum": 12,
+      "auth": {
+        "presentation": "header_api_key"
+      },
+      "required_operation_ids": [
+        "query",
+        "upsert"
+      ]
+    },
+    {
+      "name": "Twitter",
+      "id": "twitter-com-current",
+      "provider": "twitter.com:current",
+      "version": "2.61",
+      "url": "https://api.apis.guru/v2/specs/twitter.com/current/2.61/openapi.json",
+      "sha256": "8e912c4f563b3bdbec0213054bf85dda4c33659cd4378527567883c8fa6ea469",
+      "auth_shapes": [
+        "http_bearer",
+        "http_oauth",
+        "oauth2"
+      ],
+      "declared": 80,
+      "minimum": 80,
+      "auth": {
+        "presentation": "bearer"
+      }
+    },
+    {
+      "name": "1Password Events",
+      "id": "1password-com-events",
+      "provider": "1password.com:events",
+      "version": "1.0.0",
+      "url": "https://api.apis.guru/v2/specs/1password.com/events/1.0.0/openapi.json",
+      "sha256": "a0b312c4d85d4bc07894225260c79e88e8a1d568218bb9c297b4fd0d78b85a22",
+      "auth_shapes": [
+        "http_bearer"
+      ],
+      "declared": 3,
+      "minimum": 3,
+      "auth": {
+        "presentation": "bearer"
+      }
+    },
+    {
+      "name": "1Password Connect",
+      "id": "1password-local-connect",
+      "provider": "1password.local:connect",
+      "version": "1.5.7",
+      "url": "https://api.apis.guru/v2/specs/1password.local/connect/1.5.7/openapi.json",
+      "sha256": "cf419ac953e31ab216a0450ccd1bf9105201c215d34e9860213aa03338351e43",
+      "auth_shapes": [
+        "http_bearer"
+      ],
+      "declared": 15,
+      "minimum": 12,
+      "auth": {
+        "presentation": "bearer"
+      }
+    },
+    {
+      "name": "Ably Platform",
+      "id": "ably-io-platform",
+      "provider": "ably.io:platform",
+      "version": "1.1.0",
+      "url": "https://api.apis.guru/v2/specs/ably.io/platform/1.1.0/openapi.json",
+      "sha256": "e2d7989f73b78ac62ff925692797e6c7a07e0c5423e7bb5a118174848f294d41",
+      "auth_shapes": [
+        "http_basic",
+        "http_bearer"
+      ],
+      "declared": 22,
+      "minimum": 22,
+      "auth": {
+        "presentation": "bearer"
+      }
+    },
+    {
+      "name": "Adobe AEM",
+      "id": "adobe-com-aem",
+      "provider": "adobe.com:aem",
+      "version": "3.7.1-pre.0",
+      "url": "https://api.apis.guru/v2/specs/adobe.com/aem/3.7.1-pre.0/openapi.json",
+      "sha256": "ec812606758838d0b58608eef3dab96a4336f08d0d765cee4a966866d685e895",
+      "auth_shapes": [
+        "http_basic"
+      ],
+      "declared": 48,
+      "minimum": 42,
+      "auth": {
+        "presentation": "bearer"
+      }
+    },
+    {
+      "name": "Airbyte",
+      "id": "airbyte-local-config",
+      "provider": "airbyte.local:config",
+      "version": "1.0.0",
+      "url": "https://api.apis.guru/v2/specs/airbyte.local/config/1.0.0/openapi.json",
+      "sha256": "ea13f9366724dd101d7181cf78a5aa39326090c2da7bc29579080cb169796c22",
+      "auth_shapes": [
+        "http_bearer"
+      ],
+      "declared": 102,
+      "minimum": 101,
+      "auth": {
+        "presentation": "bearer"
+      }
+    },
+    {
+      "name": "Amadeus",
+      "id": "amadeus-com",
+      "provider": "amadeus.com",
+      "version": "2.2.0",
+      "url": "https://api.apis.guru/v2/specs/amadeus.com/2.2.0/openapi.json",
+      "sha256": "15e9339b4ac6a5bcdb57ccb460f85c569e13df2970f89084f9a17cbcc0e66f1f",
+      "auth_shapes": [
+        "none_declared"
+      ],
+      "declared": 2,
+      "minimum": 2,
+      "auth": {
+        "presentation": "bearer"
+      }
+    },
+    {
+      "name": "Anchore",
+      "id": "anchore-io",
+      "provider": "anchore.io",
+      "version": "0.1.20",
+      "url": "https://api.apis.guru/v2/specs/anchore.io/0.1.20/openapi.json",
+      "sha256": "664fde9931941ae811ff98d087e40306553024928ed206547173704029a932ae",
+      "auth_shapes": [
+        "none_declared"
+      ],
+      "declared": 112,
+      "minimum": 108,
+      "auth": {
+        "presentation": "basic"
+      }
+    },
+    {
+      "name": "Apache Airflow",
+      "id": "apache-org-airflow",
+      "provider": "apache.org:airflow",
+      "version": "2.5.1",
+      "url": "https://api.apis.guru/v2/specs/apache.org/airflow/2.5.1/openapi.json",
+      "sha256": "d64b718d898f5f0d3da615e61a9491e31f603dff4dbd64ba6365b472026b1b87",
+      "auth_shapes": [
+        "http_basic",
+        "http_negotiate",
+        "oauth2"
+      ],
+      "declared": 73,
+      "minimum": 73,
+      "auth": {
+        "presentation": "bearer"
+      }
+    },
+    {
+      "name": "eBay Sell Account",
+      "id": "api-ebay-com-sell-account",
+      "provider": "api.ebay.com:sell-account",
+      "version": "v1.9.0",
+      "url": "https://api.apis.guru/v2/specs/api.ebay.com/sell-account/v1.9.0/openapi.json",
+      "sha256": "e6fc413676effa99a2ff4b3acfcbe1d8230556eed188f9b503e6b820fccc1eed",
+      "auth_shapes": [
+        "oauth2"
+      ],
+      "declared": 36,
+      "minimum": 36,
+      "auth": {
+        "presentation": "bearer"
+      }
+    },
+    {
+      "name": "eBay Buy Deal",
+      "id": "ebay-com-buy-deal",
+      "provider": "ebay.com:buy-deal",
+      "version": "v1.3.0",
+      "url": "https://api.apis.guru/v2/specs/ebay.com/buy-deal/v1.3.0/openapi.json",
+      "sha256": "cf83113d849512b61f193d53b5bac1832e7fdd02ba6580d7ab80975f2f163d33",
+      "auth_shapes": [
+        "oauth2"
+      ],
+      "declared": 4,
+      "minimum": 4,
+      "auth": {
+        "presentation": "bearer"
+      }
+    },
+    {
+      "name": "eBay Sell Fulfillment",
+      "id": "ebay-com-sell-fulfillment",
+      "provider": "ebay.com:sell-fulfillment",
+      "version": "v1.19.19",
+      "url": "https://api.apis.guru/v2/specs/ebay.com/sell-fulfillment/v1.19.19/openapi.json",
+      "sha256": "f485b6d25ddf8703fd3fadd7ec3b548bd3d1458c659242ed42a2df09ee997b2f",
+      "auth_shapes": [
+        "oauth2"
+      ],
+      "declared": 15,
+      "minimum": 12,
+      "auth": {
+        "presentation": "bearer"
+      }
+    },
+    {
+      "name": "Apideck CRM",
+      "id": "apideck-com-crm",
+      "provider": "apideck.com:crm",
+      "version": "9.3.0",
+      "url": "https://api.apis.guru/v2/specs/apideck.com/crm/9.3.0/openapi.json",
+      "sha256": "46fda394dc20741d3f40f0d52d56718cc91138b2e5de14cf9fb671ba3d47d9bf",
+      "auth_shapes": [
+        "api_key_header"
+      ],
+      "declared": 40,
+      "minimum": 40,
+      "auth": {
+        "presentation": "compound_headers",
+        "credential_count": 3
+      }
+    },
+    {
+      "name": "APIs.guru",
+      "id": "apis-guru",
+      "provider": "apis.guru",
+      "version": "2.2.0",
+      "url": "https://api.apis.guru/v2/specs/apis.guru/2.2.0/openapi.json",
+      "sha256": "23a8f7c4e3084ec7f0a62ac9d08ecf9b5874a0dc0eb45b7064d2e689390fae1d",
+      "auth_shapes": [
+        "none_declared"
+      ],
+      "declared": 7,
+      "minimum": 7,
+      "auth": {
+        "presentation": "none"
+      }
+    },
+    {
+      "name": "Docker Engine",
+      "id": "docker-com-engine",
+      "provider": "docker.com:engine",
+      "version": "1.33",
+      "url": "https://api.apis.guru/v2/specs/docker.com/engine/1.33/openapi.json",
+      "sha256": "8c997693ce1e507b72b001bcac1603f36d8542e16017e120fa847dfabded2acc",
+      "auth_shapes": [
+        "none_declared"
+      ],
+      "declared": 105,
+      "minimum": 99,
+      "auth": {
+        "presentation": "none"
+      }
+    },
+    {
+      "name": "Docker Hub",
+      "id": "docker-com-hub",
+      "provider": "docker.com:hub",
+      "version": "beta",
+      "url": "https://api.apis.guru/v2/specs/docker.com/hub/beta/openapi.json",
+      "sha256": "15cd1aa2dbea6d9db239b2fd6721d595ff666b218ae457d575e0a96e618f54c7",
+      "auth_shapes": [
+        "none_declared"
+      ],
+      "declared": 28,
+      "minimum": 26,
+      "auth": {
+        "presentation": "bearer"
+      }
+    },
+    {
+      "name": "Google Calendar",
+      "id": "googleapis-com-calendar",
+      "provider": "googleapis.com:calendar",
+      "version": "v3",
+      "url": "https://api.apis.guru/v2/specs/googleapis.com/calendar/v3/openapi.json",
+      "sha256": "f6488df876df850fb11e2eb4ba1fd55df8f0c48a5b78309e010482a249012268",
+      "auth_shapes": [
+        "oauth2"
+      ],
+      "declared": 37,
+      "minimum": 37,
+      "auth": {
+        "presentation": "bearer"
+      }
+    },
+    {
+      "name": "Google Drive",
+      "id": "googleapis-com-drive",
+      "provider": "googleapis.com:drive",
+      "version": "v3",
+      "url": "https://api.apis.guru/v2/specs/googleapis.com/drive/v3/openapi.json",
+      "sha256": "e274823d74b0677ea391d0ea8bbf4c06c2aa6a488554ee0eab88e4e07523c9ca",
+      "auth_shapes": [
+        "oauth2"
+      ],
+      "declared": 48,
+      "minimum": 46,
+      "auth": {
+        "presentation": "bearer"
+      }
+    },
+    {
+      "name": "Gmail",
+      "id": "googleapis-com-gmail",
+      "provider": "googleapis.com:gmail",
+      "version": "v1",
+      "url": "https://api.apis.guru/v2/specs/googleapis.com/gmail/v1/openapi.json",
+      "sha256": "5acbed6ac4384d93053cd4346b22c9babef10965b1aeb3396c4e5a647db14ecd",
+      "auth_shapes": [
+        "oauth2"
+      ],
+      "declared": 79,
+      "minimum": 73,
+      "auth": {
+        "presentation": "bearer"
+      }
+    },
+    {
+      "name": "Google Sheets",
+      "id": "googleapis-com-sheets",
+      "provider": "googleapis.com:sheets",
+      "version": "v4",
+      "url": "https://api.apis.guru/v2/specs/googleapis.com/sheets/v4/openapi.json",
+      "sha256": "ac02b8944a49ddabc2352e6a7c0b0d8724bd42f1e77fd49f20924ebdf4fdf046",
+      "auth_shapes": [
+        "oauth2"
+      ],
+      "declared": 17,
+      "minimum": 17,
+      "auth": {
+        "presentation": "bearer"
+      }
+    },
+    {
+      "name": "YouTube",
+      "id": "googleapis-com-youtube",
+      "provider": "googleapis.com:youtube",
+      "version": "v3",
+      "url": "https://api.apis.guru/v2/specs/googleapis.com/youtube/v3/openapi.json",
+      "sha256": "80c56500052356e9b24a76523ff330267d5d58f182ec7c993fa8b13f74dfde5e",
+      "auth_shapes": [
+        "oauth2"
+      ],
+      "declared": 76,
+      "minimum": 71,
+      "auth": {
+        "presentation": "bearer"
+      }
+    },
+    {
+      "name": "HubSpot CRM",
+      "id": "hubapi-com-crm",
+      "provider": "hubapi.com:crm",
+      "version": "v3",
+      "url": "https://api.apis.guru/v2/specs/hubapi.com/crm/v3/openapi.json",
+      "sha256": "c50664180ea1357f5d0245f75be14119ebf26d0e8dbb5f04b9390cf0f682c617",
+      "auth_shapes": [
+        "api_key_query"
+      ],
+      "declared": 6,
+      "minimum": 6,
+      "auth": {
+        "presentation": "bearer"
+      }
+    },
+    {
+      "name": "HubSpot Conversations",
+      "id": "hubapi-com-conversations",
+      "provider": "hubapi.com:conversations",
+      "version": "v3",
+      "url": "https://api.apis.guru/v2/specs/hubapi.com/conversations/v3/openapi.json",
+      "sha256": "a17299c5f9f4cb7a6f226d2761cb2d5dd07872114b3b89c2bf676b2a62f5c2c6",
+      "auth_shapes": [
+        "api_key_header",
+        "api_key_query",
+        "oauth2"
+      ],
+      "declared": 1,
+      "minimum": 1,
+      "auth": {
+        "presentation": "bearer"
+      }
+    },
+    {
+      "name": "HubSpot Files",
+      "id": "hubapi-com-files",
+      "provider": "hubapi.com:files",
+      "version": "v3",
+      "url": "https://api.apis.guru/v2/specs/hubapi.com/files/v3/openapi.json",
+      "sha256": "07ed8a911b84be2bbcbfc326179d79fd053c23c5873b425df586f67241f2b463",
+      "auth_shapes": [
+        "api_key_header",
+        "api_key_query",
+        "oauth2"
+      ],
+      "declared": 18,
+      "minimum": 16,
+      "auth": {
+        "presentation": "bearer"
+      }
+    },
+    {
+      "name": "HubSpot Marketing",
+      "id": "hubapi-com-marketing",
+      "provider": "hubapi.com:marketing",
+      "version": "v3",
+      "url": "https://api.apis.guru/v2/specs/hubapi.com/marketing/v3/openapi.json",
+      "sha256": "8eacef7bb3925549aee007cfffdeac5217074334be5a876e77ef9ebf3e6f1119",
+      "auth_shapes": [
+        "api_key_header",
+        "api_key_query",
+        "oauth2"
+      ],
+      "declared": 16,
+      "minimum": 16,
+      "auth": {
+        "presentation": "bearer"
+      }
+    },
+    {
+      "name": "HubSpot Webhooks",
+      "id": "hubapi-com-webhooks",
+      "provider": "hubapi.com:webhooks",
+      "version": "v3",
+      "url": "https://api.apis.guru/v2/specs/hubapi.com/webhooks/v3/openapi.json",
+      "sha256": "8d0edb781b13555293cad83ee53cf62055a791595fc7b6166b22f364bfea4d01",
+      "auth_shapes": [
+        "api_key_query"
+      ],
+      "declared": 9,
+      "minimum": 9,
+      "auth": {
+        "presentation": "bearer"
+      }
+    },
+    {
+      "name": "InfluxDB",
+      "id": "influxdata-com",
+      "provider": "influxdata.com",
+      "version": "2.0.0",
+      "url": "https://api.apis.guru/v2/specs/influxdata.com/2.0.0/openapi.json",
+      "sha256": "7a95795d106730673032a8dda5f56d56a1f28f868b925d471ddcfe7ac87f7ea4",
+      "auth_shapes": [
+        "http_basic"
+      ],
+      "declared": 197,
+      "minimum": 190,
+      "auth": {
+        "presentation": "header_api_key"
+      }
+    },
+    {
+      "name": "Keycloak",
+      "id": "keycloak-local",
+      "provider": "keycloak.local",
+      "version": "1",
+      "url": "https://api.apis.guru/v2/specs/keycloak.local/1/openapi.json",
+      "sha256": "a4b3bbcdb59659f48d83b26b448e81bed56201828a00d6b58e792e29d562230f",
+      "auth_shapes": [
+        "http_bearer"
+      ],
+      "declared": 281,
+      "minimum": 271,
+      "auth": {
+        "presentation": "bearer"
+      }
+    },
+    {
+      "name": "Linode",
+      "id": "linode-com",
+      "provider": "linode.com",
+      "version": "4.145.0",
+      "url": "https://api.apis.guru/v2/specs/linode.com/4.145.0/openapi.json",
+      "sha256": "f8de7e6d551673a8871009982b3936674a9a54ff56c9439ead5282986cb1bfbd",
+      "auth_shapes": [
+        "http_bearer",
+        "oauth2"
+      ],
+      "declared": 350,
+      "minimum": 280,
+      "auth": {
+        "presentation": "bearer"
+      }
+    },
+    {
+      "name": "Mastodon",
+      "id": "mastodon-local",
+      "provider": "mastodon.local",
+      "version": "1.0",
+      "url": "https://api.apis.guru/v2/specs/mastodon.local/1.0/openapi.json",
+      "sha256": "4f3dc537804a61d63635edc376cda80dda4a3639281589fabe94b050c30071de",
+      "auth_shapes": [
+        "http_bearer",
+        "oauth2"
+      ],
+      "declared": 127,
+      "minimum": 113,
+      "auth": {
+        "presentation": "bearer"
+      }
+    },
+    {
+      "name": "Meilisearch",
+      "id": "meilisearch-com",
+      "provider": "meilisearch.com",
+      "version": "1.0.0",
+      "url": "https://api.apis.guru/v2/specs/meilisearch.com/1.0.0/openapi.json",
+      "sha256": "2ed7c497c0fce8ea87b8ae6788cbba5b6ae8f75af4494348f59aa582de886aa2",
+      "auth_shapes": [
+        "none_declared"
+      ],
+      "declared": 65,
+      "minimum": 62,
+      "auth": {
+        "presentation": "bearer"
+      }
+    },
+    {
+      "name": "Okta",
+      "id": "okta-local",
+      "provider": "okta.local",
+      "version": "1.0.0",
+      "url": "https://api.apis.guru/v2/specs/okta.local/1.0.0/openapi.json",
+      "sha256": "24d758ad8e32c83bc900c60695636d02366cebc5e38187857d2c2089c14b1b06",
+      "auth_shapes": [
+        "none_declared"
+      ],
+      "declared": 19,
+      "minimum": 16,
+      "auth": {
+        "presentation": "header_api_key"
+      }
+    },
+    {
+      "name": "Snyk",
+      "id": "snyk-io",
+      "provider": "snyk.io",
+      "version": "1.0.0",
+      "url": "https://api.apis.guru/v2/specs/snyk.io/1.0.0/openapi.json",
+      "sha256": "fefa07b85a73f219b07193708faade7b191282e9f0e56da97e3b80d0b0f32fc5",
+      "auth_shapes": [
+        "none_declared"
+      ],
+      "declared": 103,
+      "minimum": 103,
+      "auth": {
+        "presentation": "header_api_key"
+      }
+    },
+    {
+      "name": "Stack Exchange",
+      "id": "stackexchange-com",
+      "provider": "stackexchange.com",
+      "version": "2.0",
+      "url": "https://api.apis.guru/v2/specs/stackexchange.com/2.0/openapi.json",
+      "sha256": "b10f4129a635123583ed6565c7ea31b813aa0c733114ce06d787e9a7d6c82099",
+      "auth_shapes": [
+        "oauth2"
+      ],
+      "declared": 124,
+      "minimum": 124,
+      "auth": {
+        "presentation": "bearer"
+      }
+    },
+    {
+      "name": "Apache Superset",
+      "id": "superset-apache-local-superset",
+      "provider": "superset.apache.local:superset",
+      "version": "v1",
+      "url": "https://api.apis.guru/v2/specs/superset.apache.local/superset/v1/openapi.json",
+      "sha256": "f7161279680a0d3d1ed862d7fc4398e061f9eb61d6c9fe896d3d271e6b74a377",
+      "auth_shapes": [
+        "http_bearer"
+      ],
+      "declared": 120,
+      "minimum": 96,
+      "auth": {
+        "presentation": "bearer"
+      }
+    },
+    {
+      "name": "Telegram",
+      "id": "telegram-org",
+      "provider": "telegram.org",
+      "version": "5.0.0",
+      "url": "https://api.apis.guru/v2/specs/telegram.org/5.0.0/openapi.json",
+      "sha256": "cebab51778f0341333daafbe124bf7944197ca8c09a6b4740f72f1ae84c6c087",
+      "auth_shapes": [
+        "none_declared"
+      ],
+      "declared": 74,
+      "minimum": 60,
+      "auth": {
+        "presentation": "path_api_key",
+        "name": "token",
+        "base_url": "https://api.example.com/bot{token}"
+      }
+    },
+    {
+      "name": "Ticketmaster Discovery",
+      "id": "ticketmaster-com-discovery",
+      "provider": "ticketmaster.com:discovery",
+      "version": "v2",
+      "url": "https://api.apis.guru/v2/specs/ticketmaster.com/discovery/v2/openapi.json",
+      "sha256": "d546f24ec8358dcb5012bb6d57ae9491e5ff708fbb8433d75fea60bb10356d7f",
+      "auth_shapes": [
+        "none_declared"
+      ],
+      "declared": 13,
+      "minimum": 11,
+      "auth": {
+        "presentation": "query_api_key"
+      }
+    },
+    {
+      "name": "Ticketmaster Publish",
+      "id": "ticketmaster-com-publish",
+      "provider": "ticketmaster.com:publish",
+      "version": "v2",
+      "url": "https://api.apis.guru/v2/specs/ticketmaster.com/publish/v2/openapi.json",
+      "sha256": "70f3bed59c130bf6309077490dcd00e81c1b49376d7ccf09ed55d88b261a97a1",
+      "auth_shapes": [
+        "none_declared"
+      ],
+      "declared": 10,
+      "minimum": 10,
+      "auth": {
+        "presentation": "header_api_key"
+      }
+    },
+    {
+      "name": "Vimeo",
+      "id": "vimeo-com",
+      "provider": "vimeo.com",
+      "version": "3.4",
+      "url": "https://api.apis.guru/v2/specs/vimeo.com/3.4/openapi.json",
+      "sha256": "903a5ccd13df36451e3f3855c686cbc4f379b0a5767cbdb47421634af9a7fcc9",
+      "auth_shapes": [
+        "http_bearer",
+        "oauth2"
+      ],
+      "declared": 326,
+      "minimum": 279,
+      "auth": {
+        "presentation": "bearer"
+      }
+    },
+    {
+      "name": "Webflow",
+      "id": "webflow-com",
+      "provider": "webflow.com",
+      "version": "2023-03-01T164537Z",
+      "url": "https://api.apis.guru/v2/specs/webflow.com/2023-03-01T164537Z/openapi.json",
+      "sha256": "550233e93e78ded22dcce92c91b37be05f459bcea03031efaeaa33b1e861d6aa",
+      "auth_shapes": [
+        "oauth2"
+      ],
+      "declared": 121,
+      "minimum": 97,
+      "auth": {
+        "presentation": "bearer"
+      }
+    },
+    {
+      "name": "Xero Accounting",
+      "id": "xero-com-xero-accounting",
+      "provider": "xero.com:xero_accounting",
+      "version": "2.9.4",
+      "url": "https://api.apis.guru/v2/specs/xero.com/xero_accounting/2.9.4/openapi.json",
+      "sha256": "1c72bca077fc62931fe2be34f717f4cf6c10475768f3e3f7d55f48e9beb6ac12",
+      "auth_shapes": [
+        "oauth2"
+      ],
+      "declared": 224,
+      "minimum": 180,
+      "auth": {
+        "presentation": "bearer"
+      }
+    },
+    {
+      "name": "Xero Payroll AU",
+      "id": "xero-com-xero-payroll-au",
+      "provider": "xero.com:xero-payroll-au",
+      "version": "2.9.4",
+      "url": "https://api.apis.guru/v2/specs/xero.com/xero-payroll-au/2.9.4/openapi.json",
+      "sha256": "85fef9555e7253bb593137ec1640ebc8a0a792b2384b1e8ebf5c39fd2841a63c",
+      "auth_shapes": [
+        "oauth2"
+      ],
+      "declared": 29,
+      "minimum": 29,
+      "auth": {
+        "presentation": "bearer"
+      }
+    },
+    {
+      "name": "Xero Files",
+      "id": "xero-com-xero-files",
+      "provider": "xero.com:xero_files",
+      "version": "2.9.4",
+      "url": "https://api.apis.guru/v2/specs/xero.com/xero_files/2.9.4/openapi.json",
+      "sha256": "704c1712373cb9cfeee8e6d9af8dbcbad4e6806f226eb817e5e0485f5c22d76d",
+      "auth_shapes": [
+        "oauth2"
+      ],
+      "declared": 16,
+      "minimum": 15,
+      "auth": {
+        "presentation": "bearer"
+      }
+    },
+    {
+      "name": "Xero Identity",
+      "id": "xero-com-xero-identity",
+      "provider": "xero.com:xero-identity",
+      "version": "2.9.4",
+      "url": "https://api.apis.guru/v2/specs/xero.com/xero-identity/2.9.4/openapi.json",
+      "sha256": "feece0946fcd84f7cee2f8c77252efdc4a0e853808e6603efce71840ec1840f2",
+      "auth_shapes": [
+        "http_basic",
+        "oauth2"
+      ],
+      "declared": 2,
+      "minimum": 2,
+      "auth": {
+        "presentation": "bearer"
+      }
+    },
+    {
+      "name": "Zapier NLA",
+      "id": "zapier-com-nla",
+      "provider": "zapier.com:nla",
+      "version": "1.0.0",
+      "url": "https://api.apis.guru/v2/specs/zapier.com/nla/1.0.0/openapi.json",
+      "sha256": "4e7cae2613c35e18c6028b9f8d0aeab1c9331f630cdc793e420a571a22b4bbb7",
+      "auth_shapes": [
+        "api_key_cookie",
+        "api_key_header",
+        "api_key_query",
+        "oauth2"
+      ],
+      "declared": 4,
+      "minimum": 4,
+      "auth": {
+        "presentation": "bearer"
+      }
+    },
+    {
+      "name": "NASA APOD",
+      "id": "nasa-gov-apod",
+      "provider": "nasa.gov:apod",
+      "version": "1.0.0",
+      "url": "https://api.apis.guru/v2/specs/nasa.gov/apod/1.0.0/openapi.json",
+      "sha256": "e082b43d8945db2345b088be41be4982f67fd116e129e7e194f156a4b4143028",
+      "auth_shapes": [
+        "api_key_query"
+      ],
+      "declared": 1,
+      "minimum": 1,
+      "auth": {
+        "presentation": "query_api_key"
+      }
+    },
+    {
+      "name": "New York Times Article Search",
+      "id": "nytimes-com-article-search",
+      "provider": "nytimes.com:article_search",
+      "version": "1.0.0",
+      "url": "https://api.apis.guru/v2/specs/nytimes.com/article_search/1.0.0/openapi.json",
+      "sha256": "c8d4afdb86ad52840ac9660f4e15fd2382f9da289cf7c54d2c65888d81b49486",
+      "auth_shapes": [
+        "api_key_query"
+      ],
+      "declared": 1,
+      "minimum": 1,
+      "auth": {
+        "presentation": "query_api_key"
+      }
+    },
+    {
+      "name": "ShipEngine",
+      "id": "shipengine-com",
+      "provider": "shipengine.com",
+      "version": "1.1.202303022103",
+      "url": "https://api.apis.guru/v2/specs/shipengine.com/1.1.202303022103/openapi.json",
+      "sha256": "f18bb4671b11749cc896c0234f11f5dd0db01d9068b9cff165db2101dfb08f5b",
+      "auth_shapes": [
+        "api_key_header"
+      ],
+      "declared": 84,
+      "minimum": 74,
+      "auth": {
+        "presentation": "header_api_key"
+      }
+    },
+    {
+      "name": "Google People",
+      "id": "googleapis-com-people",
+      "provider": "googleapis.com:people",
+      "version": "v1",
+      "url": "https://api.apis.guru/v2/specs/googleapis.com/people/v1/openapi.json",
+      "sha256": "99f51a5128b0c56c0f9311a66404a56308fa759bfc7606d87ebaa858181c9ca8",
+      "auth_shapes": [
+        "oauth2"
+      ],
+      "declared": 23,
+      "minimum": 23,
+      "auth": {
+        "presentation": "bearer"
+      }
+    },
+    {
+      "name": "Rev.ai",
+      "id": "rev-ai",
+      "provider": "rev.ai",
+      "version": "v1",
+      "url": "https://api.apis.guru/v2/specs/rev.ai/v1/openapi.json",
+      "sha256": "2b8675b1c4fc28a6909922057d5ffbb25fd8a729329b8e2a9a9e5daa2a04c63b",
+      "auth_shapes": [
+        "http_bearer"
+      ],
+      "declared": 7,
+      "minimum": 7,
+      "auth": {
+        "presentation": "bearer"
+      }
+    },
+    {
+      "name": "Google Docs",
+      "id": "googleapis-com-docs",
+      "provider": "googleapis.com:docs",
+      "version": "v1",
+      "url": "https://api.apis.guru/v2/specs/googleapis.com/docs/v1/openapi.json",
+      "sha256": "5f0a0342d83146444a81cdf311c89608a651f48bc664658f9826397fbe0ac5da",
+      "auth_shapes": [
+        "oauth2"
+      ],
+      "declared": 3,
+      "minimum": 3,
+      "auth": {
+        "presentation": "bearer"
+      }
+    },
+    {
+      "name": "Google Tasks",
+      "id": "googleapis-com-tasks",
+      "provider": "googleapis.com:tasks",
+      "version": "v1",
+      "url": "https://api.apis.guru/v2/specs/googleapis.com/tasks/v1/openapi.json",
+      "sha256": "efe3c735588bb5b81f5eb97c9ce172b9b1d7f9f79ab39728fd6ce64eb6983c48",
+      "auth_shapes": [
+        "oauth2"
+      ],
+      "declared": 14,
+      "minimum": 14,
+      "auth": {
+        "presentation": "bearer"
+      }
+    },
+    {
+      "name": "Google Forms",
+      "id": "googleapis-com-forms",
+      "provider": "googleapis.com:forms",
+      "version": "v1",
+      "url": "https://api.apis.guru/v2/specs/googleapis.com/forms/v1/openapi.json",
+      "sha256": "ce5abc7b7d316bf92096b36bd079c441e5d2b2b52159b87266d4b5bf90dd6c67",
+      "auth_shapes": [
+        "oauth2"
+      ],
+      "declared": 9,
+      "minimum": 9,
+      "auth": {
+        "presentation": "bearer"
+      }
+    },
+    {
+      "name": "Google Slides",
+      "id": "googleapis-com-slides",
+      "provider": "googleapis.com:slides",
+      "version": "v1",
+      "url": "https://api.apis.guru/v2/specs/googleapis.com/slides/v1/openapi.json",
+      "sha256": "8cf2b6064490ec81d3b0cd8478d995005171e9f46c9e2b38e15bcb5964187265",
+      "auth_shapes": [
+        "oauth2"
+      ],
+      "declared": 5,
+      "minimum": 4,
+      "auth": {
+        "presentation": "bearer"
+      }
+    },
+    {
+      "name": "Google BigQuery",
+      "id": "googleapis-com-bigquery",
+      "provider": "googleapis.com:bigquery",
+      "version": "v2",
+      "url": "https://api.apis.guru/v2/specs/googleapis.com/bigquery/v2/openapi.json",
+      "sha256": "067fe7b1ec3279d0fb62ee5fadd080d98aced8d8d60a83292a951d9cd94a3c76",
+      "auth_shapes": [
+        "oauth2"
+      ],
+      "declared": 36,
+      "minimum": 29,
+      "auth": {
+        "presentation": "bearer"
+      }
+    },
+    {
+      "name": "Google Analytics Data",
+      "id": "googleapis-com-analyticsdata",
+      "provider": "googleapis.com:analyticsdata",
+      "version": "v1beta",
+      "url": "https://api.apis.guru/v2/specs/googleapis.com/analyticsdata/v1beta/openapi.json",
+      "sha256": "b1a576a31965d45732593633fae04c061f682c659db61e3ec669953738396c3e",
+      "auth_shapes": [
+        "oauth2"
+      ],
+      "declared": 7,
+      "minimum": 6,
+      "auth": {
+        "presentation": "bearer"
+      }
+    },
+    {
+      "name": "Google Cloud Resource Manager",
+      "id": "googleapis-com-cloudresourcemanager",
+      "provider": "googleapis.com:cloudresourcemanager",
+      "version": "v3",
+      "url": "https://api.apis.guru/v2/specs/googleapis.com/cloudresourcemanager/v3/openapi.json",
+      "sha256": "1dade28d0fba205cd780c3f294ad054ab1ebf3a9e1d3c2a1820390e172560bf4",
+      "auth_shapes": [
+        "oauth2"
+      ],
+      "declared": 28,
+      "minimum": 28,
+      "auth": {
+        "presentation": "bearer"
+      }
+    },
+    {
+      "name": "Google Cloud Storage",
+      "id": "googleapis-com-storage",
+      "provider": "googleapis.com:storage",
+      "version": "v1",
+      "url": "https://api.apis.guru/v2/specs/googleapis.com/storage/v1/openapi.json",
+      "sha256": "da616d8024182b92ff1651ceabb920cb15bc7f5372f9729c9ac7244823ccf416",
+      "auth_shapes": [
+        "oauth2"
+      ],
+      "declared": 52,
+      "minimum": 51,
+      "auth": {
+        "presentation": "bearer"
+      }
+    },
+    {
+      "name": "Google Translate",
+      "id": "googleapis-com-translate",
+      "provider": "googleapis.com:translate",
+      "version": "v3beta1",
+      "url": "https://api.apis.guru/v2/specs/googleapis.com/translate/v3beta1/openapi.json",
+      "sha256": "cc71e9e3413ee32e656451b37c44b326c80d530417ab3117a6626c9789f3ba2a",
+      "auth_shapes": [
+        "oauth2"
+      ],
+      "declared": 14,
+      "minimum": 14,
+      "auth": {
+        "presentation": "bearer"
+      }
+    },
+    {
+      "name": "Google Vision",
+      "id": "googleapis-com-vision",
+      "provider": "googleapis.com:vision",
+      "version": "v1p1beta1",
+      "url": "https://api.apis.guru/v2/specs/googleapis.com/vision/v1p1beta1/openapi.json",
+      "sha256": "cce1a242baa08e98ba9144c6ba5ce435bf98143b42008b57a582bb82755f24e2",
+      "auth_shapes": [
+        "oauth2"
+      ],
+      "declared": 8,
+      "minimum": 8,
+      "auth": {
+        "presentation": "bearer"
+      }
+    },
+    {
+      "name": "Google Speech",
+      "id": "googleapis-com-speech",
+      "provider": "googleapis.com:speech",
+      "version": "v2beta1",
+      "url": "https://api.apis.guru/v2/specs/googleapis.com/speech/v2beta1/openapi.json",
+      "sha256": "da3148ac5c6cdaf18b9fe5b30a5c80a0ffa3791fcd6a589c97dd6b578144e661",
+      "auth_shapes": [
+        "oauth2"
+      ],
+      "declared": 2,
+      "minimum": 2,
+      "auth": {
+        "presentation": "bearer"
+      }
+    },
+    {
+      "name": "Google Drive Activity",
+      "id": "googleapis-com-driveactivity",
+      "provider": "googleapis.com:driveactivity",
+      "version": "v2",
+      "url": "https://api.apis.guru/v2/specs/googleapis.com/driveactivity/v2/openapi.json",
+      "sha256": "7607ded1c2175ca44630380a900c453a047b0c21f5829fe9c4faeaad1b5f39dc",
+      "auth_shapes": [
+        "oauth2"
+      ],
+      "declared": 1,
+      "minimum": 1,
+      "auth": {
+        "presentation": "bearer"
+      }
+    },
+    {
+      "name": "Google Chat",
+      "id": "googleapis-com-chat",
+      "provider": "googleapis.com:chat",
+      "version": "v1",
+      "url": "https://api.apis.guru/v2/specs/googleapis.com/chat/v1/openapi.json",
+      "sha256": "88d074d3d065f80983e1584653c811d2a747e642117ae729edebd44ef91b6298",
+      "auth_shapes": [
+        "oauth2"
+      ],
+      "declared": 8,
+      "minimum": 7,
+      "auth": {
+        "presentation": "bearer"
+      }
+    },
+    {
+      "name": "Google Classroom",
+      "id": "googleapis-com-classroom",
+      "provider": "googleapis.com:classroom",
+      "version": "v1",
+      "url": "https://api.apis.guru/v2/specs/googleapis.com/classroom/v1/openapi.json",
+      "sha256": "3614c96b5d6960a040928d8c5f33db630f347f843bbff29d17da2c0043bc9607",
+      "auth_shapes": [
+        "oauth2"
+      ],
+      "declared": 61,
+      "minimum": 61,
+      "auth": {
+        "presentation": "bearer"
+      }
+    },
+    {
+      "name": "eBay Sell Marketing",
+      "id": "ebay-com-sell-marketing",
+      "provider": "ebay.com:sell-marketing",
+      "version": "v1.14.0",
+      "url": "https://api.apis.guru/v2/specs/ebay.com/sell-marketing/v1.14.0/openapi.json",
+      "sha256": "2166e80f15141ef18328cf6a79bc7cf23de7964927b027e1e5f636fbc086fcda",
+      "auth_shapes": [
+        "oauth2"
+      ],
+      "declared": 69,
+      "minimum": 69,
+      "auth": {
+        "presentation": "bearer"
+      }
+    },
+    {
+      "name": "eBay Sell Listing",
+      "id": "ebay-com-sell-listing",
+      "provider": "ebay.com:sell-listing",
+      "version": "v1_beta.3.0",
+      "url": "https://api.apis.guru/v2/specs/ebay.com/sell-listing/v1_beta.3.0/openapi.json",
+      "sha256": "876d02496b87936e6eca859e6b92eb532429246b0da12c1f11db6ec5b2fb1759",
+      "auth_shapes": [
+        "oauth2"
+      ],
+      "declared": 1,
+      "minimum": 1,
+      "auth": {
+        "presentation": "bearer"
+      }
+    },
+    {
+      "name": "eBay Sell Feed",
+      "id": "ebay-com-sell-feed",
+      "provider": "ebay.com:sell-feed",
+      "version": "v1.3.1",
+      "url": "https://api.apis.guru/v2/specs/ebay.com/sell-feed/v1.3.1/openapi.json",
+      "sha256": "72d6a7452c395f7540de85a0ed179c05db240844ce960205f43a5bfec984b129",
+      "auth_shapes": [
+        "oauth2"
+      ],
+      "declared": 23,
+      "minimum": 22,
+      "auth": {
+        "presentation": "bearer"
+      }
+    },
+    {
+      "name": "eBay Sell Negotiation",
+      "id": "ebay-com-sell-negotiation",
+      "provider": "ebay.com:sell-negotiation",
+      "version": "v1.1.0",
+      "url": "https://api.apis.guru/v2/specs/ebay.com/sell-negotiation/v1.1.0/openapi.json",
+      "sha256": "b49c467a72c0f95ffa619241029eb8b0bebcc0c7d4690842f0ea1c61a7a4bf8b",
+      "auth_shapes": [
+        "oauth2"
+      ],
+      "declared": 2,
+      "minimum": 2,
+      "auth": {
+        "presentation": "bearer"
+      }
+    },
+    {
+      "name": "eBay Commerce Catalog",
+      "id": "ebay-com-commerce-catalog",
+      "provider": "ebay.com:commerce-catalog",
+      "version": "v1_beta.5.0",
+      "url": "https://api.apis.guru/v2/specs/ebay.com/commerce-catalog/v1_beta.5.0/openapi.json",
+      "sha256": "b7469f5cf07fc087e4a24e3a0dd67b804930ce58cd1a9f776c40275b8011351d",
+      "auth_shapes": [
+        "oauth2"
+      ],
+      "declared": 2,
+      "minimum": 2,
+      "auth": {
+        "presentation": "bearer"
+      }
+    },
+    {
+      "name": "HubSpot Automation",
+      "id": "hubapi-com-automation",
+      "provider": "hubapi.com:automation",
+      "version": "v4",
+      "url": "https://api.apis.guru/v2/specs/hubapi.com/automation/v4/openapi.json",
+      "sha256": "72a39a156285a8b1cf2255418baa7266274daf07a42bd71a0d17f703e3e77dc5",
+      "auth_shapes": [
+        "api_key_header",
+        "api_key_query",
+        "oauth2"
+      ],
+      "declared": 16,
+      "minimum": 14,
+      "auth": {
+        "presentation": "bearer"
+      }
+    },
+    {
+      "name": "HubSpot Analytics",
+      "id": "hubapi-com-analytics",
+      "provider": "hubapi.com:analytics",
+      "version": "v3",
+      "url": "https://api.apis.guru/v2/specs/hubapi.com/analytics/v3/openapi.json",
+      "sha256": "e44af82f28e1f61e0428ff36d0fd6f91d0ddbda63133a5e9e3b13c5846475749",
+      "auth_shapes": [
+        "api_key_header",
+        "api_key_query",
+        "oauth2"
+      ],
+      "declared": 1,
+      "minimum": 1,
+      "auth": {
+        "presentation": "bearer"
+      }
+    },
+    {
+      "name": "HubSpot CMS",
+      "id": "hubapi-com-cms",
+      "provider": "hubapi.com:cms",
+      "version": "v3",
+      "url": "https://api.apis.guru/v2/specs/hubapi.com/cms/v3/openapi.json",
+      "sha256": "5132ab8f1b5bee70c645ddd43c5b96044bd0b6be75b0db8df3e232857e02d010",
+      "auth_shapes": [
+        "api_key_header",
+        "api_key_query",
+        "oauth2"
+      ],
+      "declared": 2,
+      "minimum": 2,
+      "auth": {
+        "presentation": "bearer"
+      }
+    },
+    {
+      "name": "HubSpot Communication Preferences",
+      "id": "hubapi-com-communication-preferences",
+      "provider": "hubapi.com:communication-preferences",
+      "version": "v3",
+      "url": "https://api.apis.guru/v2/specs/hubapi.com/communication-preferences/v3/openapi.json",
+      "sha256": "9788db4a1ccd0384fbe9fab490ea4008ac067c68015315e7ce401aac65f162b8",
+      "auth_shapes": [
+        "api_key_header",
+        "api_key_query",
+        "oauth2"
+      ],
+      "declared": 4,
+      "minimum": 4,
+      "auth": {
+        "presentation": "bearer"
+      }
+    },
+    {
+      "name": "HubSpot Events",
+      "id": "hubapi-com-events",
+      "provider": "hubapi.com:events",
+      "version": "v3",
+      "url": "https://api.apis.guru/v2/specs/hubapi.com/events/v3/openapi.json",
+      "sha256": "d80d6547573565419b6523347ef8c26e3f44747a05d1b0251646dd4cb06dc454",
+      "auth_shapes": [
+        "api_key_header",
+        "api_key_query",
+        "oauth2"
+      ],
+      "declared": 1,
+      "minimum": 1,
+      "auth": {
+        "presentation": "bearer"
+      }
+    },
+    {
+      "name": "Adyen Management",
+      "id": "adyen-com-managementservice",
+      "provider": "adyen.com:ManagementService",
+      "version": "1",
+      "url": "https://api.apis.guru/v2/specs/adyen.com/ManagementService/1/openapi.json",
+      "sha256": "64581e597b39b01239da056b7b3838df544e3fc9d2c53e5b5b8188a85a7db667",
+      "auth_shapes": [
+        "api_key_header",
+        "http_basic"
+      ],
+      "declared": 119,
+      "minimum": 119,
+      "auth": {
+        "presentation": "header_api_key"
+      }
+    },
+    {
+      "name": "NetBox",
+      "id": "netbox-dev",
+      "provider": "netbox.dev",
+      "version": "3.4",
+      "url": "https://api.apis.guru/v2/specs/netbox.dev/3.4/openapi.json",
+      "sha256": "1ec11a5f4126a097ec743dae2686f6cf0244dff8e79a02439f230b29c0be7b0d",
+      "auth_shapes": [
+        "api_key_header"
+      ],
+      "declared": 844,
+      "minimum": 844,
+      "auth": {
+        "presentation": "header_api_key"
+      }
+    }
+  ]
+}

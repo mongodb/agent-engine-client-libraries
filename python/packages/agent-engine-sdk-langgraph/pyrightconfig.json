@@ -1,0 +1,4 @@
+{
+  "reportMissingTypeStubs": false,
+  "ignore": ["langgraph.checkpoint.mongodb"]
+}

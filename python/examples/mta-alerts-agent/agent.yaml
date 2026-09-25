@@ -1,0 +1,25 @@
+name: mta-alerts-agent
+entrypoint: mta_alerts_agent.agent:app
+
+# Named sandboxes control tool placement and which secrets each guest sees.
+sandboxes:
+  agent:
+    secrets:
+      - OPENAI_API_KEY
+    tools:
+      - get_subway_alerts
+      - search_stops
+      - get_stop_arrivals
+  tool:
+    secrets:
+      - OPENAI_API_KEY
+
+# Atlas reachability is deliberately absent: the e2e links its project to the
+# shared dev Atlas project, so ECP's egress sync manages the TenantEnvironment
+# allowlist instead of per-workspace `network.atlas_clusters`.
+network:
+  egress:
+    - fqdn: api-endpoint.mta.info
+      ports: [443]
+    - fqdn: grove-gateway-prod.azure-api.net
+      ports: [443]

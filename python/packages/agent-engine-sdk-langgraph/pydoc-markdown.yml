@@ -1,0 +1,21 @@
+loaders:
+  - type: python
+    search_path: [src]
+    modules:
+      - agent_engine_sdk_langgraph.runtime
+      - agent_engine_sdk_langgraph.agent
+
+processors:
+  - type: filter
+    # Only document public members (no underscore prefix).
+    # _register_hooks, _builder_fn, etc. are excluded.
+    skip_empty_modules: true
+  - type: smart
+  - type: crossref
+
+renderer:
+  type: markdown
+  render_module_header: false
+  descriptive_class_title: false
+  render_toc: true
+  toc_maxdepth: 3

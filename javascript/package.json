@@ -1,0 +1,36 @@
+{
+  "name": "@mongodb-js/agent-engine-sdk-workspace",
+  "private": true,
+  "packageManager": "npm@11.14.1",
+  "engines": {
+    "node": ">=24",
+    "npm": ">=11.10.0"
+  },
+  "workspaces": [
+    "packages/agent-engine-sdk",
+    "packages/agent-engine-memory",
+    "packages/agent-engine-runner-shared",
+    "packages/agent-engine-sdk-langgraph"
+  ],
+  "scripts": {
+    "docs": "npm run build --workspaces --if-present && bash scripts/gen-docs.sh"
+  },
+  "dependencies": {
+    "fdir": "^6.5.0",
+    "ipaddr.js": "^2.4.0",
+    "mnemonist": "^0.40.4",
+    "quick-format-unescaped": "^4.0.4",
+    "real-require": "^1.0.0",
+    "require-from-string": "^2.0.2",
+    "ret": "^0.5.0",
+    "thread-stream": "^4.2.0"
+  },
+  "optionalDependencies": {
+    "@rolldown/binding-linux-x64-gnu": "1.0.1"
+  },
+  "devDependencies": {
+    "prettier": "3.8.5",
+    "typedoc": "0.28.20",
+    "typedoc-plugin-markdown": "4.13.0"
+  }
+}

@@ -1,0 +1,54 @@
+# Example manifest for running this agent locally (`agentengine dev up`).
+#
+# It is not the manifest any deployed copy uses: the canary deploys with
+# canary/insurance-agent/agent.yaml, and the CLI integration suites generate one
+# bound to whichever provider key the run holds. Committed edits must match the
+# canary manifest outside `scaling` (scripts/lint-insurance-agent-consistency.sh).
+name: insurance-agent
+entrypoint: insurance_agent.main:app
+
+# Named sandboxes control tool placement and which secrets each guest sees.
+# The native interrupt tool stays on the agent sandbox.
+sandboxes:
+  agent:
+    secrets:
+      - GEMINI_API_KEY
+    tools:
+      - human_review
+      - send_notification
+  tool:
+    secrets:
+      - GEMINI_API_KEY
+    tools:
+      - lookup_policy
+      - get_quote
+      - create_policy
+      - list_customer_policies
+      - file_claim
+      - analyze_claim_risk
+      - check_claim_status
+      - list_customer_claims
+      - resolve_claim
+      - save_customer_info
+      - recall_customer_info
+      - save_conversation_summary
+      - recall_past_conversations
+      - explain_insurance_term
+      - get_coverage_options
+
+features:
+  guardrails: false
+  memory: false
+
+# The Insurance Agent project is not Atlas-linked, so ECP's atlasegresssync
+# never populates the tenant's Atlas egress allowlist. Declare the agent's Atlas
+# cluster here so the build stamps it onto the TenantEnvironment and the
+# microVM's DNS SRV lookup is allowed through the Cilium L7 DNS proxy.
+# atlas_clusters is not an outbound-access policy: Gemini traffic still needs
+# network.egress (or egress_mode). deny_all would block the model.
+network:
+  atlas_clusters:
+    - agentic-demos-aws-us-ea.cjop1d.mongodb.net
+  egress:
+    - fqdn: generativelanguage.googleapis.com
+      ports: [443]

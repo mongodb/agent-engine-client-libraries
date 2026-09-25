@@ -1,0 +1,94 @@
+name: publish-javascript-package
+description: Build and publish one JavaScript SDK package. Skips if the version is already on the registry.
+
+inputs:
+  name:
+    description: npm package name (e.g. @mongodb-js/agent-engine-sdk)
+    required: true
+  directory:
+    description: Directory under javascript/packages/
+    required: true
+  registry-url:
+    description: npm-compatible registry URL; unused when start-mock is true (the mock script's echoed URL wins)
+    required: false
+    default: ""
+  build-first:
+    description: Comma-separated workspace names to build before this package
+    required: false
+    default: ""
+  start-mock:
+    description: Start a loopback Verdaccio before publishing
+    required: false
+    default: "true"
+  dry-run:
+    description: Pack and validate without uploading
+    required: false
+    default: "false"
+  npm-token:
+    description: Auth token used when publishing to a real registry
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: Preload Verdaccio image
+      if: ${{ inputs.start-mock == 'true' }}
+      shell: bash
+      env:
+        VERDACCIO_IMAGE: verdaccio/verdaccio:6.2.9@sha256:e3fc342181fd581de012659e55c14e8df4103aac6183698bbfd7cfc3c55d78d2
+      run: docker pull "$VERDACCIO_IMAGE"
+
+    - name: Start mock npm registry
+      id: mock-npm
+      if: ${{ inputs.start-mock == 'true' }}
+      shell: bash
+      env:
+        VERDACCIO_IMAGE: verdaccio/verdaccio:6.2.9@sha256:e3fc342181fd581de012659e55c14e8df4103aac6183698bbfd7cfc3c55d78d2
+      run: |
+        out="$(./scripts/start-mock-registries.sh --npm)"
+        echo "$out"
+        echo "url=$(printf '%s\n' "$out" | sed -n 's/^NPM_REGISTRY=//p')" >> "$GITHUB_OUTPUT"
+        echo "npmrc=$(printf '%s\n' "$out" | sed -n 's/^NPM_NPMRC=//p')" >> "$GITHUB_OUTPUT"
+
+    - name: Configure real registry auth
+      id: registry-auth
+      if: ${{ inputs.start-mock != 'true' }}
+      shell: bash
+      env:
+        NPM_TOKEN: ${{ inputs.npm-token }}
+        NPM_REGISTRY: ${{ inputs.registry-url }}
+      run: |
+        set -euo pipefail
+        : "${NPM_TOKEN:?npm-token is required when start-mock is false}"
+        : "${NPM_REGISTRY:?registry-url is required when start-mock is false}"
+        npmrc="${RUNNER_TEMP}/sdk-release-npmrc"
+        host="${NPM_REGISTRY#https://}"
+        umask 077
+        printf '//%s/:_authToken=%s\n' "${host%/}" "$NPM_TOKEN" > "$npmrc"
+        echo "npmrc=$npmrc" >> "$GITHUB_OUTPUT"
+
+    - name: Install and build
+      shell: bash
+      env:
+        NPM_NAME: ${{ inputs.name }}
+        BUILD_FIRST: ${{ inputs.build-first }}
+      run: |
+        set -euo pipefail
+        cd javascript
+        npm ci --ignore-scripts --no-audit --no-fund --prefer-offline
+        IFS=',' read -ra extras <<< "$BUILD_FIRST"
+        for workspace in "${extras[@]}" "$NPM_NAME"; do
+          [ -n "$workspace" ] || continue
+          npm run build --workspace="$workspace"
+        done
+
+    - name: Publish package
+      shell: bash
+      env:
+        NPM_REGISTRY: ${{ steps.mock-npm.outputs.url || inputs.registry-url }}
+        NPM_NPMRC: ${{ steps.mock-npm.outputs.npmrc || steps.registry-auth.outputs.npmrc }}
+        NPM_NAME: ${{ inputs.name }}
+        PACKAGE_DIRECTORY: ${{ inputs.directory }}
+        DRY_RUN: ${{ inputs.dry-run }}
+      run: ./scripts/publish-javascript-package.sh --name "$NPM_NAME" --directory "$PACKAGE_DIRECTORY"

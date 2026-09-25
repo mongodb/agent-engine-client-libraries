@@ -1,0 +1,19 @@
+name: test-agent
+entrypoint: test_agent.agent:app
+
+# Named sandboxes control tool placement and which secrets each guest sees.
+sandboxes:
+  agent:
+    secrets:
+      - GEMINI_API_KEY
+      - VOYAGE_API_KEY
+    tools:
+      - get_weather
+      - get_custom_headers
+      - get_payload
+  tool:
+    secrets:
+      - GEMINI_API_KEY
+
+features:
+  memory: true

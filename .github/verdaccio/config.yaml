@@ -1,0 +1,31 @@
+# Local-only npm registry for SDK release rehearsal. No uplinks, so a cache
+# miss fails here instead of being forwarded to npmjs.
+storage: /verdaccio/storage
+
+auth:
+  htpasswd:
+    file: /verdaccio/storage/htpasswd
+    # Allow the single CI publisher to self-register. This registry is
+    # ephemeral (recreated per job), so the count never accumulates.
+    max_users: 1
+
+uplinks: {}
+
+packages:
+  '@*/*':
+    access: $all
+    publish: $all
+    unpublish: $all
+  '**':
+    access: $all
+    publish: $all
+    unpublish: $all
+
+middlewares:
+  audit:
+    enabled: false
+
+log:
+  type: stdout
+  format: pretty
+  level: http

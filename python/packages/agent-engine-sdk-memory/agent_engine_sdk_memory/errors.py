@@ -1,0 +1,93 @@
+"""Exceptions raised by the memory seam."""
+
+from __future__ import annotations
+
+
+class MemoryIdentityError(ValueError):
+    """Raised when a required identity dimension cannot be resolved."""
+
+
+class MemoryClientError(ValueError):
+    """Base for pre-HTTP client/usage errors (no status code or response body).
+
+    Subclasses ``ValueError`` so callers that guard client-side validation with
+    a plain ``except ValueError`` keep working.
+    """
+
+
+class MemoryNotSupportedError(MemoryClientError):
+    """Raised when an operation is unavailable in the active transport mode.
+
+    This is a client-side capability check raised before any HTTP request is
+    attempted, so it carries no status code or response body.
+    """
+
+
+class MemoryAPIError(Exception):
+    """Base for typed transport errors from the HTTP memory transports."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status: int | None = None,
+        code: str | None = None,
+        response_text: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.message = message
+        self.status = status
+        self.code = code
+        self.response_text = response_text
+
+    def __str__(self) -> str:
+        if self.code:
+            return f"{self.message} (code={self.code})"
+        return self.message
+
+
+class MemoryAuthError(MemoryAPIError):
+    """Raised for 401 / 403 responses."""
+
+
+class MemoryNotProvisionedError(MemoryAPIError):
+    """Raised when the project's memory runtime is not yet reachable."""
+
+
+class MemoryBadRequestError(MemoryAPIError):
+    """Raised for 4xx responses other than auth / not-provisioned."""
+
+
+class MemoryRouteNotFoundError(MemoryBadRequestError):
+    """Raised when a core-loop request 404s, hinting a route-shape mismatch.
+
+    The SDK selects the route shape from ``project_id`` presence (set =>
+    project-scoped Gateway routes; empty => flat OE routes). A 404 on a core-loop
+    POST most often means that shape does not match the backend the ``base_url``
+    points at, so this carries a directional, actionable hint rather than the
+    opaque 404. It subclasses ``MemoryBadRequestError`` so existing 4xx handling
+    still catches it.
+    """
+
+
+class MemoryServerError(MemoryAPIError):
+    """Raised for 5xx responses, and for success responses whose body is
+    unparseable or has an unexpected shape."""
+
+
+class MemoryConnectionError(MemoryAPIError):
+    """Raised when the transport fails to reach the memory backend (connect/timeout)."""
+
+
+__all__ = [
+    "MemoryAPIError",
+    "MemoryAuthError",
+    "MemoryBadRequestError",
+    "MemoryClientError",
+    "MemoryConnectionError",
+    "MemoryIdentityError",
+    "MemoryNotProvisionedError",
+    "MemoryNotSupportedError",
+    "MemoryRouteNotFoundError",
+    "MemoryServerError",
+]
