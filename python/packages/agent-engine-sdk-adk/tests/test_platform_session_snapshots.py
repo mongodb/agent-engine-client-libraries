@@ -129,6 +129,23 @@ def test_session_snapshot_round_trip_preserves_adk_state_events_and_messages() -
     ]
 
 
+@pytest.mark.parametrize("state", [{}, {"temp:scratch": "discard"}])
+def test_session_snapshot_preserves_explicit_empty_replay_state(
+    state: dict[str, object],
+) -> None:
+    session = _session()
+    session.state = state
+
+    snapshot = session_to_state_snapshot(session)
+    restored = StateSnapshot.FromString(snapshot.SerializeToString())
+
+    assert restored.HasField("replay_properties")
+    assert proto_struct_to_json(restored.replay_properties) == {}
+    envelope = proto_struct_to_json(restored.properties)[_ADAPTER_STATE_KEY]
+    assert envelope["state"] == {}
+    assert len(envelope["events"]) == 4
+
+
 def test_fresh_session_requires_no_previous_snapshot() -> None:
     session = session_from_state_snapshot(
         None,

@@ -1,5 +1,6 @@
 """Unit tests for secure_wrapper retry logic."""
 
+import asyncio
 import json
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -19,6 +20,143 @@ from agent_engine_runner_shared.utils import (
 
 class TestIsRetryableError:
     """Tests for is_retryable_error helper function."""
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            TimeoutError("read timed out"),
+            ConnectionResetError("connection reset"),
+            httpx.ReadTimeout("read timed out"),
+            httpx.ReadError("connection reset"),
+            httpx.RemoteProtocolError("peer disconnected"),
+        ],
+    )
+    def test_transport_errors_and_explicit_causes(self, error):
+        assert is_retryable_error(error)
+        wrapped = RuntimeError("adapter failed")
+        wrapped.__cause__ = error
+        assert is_retryable_error(wrapped)
+
+    @pytest.mark.parametrize("suppressed", [False, True])
+    def test_implicit_transport_context_respects_suppression(self, suppressed):
+        try:
+            try:
+                raise TimeoutError("provider did not respond")
+            except TimeoutError:
+                if suppressed:
+                    raise RuntimeError("adapter failed") from None
+                raise RuntimeError("adapter failed")
+        except RuntimeError as error:
+            assert is_retryable_error(error) is (not suppressed)
+
+    def test_explicit_cause_takes_precedence_over_context(self):
+        try:
+            try:
+                raise TimeoutError("provider did not respond")
+            except TimeoutError:
+                raise RuntimeError("adapter failed") from ValueError("invalid request")
+        except RuntimeError as error:
+            assert not is_retryable_error(error)
+
+    @pytest.mark.parametrize("cancelled", [False, True])
+    def test_terminal_context_overrides_retryable_wrapper(self, cancelled):
+        rejection = (
+            asyncio.CancelledError()
+            if cancelled
+            else httpx.HTTPStatusError(
+                "rejected",
+                request=httpx.Request("POST", "https://provider.invalid"),
+                response=httpx.Response(401),
+            )
+        )
+        try:
+            try:
+                raise rejection
+            except (asyncio.CancelledError, httpx.HTTPStatusError):
+                raise TimeoutError("HTTP 503")
+        except TimeoutError as error:
+            assert not is_retryable_error(error)
+
+    def test_cyclic_implicit_context_remains_terminal(self):
+        error = RuntimeError("adapter failed")
+        error.__context__ = error
+        assert not is_retryable_error(error)
+
+    @pytest.mark.parametrize("status", [408, 409, 429, 500, 502, 503, 504])
+    def test_structured_retryable_http_status(self, status):
+        error = httpx.HTTPStatusError(
+            "provider rejected request",
+            request=httpx.Request("POST", "https://provider.invalid"),
+            response=httpx.Response(status),
+        )
+        assert is_retryable_error(error)
+
+    @pytest.mark.parametrize("status", [400, 401, 403, 404, 422])
+    def test_permanent_status_overrides_misleading_body(self, status):
+        error = httpx.HTTPStatusError(
+            "invalid input contains 500 and overloaded",
+            request=httpx.Request("POST", "https://provider.invalid"),
+            response=httpx.Response(status),
+        )
+        assert not is_retryable_error(error)
+
+    def test_provider_stream_error_code_and_cause_cycle(self):
+        error = Exception("upstream failed")
+        error.code = "server_error"
+        assert is_retryable_error(error)
+        error.code = "content_filter"
+        error.__cause__ = error
+        assert not is_retryable_error(error)
+
+    @pytest.mark.parametrize("name", ["APITimeoutError", "APIConnectionError"])
+    def test_provider_transport_wrapper_without_cause(self, name):
+        error_type = type(name, (Exception,), {})
+        assert is_retryable_error(error_type("provider unavailable"))
+
+    @pytest.mark.parametrize(
+        "message",
+        [
+            "upstream connect error or disconnect/reset before headers. reset reason: connection termination",
+            "The server had an error processing your request. Sorry about that! You can retry your request",
+            "rate_limit exceeded",
+            "server overloaded",
+            "HTTP 502 Bad Gateway",
+        ],
+    )
+    def test_text_only_transient_errors_through_nested_causes(self, message):
+        error = Exception(message)
+        assert is_retryable_error(error)
+        for _ in range(2):
+            wrapper = RuntimeError("adapter failed")
+            wrapper.__cause__ = error
+            assert is_retryable_error(wrapper)
+            error = wrapper
+
+    @pytest.mark.parametrize("status", [400, 401, 403, 422])
+    def test_permanent_cause_overrides_retryable_wrapper(self, status):
+        rejection = httpx.HTTPStatusError(
+            "server overloaded",
+            request=httpx.Request("POST", "https://provider.invalid"),
+            response=httpx.Response(status),
+        )
+        wrapper = TimeoutError("HTTP 503")
+        wrapper.__cause__ = rejection
+        assert not is_retryable_error(wrapper)
+
+    def test_cancelled_cause_overrides_retryable_wrapper(self):
+        wrapper = TimeoutError("HTTP 503")
+        wrapper.__cause__ = asyncio.CancelledError()
+        assert not is_retryable_error(wrapper)
+
+    @pytest.mark.parametrize(
+        "message", ["maximum 500 tokens", "invalid request id 1429", "value 503 is invalid"]
+    )
+    def test_unrelated_numbers_are_not_retryable(self, message):
+        error = ValueError(message)
+        wrapper = RuntimeError("adapter failed")
+        wrapper.__cause__ = error
+        assert not is_retryable_error(error)
+        assert not is_retryable_error(wrapper)
 
     def test_detects_too_many_requests(self):
         """Detects too_many_requests_error pattern."""

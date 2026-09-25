@@ -8,6 +8,11 @@ Release notes for the Python SDK packages. Per-package historical changelogs:
 
 <!-- New entries go at the top. -->
 
+## v0.1.112
+
+No user-facing changes.
+
+
 ## v0.1.111
 
 - **Updated default gateway domain**: The Memory SDK now connects to `agentengine.mongodb.com` by default, replacing the previous domain, so existing code that relied on the old default URL should be updated to point to the new domain if a custom URL was not already configured.

@@ -1176,9 +1176,9 @@ export class ToolServer extends BaseServer {
 
     let lastError: unknown = null;
     let streamStarted = false;
-    let usage: LLMTokenUsage | undefined;
 
     for (let attempt = 0; attempt < LLM_MAX_RETRIES; attempt++) {
+      let usage: LLMTokenUsage | undefined;
       if (signal?.aborted) {
         throw new DOMException("This operation was aborted", "AbortError");
       }
@@ -1189,8 +1189,8 @@ export class ToolServer extends BaseServer {
             throw new DOMException("This operation was aborted", "AbortError");
           }
           const streamChunk = coerceStreamChunk(chunk);
-          streamStarted = true;
           if (streamChunkHasPayload(streamChunk)) {
+            streamStarted = true;
             yield streamChunk;
           }
           if (streamChunk.usage !== undefined) {
@@ -1219,7 +1219,7 @@ export class ToolServer extends BaseServer {
             LLM_MAX_BACKOFF,
           );
           logger.warn(
-            `LLM Pod Stream: Rate limited (attempt ${attempt + 1}/${LLM_MAX_RETRIES}). ` +
+            `LLM Pod Stream: Transient provider failure (attempt ${attempt + 1}/${LLM_MAX_RETRIES}). ` +
               `Retrying in ${backoff.toFixed(1)}s...`,
           );
           await sleep(backoff * 1000, signal);

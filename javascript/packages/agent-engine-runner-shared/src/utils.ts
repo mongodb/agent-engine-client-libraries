@@ -324,21 +324,94 @@ export const LLM_READ_TIMEOUT = getEnvFloat(
   getEnvFloat("RUNNER_STREAM_READ_TIMEOUT", 300.0),
 ); // seconds
 
-/** Check if an error is retryable (rate limit, server overload, etc.). */
+/** Classify provider failures before any LLM output has been exposed. */
 export function isRetryableError(error: unknown): boolean {
-  const errorStr = String(error).toLowerCase();
+  const seen = new Set<unknown>();
+  let current = error;
+  let retryable = false;
+  const messages: string[] = [];
+  while (current !== undefined && current !== null && !seen.has(current)) {
+    seen.add(current);
+    if (typeof current !== "object") {
+      messages.push(String(current).toLowerCase());
+      break;
+    }
+    const candidate = current as Record<string, unknown>;
+    const errorType =
+      current instanceof Error ? current.constructor.name : undefined;
+    if (
+      candidate["name"] === "AbortError" ||
+      errorType === "APIUserAbortError"
+    ) {
+      return false;
+    }
+    const status = exceptionHttpStatus(current);
+    if (status !== undefined) {
+      // A structured rejection must not be overridden by error body text.
+      if (![408, 409, 429].includes(status) && !(status >= 500 && status < 600))
+        return false;
+      retryable = true;
+    }
+    // Provider SDKs wrap transport exceptions, sometimes without a cause.
+    if (
+      candidate["name"] === "TimeoutError" ||
+      errorType === "APIConnectionError" ||
+      errorType === "APIConnectionTimeoutError"
+    )
+      retryable = true;
+    if (
+      [
+        "ETIMEDOUT",
+        "ECONNRESET",
+        "ECONNREFUSED",
+        "ECONNABORTED",
+        "EPIPE",
+        "UND_ERR_CONNECT_TIMEOUT",
+        "UND_ERR_HEADERS_TIMEOUT",
+        "UND_ERR_BODY_TIMEOUT",
+        "UND_ERR_SOCKET",
+        "server_error",
+        "rate_limit_exceeded",
+        "too_many_requests",
+        "overloaded_error",
+      ].includes(String(candidate["code"]))
+    )
+      retryable = true;
+    if (
+      ["server_error", "overloaded_error"].includes(String(candidate["type"]))
+    ) {
+      retryable = true;
+    }
+    messages.push(String(current).toLowerCase());
+    current = candidate["cause"];
+  }
+  // Retain support for adapters that expose only an unstructured exception.
   const retryablePatterns = [
     "too_many_requests",
     "rate_limit",
-    "429",
-    "500",
-    "503",
+    "too many requests",
+    "rate limit exceeded",
+    "internal server error",
+    "service unavailable",
+    "gateway timeout",
     "server error",
     "queue_exceeded",
     "high traffic",
     "overloaded",
+    "upstream connect error or disconnect/reset before headers",
+    "the server had an error processing your request",
   ];
-  return retryablePatterns.some((p) => errorStr.includes(p));
+  // Require status context: an arbitrary token count or request ID is not an HTTP failure.
+  const statusPattern =
+    /\b(?:http(?: status)?|status(?: code)?|error code)[:=]?\s*(?:408|409|429|5\d\d)\b/;
+  return (
+    retryable ||
+    messages.some(
+      (message) =>
+        retryablePatterns.some((pattern) => message.includes(pattern)) ||
+        statusPattern.test(message),
+    )
+  );
 }
 
 /**
@@ -465,7 +538,12 @@ function exceptionHttpStatus(error: unknown): number | undefined {
     responseStatus,
     e["code"],
   ]) {
-    if (typeof candidate === "number" && Number.isInteger(candidate)) {
+    if (
+      typeof candidate === "number" &&
+      Number.isInteger(candidate) &&
+      candidate >= 100 &&
+      candidate < 600
+    ) {
       return candidate;
     }
   }

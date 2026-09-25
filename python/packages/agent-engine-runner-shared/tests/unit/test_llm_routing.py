@@ -1,5 +1,6 @@
 """Unit tests for LLM routing through tool executor pods."""
 
+import asyncio
 import json
 import logging
 from collections.abc import Mapping
@@ -1074,6 +1075,142 @@ class TestStreamRetryDuringIteration:
                 "index": 0,
             }
         ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize("empty_prefix", [False, True])
+@pytest.mark.parametrize("implicit_wrapper", [False, True])
+async def test_transient_llm_failure_recovers_before_output(
+    streaming, empty_prefix, implicit_wrapper
+):
+    server = _make_tool_server()
+    calls = 0
+
+    async def provider_stream(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            if empty_prefix:
+                yield LLMStreamChunk(usage=LLMTokenUsage(total_tokens=99))
+            try:
+                raise TimeoutError("provider did not respond")
+            except TimeoutError:
+                if implicit_wrapper:
+                    raise RuntimeError("adapter failed")
+                raise
+        yield LLMStreamChunk(content="recovered")
+        yield LLMStreamChunk(usage=LLMTokenUsage(total_tokens=3))
+
+    request = LLMPodInvokeRequest(
+        execution_id="resumed-execution",
+        arguments=InvokeLLMRequestArguments(
+            model="test-model", llm_id="primary", messages=[{"role": "user", "content": "approved"}]
+        ),
+    )
+    with (
+        patch.object(
+            server, "_create_llm_for_pod", return_value=SimpleNamespace(astream=provider_stream)
+        ),
+        patch("asyncio.sleep", new_callable=AsyncMock),
+    ):
+        if streaming:
+            events = [
+                json.loads(frame.removeprefix("data: "))
+                async for frame in server._handle_invoke_llm_stream(request)
+            ]
+            assert not any(event.get("error") for event in events)
+            assert events[0]["content"] == "recovered"
+            assert events[-1]["done"] is True
+            assert events[-1]["usage"]["total_tokens"] == 3
+        else:
+            response = await server._handle_invoke_llm(request)
+            assert response.status == "success"
+            assert response.result.content == "recovered"
+            assert response.usage.total_tokens == 3
+    assert calls == 2
+
+
+def test_recovered_llm_activity_records_once_and_replays_without_provider():
+    from agent_engine_runner_shared.generated.workflow.v1.activity_pb2 import (
+        ACTIVITY_KIND_LLM,
+        ACTIVITY_OUTCOME_KIND_COMPLETED,
+        ActivityContext,
+    )
+    from agent_engine_runner_shared.generated.workflow.v1.common_pb2 import WorkflowIdentity
+    from agent_engine_runner_shared.generated.workflow.v1.runtime_pb2 import AttemptContext
+    from agent_engine_runner_shared.workflow.activity import run_streaming_activity, value_to_json
+    from agent_engine_runner_shared.workflow.client import (
+        ActivityDispatch,
+        ActivityReplay,
+        WorkflowClient,
+    )
+
+    identity = WorkflowIdentity(session_id="session", execution_id="execution")
+    attempt = AttemptContext(attempt_id="continuation", fencing_token=2, workflow_identity=identity)
+    context = ActivityContext(
+        workflow_identity=identity, activity_id="llm", attempt_id="continuation", fencing_token=2
+    )
+    client = MagicMock(spec=WorkflowClient)
+    client.start_activity.return_value = ActivityDispatch(context=context)
+    server = _make_tool_server()
+    calls = 0
+
+    async def provider_stream(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise ConnectionResetError("peer disconnected")
+        yield LLMStreamChunk(content="continued")
+
+    request = LLMPodInvokeRequest(
+        execution_id="execution",
+        arguments=InvokeLLMRequestArguments(
+            model="test-model", llm_id="primary", messages=[{"role": "user", "content": "approved"}]
+        ),
+    )
+
+    def execute():
+        with asyncio.Runner() as runner:
+            stream = server._stream_llm_chunks(request)
+            while True:
+                try:
+                    chunk = runner.run(anext(stream))
+                except StopAsyncIteration:
+                    return
+                yield chunk.content
+
+    def run():
+        return list(
+            run_streaming_activity(
+                kind=ACTIVITY_KIND_LLM,
+                name="test-model",
+                activity_ordinal=2,
+                step_ordinal=2,
+                semantic_input={"messages": [{"role": "user", "content": "approved"}]},
+                execute=execute,
+                replay=lambda result: iter([result]),
+                fold=lambda chunks: "".join(chunks),
+                client=client,
+                attempt=attempt,
+            )
+        )
+
+    with (
+        patch.object(
+            server, "_create_llm_for_pod", return_value=SimpleNamespace(astream=provider_stream)
+        ),
+        patch("asyncio.sleep", new_callable=AsyncMock),
+    ):
+        assert run() == ["continued"]
+        client.report_outcome.assert_called_once()
+        outcome = client.report_outcome.call_args.args[0]
+        assert outcome.outcome_kind == ACTIVITY_OUTCOME_KIND_COMPLETED
+        assert value_to_json(outcome.result) == "continued"
+        client.start_activity.return_value = ActivityReplay(outcome=outcome)
+        assert run() == ["continued"]
+        client.report_outcome.assert_called_once()
+        assert calls == 2
 
 
 class TestStreamLLMChunks:

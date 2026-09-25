@@ -1045,9 +1045,9 @@ class ToolServer(ToolExecution, BaseServer):
 
         last_error: Exception | None = None
         stream_started = False
-        usage = None
 
         for attempt in range(LLM_MAX_RETRIES):
+            usage = None
             try:
                 stream = llm.astream(
                     messages,
@@ -1057,8 +1057,8 @@ class ToolServer(ToolExecution, BaseServer):
 
                 async for chunk in stream:
                     stream_chunk = _coerce_stream_chunk(chunk)
-                    stream_started = True
                     if _stream_chunk_has_payload(stream_chunk):
+                        stream_started = True
                         yield stream_chunk
                     if stream_chunk.usage is not None:
                         usage = merge_token_usage(usage, stream_chunk.usage)
@@ -1075,7 +1075,7 @@ class ToolServer(ToolExecution, BaseServer):
                         LLM_MAX_BACKOFF,
                     )
                     logger.warning(
-                        f"LLM Pod Stream: Rate limited (attempt {attempt + 1}/{LLM_MAX_RETRIES}). "
+                        f"LLM Pod Stream: Transient provider failure (attempt {attempt + 1}/{LLM_MAX_RETRIES}). "
                         f"Retrying in {backoff:.1f}s..."
                     )
                     await asyncio.sleep(backoff)

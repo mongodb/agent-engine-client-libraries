@@ -4,6 +4,7 @@ Utility functions for Runner SDK.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -14,6 +15,8 @@ from enum import Enum
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional
+
+import httpx
 
 
 def normalize_content(content: Any) -> str:
@@ -408,20 +411,77 @@ def sleep_oe_stream_retry(delay_s: float) -> None:
 
 
 def is_retryable_error(error: Exception) -> bool:
-    """Check if an error is retryable (rate limit, server overload, etc.)."""
-    error_str = str(error).lower()
+    """Classify provider failures before any LLM output has been exposed."""
+    seen: set[int] = set()
+    retryable = False
+    messages: list[str] = []
+    current: BaseException | None = error
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, asyncio.CancelledError):
+            return False
+        status = _exception_http_status(current)
+        if status is not None:
+            # A structured rejection must not be overridden by error body text.
+            if status not in (408, 409, 429) and not 500 <= status < 600:
+                return False
+            retryable = True
+        if isinstance(
+            current,
+            (
+                TimeoutError,
+                ConnectionError,
+                httpx.TimeoutException,
+                httpx.NetworkError,
+                httpx.RemoteProtocolError,
+            ),
+        ):
+            retryable = True
+        # Provider SDKs wrap transport exceptions, sometimes without a cause.
+        if type(current).__name__ in ("APITimeoutError", "APIConnectionError"):
+            retryable = True
+        if getattr(current, "code", None) in (
+            "server_error",
+            "rate_limit_exceeded",
+            "too_many_requests",
+            "overloaded_error",
+        ):
+            retryable = True
+        if getattr(current, "type", None) in ("server_error", "overloaded_error"):
+            retryable = True
+        messages.append(str(current).lower())
+        if current.__cause__ is not None:
+            current = current.__cause__
+        elif not current.__suppress_context__:
+            current = current.__context__
+        else:
+            current = None
+
+    # Retain support for adapters that expose only an unstructured exception.
     retryable_patterns = [
         "too_many_requests",
         "rate_limit",
-        "429",
-        "500",
-        "503",
+        "too many requests",
+        "rate limit exceeded",
+        "internal server error",
+        "service unavailable",
+        "gateway timeout",
         "server error",
         "queue_exceeded",
         "high traffic",
         "overloaded",
+        "upstream connect error or disconnect/reset before headers",
+        "the server had an error processing your request",
     ]
-    return any(pattern in error_str for pattern in retryable_patterns)
+    # Require status context: an arbitrary token count or request ID is not an HTTP failure.
+    status_pattern = (
+        r"\b(?:http(?: status)?|status(?: code)?|error code)[:=]?\s*(?:408|409|429|5\d\d)\b"
+    )
+    return retryable or any(
+        any(pattern in message for pattern in retryable_patterns)
+        or re.search(status_pattern, message) is not None
+        for message in messages
+    )
 
 
 def format_llm_error(error: Exception) -> str:
@@ -505,7 +565,11 @@ def _exception_http_status(error: BaseException) -> int | None:
         getattr(error, "code", None),
     ):
         # bool is an int subclass; a True/False attribute is never a status.
-        if isinstance(candidate, int) and not isinstance(candidate, bool):
+        if (
+            isinstance(candidate, int)
+            and not isinstance(candidate, bool)
+            and 100 <= candidate < 600
+        ):
             return candidate
     return None
 

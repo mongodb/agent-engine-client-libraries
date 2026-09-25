@@ -79,6 +79,119 @@ import {
 // ---------------------------------------------------------------------------
 
 describe("isRetryableError", () => {
+  test.each([
+    "ETIMEDOUT",
+    "ECONNRESET",
+    "ECONNREFUSED",
+    "UND_ERR_SOCKET",
+    "UND_ERR_HEADERS_TIMEOUT",
+    "server_error",
+  ])("retries structured %s errors and their causes", (code) => {
+    const error = Object.assign(new Error("provider unavailable"), { code });
+    expect(isRetryableError(error)).toBe(true);
+    expect(
+      isRetryableError(new Error("adapter failed", { cause: error })),
+    ).toBe(true);
+  });
+
+  test.each([408, 409, 429, 500, 502, 503, 504])(
+    "retries HTTP %s",
+    (status) => {
+      expect(
+        isRetryableError(
+          Object.assign(new Error("provider unavailable"), { status }),
+        ),
+      ).toBe(true);
+    },
+  );
+
+  test.each([400, 401, 403, 404, 422])(
+    "HTTP %s overrides misleading body text",
+    (status) => {
+      expect(
+        isRetryableError(
+          Object.assign(
+            new Error("invalid input contains 500 and overloaded"),
+            { status },
+          ),
+        ),
+      ).toBe(false);
+    },
+  );
+
+  test("provider transport wrappers without causes", () => {
+    class APIConnectionError extends Error {}
+    class APIConnectionTimeoutError extends APIConnectionError {}
+    class APIUserAbortError extends Error {}
+    expect(isRetryableError(new APIConnectionError())).toBe(true);
+    expect(isRetryableError(new APIConnectionTimeoutError())).toBe(true);
+    expect(isRetryableError(new APIUserAbortError("500"))).toBe(false);
+    expect(isRetryableError(new DOMException("500", "AbortError"))).toBe(false);
+    expect(isRetryableError(new DOMException("expired", "TimeoutError"))).toBe(
+      true,
+    );
+  });
+
+  test("unrecognized cyclic cause remains terminal", () => {
+    const error = new Error("upstream failed");
+    error.cause = error;
+    expect(isRetryableError(error)).toBe(false);
+  });
+
+  test.each([
+    "upstream connect error or disconnect/reset before headers. reset reason: connection termination",
+    "The server had an error processing your request. Sorry about that! You can retry your request",
+    "rate_limit exceeded",
+    "server overloaded",
+    "HTTP 502 Bad Gateway",
+  ])(
+    "recognizes text-only transient errors through nested causes: %s",
+    (message) => {
+      let error = new Error(message);
+      expect(isRetryableError(error)).toBe(true);
+      for (let depth = 0; depth < 2; depth++) {
+        error = new Error("adapter failed", { cause: error });
+        expect(isRetryableError(error)).toBe(true);
+      }
+    },
+  );
+
+  test.each([400, 401, 403, 422])(
+    "permanent HTTP %s cause overrides retryable wrapper",
+    (status) => {
+      const rejection = Object.assign(new Error("server overloaded"), {
+        status,
+      });
+      const wrapper = Object.assign(
+        new Error("HTTP 503", { cause: rejection }),
+        { code: "ETIMEDOUT" },
+      );
+      expect(isRetryableError(wrapper)).toBe(false);
+    },
+  );
+
+  test("cancelled cause overrides retryable wrapper", () => {
+    const wrapper = Object.assign(
+      new Error("HTTP 503", {
+        cause: new DOMException("cancelled", "AbortError"),
+      }),
+      { code: "ETIMEDOUT" },
+    );
+    expect(isRetryableError(wrapper)).toBe(false);
+  });
+
+  test.each([
+    "maximum 500 tokens",
+    "invalid request id 1429",
+    "value 503 is invalid",
+  ])("unrelated numbers are not retryable: %s", (message) => {
+    const error = new Error(message);
+    expect(isRetryableError(error)).toBe(false);
+    expect(
+      isRetryableError(new Error("adapter failed", { cause: error })),
+    ).toBe(false);
+  });
+
   test("detects too_many_requests pattern", () => {
     // test_detects_too_many_requests
     const error = new Error(

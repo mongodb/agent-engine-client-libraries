@@ -12245,7 +12245,7 @@ Public-API view of the same membership check used by `tenantEnvVars`.
 function isRetryableError(error): boolean;
 ```
 
-Check if an error is retryable (rate limit, server overload, etc.).
+Classify provider failures before any LLM output has been exposed.
 
 #### Parameters
 

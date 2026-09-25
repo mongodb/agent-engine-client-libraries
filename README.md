@@ -9,6 +9,13 @@ Download the binary for your operating system from the
 [Releases](../../releases) page. After making the downloaded binary executable,
 run `agentengine version` to verify the installed version.
 
+## SDK documentation
+
+API references and guides for the SDKs are in this repository:
+
+- [TypeScript SDKs](javascript/docs/README.md)
+- [Python SDKs](python/docs/README.md)
+
 ## Container images
 
 Local-development images are published at

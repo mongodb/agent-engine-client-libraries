@@ -461,6 +461,49 @@ describe("handleInvokeLlmStream retry behavior", () => {
 // ---------------------------------------------------------------------------
 
 describe("streamLlmChunks retry behavior", () => {
+  test.each([
+    [false, false],
+    [false, true],
+    [true, false],
+    [true, true],
+  ])(
+    "transient failure recovers before output (stream=%s, empty prefix=%s)",
+    async (streaming, emptyPrefix) => {
+      const server = makeToolServer();
+      const { adapter, callCount } = makeAdapter(
+        async function* () {
+          if (emptyPrefix)
+            yield { usage: new LLMTokenUsage({ total_tokens: 99 }) };
+          throw Object.assign(new Error("provider did not respond"), {
+            code: "ETIMEDOUT",
+          });
+        },
+        () =>
+          asyncGenFromArray([
+            { content: "recovered" },
+            { usage: new LLMTokenUsage({ total_tokens: 3 }) },
+          ]),
+      );
+      spyCreateLlmForPod(server, adapter);
+      if (streaming) {
+        const frames: string[] = [];
+        for await (const frame of server.handleInvokeLlmStream(makeRequest()))
+          frames.push(frame);
+        const events = parseSseEvents(frames);
+        expect(events.some((event) => event["error"])).toBe(false);
+        expect(events[0]?.["content"]).toBe("recovered");
+        expect(events.at(-1)?.["done"]).toBe(true);
+        expect(events.at(-1)?.["usage"]).toMatchObject({ total_tokens: 3 });
+      } else {
+        const response = await server.doHandleInvokeLlm(makeRequest());
+        expect(response.status).toBe("success");
+        expect(response.result).toMatchObject({ content: "recovered" });
+        expect(response.usage?.totalTokens).toBe(3);
+      }
+      expect(callCount()).toBe(2);
+    },
+  );
+
   test("retry succeeds on the second attempt", async () => {
     // test_retry_succeeds_on_second_attempt
     const server = makeToolServer();
@@ -566,8 +609,6 @@ describe("ToolServer.doHandleInvokeLlm", () => {
     // test_retry_on_rate_limit
     const server = makeToolServer();
     const { adapter, callCount } = makeAdapter(
-      // "429" matches TS isRetryableError patterns (Python tests patch is_retryable_error;
-      // TS can't patch intra-module imports, so we include a retryable token in the message).
       throwingStream(new Error("429: Rate limit exceeded")),
       () => asyncGenFromArray([{ content: "Retry success" } as LLMStreamChunk]),
     );
@@ -586,8 +627,6 @@ describe("ToolServer.doHandleInvokeLlm", () => {
     // test_all_retries_exhausted
     const server = makeToolServer();
     const { adapter } = makeAdapter(
-      // "429" matches TS isRetryableError patterns (Python tests patch is_retryable_error;
-      // TS can't patch intra-module imports, so we include a retryable token in the message).
       throwingStream(new Error("429: Rate limit exceeded")),
     );
     spyCreateLlmForPod(server, adapter);
