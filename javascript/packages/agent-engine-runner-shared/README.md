@@ -10,6 +10,8 @@ This package is an open-source runtime integration library. Running an agent
 through the managed service requires Atlas Agent Engine services such as the
 Orchestration Engine and Agent Execution Runtime; those services are not
 distributed with this package.
+> This is an internal core package; agents don't install it directly. Install a
+> framework SDK (`@mongodb-js/agent-engine-sdk-langgraph`), which depends on it.
 
 ## Development
 
@@ -21,7 +23,8 @@ npm run build --workspace=@mongodb-js/agent-engine-runner-shared
 npm run test --workspace=@mongodb-js/agent-engine-runner-shared
 ```
 
-See the workspace [open-source distribution notes](../../OPEN_SOURCE.md) for
-the package boundary and dependency policy.
+Every direct dependency is a third-party open-source project or a sibling SDK
+package. The platform services this package integrates with are not source
+dependencies.
 
 Copyright 2026 MongoDB, Inc. Licensed under the Apache License, Version 2.0.

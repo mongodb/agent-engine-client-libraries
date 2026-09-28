@@ -29,8 +29,7 @@ const TRUTHY = new Set(["1", "true", "yes", "on"]);
  *    - else an existing unscoped `legacyBases` candidate -> use it.
  *    - else -> use `scoped` (fresh deployment).
  *
- * Unscoped fallback is limited to known platform defaults during private
- * preview. The current base and arbitrary names are never auto-adopted.
+ * Unscoped fallback is limited to known platform defaults. The current base and arbitrary names are never auto-adopted.
  */
 export function resolveProjectScopedDb(
   base: string,
@@ -79,7 +78,7 @@ export interface ListsDatabaseNames {
  * failure throws so a transient error cannot create a competing current-name
  * database beside an existing legacy one. `legacyBases` are previous defaults
  * whose project-scoped forms, then bare forms, are adopted before a fresh
- * scoped database is created during private preview.
+ * scoped database is created.
  */
 export async function resolveEffectiveDb(
   client: ListsDatabaseNames,

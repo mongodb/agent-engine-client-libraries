@@ -25,7 +25,6 @@ import type { BaseCheckpointSaver } from "@langchain/langgraph";
 import { validateSubagentTree } from "./subagents.js";
 import { checkpointerForDeepAgent } from "./deep_agent_checkpointer.js";
 import { createDurableDeepAgentMiddleware } from "./durable_deep_agent.js";
-import { StoppedToolCallMiddleware } from "./stopped_tool_call_middleware.js";
 
 /** Names of compiled subagent specs whose runnable carries its own checkpointer. */
 function compiledSubagentCheckpointerNames(
@@ -54,7 +53,7 @@ export interface CreateAgentEngineDeepAgentOptions {
   subagents?: readonly AnySubAgent[];
   /** Custom system instructions. */
   systemPrompt?: string;
-  /** Additional middleware, appended after the default `StoppedToolCallMiddleware`. */
+  /** Additional middleware, appended after the default durable middleware. */
   middleware?: CreateDeepAgentParams["middleware"];
   /** LangGraph checkpointer for state persistence, HITL, and multi-turn. */
   checkpointer?: BaseCheckpointSaver | boolean;
@@ -143,10 +142,11 @@ export function createAgentEngineDeepAgent(
     ...(options.systemPrompt !== undefined && {
       systemPrompt: options.systemPrompt,
     }),
-    // Prepended so every agent gets deterministic stopped-tool-call
-    // handling and durable local-subagent attribution by default.
+    // Prepended so every agent gets durable local-subagent attribution by
+    // default. A per-call-stopped tool batch goes to the model as ordinary
+    // interrupted ToolMessages — continuation is the model's call, matching
+    // the Python twin.
     middleware: [
-      StoppedToolCallMiddleware(),
       createDurableDeepAgentMiddleware({
         unsupportedSubagentNames: compiledSubagentCheckpointerNames(
           options.subagents,

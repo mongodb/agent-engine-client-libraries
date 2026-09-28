@@ -19,10 +19,12 @@ import threading
 import time
 from collections.abc import Mapping
 from contextlib import contextmanager
+from contextvars import ContextVar
 from functools import partial
-from typing import TYPE_CHECKING, Any, Callable, Dict, Iterator, Literal, Optional
+from typing import TYPE_CHECKING, Any, Callable, Coroutine, Dict, Iterator, Literal, Optional
 
 import httpx
+from fastapi import HTTPException
 
 from agent_engine_runner_shared.context import (
     get_current_execution_id,
@@ -85,6 +87,7 @@ from agent_engine_runner_shared.workflow.context import (
 if TYPE_CHECKING:
     from opentelemetry.trace import Span
 
+    from agent_engine_runner_shared.server.drain import DrainRegistry
     from agent_engine_runner_shared.workflow.memory import DurableMemoryState
 
 logger = logging.getLogger(__name__)
@@ -798,7 +801,59 @@ def report_oe_result(
                 span.set_attribute("attempt_count", attempt_count)
 
 
-def _resolve_registered_tool_result(value: Any) -> Any:
+# Set by SecureToolWrapper._execute_local_tool around a callback-routed tool
+# body: how the body registers its abort channel with the drain registry once
+# its cancellable unit exists, so POST /interrupt/call can stop that one call.
+# The whole local-execution chain runs on one framework worker thread, which
+# keeps the handoff off every adapter's signature.
+_pending_call_abort_channel: ContextVar[Optional[Callable[[Callable[[], None]], bool]]] = (
+    ContextVar("pending_call_abort_channel", default=None)
+)
+
+
+def _run_coroutine_with_abort_channel(
+    coro: "Coroutine[Any, Any, Any]",
+    register_cancel: Callable[[Callable[[], None]], bool],
+) -> Any:
+    """Run a tool coroutine on this worker thread's private loop while the
+    drain registry holds a thread-safe cancel channel for it. Same cleanup as
+    asyncio.run; the difference is the registered task, which a per-call abort
+    cancels so the call stops while the rest of the execution continues."""
+    loop = asyncio.new_event_loop()
+    try:
+        task = loop.create_task(coro)
+
+        def cancel() -> None:
+            try:
+                # The message surfaces in the trace's cancellation row, so it
+                # reads like the TS twin's AbortError instead of a bare class
+                # name.
+                loop.call_soon_threadsafe(task.cancel, INTERRUPTED_CALL_CONTENT)
+            except RuntimeError:
+                # The loop already closed: the body ended and a late abort has
+                # nothing left to stop.
+                pass
+
+        if not register_cancel(cancel):
+            # The call's registration ended before the body started: run
+            # untracked rather than drop tenant work.
+            logger.warning("call abort channel attach failed; running the tool untracked")
+        return loop.run_until_complete(task)
+    finally:
+        pending = [t for t in asyncio.all_tasks(loop) if not t.done()]
+        for t in pending:
+            t.cancel()
+        if pending:
+            loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+        loop.run_until_complete(loop.shutdown_asyncgens())
+        loop.run_until_complete(loop.shutdown_default_executor())
+        loop.close()
+
+
+def _resolve_registered_tool_result(
+    value: Any,
+    register_cancel: Optional[Callable[[Callable[[], None]], bool]] = None,
+) -> Any:
     if not inspect.isawaitable(value):
         return value
     if not inspect.iscoroutine(value):
@@ -806,6 +861,8 @@ def _resolve_registered_tool_result(value: Any) -> Any:
     try:
         asyncio.get_running_loop()
     except RuntimeError:
+        if register_cancel is not None:
+            return _run_coroutine_with_abort_channel(value, register_cancel)
         return asyncio.run(value)
     value.close()
     raise RuntimeError(
@@ -814,12 +871,13 @@ def _resolve_registered_tool_result(value: Any) -> Any:
 
 
 def _invoke_registered_tool(original_tool: Any, kwargs: Dict[str, Any]) -> Any:
+    register_cancel = _pending_call_abort_channel.get()
     async_invoke = getattr(original_tool, "ainvoke", None)
     if hasattr(original_tool, "invoke"):
         if getattr(original_tool, "func", None) is None and callable(async_invoke):
-            return _resolve_registered_tool_result(async_invoke(kwargs))
-        return _resolve_registered_tool_result(original_tool.invoke(kwargs))
-    return _resolve_registered_tool_result(original_tool(**kwargs))
+            return _resolve_registered_tool_result(async_invoke(kwargs), register_cancel)
+        return _resolve_registered_tool_result(original_tool.invoke(kwargs), register_cancel)
+    return _resolve_registered_tool_result(original_tool(**kwargs), register_cancel)
 
 
 # =============================================================================
@@ -849,6 +907,7 @@ class SecureToolWrapper:
         custom_headers: Optional[Dict[str, str]] = None,
         durable_memory: Optional[DurableMemoryState] = None,
         oe_owner_url: Optional[str] = None,
+        call_registry: Optional["DrainRegistry"] = None,
     ):
         """
         Initialize the wrapper.
@@ -860,12 +919,16 @@ class SecureToolWrapper:
             durable_memory: Durable activity Memory state, when enabled
             oe_owner_url: Validated replica-specific OE owner URL for tool-result
                 callback fallback, or None when the request supplied no usable one
+            call_registry: Per-execution drain registry, enabling the per-call
+                abort (POST /interrupt/call) for tools this wrapper runs locally;
+                None leaves local calls unaddressable, as before
         """
         self.oe_url = oe_url.rstrip("/")
         self.oe_owner_url = oe_owner_url
         self._oe_owner_url_failed = False
         self.execution_id = execution_id
         self.durable_memory = durable_memory
+        self._call_registry = call_registry
         # Shared with SecureLLMProxy for this execution (single-AER assumption).
         self.operational_steps = OperationalStepAllocator()
         self.custom_headers: Dict[str, str] = custom_headers or {}
@@ -923,6 +986,7 @@ class SecureToolWrapper:
         is_local: bool = True,
         local_executor: Optional[Callable[[], Any]] = None,
         is_framework_control_flow: Optional[Callable[[BaseException], bool]] = None,
+        call_channel_expected: bool = False,
     ) -> Any:
         """
         Execute a tool call through OE.
@@ -972,6 +1036,7 @@ class SecureToolWrapper:
                 tool_call_id=tool_call_id,
                 raw_on_interrupt=raw_on_interrupt,
                 is_framework_control_flow=is_framework_control_flow,
+                call_channel_expected=call_channel_expected,
             )
 
         # Platform-owned workflow route: wrap the call in ActivityCommand
@@ -1021,6 +1086,7 @@ class SecureToolWrapper:
                         # to the reserved wire marker below.
                         raw_on_interrupt=True,
                         is_framework_control_flow=is_framework_control_flow,
+                        call_channel_expected=call_channel_expected,
                     )
             except PolicyDeniedException as denial:
                 # Record the denial as a DENIED outcome (not FAILED) so a
@@ -1107,6 +1173,7 @@ class SecureToolWrapper:
         tool_call_id: Optional[str] = None,
         raw_on_interrupt: bool = False,
         is_framework_control_flow: Optional[Callable[[BaseException], bool]] = None,
+        call_channel_expected: bool = False,
     ) -> Any:
         effective_is_local = is_local and not provider_type and not scopes
         effective_local_executor = local_executor if effective_is_local else None
@@ -1181,6 +1248,7 @@ class SecureToolWrapper:
                 tool_call_id=tool_call_id,
                 metadata=metadata,
                 is_framework_control_flow=is_framework_control_flow,
+                call_channel_expected=call_channel_expected,
             )
         if response.route_to is not None:
             raise ToolExecutionError(f"Unexpected OE tool route: {response.route_to}")
@@ -1226,99 +1294,180 @@ class SecureToolWrapper:
         tool_call_id: Optional[str],
         metadata: Optional[Dict[str, Any]],
         is_framework_control_flow: Optional[Callable[[BaseException], bool]],
+        call_channel_expected: bool = False,
     ) -> Any:
         """Execute an OE-approved local call on the current framework stack."""
         import socket
 
+        # Register the call with the drain registry so POST /interrupt/call can
+        # address it. Async bodies attach a thread-safe abort channel once their
+        # task exists (see _run_coroutine_with_abort_channel); a sync body never
+        # does, so its abort honestly answers not_cancellable and its outcome
+        # still flows. This method runs on a framework worker thread, so every
+        # registry mutation marshals onto the registry's owner loop.
+        registry = self._call_registry
+        handle = None
+        channel_token = None
+        if registry is not None:
+            try:
+                handle = registry.owner_loop_call(
+                    partial(
+                        registry.begin_work,
+                        self.execution_id,
+                        None,
+                        step_number=step,
+                        channel_expected=call_channel_expected,
+                    )
+                )
+            except HTTPException:
+                # A whole-run drain latched between the OE claim and this
+                # dispatch: the run is terminal, so the tool must not start.
+                raise asyncio.CancelledError()
+
+            def _register_abort_channel(callback: Callable[[], None]) -> bool:
+                # Narrowed: this closure is defined only when a registration exists.
+                return registry.owner_loop_call(
+                    partial(registry.attach_cancel_callback, handle, callback)
+                )
+
+            channel_token = _pending_call_abort_channel.set(_register_abort_channel)
         started = time.monotonic()
         try:
-            with local_suspend_request_context():
-                from agent_engine_runner_shared.context import customer_origin_scope
+            try:
+                if handle is not None and handle.aborted:
+                    # The abort preceded this registration (the Stop landed in
+                    # the OE-claim → in-graph-dispatch handoff): skip the body
+                    # and settle interrupted.
+                    raise asyncio.CancelledError(INTERRUPTED_CALL_CONTENT)
+                with local_suspend_request_context():
+                    from agent_engine_runner_shared.context import customer_origin_scope
 
-                with customer_origin_scope():
-                    result = local_executor()
-                    suspend_marker = get_requested_suspend()
-        except BaseException as error:
-            is_control_flow = (
-                isinstance(error, asyncio.CancelledError)
-                or is_framework_control_flow is not None
-                and is_framework_control_flow(error)
-            )
-            if not is_control_flow and not isinstance(error, Exception):
+                    with customer_origin_scope():
+                        result = local_executor()
+                        suspend_marker = get_requested_suspend()
+                if (
+                    registry is not None
+                    and handle is not None
+                    and not registry.owner_loop_call(partial(registry.claim_settlement, handle))
+                ):
+                    # A Stop claimed the outcome as the body returned: settle
+                    # interrupted so the durable record matches the verdict the
+                    # caller already got.
+                    raise asyncio.CancelledError(INTERRUPTED_CALL_CONTENT)
+            except BaseException as error:
+                # Claim the settlement before the blocking report below: a Stop
+                # landing mid-report reads already_settled instead of claiming
+                # a stop the durable record will contradict. The claim's answer
+                # is the stop decision — an abort that won first owns the
+                # outcome, so an already-classified genuine error is never
+                # repainted as a stopped call.
+                stopped_by_call_interrupt = (
+                    handle is not None
+                    and registry is not None
+                    and not registry.owner_loop_call(partial(registry.claim_settlement, handle))
+                )
+                is_control_flow = (
+                    isinstance(error, asyncio.CancelledError)
+                    or is_framework_control_flow is not None
+                    and is_framework_control_flow(error)
+                )
+                if not is_control_flow and not isinstance(error, Exception):
+                    raise
+                duration_ms = (time.monotonic() - started) * 1000
+                # The settlement winner, not the exception type alone, decides
+                # the reported outcome: when the Stop claimed the call first, an
+                # ordinary exception from cancellation cleanup (a provider
+                # translating CancelledError into its own error type) is the
+                # stop's noise, not the call's outcome.
+                settle_interrupted = is_control_flow or stopped_by_call_interrupt
+                status = "interrupted" if settle_interrupted else "error"
+                classified = (
+                    None
+                    if settle_interrupted
+                    else classify_tool_api_error(
+                        error, None, credentials=request_credential_values()
+                    )
+                )
+                error_text = classified[1] if classified else f"{type(error).__name__}: {error}"
+                tool_api_error = classified[0] if classified else None
+                log_tool_result(
+                    tool_name,
+                    step,
+                    status,
+                    result=None,
+                    error=error_text,
+                    duration_ms=duration_ms,
+                    prefix="TOOL",
+                )
+                if stopped_by_call_interrupt and not is_control_flow:
+                    # Report the stopped reason the caller's verdict already
+                    # named; the cleanup exception stays in the log above as
+                    # the diagnostic.
+                    error_text = f"CancelledError: {INTERRUPTED_CALL_CONTENT}"
+                try:
+                    report_oe_result(
+                        oe_url=self.oe_url,
+                        execution_id=self.execution_id,
+                        tool_name=tool_name,
+                        step=step,
+                        status=status,
+                        result=None,
+                        error=error_text,
+                        duration_ms=duration_ms,
+                        pod_name=socket.gethostname(),
+                        metadata=metadata,
+                        tool_call_id=tool_call_id,
+                        owner_url=self._current_oe_owner_url(),
+                        on_owner_failure=self._report_oe_owner_failure,
+                        tool_api_error=tool_api_error,
+                    )
+                except Exception as settlement_error:
+                    raise settlement_error from error
+                if stopped_by_call_interrupt:
+                    # This call was deliberately stopped: the graph continues
+                    # with the stopped-call result instead of unwinding.
+                    return _CALL_INTERRUPTED
                 raise
+
             duration_ms = (time.monotonic() - started) * 1000
-            status = "interrupted" if is_control_flow else "error"
-            classified = (
-                None
-                if is_control_flow
-                else classify_tool_api_error(error, None, credentials=request_credential_values())
-            )
-            error_text = classified[1] if classified else f"{type(error).__name__}: {error}"
-            tool_api_error = classified[0] if classified else None
+            pod_name = socket.gethostname()
+            status = "suspend" if suspend_marker is not None else "success"
+            reported_result = json.dumps(suspend_marker) if suspend_marker is not None else result
+
             log_tool_result(
                 tool_name,
                 step,
                 status,
-                result=None,
-                error=error_text,
+                result=reported_result,
+                error=None,
                 duration_ms=duration_ms,
                 prefix="TOOL",
             )
-            try:
-                report_oe_result(
-                    oe_url=self.oe_url,
-                    execution_id=self.execution_id,
-                    tool_name=tool_name,
-                    step=step,
-                    status=status,
-                    result=None,
-                    error=error_text,
-                    duration_ms=duration_ms,
-                    pod_name=socket.gethostname(),
-                    metadata=metadata,
-                    tool_call_id=tool_call_id,
-                    owner_url=self._current_oe_owner_url(),
-                    on_owner_failure=self._report_oe_owner_failure,
-                    tool_api_error=tool_api_error,
-                )
-            except Exception as settlement_error:
-                raise settlement_error from error
-            raise
-
-        duration_ms = (time.monotonic() - started) * 1000
-        pod_name = socket.gethostname()
-        status = "suspend" if suspend_marker is not None else "success"
-        reported_result = json.dumps(suspend_marker) if suspend_marker is not None else result
-
-        log_tool_result(
-            tool_name,
-            step,
-            status,
-            result=reported_result,
-            error=None,
-            duration_ms=duration_ms,
-            prefix="TOOL",
-        )
-        report_oe_result(
-            oe_url=self.oe_url,
-            execution_id=self.execution_id,
-            tool_name=tool_name,
-            step=step,
-            status=status,
-            result=reported_result,
-            error=None,
-            duration_ms=duration_ms,
-            pod_name=pod_name,
-            metadata=metadata,
-            tool_call_id=tool_call_id,
-            owner_url=self._current_oe_owner_url(),
-            on_owner_failure=self._report_oe_owner_failure,
-        )
-        if suspend_marker is not None:
-            # SuspendPayload.to_json records this out of band, so relayed tool
-            # output cannot forge a wait.
-            return self._handle_suspend(reported_result)
-        return result
+            report_oe_result(
+                oe_url=self.oe_url,
+                execution_id=self.execution_id,
+                tool_name=tool_name,
+                step=step,
+                status=status,
+                result=reported_result,
+                error=None,
+                duration_ms=duration_ms,
+                pod_name=pod_name,
+                metadata=metadata,
+                tool_call_id=tool_call_id,
+                owner_url=self._current_oe_owner_url(),
+                on_owner_failure=self._report_oe_owner_failure,
+            )
+            if suspend_marker is not None:
+                # SuspendPayload.to_json records this out of band, so relayed tool
+                # output cannot forge a wait.
+                return self._handle_suspend(reported_result)
+            return result
+        finally:
+            if channel_token is not None:
+                _pending_call_abort_channel.reset(channel_token)
+            if handle is not None and registry is not None:
+                registry.owner_loop_call(partial(registry.end_work, handle))
 
     def _handle_suspend(self, result: Any) -> Any:
         """Fire the HITL interrupt for an OE-confirmed suspend.
@@ -1473,6 +1622,24 @@ def create_secure_tool_function(
         or original_tool
     )
 
+    # Declare at registration time whether the body can attach an abort
+    # channel: only a coroutine body gets one (its task lives on the worker
+    # thread's private loop). Mirrors the value-based decision
+    # _invoke_registered_tool makes at invoke time. A misdeclaration degrades
+    # honestly either way — the registry never masks a refused abort.
+    _tool_func = getattr(original_tool, "func", None)
+    _tool_coroutine = getattr(original_tool, "coroutine", None)
+    call_channel_expected = (
+        (_tool_func is None and callable(getattr(original_tool, "ainvoke", None)))
+        or inspect.iscoroutinefunction(_tool_func)
+        or inspect.iscoroutinefunction(_tool_coroutine)
+        or (
+            _tool_func is None
+            and _tool_coroutine is None
+            and inspect.iscoroutinefunction(original_tool)
+        )
+    )
+
     @functools.wraps(wrapped_source)
     def wrapped_func(**kwargs):
         # The framework SDK (LangChain InjectedToolCallId / ADK function_call_id)
@@ -1524,6 +1691,7 @@ def create_secure_tool_function(
                 is_framework_control_flow=is_framework_control_flow,
                 raw_on_interrupt=True,
                 redact_fields=redact_fields,
+                call_channel_expected=call_channel_expected,
             )
         except ToolExecutionError as exc:
             logger.info(

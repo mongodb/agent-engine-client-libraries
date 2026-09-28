@@ -67,7 +67,7 @@ export interface InstallStructuredLoggingArgs {
 /**
  * Install structured logging on the log4js root.
  *
- * Mirrors `install_structured_logging` in the Python port:
+ * Behaves like the Python SDK's `install_structured_logging`:
  *
  * - Idempotent: re-installing routes the appender through the snapshotted
  *   original `stdout.write` (stashed under `ORIGINAL_WRITE_SLOT`), so it

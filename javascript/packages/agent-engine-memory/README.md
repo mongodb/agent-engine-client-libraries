@@ -7,6 +7,12 @@ counterpart of the Python `agent-engine-sdk-memory` package: TypeScript agents
 read from and write to the Memory Server through the same routes, with memory
 that persists across turns and sessions.
 
+## Install
+
+```bash
+npm install @mongodb-js/agent-engine-sdk-memory
+```
+
 ## The `Memory` facade
 
 `Memory` exposes every memory type behind one transport-agnostic surface:
@@ -103,7 +109,7 @@ Transport retries 502/503/504 up to three times.
 ## Development
 
 ```bash
-npm install   # from the client-libraries/packages workspace root
+npm install
 npm test      # vitest
 npm run build # tsc
 ```

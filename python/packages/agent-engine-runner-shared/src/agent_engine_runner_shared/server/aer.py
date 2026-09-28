@@ -904,6 +904,7 @@ class AERServer(BaseServer):
                 if durable_attempt is not None and self.runtime.memory_enabled
                 else None
             ),
+            call_registry=self.drain_registry,
         )
         # Native resume continues after its checkpoint. Durable replay instead
         # restarts at zero so each activity reaches its original OE identity.

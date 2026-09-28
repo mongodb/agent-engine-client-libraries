@@ -55,7 +55,9 @@
   - [MAX\_SUBAGENT\_NESTING\_DEPTH](#api-max_subagent_nesting_depth)
 - **Functions**
   - [createAgentEngineDeepAgent()](#api-createagentenginedeepagent)
+  - [getCallAbortSignal()](#api-getcallabortsignal)
   - [validateSubagentTree()](#api-validatesubagenttree)
+  - [withCallInterruptSupport()](#api-withcallinterruptsupport)
 - **References**
   - [AgentEngineToolSandboxBackend](#api-agentenginetoolsandboxbackend)
 
@@ -907,7 +909,7 @@ prepareAgentInput<F>(fn): F;
 Register a hook that builds the graph's starting input from the caller's
 `AgentInput` and `RequestContext` for a fresh execution. Resume stays
 platform-managed. Returns the function unchanged so it can be used as a
-decorator. Port of Python's `@app.prepare_agent_input`.
+decorator. Equivalent to the Python SDK's `@app.prepare_agent_input`.
 
 **Type Parameters**
 
@@ -962,7 +964,7 @@ Custom keys are invisible to Atlas Agent Engine session-history queries
 session/workspace-derived keys. Agents that bypass workspace scoping also
 own collision isolation within the checkpoint database.
 
-Port of Python's `@app.resolve_thread_id`.
+Equivalent to the Python SDK's `@app.resolve_thread_id`.
 
 **Type Parameters**
 
@@ -1344,7 +1346,7 @@ getSummariesForSessions(sessionIds): Promise<{
 | Property | Type | Description |
 | :------ | :------ | :------ |
 | <a id="api-property-checkpointer"></a> `checkpointer?` | `boolean` \| `BaseCheckpointSaver`\<`number`\> | LangGraph checkpointer for state persistence, HITL, and multi-turn. |
-| <a id="api-property-middleware"></a> `middleware?` | readonly `AgentMiddleware`\<`any`, `any`, `any`, readonly (`ClientTool` \| `ServerTool`)[]\>[] | Additional middleware, appended after the default `StoppedToolCallMiddleware`. |
+| <a id="api-property-middleware"></a> `middleware?` | readonly `AgentMiddleware`\<`any`, `any`, `any`, readonly (`ClientTool` \| `ServerTool`)[]\>[] | Additional middleware, appended after the default durable middleware. |
 | <a id="api-property-skills"></a> `skills?` | `string`[] | Parent directories for deepagents' one-level skill discovery. |
 | <a id="api-property-skillsbasedir"></a> `skillsBaseDir?` | `string` | Base directory for relative skill paths (set by `App.deepAgent()`). |
 | <a id="api-property-store"></a> `store?` | `BaseStore` | LangGraph store for skills and shared data. |
@@ -1370,7 +1372,7 @@ Options for [App.deepAgent](#api-deepagent).
 | :------ | :------ | :------ | :------ |
 | <a id="api-property-backend"></a> `backend?` | `AnyBackendProtocol` | Backend for filesystem/shell ops. Defaults to `AgentEngineToolPodBackend`, so every op is OE-audited and sandboxed in the Tool Pod. Pass a custom backend (e.g. deepagents' in-memory `StateBackend`) to override — note that doing so bypasses the OE audit path. | - |
 | <a id="api-property-checkpointer-1"></a> `checkpointer?` | `boolean` \| `BaseCheckpointSaver`\<`number`\> | Checkpointer selection. Omitted (`undefined`) resolves to `app.checkpointer()` (MongoDB when configured, else none). `false` disables checkpointing. A `BaseCheckpointSaver` instance is used directly. Note the mapping differs from Python (`None` disables there): in TS, "disable" is `false`, and "use the default" is simply leaving it out. | - |
-| <a id="api-property-middleware-1"></a> `middleware?` | readonly `AgentMiddleware`\<`any`, `any`, `any`, readonly (`ClientTool` \| `ServerTool`)[]\>[] | Additional middleware, appended after the default `StoppedToolCallMiddleware`. | [`CreateAgentEngineDeepAgentOptions`](#api-createagentenginedeepagentoptions).[`middleware`](#api-property-middleware) |
+| <a id="api-property-middleware-1"></a> `middleware?` | readonly `AgentMiddleware`\<`any`, `any`, `any`, readonly (`ClientTool` \| `ServerTool`)[]\>[] | Additional middleware, appended after the default durable middleware. | [`CreateAgentEngineDeepAgentOptions`](#api-createagentenginedeepagentoptions).[`middleware`](#api-property-middleware) |
 | <a id="api-property-skills-1"></a> `skills?` | `string`[] | Parent directories for deepagents' one-level skill discovery. | [`CreateAgentEngineDeepAgentOptions`](#api-createagentenginedeepagentoptions).[`skills`](#api-property-skills) |
 | <a id="api-property-store-1"></a> `store?` | `BaseStore` | LangGraph store for skills and shared data. | [`CreateAgentEngineDeepAgentOptions`](#api-createagentenginedeepagentoptions).[`store`](#api-property-store) |
 | <a id="api-property-subagents-1"></a> `subagents?` | readonly `AnySubAgent`[] | SubAgent specs. Plain specs with a `model` field must use a model instance, not a string — string models bypass OE routing. | [`CreateAgentEngineDeepAgentOptions`](#api-createagentenginedeepagentoptions).[`subagents`](#api-property-subagents) |
@@ -1597,6 +1599,25 @@ A subagent spec uses a string model, or nesting exceeds the cap.
 
 ***
 
+<a id="api-getcallabortsignal"></a>
+
+### getCallAbortSignal()
+
+```ts
+function getCallAbortSignal(): AbortSignal | undefined;
+```
+
+The per-call stop signal for the in-flight callback-routed tool call.
+Defined only inside a tool body that declared call-interrupt support; a
+cooperative body checks it (or forwards it to `fetch` etc.) to stop at its
+next checkpoint. Undefined everywhere else.
+
+#### Returns
+
+`AbortSignal` \| `undefined`
+
+***
+
 <a id="api-validatesubagenttree"></a>
 
 ### validateSubagentTree()
@@ -1635,6 +1656,38 @@ callers cannot start recursion mid-tree and bypass the cap.
 
 A subagent spec uses a string `model`, or nesting exceeds
   [MAX\_SUBAGENT\_NESTING\_DEPTH](#api-max_subagent_nesting_depth).
+
+***
+
+<a id="api-withcallinterruptsupport"></a>
+
+### withCallInterruptSupport()
+
+```ts
+function withCallInterruptSupport<T>(tool): T;
+```
+
+Brand a tool as supporting per-call interrupt. The body must honor the
+signal from `getCallAbortSignal()` — check `signal.aborted` between steps
+or pass the signal to APIs that accept one (`fetch`, streams).
+
+Returns the same tool for chaining at definition time.
+
+#### Type Parameters
+
+| Type Parameter |
+| :------ |
+| `T` |
+
+#### Parameters
+
+| Parameter | Type |
+| :------ | :------ |
+| `tool` | `T` |
+
+#### Returns
+
+`T`
 
 ## References
 

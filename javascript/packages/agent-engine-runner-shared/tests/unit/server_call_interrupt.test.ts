@@ -68,6 +68,18 @@ describe("abortCall", () => {
     expect(registry.abortCall("exec-1", 3)).toBe("already_settled");
   });
 
+  test("a claimed settlement reads already_settled and never aborts", () => {
+    // Once the result report begins, a late abort is observed, not honored:
+    // the call's controller stays live.
+    const registry = new DrainRegistry();
+    const controller = new AbortController();
+    registry.beginWork("exec-1", controller, 3);
+
+    registry.claimSettlement("exec-1", 3);
+    expect(registry.abortCall("exec-1", 3)).toBe("already_settled");
+    expect(controller.signal.aborted).toBe(false);
+  });
+
   test("a repeat abort re-reads the same outcome", () => {
     const registry = new DrainRegistry();
     registry.beginWork("exec-1", new AbortController(), 3);

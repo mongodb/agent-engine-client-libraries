@@ -688,6 +688,7 @@ export class AERServer extends BaseServer {
       request.execution_id,
       request.custom_headers,
       ownerUrl,
+      this.drainRegistry,
     );
 
     // Execution-wide cancellation. Python relies on asyncio.wait_for to cancel

@@ -307,8 +307,7 @@ function redactSpan(span: ReadableSpan): ReadableSpan {
  * Redaction failures fail closed: a batch that can't be safely redacted is
  * dropped rather than forwarded unredacted, matching the metadata-only
  * default's privacy-first intent. Transport failures on the wrapped exporter
- * never throw — they're surfaced only through `resultCallback`. Ported from
- * `ContentPolicyOTLPSpanExporter` in `agent_engine_runner_shared/tracing/exporters.py`.
+ * never throw — they're surfaced only through `resultCallback`.
  */
 export class ContentPolicyOTLPSpanExporter implements SpanExporter {
   private readonly contentCaptureMode: string;

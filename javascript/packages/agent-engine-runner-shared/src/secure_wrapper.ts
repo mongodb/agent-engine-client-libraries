@@ -41,6 +41,7 @@ import {
   getCurrentUserId,
   getCurrentWrapper,
   getRequestedSuspend,
+  runWithCallAbortSignal,
   runWithCustomerOrigin,
   reportOeOwnerUrlFailure,
   runWithSuspendRequestContext,
@@ -896,6 +897,7 @@ async function reportOeResultAttempts(
 // with a tool's own artifact keys.
 //
 import { CALL_INTERRUPTED_ARTIFACT_KEY } from "./call_interrupted.js";
+import { CALL_INTERRUPT_REASON, type DrainRegistry } from "./server/drain.js";
 
 // Re-exported so existing `secure_wrapper.js` importers keep working; the
 // canonical owner is `./call_interrupted.js` (see its comment).
@@ -907,6 +909,49 @@ export const INTERRUPTED_CALL_CONTENT =
 // real tool return value. Never shape-checked — a tool cannot return this by accident.
 class CallInterrupted {}
 const CALL_INTERRUPTED = new CallInterrupted();
+
+/**
+ * Race a tool body against its per-call abort signal. Node has no preemptive
+ * cancel: the abort stops the wait so the graph continues, while the body's
+ * detached promise runs out — its late settlement is swallowed by the race's
+ * own handlers.
+ */
+function raceWithCallAbort<T>(
+  task: Promise<T>,
+  signal: AbortSignal,
+): Promise<T> {
+  if (signal.aborted) {
+    return Promise.reject(callAbortError());
+  }
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(callAbortError());
+    signal.addEventListener("abort", onAbort, { once: true });
+    task.then(
+      (value) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(value);
+      },
+      (error: unknown) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(error instanceof Error ? error : new Error(String(error)));
+      },
+    );
+  });
+}
+
+/** The race's rejection shape: AbortError, so error paths read it as interrupted. */
+function callAbortError(): Error {
+  const error = new Error(INTERRUPTED_CALL_CONTENT);
+  error.name = "AbortError";
+  return error;
+}
+
+/** A whole-run drain latched before the tool body started. */
+function drainAbortError(): Error {
+  const error = new Error("execution is draining");
+  error.name = "AbortError";
+  return error;
+}
 
 const INTERRUPTED_WIRE_MARKER = Object.freeze({
   [CALL_INTERRUPTED_ARTIFACT_KEY]: true,
@@ -1061,6 +1106,15 @@ export interface ExecuteToolOptions {
   localExecutor?: (() => unknown | Promise<unknown>) | undefined;
   /** Identify framework-owned native control-flow errors. */
   isFrameworkControlFlow?: ((error: unknown) => boolean) | undefined;
+  /**
+   * Declares the tool body honors the per-call stop signal (available to the
+   * body via `getCallAbortSignal()`). Opt-in tools answer a per-call Stop
+   * with `interrupted` and stop at their next signal checkpoint; tools
+   * without it answer `not_cancellable` and run out — Node has no preemptive
+   * cancel, so claiming stoppability the body never honors would report
+   * Stopped while side effects continue.
+   */
+  supportsCallInterrupt?: boolean | undefined;
 }
 
 export class SecureToolWrapper {
@@ -1077,17 +1131,25 @@ export class SecureToolWrapper {
   /** Shared with SecureLLMProxy for this execution (single-AER assumption). */
   readonly operationalSteps: OperationalStepSource;
   durableMemory: DurableMemoryState | null = null;
+  /**
+   * Per-execution drain registry, enabling the per-call abort (POST
+   * /interrupt/call) for tools this wrapper runs locally; null leaves local
+   * calls unaddressable, as before.
+   */
+  private readonly drainRegistry: DrainRegistry | null;
 
   constructor(
     oeUrl: string,
     executionId: string,
     customHeaders?: Record<string, string>,
     oeOwnerUrl?: string | null,
+    drainRegistry?: DrainRegistry | null,
   ) {
     this.oeUrl = oeUrl.replace(/\/$/, "");
     this.executionId = executionId;
     this.customHeaders = customHeaders ?? {};
     this.oeOwnerUrl = oeOwnerUrl ?? null;
+    this.drainRegistry = drainRegistry ?? null;
     this.operationalSteps = new OperationalStepAllocator();
   }
 
@@ -1344,16 +1406,71 @@ export class SecureToolWrapper {
         );
       }
       const startedAt = performance.now();
+      // Register the call with the drain registry so POST /interrupt/call can
+      // address it. A controller exists only for tools that declared
+      // call-interrupt support: Node has no preemptive cancel, so the abort
+      // stops the wait, fires the signal the opted-in body honors, and lets
+      // the graph continue. A tool without the declaration answers
+      // not_cancellable and its outcome flows honestly.
+      const registry = this.drainRegistry;
+      const supportsCallInterrupt = options.supportsCallInterrupt === true;
+      let callController: AbortController | undefined;
+      let preAborted = false;
+      if (registry != null) {
+        callController = supportsCallInterrupt
+          ? new AbortController()
+          : undefined;
+        try {
+          preAborted = registry.beginWork(
+            this.executionId,
+            callController,
+            step,
+          );
+        } catch {
+          // A whole-run drain latched between the OE approval and this
+          // dispatch: the run is terminal, so the tool must not start.
+          throw drainAbortError();
+        }
+      }
       let localResult: unknown;
       let suspendMarker: Record<string, unknown> | null = null;
       try {
         await runWithSuspendRequestContext(async () => {
-          localResult = await runWithCustomerOrigin(() =>
-            effectiveLocalExecutor(),
-          );
+          if (preAborted) {
+            // The Stop landed in the OE-approval → in-graph-dispatch handoff:
+            // skip the body and settle interrupted.
+            throw callAbortError();
+          }
+          localResult = await runWithCustomerOrigin(() => {
+            const controller = callController;
+            if (controller === undefined) {
+              return Promise.resolve().then(() => effectiveLocalExecutor());
+            }
+            // The body must be scheduled inside the signal's scope:
+            // AsyncLocalStorage context is captured when the promise chain is
+            // created, so a chain built outside would run signal-blind.
+            return runWithCallAbortSignal(controller.signal, () =>
+              raceWithCallAbort(
+                Promise.resolve().then(() => effectiveLocalExecutor()),
+                controller.signal,
+              ),
+            );
+          });
           suspendMarker = getRequestedSuspend();
         });
       } catch (error) {
+        // Snapshot the stop decision before the settlement awaits below: a
+        // Stop landing mid-report must not repaint an already-classified
+        // genuine error (or a drain abort) as a stopped call.
+        const stoppedByCallInterrupt =
+          preAborted ||
+          (callController !== undefined &&
+            callController.signal.reason === CALL_INTERRUPT_REASON);
+        // Close interruptibility ahead of the report: a Stop landing
+        // mid-report reads already_settled, not a stop the durable record
+        // will contradict. No await runs between the snapshot and this claim,
+        // so no abort can slip between them.
+        registry?.claimSettlement(this.executionId, step);
         const interrupted =
           isFrameworkControlFlow?.(error) === true ||
           (error instanceof Error && error.name === "AbortError");
@@ -1397,7 +1514,16 @@ export class SecureToolWrapper {
             { cause: settlementError },
           );
         }
+        if (stoppedByCallInterrupt) {
+          // This call was deliberately stopped: the graph continues with the
+          // stopped-call result instead of unwinding.
+          return rawOnInterrupt ? CALL_INTERRUPTED : { interrupted: true };
+        }
         throw propagatedError;
+      } finally {
+        if (registry != null) {
+          registry.endWork(this.executionId, callController, step);
+        }
       }
       const durationMs = performance.now() - startedAt;
       if (suspendMarker !== null && interruptMode === "reject") {
@@ -1621,6 +1747,11 @@ export interface CreateSecureToolFunctionOptions {
   isLocal?: boolean | undefined;
   /** Identify framework-owned native control-flow errors. */
   isFrameworkControlFlow?: ((error: unknown) => boolean) | undefined;
+  /**
+   * Declares the tool body honors the per-call stop signal. See
+   * {@link ExecuteToolOptions.supportsCallInterrupt}.
+   */
+  supportsCallInterrupt?: boolean | undefined;
 }
 
 /**
@@ -1651,6 +1782,7 @@ export function createSecureToolFunction(
     redactFields,
     isLocal = true,
     isFrameworkControlFlow,
+    supportsCallInterrupt = false,
   } = options;
   const effectiveToolFormat = toolDeclaredFormat ?? responseFormat;
   return async (
@@ -1711,6 +1843,9 @@ export function createSecureToolFunction(
         isLocal,
         localExecutor,
         isFrameworkControlFlow,
+        // Absent unless declared: a present-but-false key would read as a
+        // declared capability to exact-shape consumers.
+        ...(supportsCallInterrupt && { supportsCallInterrupt }),
       });
       return coerceContentAndArtifact(
         result,

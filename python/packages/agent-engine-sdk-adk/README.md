@@ -8,11 +8,8 @@ The adapter is durable-only in AER mode. Set `features.durable_workflow: true`
 in `agent.yaml`. Omitted or `false` does not fall back to a native ADK session;
 the first invoke fails. The Orchestration Engine owns the cross-turn state and
 supplies it to each attempt; the adapter does not maintain a separate ADK
-session database. Platform concepts,
-enablement, and the identity rule behind the topology limits below:
-[Durable Workflow](../../../../../docs/orchestration-engine/durable-workflow/). Atlas
-Agent Engine
-`ctx.resume` is not an ADK checkpoint resume. Parallel ADK routes may
+session database. Atlas Agent Engine `ctx.resume` is not an ADK checkpoint
+resume. Parallel ADK routes may
 suspend together; the adapter collects them through runner quiescence and
 commits one atomic OE wait frontier. Once that frontier is answered, its step
 is committed and ADK may continue into another serial or parallel frontier.

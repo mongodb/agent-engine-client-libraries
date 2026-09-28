@@ -41,6 +41,7 @@ import type * as RunnerSharedTs from "@mongodb-js/agent-engine-runner-shared";
 import { App } from "../src/runtime.js";
 import { LangGraphBaseAgent } from "../src/agent.js";
 import { PlatformCheckpointer } from "../src/platform_checkpointer.js";
+import { withCallInterruptSupport } from "../src/call_interrupt.js";
 
 const { discoverMcpToolsMock } = vi.hoisted(() => ({
   discoverMcpToolsMock: vi.fn(),
@@ -453,6 +454,70 @@ describe("App.getTools() — AER mode wrapping", () => {
       const callArgs = executeTool.mock.calls[0] ?? [];
       const options = callArgs[2] as { redactFields?: string[] } | undefined;
       expect(options?.redactFields).toEqual(["card_number"]);
+    } finally {
+      if (prev === undefined) delete process.env["RUNNER_MODE"];
+      else process.env["RUNNER_MODE"] = prev;
+    }
+  });
+
+  it("carries the per-call Stop opt-in from registration through to the wrapper", async () => {
+    const prev = process.env["RUNNER_MODE"];
+    process.env["RUNNER_MODE"] = "aer";
+    try {
+      const app = new App({ appName: "Test Agent" });
+      app.tool({
+        isLocal: true,
+        description: "A cooperative slow check.",
+        schema: z.object({ x: z.string() }),
+      })(
+        withCallInterruptSupport(function slow_check({
+          x,
+        }: {
+          x: string;
+        }): string {
+          return x;
+        }),
+      );
+      app.tool({
+        isLocal: true,
+        description: "A plain tool.",
+        schema: z.object({ x: z.string() }),
+      })(function plain_tool({ x }: { x: string }): string {
+        return x;
+      });
+
+      const tools = app.getTools() as unknown as {
+        name: string;
+        invoke: (input: unknown) => Promise<unknown>;
+      }[];
+      const executeTool = vi.fn().mockResolvedValue("ok");
+      const declared: Record<string, unknown> = {};
+      await runWithExecutionContext(
+        {
+          executionId: "exec-1",
+          wrapper: { executeTool },
+          oeUrl: "http://localhost:8080",
+        },
+        async () => {
+          for (const tool of tools) {
+            await tool.invoke({
+              name: tool.name,
+              args: { x: "a" },
+              id: `call_${tool.name}`,
+              type: "tool_call",
+            });
+            const options = executeTool.mock.calls.at(-1)?.[2] as
+              | { supportsCallInterrupt?: boolean }
+              | undefined;
+            // The wrapper forwards the flag only when set — absence means the
+            // call registers without a controller and answers not_cancellable.
+            declared[tool.name] = options?.supportsCallInterrupt === true;
+          }
+        },
+      );
+      // The brand on the registered callable must survive App.tool()'s
+      // LangChain-tool construction; unbranded tools stay not_cancellable.
+      expect(declared).toEqual({ slow_check: true, plain_tool: false });
     } finally {
       if (prev === undefined) delete process.env["RUNNER_MODE"];
       else process.env["RUNNER_MODE"] = prev;

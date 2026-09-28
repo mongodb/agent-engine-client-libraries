@@ -1,8 +1,6 @@
 /**
- * Stable span names for the first-invoke lifecycle. Port of Python's
- * `agent_engine_runner_shared/span_names.py` — see that module for the full rationale
- * (no manual `llm.call` span; LangChain's auto-instrumentation already
- * covers it).
+ * Stable span names for the first-invoke lifecycle. There is no manual
+ * `llm.call` span; LangChain's auto-instrumentation already covers it.
  */
 
 export const AER_BUILD_AGENT = "aer.build_agent";
@@ -31,7 +29,7 @@ export const ATTR_SKILLS_LOADED_COUNT = "skills.loaded_count";
 const openinferenceSpanKindAttr = "openinference.span.kind";
 export const OPENINFERENCE_SPAN_KIND = openinferenceSpanKindAttr;
 
-/** Port of Python's `OpenInferenceSpanKind` (span_kinds.py). */
+/** OpenInference span kinds, matching the Python SDK's `OpenInferenceSpanKind`. */
 export const OpenInferenceSpanKind = {
   AGENT: "AGENT",
   CHAIN: "CHAIN",

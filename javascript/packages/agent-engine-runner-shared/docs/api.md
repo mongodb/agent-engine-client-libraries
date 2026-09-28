@@ -484,6 +484,7 @@
   - [flushErrorReporting()](#api-flusherrorreporting)
   - [formatLlmError()](#api-formatllmerror)
   - [getAllCustomHeaders()](#api-getallcustomheaders)
+  - [getCallAbortSignal()](#api-getcallabortsignal)
   - [getCheckpointWorkspaceId()](#api-getcheckpointworkspaceid)
   - [getContentCaptureMode()](#api-getcontentcapturemode)
   - [getCurrentAuthorization()](#api-getcurrentauthorization)
@@ -603,6 +604,7 @@
   - [runSerialActivity()](#api-runserialactivity)
   - [runStreamingActivity()](#api-runstreamingactivity)
   - [runWithAttemptContext()](#api-runwithattemptcontext)
+  - [runWithCallAbortSignal()](#api-runwithcallabortsignal)
   - [runWithCustomerOrigin()](#api-runwithcustomerorigin)
   - [runWithExecutionContext()](#api-runwithexecutioncontext)
   - [runWithOperationPathResolver()](#api-runwithoperationpathresolver)
@@ -1975,8 +1977,7 @@ Wraps an OTLP `SpanExporter`, enforcing `AGENTIC_PLATFORM_OTEL_CONTENT_CAPTURE`.
 Redaction failures fail closed: a batch that can't be safely redacted is
 dropped rather than forwarded unredacted, matching the metadata-only
 default's privacy-first intent. Transport failures on the wrapped exporter
-never throw — they're surfaced only through `resultCallback`. Ported from
-`ContentPolicyOTLPSpanExporter` in `agent_engine_runner_shared/tracing/exporters.py`.
+never throw — they're surfaced only through `resultCallback`.
 
 #### Implements
 
@@ -3871,7 +3872,8 @@ new SecureToolWrapper(
    oeUrl,
    executionId,
    customHeaders?,
-   oeOwnerUrl?
+   oeOwnerUrl?,
+   drainRegistry?
 ): SecureToolWrapper;
 ```
 
@@ -3883,6 +3885,7 @@ new SecureToolWrapper(
 | `executionId` | `string` |
 | `customHeaders?` | `Record`\<`string`, `string`\> |
 | `oeOwnerUrl?` | `string` \| `null` |
+| `drainRegistry?` | `DrainRegistry` \| `null` |
 
 **Returns**
 
@@ -7380,10 +7383,8 @@ Use `create(ActivitySuspensionSchema)` to create a new message.
 const AER_BUILD_AGENT: "aer.build_agent" = "aer.build_agent";
 ```
 
-Stable span names for the first-invoke lifecycle. Port of Python's
-`agent_engine_runner_shared/span_names.py` — see that module for the full rationale
-(no manual `llm.call` span; LangChain's auto-instrumentation already
-covers it).
+Stable span names for the first-invoke lifecycle. There is no manual
+`llm.call` span; LangChain's auto-instrumentation already covers it.
 
 ***
 
@@ -9160,7 +9161,7 @@ const OPENINFERENCE_SPAN_KIND: "openinference.span.kind" = openinferenceSpanKind
 const OpenInferenceSpanKind: object;
 ```
 
-Port of Python's `OpenInferenceSpanKind` (span_kinds.py).
+OpenInference span kinds, matching the Python SDK's `OpenInferenceSpanKind`.
 
 #### Type Declaration
 
@@ -11375,6 +11376,25 @@ All custom headers including platform-internal `a2a-` entries.
 
 ***
 
+<a id="api-getcallabortsignal"></a>
+
+### getCallAbortSignal()
+
+```ts
+function getCallAbortSignal(): AbortSignal | undefined;
+```
+
+The per-call stop signal for the in-flight callback-routed tool call.
+Defined only inside a tool body that declared call-interrupt support; a
+cooperative body checks it (or forwards it to `fetch` etc.) to stop at its
+next checkpoint. Undefined everywhere else.
+
+#### Returns
+
+`AbortSignal` \| `undefined`
+
+***
+
 <a id="api-getcheckpointworkspaceid"></a>
 
 ### getCheckpointWorkspaceId()
@@ -12113,7 +12133,7 @@ function installStructuredLogging(args?): Logger;
 
 Install structured logging on the log4js root.
 
-Mirrors `install_structured_logging` in the Python port:
+Behaves like the Python SDK's `install_structured_logging`:
 
 - Idempotent: re-installing routes the appender through the snapshotted
   original `stdout.write` (stashed under `ORIGINAL_WRITE_SLOT`), so it
@@ -13884,7 +13904,7 @@ Empty `projectId` throws when scoping is required (`required`, defaulting to
 failure throws so a transient error cannot create a competing current-name
 database beside an existing legacy one. `legacyBases` are previous defaults
 whose project-scoped forms, then bare forms, are adopted before a fresh
-scoped database is created during private preview.
+scoped database is created.
 
 #### Parameters
 
@@ -14120,8 +14140,7 @@ Derive the effective database name for `base` scoped to `projectId`.
    - else an existing unscoped `legacyBases` candidate -> use it.
    - else -> use `scoped` (fresh deployment).
 
-Unscoped fallback is limited to known platform defaults during private
-preview. The current base and arbitrary names are never auto-adopted.
+Unscoped fallback is limited to known platform defaults. The current base and arbitrary names are never auto-adopted.
 
 #### Parameters
 
@@ -14303,6 +14322,35 @@ function runWithAttemptContext<T>(attempt, fn): T;
 | Parameter | Type |
 | :------ | :------ |
 | `attempt` | [`AttemptContext`](#api-attemptcontext) |
+| `fn` | () => `T` |
+
+#### Returns
+
+`T`
+
+***
+
+<a id="api-runwithcallabortsignal"></a>
+
+### runWithCallAbortSignal()
+
+```ts
+function runWithCallAbortSignal<T>(signal, fn): T;
+```
+
+Run one callback-routed tool body with its per-call abort signal attached.
+
+#### Type Parameters
+
+| Type Parameter |
+| :------ |
+| `T` |
+
+#### Parameters
+
+| Parameter | Type |
+| :------ | :------ |
+| `signal` | `AbortSignal` |
 | `fn` | () => `T` |
 
 #### Returns
@@ -15039,7 +15087,7 @@ Record a bounded, redacted summary of a fatal startup error to the
 container's termination message before the process exits, so the real
 cause of the crash survives past this process's own stdout into
 `ContainerStatus.LastTerminationState.Terminated.Message` — the field the
-Agentic Operator's crash diagnostics read, and from there into the
+platform's crash diagnostics read, and from there into the
 customer-facing deploy timeline.
 
 This is customer code (container mode), so unlike the platform's own

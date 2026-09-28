@@ -1,6 +1,6 @@
 # Session fork vs LangGraph time-travel
 
-Port of Python's `agent-engine-sdk-langgraph/docs/session-fork.md`. LangGraph.js
+The Python SDK has a matching [session fork guide](../../../../python/packages/agent-engine-sdk-langgraph/docs/session-fork.md). LangGraph.js
 time-travel stays on one thread: `graph.updateState` and a historical
 `checkpoint_id` write the next checkpoint on that same `thread_id`. The
 conversation you patched is the conversation you keep using.

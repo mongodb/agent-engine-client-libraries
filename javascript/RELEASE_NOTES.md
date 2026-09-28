@@ -8,6 +8,12 @@ Release notes for the JavaScript SDK packages. Per-package historical changelogs
 
 <!-- New entries go at the top. -->
 
+## v0.1.113
+
+- Allow publishing the JS SDK packages to npm
+- Retry transient LLM failures before forwarded output
+
+
 ## v0.1.112
 
 No user-facing changes.

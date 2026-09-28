@@ -450,3 +450,20 @@ export function runWithCustomerOrigin<T>(fn: () => T): T {
   }
   return customerOriginStorage.run(true, fn);
 }
+
+const callAbortStorage = new AsyncLocalStorage<AbortSignal>();
+
+/**
+ * The per-call stop signal for the in-flight callback-routed tool call.
+ * Defined only inside a tool body that declared call-interrupt support; a
+ * cooperative body checks it (or forwards it to `fetch` etc.) to stop at its
+ * next checkpoint. Undefined everywhere else.
+ */
+export function getCallAbortSignal(): AbortSignal | undefined {
+  return callAbortStorage.getStore();
+}
+
+/** Run one callback-routed tool body with its per-call abort signal attached. */
+export function runWithCallAbortSignal<T>(signal: AbortSignal, fn: () => T): T {
+  return callAbortStorage.run(signal, fn);
+}

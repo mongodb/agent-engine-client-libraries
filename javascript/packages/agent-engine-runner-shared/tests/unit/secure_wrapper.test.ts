@@ -65,9 +65,11 @@ import {
   registerSuspendHandler,
   resetHooks,
   suspendPayloadToJson,
+  getCallAbortSignal,
   CALL_INTERRUPTED_ARTIFACT_KEY,
 } from "../../src/index.js";
 import { requestOeApprovalRetryable } from "../../src/secure_wrapper.js";
+import { DrainRegistry } from "../../src/server/drain.js";
 import {
   getRequestTimeout,
   getToolReadTimeout,
@@ -2583,5 +2585,423 @@ describe("ExternalAPICallError", () => {
     expect(exc.tool_api_error.error_code).toBe("service_down");
     expect(exc.tool_api_error.reason).toBe("Stripe is temporarily unavailable");
     expect(exc.tool_api_error.provider_type).toBe("stripe");
+  });
+});
+
+// Per-call abort of an in-process (callback-routed) tool: the AER side of
+// POST /interrupt/call. Mirrors Python's test_call_interrupt.py local-call
+// tests — the twins must stay behaviourally identical.
+describe("per-call abort of a callback-routed tool", () => {
+  test("aborts the wait mid-flight, reports interrupted, and hands the graph the stopped-call result", async () => {
+    const fetchSpy = vi
+      .fn()
+      .mockResolvedValueOnce(
+        jsonResponse({
+          proceed: true,
+          route_to: "callback",
+          latest_step_number: 1,
+        }),
+      )
+      .mockResolvedValueOnce(jsonResponse({ ok: true }));
+    vi.stubGlobal("fetch", fetchSpy);
+
+    const registry = new DrainRegistry();
+    const wrapper = new SecureToolWrapper(
+      "http://localhost:8080",
+      "exec-123",
+      undefined,
+      undefined,
+      registry,
+    );
+
+    let bodyStarted!: () => void;
+    let releaseBody!: () => void;
+    const started = new Promise<void>((r) => {
+      bodyStarted = r;
+    });
+    const released = new Promise<void>((r) => {
+      releaseBody = r;
+    });
+
+    const run = wrapper.executeTool(
+      "native_command",
+      {},
+      {
+        isLocal: true,
+        supportsCallInterrupt: true,
+        localExecutor: async () => {
+          bodyStarted();
+          await released;
+          return "unreachable";
+        },
+      },
+    );
+    await started;
+
+    // Node has no preemptive cancel: the abort stops the wait and fires the
+    // body's signal; a body that ignores its signal runs out detached.
+    expect(registry.abortCall("exec-123", 1)).toBe("interrupted");
+    await expect(run).resolves.toEqual({ interrupted: true });
+
+    const resultBody = JSON.parse(fetchSpy.mock.calls[1]?.[1].body as string);
+    expect(resultBody.status).toBe("interrupted");
+
+    releaseBody();
+    await run.catch(() => undefined);
+  });
+
+  test("a whole-run drain latched before the body starts keeps the tool from running", async () => {
+    const fetchSpy = vi
+      .fn()
+      .mockResolvedValueOnce(
+        jsonResponse({
+          proceed: true,
+          route_to: "callback",
+          latest_step_number: 1,
+        }),
+      )
+      .mockResolvedValue(jsonResponse({ ok: true }));
+    vi.stubGlobal("fetch", fetchSpy);
+
+    const registry = new DrainRegistry();
+    registry.apply({
+      request_id: "drain-1",
+      execution_id: "exec-123",
+      reason: "execution_cancelled",
+      deadline_at_ms: Date.now() + 60_000,
+      workspace_id: null,
+    });
+
+    const wrapper = new SecureToolWrapper(
+      "http://localhost:8080",
+      "exec-123",
+      undefined,
+      undefined,
+      registry,
+    );
+    let ran = false;
+    await expect(
+      wrapper.executeTool(
+        "native_command",
+        {},
+        {
+          isLocal: true,
+          localExecutor: async () => {
+            ran = true;
+            return "unreachable";
+          },
+        },
+      ),
+    ).rejects.toThrow("execution is draining");
+    expect(ran).toBe(false);
+  });
+
+  test("a settled call answers already_settled and its late settlement is untouched", async () => {
+    const fetchSpy = vi
+      .fn()
+      .mockResolvedValueOnce(
+        jsonResponse({
+          proceed: true,
+          route_to: "callback",
+          latest_step_number: 1,
+        }),
+      )
+      .mockResolvedValueOnce(jsonResponse({ ok: true }));
+    vi.stubGlobal("fetch", fetchSpy);
+
+    const registry = new DrainRegistry();
+    const wrapper = new SecureToolWrapper(
+      "http://localhost:8080",
+      "exec-123",
+      undefined,
+      undefined,
+      registry,
+    );
+    const result = await wrapper.executeTool(
+      "native_command",
+      {},
+      { isLocal: true, localExecutor: async () => "done" },
+    );
+    expect(result).toBe("done");
+
+    expect(registry.abortCall("exec-123", 1)).toBe("already_settled");
+  });
+
+  test("a tool without declared interrupt support answers not_cancellable and its outcome flows", async () => {
+    const fetchSpy = vi
+      .fn()
+      .mockResolvedValueOnce(
+        jsonResponse({
+          proceed: true,
+          route_to: "callback",
+          latest_step_number: 1,
+        }),
+      )
+      .mockResolvedValueOnce(jsonResponse({ ok: true }));
+    vi.stubGlobal("fetch", fetchSpy);
+
+    const registry = new DrainRegistry();
+    const wrapper = new SecureToolWrapper(
+      "http://localhost:8080",
+      "exec-123",
+      undefined,
+      undefined,
+      registry,
+    );
+
+    let bodyStarted!: () => void;
+    let releaseBody!: () => void;
+    const started = new Promise<void>((r) => {
+      bodyStarted = r;
+    });
+    const released = new Promise<void>((r) => {
+      releaseBody = r;
+    });
+
+    const run = wrapper.executeTool(
+      "native_command",
+      {},
+      {
+        isLocal: true,
+        localExecutor: async () => {
+          bodyStarted();
+          await released;
+          return "external work completed";
+        },
+      },
+    );
+    await started;
+
+    // No declaration, no controller: the abort is an honest refusal and the
+    // body runs out — its real result must not be masked as interrupted.
+    expect(registry.abortCall("exec-123", 1)).toBe("not_cancellable");
+
+    releaseBody();
+    await expect(run).resolves.toBe("external work completed");
+    const resultBody = JSON.parse(fetchSpy.mock.calls[1]?.[1].body as string);
+    expect(resultBody.status).toBe("success");
+  });
+
+  test("a cooperative body receives the stop signal and never performs its post-stop effect", async () => {
+    const fetchSpy = vi
+      .fn()
+      .mockResolvedValueOnce(
+        jsonResponse({
+          proceed: true,
+          route_to: "callback",
+          latest_step_number: 1,
+        }),
+      )
+      .mockResolvedValueOnce(jsonResponse({ ok: true }));
+    vi.stubGlobal("fetch", fetchSpy);
+
+    const registry = new DrainRegistry();
+    const wrapper = new SecureToolWrapper(
+      "http://localhost:8080",
+      "exec-123",
+      undefined,
+      undefined,
+      registry,
+    );
+
+    let observed: AbortSignal | undefined;
+    const effects: string[] = [];
+    const bodyReady = new Promise<void>((r) => {
+      const check = () => (observed !== undefined ? r() : setTimeout(check, 1));
+      check();
+    });
+    const run = wrapper.executeTool(
+      "native_command",
+      {},
+      {
+        isLocal: true,
+        supportsCallInterrupt: true,
+        localExecutor: async () => {
+          observed = getCallAbortSignal();
+          await new Promise<void>((resolve) => {
+            const signal = observed;
+            if (signal === undefined || signal.aborted) return resolve();
+            signal.addEventListener("abort", () => resolve(), { once: true });
+          });
+          // The cooperative checkpoint: honoring the signal means the
+          // post-stop effect never runs.
+          if (observed?.aborted !== true) effects.push("post-stop effect");
+          return "unreachable";
+        },
+      },
+    );
+    await bodyReady;
+
+    expect(observed).toBeDefined();
+    expect(registry.abortCall("exec-123", 1)).toBe("interrupted");
+    await expect(run).resolves.toEqual({ interrupted: true });
+    await new Promise((r) => setTimeout(r, 10));
+    expect(effects).toEqual([]);
+
+    const resultBody = JSON.parse(fetchSpy.mock.calls[1]?.[1].body as string);
+    expect(resultBody.status).toBe("interrupted");
+  });
+
+  test("a stop landing before the in-graph registration skips the body and settles interrupted", async () => {
+    const fetchSpy = vi
+      .fn()
+      .mockResolvedValueOnce(
+        jsonResponse({
+          proceed: true,
+          route_to: "callback",
+          latest_step_number: 1,
+        }),
+      )
+      .mockResolvedValueOnce(jsonResponse({ ok: true }));
+    vi.stubGlobal("fetch", fetchSpy);
+
+    const registry = new DrainRegistry();
+    const wrapper = new SecureToolWrapper(
+      "http://localhost:8080",
+      "exec-123",
+      undefined,
+      undefined,
+      registry,
+    );
+
+    // The OE approval and the in-graph dispatch are separate hops: the Stop
+    // can reach the runtime first.
+    expect(registry.abortCall("exec-123", 1)).toBe("not_found");
+
+    let ran = false;
+    const result = await wrapper.executeTool(
+      "native_command",
+      {},
+      {
+        isLocal: true,
+        supportsCallInterrupt: true,
+        localExecutor: async () => {
+          ran = true;
+          return "unreachable";
+        },
+      },
+    );
+    expect(result).toEqual({ interrupted: true });
+    expect(ran).toBe(false);
+
+    const resultBody = JSON.parse(fetchSpy.mock.calls[1]?.[1].body as string);
+    expect(resultBody.status).toBe("interrupted");
+  });
+
+  test("a Stop landing during error settlement cannot repaint a genuine tool error", async () => {
+    let reportStarted!: () => void;
+    let releaseReport!: () => void;
+    const reportInFlight = new Promise<void>((r) => {
+      reportStarted = r;
+    });
+    const reportGate = new Promise<void>((r) => {
+      releaseReport = r;
+    });
+    const fetchSpy = vi
+      .fn()
+      .mockResolvedValueOnce(
+        jsonResponse({
+          proceed: true,
+          route_to: "callback",
+          latest_step_number: 1,
+        }),
+      )
+      .mockImplementationOnce(() => {
+        reportStarted();
+        return reportGate.then(() => jsonResponse({ ok: true }));
+      });
+    vi.stubGlobal("fetch", fetchSpy);
+
+    const registry = new DrainRegistry();
+    const wrapper = new SecureToolWrapper(
+      "http://localhost:8080",
+      "exec-123",
+      undefined,
+      undefined,
+      registry,
+    );
+
+    const run = wrapper.executeTool(
+      "native_command",
+      {},
+      {
+        isLocal: true,
+        supportsCallInterrupt: true,
+        localExecutor: async () => {
+          throw new Error("provider exploded");
+        },
+      },
+    );
+    const observed = run.catch((error: unknown) => error);
+
+    // The body already failed and its error report is in flight; a Stop now
+    // finds the settlement already claimed — already_settled, not a stop the
+    // durable record would contradict — and must not change an outcome the
+    // caller can no longer affect.
+    await reportInFlight;
+    expect(registry.abortCall("exec-123", 1)).toBe("already_settled");
+
+    releaseReport();
+    const settled = await observed;
+    expect(settled).toBeInstanceOf(Error);
+    expect((settled as Error).message).toContain("provider exploded");
+
+    const resultBody = JSON.parse(fetchSpy.mock.calls[1]?.[1].body as string);
+    expect(resultBody.status).toBe("error");
+  });
+
+  test("a Stop landing during the success report reads already_settled and the result lands", async () => {
+    let reportStarted!: () => void;
+    let releaseReport!: () => void;
+    const reportInFlight = new Promise<void>((r) => {
+      reportStarted = r;
+    });
+    const reportGate = new Promise<void>((r) => {
+      releaseReport = r;
+    });
+    const fetchSpy = vi
+      .fn()
+      .mockResolvedValueOnce(
+        jsonResponse({
+          proceed: true,
+          route_to: "callback",
+          latest_step_number: 1,
+        }),
+      )
+      .mockImplementationOnce(() => {
+        reportStarted();
+        return reportGate.then(() => jsonResponse({ ok: true }));
+      });
+    vi.stubGlobal("fetch", fetchSpy);
+
+    const registry = new DrainRegistry();
+    const wrapper = new SecureToolWrapper(
+      "http://localhost:8080",
+      "exec-123",
+      undefined,
+      undefined,
+      registry,
+    );
+
+    const run = wrapper.executeTool(
+      "native_command",
+      {},
+      {
+        isLocal: true,
+        supportsCallInterrupt: true,
+        localExecutor: async () => "done",
+      },
+    );
+
+    // The body finished and its success report is in flight; the call's
+    // settlement is already claimed, so the Stop is observed, not honored.
+    await reportInFlight;
+    expect(registry.abortCall("exec-123", 1)).toBe("already_settled");
+
+    releaseReport();
+    await expect(run).resolves.toBe("done");
+
+    const resultBody = JSON.parse(fetchSpy.mock.calls[1]?.[1].body as string);
+    expect(resultBody.status).toBe("success");
   });
 });

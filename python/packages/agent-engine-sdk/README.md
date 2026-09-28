@@ -6,6 +6,8 @@ Framework-neutral protocols, models, and interfaces shared by Atlas Agent
 Engine SDK integrations. The package has no dependency on the platform runtime
 and can be used to define agent, execution, message, tool, and LLM contracts in
 an independent application.
+> This is an internal core package; agents don't install it directly. Install a
+> framework SDK (`agent-engine-sdk-langgraph` or `agent-engine-sdk-adk`), which depends on it.
 
 ## Install
 

@@ -32,14 +32,11 @@ from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.store.base import BaseStore
 
-from agent_engine_sdk_langgraph.stopped_tool_call_middleware import (
-    StoppedToolCallMiddleware,
-)
-from agent_engine_sdk_langgraph.durable_deep_agent import DurableDeepAgentMiddleware
 from agent_engine_sdk_langgraph import skills_tracing
 from agent_engine_sdk_langgraph.deep_agent_checkpointer import (
     checkpointer_for_deep_agent,
 )
+from agent_engine_sdk_langgraph.durable_deep_agent import DurableDeepAgentMiddleware
 from agent_engine_sdk_langgraph.subagents import validate_subagent_tree
 
 # Patches SkillsMiddleware.before_agent/abefore_agent to emit a wrapper span.
@@ -171,10 +168,11 @@ def create_agent_engine_deep_agent(
         tools=tools,
         subagents=forwarded_subagents,
         system_prompt=system_prompt,
-        # Prepended so every agent gets deterministic stopped-tool-call
-        # handling and durable local-subagent attribution by default.
+        # Prepended so every agent gets durable local-subagent attribution by
+        # default. A per-call-stopped tool batch goes to the model as ordinary
+        # interrupted ToolMessages — continuation is the model's call,
+        # matching the TypeScript twin.
         middleware=[
-            StoppedToolCallMiddleware(),
             DurableDeepAgentMiddleware(
                 unsupported_subagent_names=unsupported_subagent_names
             ),

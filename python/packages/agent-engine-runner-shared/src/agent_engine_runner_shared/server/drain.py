@@ -38,9 +38,10 @@ import asyncio
 import logging
 import math
 import os
+import threading
 import time
 from enum import Enum
-from typing import Dict, Mapping, Optional, Set
+from typing import Any, Callable, Dict, Mapping, Optional, Set
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
@@ -70,6 +71,10 @@ DEFAULT_MAX_DEADLINE_MS = 60_000
 # disconnecting before iteration starts would leak the registration forever —
 # and a later drain would wait out its deadline against phantom work.
 DEFAULT_ATTACH_GRACE_S = 30.0
+# How long an abort that preceded its call's registration stays claimable by
+# begin_work. The window covers the OE-claim → in-graph-dispatch handoff; the
+# platform's dispatch claim makes a same-step collision inside it impossible.
+PRE_ABORT_RETENTION_S = 60.0
 
 _REQUEST_ID_PATTERN = r"^[A-Za-z0-9._:-]+$"
 
@@ -171,8 +176,11 @@ class WorkHandle:
         "attached",
         "attach_timer",
         "done",
+        "settling",
         "step_number",
         "aborted",
+        "cancel_callback",
+        "channel_expected",
     )
 
     def __init__(self, entry: _ExecutionEntry, execution_id: str) -> None:
@@ -182,10 +190,24 @@ class WorkHandle:
         self.attached = False
         self.attach_timer: Optional[asyncio.TimerHandle] = None
         self.done = False
+        # Set when the call's result report begins: the body already produced
+        # its outcome, so a late abort reads already_settled instead of
+        # claiming a stop the durable record will contradict.
+        self.settling = False
         self.step_number: Optional[int] = None
-        # Set by abort_call: an abort that lands before the task attaches
-        # fires at attach time.
+        # Set by abort_call only when the abort is honored: an abort that
+        # lands before the signal channel attaches fires at attach time. A
+        # refused abort (not_cancellable) never sets it, so the call's real
+        # outcome still flows.
         self.aborted = False
+        # Abort channel for work whose cancellable unit lives off the server's
+        # event loop (a tool body on a worker thread's private loop). Invoked
+        # by abort_call; must be thread-safe. None means no signal channel.
+        self.cancel_callback: Optional[Callable[[], None]] = None
+        # The caller declares a cancel_callback will attach shortly (an async
+        # tool body whose loop starts on its worker thread). A pre-attach
+        # abort is then sticky-interrupted instead of not_cancellable.
+        self.channel_expected = False
 
 
 class DrainRegistry:
@@ -226,6 +248,29 @@ class DrainRegistry:
             "RUNNER_DRAIN_ATTACH_GRACE_S",
         )
         self._entries: Dict[str, _ExecutionEntry] = {}
+        # Aborts that arrived before their call registered, by
+        # (execution_id, step_number), with a monotonic deadline. The window
+        # is the OE-claim → in-graph-dispatch handoff; the retention covers
+        # graph scheduling delays, not call lifetimes.
+        self._pre_aborted: Dict[tuple, float] = {}
+        # The loop that owns entry state. Captured on the first on-loop
+        # registration; worker-thread callers (a tool body's boundary) must be
+        # marshalled onto it via owner_loop_call — the check-and-set invariants
+        # and asyncio.Event/timer wakeups are not safe to drive off-loop.
+        self._owner_loop: Optional[asyncio.AbstractEventLoop] = None
+
+    def _pop_pre_aborted(self, execution_id: str, step_number: int) -> bool:
+        deadline = self._pre_aborted.pop((execution_id, step_number), None)
+        self._sweep_pre_aborted()
+        return deadline is not None and deadline > _now_monotonic()
+
+    def _sweep_pre_aborted(self) -> None:
+        if not self._pre_aborted:
+            return
+        now = _now_monotonic()
+        for key, deadline in list(self._pre_aborted.items()):
+            if deadline <= now:
+                del self._pre_aborted[key]
 
     @property
     def max_deadline_ms(self) -> int:
@@ -240,6 +285,52 @@ class DrainRegistry:
                 detail=DrainReasonCode.EXECUTION_DRAINING.value,
             )
 
+    def _capture_owner_loop(self) -> None:
+        if self._owner_loop is not None:
+            return
+        try:
+            self._owner_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            pass
+
+    def owner_loop_call(self, fn: Callable[[], Any]) -> Any:
+        """Run fn on the registry's owner loop, blocking the caller until done.
+
+        The registry's check-and-set invariants and its asyncio.Event/timer
+        wakeups are single-loop state; tool bodies run on framework worker
+        threads, so their begin/attach/end calls marshal through here. On the
+        owner loop itself — or before any loop is known (single-threaded test
+        harnesses) — fn runs inline.
+        """
+        loop = self._owner_loop
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        if loop is None or running is loop:
+            return fn()
+        box: Dict[str, Any] = {}
+        done = threading.Event()
+
+        def run() -> None:
+            try:
+                box["result"] = fn()
+            except BaseException as exc:  # noqa: BLE001 - re-raised on the caller's thread
+                box["error"] = exc
+            finally:
+                done.set()
+
+        try:
+            loop.call_soon_threadsafe(run)
+        except RuntimeError:
+            # Owner loop already closed (server shutdown): run inline rather
+            # than drop the bookkeeping.
+            return fn()
+        done.wait()
+        if "error" in box:
+            raise box["error"]
+        return box.get("result")
+
     def abort_call(self, execution_id: str, step_number: int) -> CallInterruptOutcome:
         """Signal exactly one in-flight call, leaving the execution open.
 
@@ -249,24 +340,49 @@ class DrainRegistry:
         repeat abort of the same step re-reads the same outcome.
         """
         entry = self._entries.get(execution_id)
-        if entry is None:
-            return CallInterruptOutcome.NOT_FOUND
-        handle = entry.by_step.get(step_number)
+        handle = entry.by_step.get(step_number) if entry is not None else None
         if handle is None:
+            # The abort can race the call's registration: OE claims the call,
+            # then the runtime registers only when the in-graph body starts.
+            # Retain it briefly so begin_work settles the late registration
+            # as interrupted instead of running a call the caller stopped.
+            self._sweep_pre_aborted()
+            self._pre_aborted[(execution_id, step_number)] = (
+                _now_monotonic() + PRE_ABORT_RETENTION_S
+            )
             return CallInterruptOutcome.NOT_FOUND
-        if handle.done:
+        if handle.done or handle.settling:
             return CallInterruptOutcome.ALREADY_SETTLED
-        handle.aborted = True
+        if handle.cancel_callback is not None:
+            handle.aborted = True
+            handle.cancel_callback()
+            return CallInterruptOutcome.INTERRUPTED
         if handle.task is not None:
+            handle.aborted = True
             handle.task.cancel()
             return CallInterruptOutcome.INTERRUPTED
-        if handle.attach_timer is not None:
-            # Registered with expect_attach, task not yet attached: the abort
-            # fires when it attaches.
+        if handle.channel_expected or handle.attach_timer is not None:
+            # The signal channel attaches when the body's cancellable unit
+            # exists (or a stream consumer attaches): the abort fires then.
+            handle.aborted = True
             return CallInterruptOutcome.INTERRUPTED
         # Tracked work with no signal channel (a sync tool on a worker
-        # thread): the runtime can only wait it out.
+        # thread): the runtime can only wait it out. The refusal leaves
+        # handle.aborted alone so the body's real outcome still flows.
         return CallInterruptOutcome.NOT_CANCELLABLE
+
+    def claim_settlement(self, handle: "Optional[WorkHandle]") -> bool:
+        """Atomically close a call's interruptibility as its result report begins.
+
+        Marshalled onto the owner loop like every registry mutation, so it
+        serializes against abort_call: whichever claims first wins the call's
+        outcome. Returns False when an honored abort got there first — the
+        caller must report the stopped outcome, not the body's.
+        """
+        if handle is None:
+            return True
+        handle.settling = True
+        return not handle.aborted
 
     def begin_work(
         self,
@@ -275,6 +391,7 @@ class DrainRegistry:
         *,
         expect_attach: bool = False,
         step_number: "Optional[int]" = None,
+        channel_expected: bool = False,
     ) -> WorkHandle:
         """Register in-flight work for an execution, rejecting drained ones.
 
@@ -288,8 +405,11 @@ class DrainRegistry:
 
         ``step_number`` makes the work addressable by the per-call abort
         (``abort_call``); work registered without it is only ever drained
-        execution-wide.
+        execution-wide. ``channel_expected`` declares that a cancel channel
+        attaches shortly (an async tool body starting its loop), so a
+        pre-attach abort is sticky-interrupted rather than not_cancellable.
         """
+        self._capture_owner_loop()
         entry = self._entries.get(execution_id)
         if entry is None:
             entry = _ExecutionEntry()
@@ -315,7 +435,12 @@ class DrainRegistry:
                 self._attach_grace_s, self._release_unattached, handle
             )
         handle.step_number = step_number
+        handle.channel_expected = channel_expected
         if step_number is not None:
+            if self._pop_pre_aborted(execution_id, step_number):
+                # The abort preceded the registration: the caller already
+                # stopped this call, so the boundary must not run the body.
+                handle.aborted = True
             # A step maps to one in-flight call by the platform's dispatch
             # claim, so this can only replace a done handle.
             entry.by_step[step_number] = handle
@@ -342,6 +467,32 @@ class DrainRegistry:
         handle.entry.tasks.add(task)
         if handle.entry.draining or handle.aborted:
             task.cancel()
+        return True
+
+    def attach_cancel_callback(
+        self, handle: WorkHandle, callback: "Optional[Callable[[], None]]"
+    ) -> bool:
+        """Attach the abort signal channel for handle-registered work.
+
+        ``callback`` must be safe to invoke from the server's event-loop thread
+        (e.g. it hands the cancellation to a worker thread's loop). Passing
+        None declares the work has no signal channel — a sync tool body on a
+        worker thread — closing the attach window so a per-call abort answers
+        not_cancellable instead of waiting out the grace. An abort that landed
+        before the attach fires the callback here. Returns False when the
+        handle already ended: the caller must not start the work.
+        """
+        if handle.done:
+            return False
+        if handle.attached:
+            return True
+        handle.attached = True
+        handle.cancel_callback = callback
+        if handle.attach_timer is not None:
+            handle.attach_timer.cancel()
+            handle.attach_timer = None
+        if (handle.aborted or handle.entry.draining) and callback is not None:
+            callback()
         return True
 
     def end_work(self, handle: "Optional[WorkHandle]") -> None:
@@ -378,6 +529,7 @@ class DrainRegistry:
 
     def apply(self, request: DrainRequest) -> JSONResponse:
         """Apply one drain request; idempotent by request_id, coalescing per execution."""
+        self._capture_owner_loop()
         entry = self._entries.get(request.execution_id)
         if entry is not None and entry.drain is not None:
             # Same request_id or a different one: one drain per execution.
@@ -413,6 +565,14 @@ class DrainRegistry:
         entry.drain = _DrainRecord(request.request_id, request.reason, request.deadline_at_ms)
         for task in entry.tasks:
             task.cancel()
+        for step_handle in entry.by_step.values():
+            # Work tracked with an off-loop cancel channel (an in-graph tool
+            # body on a worker thread) is not in entry.tasks: fire its channel
+            # too, or the drain waits out the body for no reason. Not marked
+            # aborted — that bit belongs to the per-call abort alone, so the
+            # boundary can still tell a drain apart from a stop-this-call.
+            if not step_handle.done and step_handle.cancel_callback is not None:
+                step_handle.cancel_callback()
         asyncio.create_task(self._finalize(request.execution_id, entry, entry.drain))
         logger.info(
             "Drain accepted for execution %s (reason=%s, active=%d)",
@@ -489,6 +649,10 @@ class DrainRegistry:
 
 def _now_ms() -> int:
     return int(time.time() * 1000)
+
+
+def _now_monotonic() -> float:
+    return time.monotonic()
 
 
 def _positive(value: float, name: str) -> float:

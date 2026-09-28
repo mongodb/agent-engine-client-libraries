@@ -8,6 +8,12 @@ Release notes for the Python SDK packages. Per-package historical changelogs:
 
 <!-- New entries go at the top. -->
 
+## v0.1.113
+
+- **Improved transient LLM failure recovery**: Workflows that encounter timeouts, connection resets, or provider-side errors (such as rate limits, server overload, or gateway timeouts) before any response output is produced now automatically retry the LLM call instead of failing immediately, so transient provider disruptions are less likely to surface as workflow errors.
+- **Fixed replay hash mismatch for empty application state**: Workflows that completed with an explicitly empty application-state selection no longer fail with a `replay state hash does not match` error after persistence, ensuring ADK-produced sessions with empty state are accepted and replayed correctly.
+
+
 ## v0.1.112
 
 No user-facing changes.

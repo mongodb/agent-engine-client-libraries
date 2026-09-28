@@ -45,7 +45,7 @@ export interface BaseAgent {
  *
  * Used at runtime by the ToolPod. In Python, this protocol exposes both `invoke`
  * (sync) and `ainvoke` (async) since Python supports both call styles. JS has no
- * sync HTTP, so this port collapses to a single async `invoke` plus `stream`.
+ * sync HTTP, so this interface has a single async `invoke` plus `stream`.
  */
 export interface BaseLLM {
   invoke(

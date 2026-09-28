@@ -428,12 +428,22 @@ export class App extends BaseApp {
     };
     // His TenantRuntime.registerTool signature: (name, func, metadata) positional.
     this.runtime.registerTool(args.name, args.func as never, metadata);
-    this.lcTools.set(
-      args.name,
+    const storedLcTool =
       args.langchainTool !== undefined
         ? args.langchainTool
-        : lcTool(args.func as never, { name: args.name, description }),
-    );
+        : lcTool(args.func as never, { name: args.name, description });
+    // getTools() reads the per-call Stop opt-in off the stored LangChain tool,
+    // but withCallInterruptSupport brands the registered callable — carry the
+    // brand over or every App.tool() registration would answer not_cancellable.
+    if (
+      (args.func as { supportsCallInterrupt?: boolean })
+        .supportsCallInterrupt === true
+    ) {
+      (
+        storedLcTool as { supportsCallInterrupt?: boolean }
+      ).supportsCallInterrupt = true;
+    }
+    this.lcTools.set(args.name, storedLcTool);
     this.toolDefs.push({
       name: args.name,
       description,
@@ -510,7 +520,7 @@ export class App extends BaseApp {
    * Register a hook that builds the graph's starting input from the caller's
    * `AgentInput` and `RequestContext` for a fresh execution. Resume stays
    * platform-managed. Returns the function unchanged so it can be used as a
-   * decorator. Port of Python's `@app.prepare_agent_input`.
+   * decorator. Equivalent to the Python SDK's `@app.prepare_agent_input`.
    */
   prepareAgentInput<F extends PrepareAgentInput>(fn: F): F {
     this.prepareInputFn = fn;
@@ -531,7 +541,7 @@ export class App extends BaseApp {
    * session/workspace-derived keys. Agents that bypass workspace scoping also
    * own collision isolation within the checkpoint database.
    *
-   * Port of Python's `@app.resolve_thread_id`.
+   * Equivalent to the Python SDK's `@app.resolve_thread_id`.
    *
    * @example
    * ```ts
@@ -1057,6 +1067,10 @@ export class App extends BaseApp {
         "content_and_artifact"
           ? "content_and_artifact"
           : "content";
+      // Opt-in per-call Stop support, branded by withCallInterruptSupport.
+      const supportsCallInterrupt =
+        (toolAny as { supportsCallInterrupt?: boolean })
+          .supportsCallInterrupt === true;
       // The tool's redact_fields policy must reach the wrapper's debug
       // argument dump.
       const rawRedactFields = toolMetadata["redact_fields"];
@@ -1076,6 +1090,7 @@ export class App extends BaseApp {
           toolDeclaredFormat,
           redactFields,
           isFrameworkControlFlow: isGraphBubbleUp,
+          supportsCallInterrupt,
         },
       );
       const durableWrapperFunc = withDurableToolResultIdentity(

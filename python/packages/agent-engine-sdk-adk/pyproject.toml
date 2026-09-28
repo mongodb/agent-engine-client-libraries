@@ -4,20 +4,20 @@ build-backend = "hatchling.build"
 
 [project]
 name = "agent-engine-sdk-adk"
-version = "0.11.2"
+version = "0.11.3"
 description = "Google ADK adapter for Atlas Agent Engine"
 readme = "README.md"
 license = {text = "Apache-2.0"}
 requires-python = ">=3.11"
 dependencies = [
-    "agent-engine-sdk-memory==0.11.2",
-    "agent-engine-sdk==0.11.2",
+    "agent-engine-sdk-memory==0.11.3",
+    "agent-engine-sdk==0.11.3",
     "google-adk>=2.9.0,<3",
     # ADK requires this detector; exclude the known-broken 1.13.0 release.
     "opentelemetry-resourcedetector-gcp>=1.12.0a0,<2,!=1.13.0",
     # Floor required: this package imports agent_engine_runner_shared.memory_appbound at
     # import time.
-    "agent-engine-runner-shared[mongodb,tracing]==0.11.2",
+    "agent-engine-runner-shared[mongodb,tracing]==0.11.3",
     # Required: ADK's native OTEL telemetry throws "ContextVar created in a
     # different Context" errors when run_async is driven across the AER's
     # async boundaries; the OpenInference instrumentor (registered in

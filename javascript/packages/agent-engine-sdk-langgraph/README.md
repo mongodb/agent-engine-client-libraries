@@ -1,33 +1,34 @@
 # @mongodb-js/agent-engine-sdk-langgraph
 
-TypeScript port of [`agent-engine-sdk-langgraph`](../python/packages/agent-engine-sdk-langgraph/) — the LangGraph-based agent SDK that wraps customer agents with platform security, audit, and observability.
+The LangGraph framework SDK for Atlas Agent Engine in TypeScript. It wraps LangGraph agents with platform security, audit, and observability. A [Python version](../../../python/packages/agent-engine-sdk-langgraph/) is also available.
 
-> **Status:** 🚧 Under active development. Not ready for production use.
+## Install
+
+```bash
+npm install @mongodb-js/agent-engine-sdk-langgraph
+```
 
 ---
 
 ## Architecture
 
-This package mirrors the Python `agent-engine-sdk-langgraph` module-for-module. Each TypeScript file ports a single Python file of the same name.
-
-| TypeScript file              | Python original          | Purpose                                                                             |
-| ---------------------------- | ------------------------ | ----------------------------------------------------------------------------------- |
-| `src/index.ts`               | `__init__.py`            | Public re-exports (`App`, `LangGraphBaseAgent`, etc.)                               |
-| `src/runtime.ts`             | `runtime.py`             | `App` class — the SDK entry point                                                   |
-| `src/agent.ts`               | `agent.py`               | `LangGraphBaseAgent` wrapping `CompiledStateGraph`                                  |
-| `src/query.ts`               | `query.py`               | `LangGraphQueryPlugin` — session summaries/messages from `MongoDBSaver` collections |
-| `src/secure_llm.ts`          | `secure_llm.py`          | `SecureWrappedLLM` — routes LLM calls through proxy                                 |
-| `src/messages.ts`            | `messages.py`            | LangChain ↔ platform message translator                                             |
-| `src/llm_adapter.ts`         | `llm_adapter.py`         | Adapter from `BaseChatModel` to platform `BaseLLM`                                  |
-| `src/subagents.ts`           | `subagents.py`           | Subagent dispatch + `lc_agent_name` tracking                                        |
-| `src/node_logger_adapter.ts` | `node_logger_adapter.py` | LangGraph callbacks → `NodeExecutionLogger`                                         |
-| `src/deep_agent.ts`          | `deep_agent.py`          | `deepagents` library wrapper                                                        |
-| `src/deep_agent_task.ts`     | `deep_agent_task.py`     | Deep Agent `task` tool-call parsing                                                 |
-| `src/deep_agent_checkpointer.ts` | `deep_agent_checkpointer.py` | Deep Agent checkpointer policy (tolerates adapter-owned Send routing)     |
-| `src/durable_deep_agent.ts`  | `durable_deep_agent.py`  | Durable `task` dispatch: child operation paths + message-id stamping                |
-| `src/session_fork.ts`        | `session_fork.py`        | Session fork: native copy + durable OE branch, wrapped into `updateState`           |
-| `src/backends/toolpod.ts`    | `backends/toolpod.py`    | `AgentEngineToolPodBackend` (sandbox backend)                                       |
-| `src/_stubs.ts`              | (none)                   | Temporary stubs for Phase 9/12 agent-engine-runner-shared symbols                             |
+| File | Purpose |
+| --- | --- |
+| `src/index.ts` | Public re-exports (`App`, `LangGraphBaseAgent`, etc.) |
+| `src/runtime.ts` | `App` class — the SDK entry point |
+| `src/agent.ts` | `LangGraphBaseAgent` wrapping `CompiledStateGraph` |
+| `src/query.ts` | `LangGraphQueryPlugin` — session summaries/messages from `MongoDBSaver` collections |
+| `src/secure_llm.ts` | `SecureWrappedLLM` — routes LLM calls through proxy |
+| `src/messages.ts` | LangChain ↔ platform message translator |
+| `src/llm_adapter.ts` | Adapter from `BaseChatModel` to platform `BaseLLM` |
+| `src/subagents.ts` | Subagent dispatch + `lc_agent_name` tracking |
+| `src/node_logger_adapter.ts` | LangGraph callbacks → `NodeExecutionLogger` |
+| `src/deep_agent.ts` | `deepagents` library wrapper |
+| `src/deep_agent_task.ts` | Deep Agent `task` tool-call parsing |
+| `src/deep_agent_checkpointer.ts` | Deep Agent checkpointer policy (tolerates adapter-owned Send routing) |
+| `src/durable_deep_agent.ts` | Durable `task` dispatch: child operation paths + message-id stamping |
+| `src/session_fork.ts` | Session fork: native copy + durable OE branch, wrapped into `updateState` |
+| `src/backends/toolpod.ts` | `AgentEngineToolPodBackend` (sandbox backend) |
 
 ## Dependency direction
 
@@ -56,7 +57,7 @@ A file **may only import from files on lower lines** in this tree. Imports going
 ## Configuration
 
 | Environment variable | Default | Description |
-| -------------------- | ------- | ----------- |
+| --- | --- |
 | `MONGODB_URI` | _(unset)_ | MongoDB connection source for the checkpointer and query plugin in AER mode. |
 | `MDB_AGENTIC_STORE_DB` | `mdb_store` | Base name for the per-project MongoDB store used for LangGraph checkpoints in AER mode. Project scoping and discovery still apply unless overridden below. |
 | `CHECKPOINT_DB_NAME` | _(unset)_ | Exact `MongoDBSaver` database name when set. Skips project scoping and discovery. Set it on the agent AER pod environment or a SecretRef to opt into a checkpoint database shared by dual-runtime agents. |
@@ -98,26 +99,7 @@ app.entrypoint(() => {
 // On the agent AER pod, set CHECKPOINT_DB_NAME to the exact shared database.
 ```
 
-## Status — what is ready vs. blocked
-
-| Module                 | Status  | Blocking dependency                 |
-| ---------------------- | ------- | ----------------------------------- |
-| messages.ts            | pending | none — depends only on LangChain    |
-| llm_adapter.ts         | pending | none — runner-shared symbols ready  |
-| node_logger_adapter.ts | pending | none — `Metrics` ready              |
-| deep_agent.ts          | pending | none — `deepagents` npm available   |
-| deep_agent_task.ts     | done    | none — implemented + tested         |
-| deep_agent_checkpointer.ts | done | none — implemented + tested        |
-| durable_deep_agent.ts  | done    | none — implemented + tested         |
-| platform_checkpointer.ts | done  | none — implemented + tested         |
-| secure_llm.ts          | pending | agent-engine-runner-shared Phase 9            |
-| backends/toolpod.ts    | done    | none — implemented + tested         |
-| subagents.ts           | pending | agent-engine-runner-shared Phase 9            |
-| agent.ts               | pending | agent-engine-runner-shared Phase 9            |
-| runtime.ts             | pending | agent-engine-runner-shared Phase 9 + Phase 12 |
-| index.ts               | pending | all of the above                    |
-
-## Known gaps from Python parity
+## Differences from the Python SDK
 
 | Feature                     | Python | TypeScript | Notes                                                                                     |
 | --------------------------- | ------ | ---------- | ----------------------------------------------------------------------------------------- |
@@ -140,7 +122,7 @@ import-order workaround is needed.
 ## Development
 
 ```sh
-# install (requires workspace setup once teammate's branch lands)
+# install dependencies
 npm install
 
 # type-check only (no emit)
@@ -159,11 +141,9 @@ npm run lint
 ## Coding standards
 
 - Strict TypeScript (`strict: true` + `noUncheckedIndexedAccess` + `exactOptionalPropertyTypes`).
-- Snake_case filenames (matching the Python original 1:1 for review).
+- Snake_case filenames.
 - camelCase function/variable names.
 - PascalCase class/type names.
 - Each file = single responsibility (one class or one focused concept).
 - Public surface depends on interfaces (Dependency Inversion).
 - No hardcoded secrets, ever.
-
-See the root `docs/coding-standards/typescript.md` for repo-wide rules.

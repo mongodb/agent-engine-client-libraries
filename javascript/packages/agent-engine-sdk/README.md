@@ -6,6 +6,8 @@ Core TypeScript protocols, models, schemas, and clients shared by Atlas Agent
 Engine SDK integrations. The package has no dependency on the platform runtime
 and can be used to define agent, execution, message, tool, and LLM contracts in
 an independent application.
+> This is an internal core package; agents don't install it directly. Install a
+> framework SDK (`@mongodb-js/agent-engine-sdk-langgraph`), which depends on it.
 
 ## Install
 

@@ -201,10 +201,9 @@ context = app.memory.build_context(query="help me", user_id="u1")
 prompt = context.formatted_context
 ```
 
-**Reference migrations** (paths relative to the monorepo root / Agent Engine examples repository):
+**Reference migration** (in the Agent Engine examples repository):
 
-- `client-libraries/packages/python/examples/insurance-agent/src/insurance_agent/main.py`
-- Agent Engine examples repository `agents/insurance-agent/src/insurance_agent/main.py`
+- `agents/insurance-agent/src/insurance_agent/main.py`
 
 Per-backend capability differences and app-bound gaps are documented in the memory package
 [capability matrix](../agent-engine-sdk-memory/docs/capability-matrix.md).
@@ -326,7 +325,6 @@ See the Code Reviewer Agent in Agent Engine examples repository for a reference 
 
 - Agent Engine examples repository `agents/code-reviewer-agent/src/code_reviewer_agent/main.py` — wiring
 - Agent Engine examples repository `agents/code-reviewer-agent/skills/*/SKILL.md` — example skills
-- `client-libraries/packages/agent-engine-sdk-langgraph/tests/test_skills_e2e.py` — offline proof that skills reach the LLM
 
 ## Streaming
 
@@ -393,9 +391,6 @@ onto a new thread; durable-workflow sessions branch from OE-validated state
 reconstructed in fenced scratch. See
 [Session fork vs LangGraph time-travel](docs/session-fork.md).
 
-Platform teaching docs (what Durable Workflow is, primitives, enablement,
-restrictions):
-[Durable Workflow](../../../../../docs/orchestration-engine/durable-workflow/).
 The shared Tool and LLM replay model is described in
 [Durable activity identity](docs/durable-activity-identity.md). See
 [Durable compiled subgraphs](docs/durable-subgraphs.md) and

@@ -14,6 +14,8 @@ export type { LangGraphQueryPluginParams } from "./query.js";
 export { App } from "./runtime.js";
 export type { DeepAgentOptions } from "./runtime.js";
 export type { SessionFinishStatus } from "@mongodb-js/agent-engine-runner-shared";
+export { getCallAbortSignal } from "@mongodb-js/agent-engine-runner-shared";
+export { withCallInterruptSupport } from "./call_interrupt.js";
 export {
   createAgentEngineDeepAgent,
   type CreateAgentEngineDeepAgentOptions,

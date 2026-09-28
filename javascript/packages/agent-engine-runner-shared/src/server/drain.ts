@@ -142,6 +142,14 @@ interface ExecutionEntry {
  */
 export const DRAIN_ABORT_REASON = "execution_drained";
 
+/**
+ * How long an abort that preceded its call's registration stays claimable by
+ * `beginWork`. The window covers the OE-claim → in-graph-dispatch handoff; the
+ * platform's dispatch claim makes a same-step collision inside it impossible.
+ * Mirrors Python's `PRE_ABORT_RETENTION_S`.
+ */
+const PRE_ABORT_RETENTION_MS = 60_000;
+
 function newIdle(): ExecutionEntry["idle"] {
   let resolve!: () => void;
   const promise = new Promise<void>((r) => {
@@ -188,6 +196,12 @@ export class DrainRegistry {
   private readonly recordTtlMs: number;
   private readonly maxDeadlineMsValue: number;
   private readonly entries = new Map<string, ExecutionEntry>();
+  /**
+   * Aborts that arrived before their call registered, keyed by execution and
+   * step, valued by expiry. The window is the OE-claim → in-graph-dispatch
+   * handoff; the retention covers graph scheduling delays, not call lifetimes.
+   */
+  private readonly preAborted = new Map<string, number>();
 
   constructor(
     opts: {
@@ -231,12 +245,16 @@ export class DrainRegistry {
    * `stepNumber` makes the work addressable by the per-call abort
    * (`abortCall`); work registered without it is only ever drained
    * execution-wide.
+   *
+   * Returns true when a per-call abort preceded this registration (the Stop
+   * landed in the OE-claim → in-graph-dispatch handoff): the caller must not
+   * start the body and must settle the call interrupted.
    */
   beginWork(
     executionId: string,
     controller?: AbortController,
     stepNumber?: number,
-  ): void {
+  ): boolean {
     let entry = this.entries.get(executionId);
     if (entry === undefined) {
       entry = {
@@ -258,14 +276,40 @@ export class DrainRegistry {
     }
     entry.activeCount += 1;
     if (controller !== undefined) entry.controllers.add(controller);
+    let preAborted = false;
     if (stepNumber !== undefined) {
+      preAborted = this.popPreAborted(executionId, stepNumber);
       // A step maps to one in-flight call by the platform's dispatch claim,
       // so this can only replace a settled entry.
       entry.byStep.set(stepNumber, {
         controller,
         settled: false,
-        aborted: false,
+        aborted: preAborted,
       });
+      if (preAborted && controller !== undefined) {
+        controller.abort(CALL_INTERRUPT_REASON);
+      }
+    }
+    return preAborted;
+  }
+
+  private preAbortKey(executionId: string, stepNumber: number): string {
+    return `${executionId}\n${stepNumber}`;
+  }
+
+  private popPreAborted(executionId: string, stepNumber: number): boolean {
+    const key = this.preAbortKey(executionId, stepNumber);
+    const expiry = this.preAborted.get(key);
+    this.preAborted.delete(key);
+    this.sweepPreAborted();
+    return expiry !== undefined && expiry > Date.now();
+  }
+
+  private sweepPreAborted(): void {
+    if (this.preAborted.size === 0) return;
+    const now = Date.now();
+    for (const [key, expiry] of this.preAborted) {
+      if (expiry <= now) this.preAborted.delete(key);
     }
   }
 
@@ -277,9 +321,19 @@ export class DrainRegistry {
    */
   abortCall(executionId: string, stepNumber: number): CallInterruptOutcome {
     const entry = this.entries.get(executionId);
-    if (entry === undefined) return "not_found";
-    const work = entry.byStep.get(stepNumber);
-    if (work === undefined) return "not_found";
+    const work = entry?.byStep.get(stepNumber);
+    if (work === undefined) {
+      // The abort can race the call's registration: OE claims the call, then
+      // the runtime registers only when the in-graph body starts. Retain it
+      // briefly so beginWork settles the late registration as interrupted
+      // instead of running a call the caller stopped.
+      this.sweepPreAborted();
+      this.preAborted.set(
+        this.preAbortKey(executionId, stepNumber),
+        Date.now() + PRE_ABORT_RETENTION_MS,
+      );
+      return "not_found";
+    }
     if (work.settled) return "already_settled";
     // The missing-controller check precedes the repeat check: a repeat abort
     // of track-only work must keep answering not_cancellable, matching the
@@ -289,6 +343,16 @@ export class DrainRegistry {
     work.aborted = true;
     work.controller.abort(CALL_INTERRUPT_REASON);
     return "interrupted";
+  }
+
+  /**
+   * Close a call's interruptibility as its result report begins: the body
+   * already produced its outcome, so a late abort must read already_settled
+   * rather than claim a stop the durable record will contradict.
+   */
+  claimSettlement(executionId: string, stepNumber: number): void {
+    const work = this.entries.get(executionId)?.byStep.get(stepNumber);
+    if (work !== undefined) work.settled = true;
   }
 
   /**

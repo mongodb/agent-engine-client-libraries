@@ -20,9 +20,6 @@ from langgraph.graph.state import CompiledStateGraph
 from agent_engine_sdk_langgraph.deep_agent import create_agent_engine_deep_agent
 from agent_engine_sdk_langgraph.durable_deep_agent import DurableDeepAgentMiddleware
 from agent_engine_sdk_langgraph.platform_checkpointer import PlatformCheckpointer
-from agent_engine_sdk_langgraph.stopped_tool_call_middleware import (
-    StoppedToolCallMiddleware,
-)
 from agent_engine_sdk_langgraph.runtime import App
 
 
@@ -92,9 +89,8 @@ class TestCreateAgentEngineDeepAgent:
         assert kwargs["checkpointer"] is None
         assert kwargs["store"] is None
         assert kwargs["skills"] is None
-        assert len(kwargs["middleware"]) == 2
-        assert isinstance(kwargs["middleware"][0], StoppedToolCallMiddleware)
-        assert isinstance(kwargs["middleware"][1], DurableDeepAgentMiddleware)
+        assert len(kwargs["middleware"]) == 1
+        assert isinstance(kwargs["middleware"][0], DurableDeepAgentMiddleware)
 
     @patch("agent_engine_sdk_langgraph.deep_agent.create_deep_agent")
     def test_passes_checkpointer_store_skills(self, mock_create, tmp_path):
@@ -226,7 +222,7 @@ class TestCreateAgentEngineDeepAgent:
             ),
         )
 
-        durable_middleware = mock_create.call_args.kwargs["middleware"][1]
+        durable_middleware = mock_create.call_args.kwargs["middleware"][0]
         assert isinstance(durable_middleware, DurableDeepAgentMiddleware)
         assert durable_middleware.unsupported_subagent_names == frozenset({"isolated"})
 

@@ -1,9 +1,9 @@
 /**
- * `createAgentEngineDeepAgent` registers `StoppedToolCallMiddleware` and
- * `DurableDeepAgentMiddleware` by default so graph continuation after a
- * stopped tool call doesn't depend on the model's own judgment and durable
- * task dispatch gets deterministic attribution. Mirrors Python's
- * test_factory_sdk.py coverage.
+ * `createAgentEngineDeepAgent` registers `DurableDeepAgentMiddleware` by
+ * default so durable task dispatch gets deterministic attribution. A stopped
+ * tool call deliberately gets no default short-circuit: the batch reaches the
+ * model as ordinary interrupted ToolMessages, matching the Python twin.
+ * Mirrors Python's test_factory_sdk.py coverage.
  */
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -70,22 +70,19 @@ describe("createAgentEngineDeepAgent middleware defaults", () => {
     createDeepAgent.mockClear();
   });
 
-  it("prepends StoppedToolCallMiddleware when no middleware is supplied", () => {
+  it("registers only the durable middleware when no middleware is supplied", () => {
     createAgentEngineDeepAgent(model(), undefined);
     expect(createDeepAgent).toHaveBeenCalledTimes(1);
     const [call] = createDeepAgent.mock.calls;
     if (call === undefined) throw new Error("createDeepAgent was not called");
     const { middleware } = call[0];
-    expect(middleware).toHaveLength(2);
+    expect(middleware).toHaveLength(1);
     expect(middleware[0]).toMatchObject({
-      name: "StoppedToolCallMiddleware",
-    });
-    expect(middleware[1]).toMatchObject({
       name: "durableDeepAgentMiddleware",
     });
   });
 
-  it("keeps the default middlewares first, ahead of caller-supplied middleware", () => {
+  it("keeps the default middleware first, ahead of caller-supplied middleware", () => {
     const custom = { name: "custom" };
     createAgentEngineDeepAgent(model(), undefined, {
       middleware: [custom as never],
@@ -94,8 +91,8 @@ describe("createAgentEngineDeepAgent middleware defaults", () => {
     const [call] = createDeepAgent.mock.calls;
     if (call === undefined) throw new Error("createDeepAgent was not called");
     const { middleware } = call[0];
-    expect(middleware).toHaveLength(3);
-    expect(middleware[2]).toBe(custom);
+    expect(middleware).toHaveLength(2);
+    expect(middleware[1]).toBe(custom);
   });
 
   it("rejects a durable task dispatch for a compiled subagent with its own checkpointer", async () => {

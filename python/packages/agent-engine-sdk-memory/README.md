@@ -299,7 +299,7 @@ external path requires you to be explicit.
 
 The managed service. Pass a service-account access token and your project id.
 
-Mint the token with the `agentic` CLI. Create a service account once — the
+Mint the token with the `agentengine` CLI. Create a service account once — the
 client secret is shown only once, so save it immediately:
 
 ```
@@ -518,7 +518,7 @@ short_term:
 > runtime onto the current image:
 >
 > ```
-> agentic memory apply --upgrade
+> agentengine memory apply --upgrade
 > ```
 >
 > `--upgrade` moves the runtime to the image your environment currently pins,
@@ -642,8 +642,8 @@ and are applied with the CLI. Only that sub-document is uploaded; the rest of
 the file is ignored.
 
 ```bash
-agentic memory configure          # store the memory: block for this project
-agentic memory apply --wait       # roll the memory server so it takes effect
+agentengine memory configure      # store the memory: block for this project
+agentengine memory apply --wait   # roll the memory server so it takes effect
 ```
 
 **Storing is not applying.** `configure` saves the config and the platform

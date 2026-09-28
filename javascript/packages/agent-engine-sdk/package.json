@@ -1,11 +1,11 @@
 {
   "name": "@mongodb-js/agent-engine-sdk",
-  "version": "0.11.2",
+  "version": "0.11.3",
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
-    "url": "https://github.com/10gen/agentic-platform.git",
-    "directory": "client-libraries/packages/javascript/packages/agent-engine-sdk"
+    "url": "https://github.com/mongodb/agent-engine-client-libraries.git",
+    "directory": "javascript/packages/agent-engine-sdk"
   },
   "description": "Core TypeScript protocols and models for the Atlas Agent Engine SDK",
   "type": "module",

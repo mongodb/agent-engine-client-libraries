@@ -112,7 +112,7 @@ export function boundText(
  * container's termination message before the process exits, so the real
  * cause of the crash survives past this process's own stdout into
  * `ContainerStatus.LastTerminationState.Terminated.Message` — the field the
- * Agentic Operator's crash diagnostics read, and from there into the
+ * platform's crash diagnostics read, and from there into the
  * customer-facing deploy timeline.
  *
  * This is customer code (container mode), so unlike the platform's own
