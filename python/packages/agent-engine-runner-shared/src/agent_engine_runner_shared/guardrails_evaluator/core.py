@@ -49,6 +49,7 @@ _POLICY_ENGINES: dict[str, GuardrailPolicyEngine] = {}
 
 
 def register_guardrail_policy_engine(engine: GuardrailPolicyEngine) -> None:
+    """Register a policy engine so ``evaluate_guardrail_check`` can dispatch to it by ``policy_type``."""
     _POLICY_ENGINES[engine.policy_type] = engine
 
 

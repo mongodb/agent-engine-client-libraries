@@ -8,6 +8,13 @@ Release notes for the Python SDK packages. Per-package historical changelogs:
 
 <!-- New entries go at the top. -->
 
+## v0.1.114
+
+- **Per-call interrupt for in-runtime tool calls**: Clicking Stop on an individual tool call now correctly interrupts tools running inside the agent runtime — previously, the interrupt was silently ignored and the tool ran to completion.
+- **Continued execution after a per-call stop in deep agents**: Stopping a single tool call in a deep agent no longer ends the entire turn; the remaining tool calls and the model's response continue as normal.
+- **Honest stop outcomes for non-cancellable tools**: Synchronous tool bodies that cannot be preempted now report themselves as non-cancellable instead of being incorrectly marked as stopped, so their real success or error result is preserved.
+
+
 ## v0.1.113
 
 - **Improved transient LLM failure recovery**: Workflows that encounter timeouts, connection resets, or provider-side errors (such as rate limits, server overload, or gateway timeouts) before any response output is produced now automatically retry the LLM call instead of failing immediately, so transient provider disruptions are less likely to surface as workflow errors.

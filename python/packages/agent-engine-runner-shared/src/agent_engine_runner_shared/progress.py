@@ -170,8 +170,8 @@ def emit(event: str, data: str) -> None:
             ``subagent_end``) raise ``ValueError`` to prevent tool code from
             prematurely closing or spoofing the stream. ``"custom_event"`` is
             not this API — use :func:`agent_engine_runner_shared.emit_custom_event` and
-            ``features.use_custom_parser`` in ``agent.yaml``. Gateway drops
-            ``chunk_type: "custom_event"`` unless that feature is on.
+            ``features.use_custom_parser`` in ``agent.yaml``. Gateway drops the
+            ``"custom_event"`` chunk_type unless that feature is on.
         data: Payload string for the event.
 
     Raises:

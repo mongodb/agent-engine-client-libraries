@@ -8,6 +8,14 @@ Release notes for the JavaScript SDK packages. Per-package historical changelogs
 
 <!-- New entries go at the top. -->
 
+## v0.1.114
+
+- **Per-call tool interrupt support in the TypeScript LangGraph SDK**: Tools wrapped with the new `withCallInterruptSupport(...)` function now receive a per-call `AbortController`; read the abort signal inside your tool body via `getCallAbortSignal()` to stop at your own checkpoints when a user clicks Stop on an individual tool call.
+- **Breaking: `StoppedToolCallMiddleware` removed from deep-agent defaults**: The `StoppedToolCallMiddleware` module has been deleted from the LangGraph SDK; deep agents no longer end the turn automatically when a tool call is stopped — the interrupted result is forwarded to the model and the turn continues, making per-call interrupt and whole-run cancel behave distinctly. If you imported or referenced `StoppedToolCallMiddleware` directly, remove that usage before upgrading.
+- **LangGraph SDK marked production-ready**: The "not ready for production" banner and stale per-module readiness table have been removed from the LangGraph SDK documentation; all previously listed pending features are now shipped.
+- **Corrected CLI commands in documentation**: Outdated `agentic` CLI references in the memory package documentation have been replaced with the correct `agentengine` commands.
+
+
 ## v0.1.113
 
 - Allow publishing the JS SDK packages to npm

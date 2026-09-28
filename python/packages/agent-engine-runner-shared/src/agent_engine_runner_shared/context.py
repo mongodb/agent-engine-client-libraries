@@ -208,7 +208,7 @@ def set_execution_context(
         user_id: Optional user ID for the current execution
         session_id: Optional session/thread ID for conversation continuity
         workspace_id: Optional workspace ID for guardrails/cost attribution
-        custom_headers: Optional caller-provided custom headers (X-Mdb-Agent-Engine-Custom-* prefix-stripped)
+        custom_headers: Optional caller-provided custom headers (X-Mdb-Agent-Engine-Custom-* prefix-stripped and lowercased)
         authorization: Optional delegated credential context for tool execution
         payload: Optional opaque caller-provided invocation payload
         oe_owner_url: Optional validated replica-specific OE owner URL for callback fallback

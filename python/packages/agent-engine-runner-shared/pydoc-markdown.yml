@@ -1,0 +1,30 @@
+loaders:
+  - type: python
+    search_path: [src]
+    modules:
+      - agent_engine_runner_shared.runtime
+      - agent_engine_runner_shared.agent_config
+      - agent_engine_runner_shared.context
+      - agent_engine_runner_shared.models
+      - agent_engine_runner_shared.progress
+      - agent_engine_runner_shared.custom_events
+      - agent_engine_runner_shared.guardrails_evaluator.core
+      - agent_engine_runner_shared.secure_llm_proxy
+      - agent_engine_runner_shared.secure_wrapper
+      - agent_engine_runner_shared.structured_logging
+      - agent_engine_runner_shared.metrics
+      - agent_engine_runner_shared.utils
+
+processors:
+  - type: filter
+    # Only document public members (no underscore prefix).
+    skip_empty_modules: true
+  - type: smart
+  - type: crossref
+
+renderer:
+  type: markdown
+  render_module_header: false
+  descriptive_class_title: false
+  render_toc: true
+  toc_maxdepth: 3
