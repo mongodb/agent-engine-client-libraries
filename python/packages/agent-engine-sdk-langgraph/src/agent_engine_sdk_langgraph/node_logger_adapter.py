@@ -7,6 +7,7 @@ metadata and converts UUID run_ids to strings.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any
 from uuid import UUID
@@ -28,6 +29,15 @@ class LangGraphCallbackAdapter(BaseCallbackHandler):
     def __init__(self, callback: BaseExecutionCallback):
         super().__init__()
         self._callback = callback
+        # run_ids skipped at start (nested chains inside a node): their
+        # end/error callbacks are dropped so a ghost pair never reaches the
+        # callback. Entries are deleted on end/error to bound the set's size.
+        self._skipped_runs: set[str] = set()
+        # LangChain Python passes no metadata to on_chain_end/on_chain_error,
+        # so the node name is recovered from the start event by run_id — the
+        # TS twin keeps the same map for the same reason. Entries are popped on
+        # the terminal event to bound the map's size.
+        self._run_node_names: dict[str, str] = {}
 
     def on_chain_start(
         self,
@@ -40,10 +50,14 @@ class LangGraphCallbackAdapter(BaseCallbackHandler):
         metadata: dict[str, Any] | None = None,
         **kwargs: Any,
     ) -> None:
+        if _is_nested_run(tags, metadata):
+            self._skipped_runs.add(str(run_id))
+            return
         node_name = _extract_node_name(serialized, tags, metadata)
         if not node_name or node_name.startswith("RunnableSequence"):
             return
 
+        self._run_node_names[str(run_id)] = node_name
         self._callback.on_node_start(
             node_name=node_name,
             inputs=inputs,
@@ -62,7 +76,12 @@ class LangGraphCallbackAdapter(BaseCallbackHandler):
         metadata: dict[str, Any] | None = None,
         **kwargs: Any,
     ) -> None:
-        node_name = _extract_node_name({}, tags, metadata)
+        if str(run_id) in self._skipped_runs:
+            self._skipped_runs.discard(str(run_id))
+            return
+        node_name = self._run_node_names.pop(str(run_id), None) or _extract_node_name(
+            {}, tags, metadata
+        )
         if not node_name or node_name.startswith("RunnableSequence"):
             return
 
@@ -84,8 +103,47 @@ class LangGraphCallbackAdapter(BaseCallbackHandler):
         metadata: dict[str, Any] | None = None,
         **kwargs: Any,
     ) -> None:
-        node_name = _extract_node_name({}, tags, metadata)
+        if str(run_id) in self._skipped_runs:
+            self._skipped_runs.discard(str(run_id))
+            return
+        node_name = self._run_node_names.pop(str(run_id), None) or _extract_node_name(
+            {}, tags, metadata
+        )
         if not node_name or node_name.startswith("RunnableSequence"):
+            return
+
+        if isinstance(error, asyncio.CancelledError):
+            # Cooperative cancellation (per-call stop, run drain, pod
+            # teardown), not a node failure: plain cancels carry an empty
+            # message, and langgraph's background executor cancels leftover
+            # tasks with a bare object() sentinel whose str() is an opaque
+            # address — neither belongs on an error row.
+            interrupt_fn = getattr(self._callback, "on_node_interrupted", None)
+            if interrupt_fn is not None:
+                interrupt_fn(
+                    node_name=node_name,
+                    run_id=str(run_id),
+                    parent_run_id=str(parent_run_id) if parent_run_id else None,
+                    metadata=metadata,
+                )
+            else:
+                # Backward compat: callbacks that predate on_node_interrupted
+                # fall back to on_node_end so the node timing is closed out.
+                # The recorded status will be "success" rather than
+                # "interrupted" — acceptable until the callback is upgraded.
+                logger.warning(
+                    "%s does not implement on_node_interrupted; CancelledError on node %r "
+                    "recorded as success. Subclass NullExecutionCallback to fix this.",
+                    type(self._callback).__name__,
+                    node_name,
+                )
+                self._callback.on_node_end(
+                    node_name=node_name,
+                    outputs={},
+                    run_id=str(run_id),
+                    parent_run_id=str(parent_run_id) if parent_run_id else None,
+                    metadata=metadata,
+                )
             return
 
         if isinstance(error, GraphInterrupt):
@@ -141,3 +199,17 @@ def _extract_node_name(
     if serialized and "name" in serialized:
         return serialized["name"]
     return None
+
+
+def _is_nested_run(tags: list[str] | None, metadata: dict[str, Any] | None) -> bool:
+    """True for a nested chain running inside a node, not the node itself.
+
+    Pregel stamps every node task run with a ``graph:step:N`` tag. A nested
+    chain (the model-call sequence, a lambda, a router) inherits the node's
+    ``langgraph_node`` metadata but never the tag — so metadata alone cannot
+    tell a node execution from its own innards. Port of the TS twin's
+    ``isRouterEvaluation``.
+    """
+    if not metadata or "langgraph_node" not in metadata:
+        return False
+    return not any(tag.startswith("graph:step:") for tag in (tags or []))

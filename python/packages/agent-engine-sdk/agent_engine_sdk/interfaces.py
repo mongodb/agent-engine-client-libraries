@@ -175,3 +175,13 @@ class NullExecutionCallback:
         metadata: dict[str, Any] | None = None,
     ) -> None:
         pass
+
+    def on_node_interrupted(
+        self,
+        node_name: str,
+        *,
+        run_id: str,
+        parent_run_id: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        pass

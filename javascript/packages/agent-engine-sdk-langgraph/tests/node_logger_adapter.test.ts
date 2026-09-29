@@ -27,12 +27,21 @@ function mockCallback(): BaseExecutionCallback & {
       metadata?: Record<string, unknown>;
     },
   ) => void;
+  onNodeInterrupted?: (
+    nodeName: string,
+    opts: {
+      runId: string;
+      parentRunId?: string;
+      metadata?: Record<string, unknown>;
+    },
+  ) => void;
 } {
   return {
     onNodeStart: vi.fn(),
     onNodeEnd: vi.fn(),
     onNodeError: vi.fn(),
     onNodeSuspend: vi.fn(),
+    onNodeInterrupted: vi.fn(),
   };
 }
 
@@ -228,6 +237,62 @@ describe("LangGraphCallbackAdapter delegation", () => {
     const args = (cb.onNodeEnd as ReturnType<typeof vi.fn>).mock.calls[0];
     expect(args?.[0]).toBe("agent_node");
     expect(args?.[1]).toEqual({}); // outputs is empty when falling back from suspend
+  });
+
+  it("handleChainError routes AbortError to onNodeInterrupted (not onNodeError)", () => {
+    // Cooperative cancellation (per-call stop, run drain, teardown) closes the
+    // node as interrupted; an error row would double-count the stop.
+    const cb = mockCallback();
+    const adapter = new LangGraphCallbackAdapter(cb);
+    adapter.handleChainStart(
+      {} as never,
+      {},
+      "run-1",
+      undefined,
+      ["graph:step:1"],
+      {
+        langgraph_node: "agent_node",
+      },
+    );
+
+    const abort = new Error("This call was stopped before completing.");
+    abort.name = "AbortError";
+    adapter.handleChainError(abort, "run-1");
+
+    expect(cb.onNodeError).not.toHaveBeenCalled();
+    expect(cb.onNodeInterrupted).toHaveBeenCalledOnce();
+    const args = (cb.onNodeInterrupted as ReturnType<typeof vi.fn>).mock
+      .calls[0];
+    expect(args?.[0]).toBe("agent_node");
+  });
+
+  it("AbortError falls back to onNodeEnd when callback lacks onNodeInterrupted", () => {
+    // Legacy callback — no onNodeInterrupted method.
+    const cb = {
+      onNodeStart: vi.fn(),
+      onNodeEnd: vi.fn(),
+      onNodeError: vi.fn(),
+    } as BaseExecutionCallback;
+    const adapter = new LangGraphCallbackAdapter(cb);
+    adapter.handleChainStart(
+      {} as never,
+      {},
+      "run-1",
+      undefined,
+      ["graph:step:1"],
+      {
+        langgraph_node: "agent_node",
+      },
+    );
+
+    const abort = new Error("execution is draining");
+    abort.name = "AbortError";
+    adapter.handleChainError(abort, "run-1");
+
+    expect(cb.onNodeEnd).toHaveBeenCalledOnce();
+    expect(cb.onNodeError).not.toHaveBeenCalled();
+    const args = (cb.onNodeEnd as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(args?.[0]).toBe("agent_node");
   });
 
   it("propagates parentRunId through to the callback", () => {

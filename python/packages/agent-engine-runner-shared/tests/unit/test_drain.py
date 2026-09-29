@@ -506,10 +506,12 @@ async def test_aer_turn_blocked_mid_execution_is_stopped_by_drain() -> None:
         )
         assert resp.status_code == 202
 
-        with pytest.raises(BaseException):
-            # The turn is cancelled out of its blocked await; the client
-            # surface (closed connection vs. cancellation) is not the contract.
-            await asyncio.wait_for(execute_task, timeout=5)
+        # The drained turn answers the held /execute cleanly: the OE's cancel
+        # path owns the terminal Cancelled settlement, and a failed ack would
+        # race it into an ERROR outcome for a run the operator cancelled.
+        execute_resp = await asyncio.wait_for(execute_task, timeout=5)
+        assert execute_resp.status_code == 200
+        assert execute_resp.json()["status"] == "cancelled"
 
         drain_body = {
             "request_id": "drain-aaaa",

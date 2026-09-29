@@ -169,6 +169,49 @@ export class LangGraphCallbackAdapter extends BaseCallbackHandler {
       return;
     }
 
+    if (error instanceof Error && error.name === "AbortError") {
+      // Cooperative cancellation (per-call stop, run drain, pod teardown), not
+      // a node failure. The node closes as interrupted; an error row would
+      // double-count the stop the tool-result row already carries.
+      const interrupted = (
+        this.callback as {
+          onNodeInterrupted?: (
+            n: string,
+            o: {
+              runId: string;
+              parentRunId?: string;
+              metadata?: Record<string, unknown>;
+            },
+          ) => void;
+        }
+      ).onNodeInterrupted;
+      if (typeof interrupted === "function") {
+        interrupted.call(this.callback, nodeName, {
+          runId,
+          ...(parentRunId !== undefined && { parentRunId }),
+          ...(metadata !== undefined && { metadata }),
+        });
+      } else {
+        // Backward compat: callbacks that predate `onNodeInterrupted` fall back
+        // to `onNodeEnd` so the node timing is closed out (status "success").
+        logger.warn(
+          `${this.callback.constructor.name} does not implement onNodeInterrupted; ` +
+            `AbortError on node ${JSON.stringify(nodeName)} recorded as success. ` +
+            `Subclass NullExecutionCallback to fix this.`,
+        );
+        this.callback.onNodeEnd(
+          nodeName,
+          {},
+          {
+            runId,
+            ...(parentRunId !== undefined && { parentRunId }),
+            ...(metadata !== undefined && { metadata }),
+          },
+        );
+      }
+      return;
+    }
+
     this.callback.onNodeError(
       nodeName,
       error instanceof Error ? error.message : String(error),

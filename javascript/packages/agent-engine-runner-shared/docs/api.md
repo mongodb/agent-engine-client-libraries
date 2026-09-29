@@ -91,6 +91,7 @@
   - [NodeExecutionLogger](#api-nodeexecutionlogger)
     - [onNodeEnd()](#api-onnodeend)
     - [onNodeError()](#api-onnodeerror)
+    - [onNodeInterrupted()](#api-onnodeinterrupted)
     - [onNodeStart()](#api-onnodestart)
     - [onNodeSuspend()](#api-onnodesuspend)
   - [OperationalStepAllocator](#api-operationalstepallocator)
@@ -526,6 +527,7 @@
   - [installStructuredLogging()](#api-installstructuredlogging)
   - [interruptedActivities()](#api-interruptedactivities)
   - [isConfiguredMcpSdkToolName()](#api-isconfiguredmcpsdktoolname)
+  - [isExecutionAborted()](#api-isexecutionaborted)
   - [isLlmCredentialRejection()](#api-isllmcredentialrejection)
   - [isPlatformEnvVar()](#api-isplatformenvvar)
   - [isRetryableError()](#api-isretryableerror)
@@ -3297,6 +3299,31 @@ onNodeError(
 
 ```ts
 NullExecutionCallback.onNodeError
+```
+
+<a id="api-onnodeinterrupted"></a>
+
+##### onNodeInterrupted()
+
+```ts
+onNodeInterrupted(nodeName, opts): void;
+```
+
+**Parameters**
+
+| Parameter | Type |
+| :------ | :------ |
+| `nodeName` | `string` |
+| `opts` | `NodeCallbackOpts` |
+
+**Returns**
+
+`void`
+
+**Overrides**
+
+```ts
+NullExecutionCallback.onNodeInterrupted
 ```
 
 <a id="api-onnodestart"></a>
@@ -7402,7 +7429,8 @@ const AERExecuteResponseSchema: ZodObject<{
 
 Response from AER /execute endpoint.
 
-Returned on both normal completion and HITL suspension.
+Returned on normal completion, HITL suspension, or cancellation of the
+handler by a drain/teardown.
 
 ***
 
@@ -12196,6 +12224,26 @@ Return whether `sdkToolName` belongs to a configured MCP server.
 | `config` | \{ `servers`: `Record`\<`string`, \{ `allowed_tools`: `string`[] \| `null`; `auth`: \{ `client_id_env`: `string` \| `null`; `client_name`: `string` \| `null`; `client_secret_env`: `string` \| `null`; `redirect_uri`: `string` \| `null`; `scope`: `string` \| `null`; `token_env`: `string` \| `null`; `token_url`: `string` \| `null`; `type`: `"none"` \| `"bearer_env"` \| `"oauth"` \| `"client_credentials"`; \}; `headers`: `Record`\<`string`, `string`\>; `timeout_seconds`: `number`; `transport`: `"streamable_http"`; `url`: `string`; \}\>; \} |
 | `config.servers` | `Record`\<`string`, \{ `allowed_tools`: `string`[] \| `null`; `auth`: \{ `client_id_env`: `string` \| `null`; `client_name`: `string` \| `null`; `client_secret_env`: `string` \| `null`; `redirect_uri`: `string` \| `null`; `scope`: `string` \| `null`; `token_env`: `string` \| `null`; `token_url`: `string` \| `null`; `type`: `"none"` \| `"bearer_env"` \| `"oauth"` \| `"client_credentials"`; \}; `headers`: `Record`\<`string`, `string`\>; `timeout_seconds`: `number`; `transport`: `"streamable_http"`; `url`: `string`; \}\> |
 | `sdkToolName` | `string` |
+
+#### Returns
+
+`boolean`
+
+***
+
+<a id="api-isexecutionaborted"></a>
+
+### isExecutionAborted()
+
+```ts
+function isExecutionAborted(): boolean;
+```
+
+Whether the current execution's abort signal has fired (execution timeout,
+drain, or teardown). Lets a catch block tell "the run is being torn down"
+apart from a genuine failure of the call it was making — the abort reason
+itself arrives as whichever value the controller was aborted with, which is
+not reliably an Error.
 
 #### Returns
 

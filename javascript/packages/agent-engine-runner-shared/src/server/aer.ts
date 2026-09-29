@@ -1063,6 +1063,25 @@ export class AERServer extends BaseServer {
           if (httpError.alreadyReported) {
             throw httpError;
           }
+          // A drain (or pod teardown) aborts the execution-wide controller
+          // with DRAIN_ABORT_REASON: the OE's cancel path owns the terminal
+          // Cancelled settlement, so the held /execute must answer cleanly
+          // rather than 500 — a dispatch failure would race that settlement
+          // and mark the run ERROR. No ERROR callback is staged for the same
+          // reason. Key on the controller, not the error: the inner catch
+          // wraps the drain AbortError in a plain Error, so name-matching
+          // misses real drains — and an AbortError agent code throws with no
+          // drain in flight is a failure, not a cancellation. Mirrors
+          // runner-shared (py).
+          if (
+            abortController.signal.aborted &&
+            abortController.signal.reason === DRAIN_ABORT_REASON
+          ) {
+            logger.debug(
+              `AER: execution ${request.execution_id.slice(0, 8)} cancelled (drain or teardown)`,
+            );
+            return { status: "cancelled" };
+          }
           // A policy denial is a deliberate, terminal outcome. Attach a
           // machine-readable discriminator (metadata.error_code="policy_denied"
           // plus the bare reason) so consumers can render a "blocked by policy"

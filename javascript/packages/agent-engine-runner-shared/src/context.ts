@@ -295,6 +295,17 @@ export function withExecutionSignal(callSignal: AbortSignal): AbortSignal {
   return execSignal ? AbortSignal.any([callSignal, execSignal]) : callSignal;
 }
 
+/**
+ * Whether the current execution's abort signal has fired (execution timeout,
+ * drain, or teardown). Lets a catch block tell "the run is being torn down"
+ * apart from a genuine failure of the call it was making — the abort reason
+ * itself arrives as whichever value the controller was aborted with, which is
+ * not reliably an Error.
+ */
+export function isExecutionAborted(): boolean {
+  return current().signal?.aborted ?? false;
+}
+
 // =========================================================================
 // Memory metadata recorder
 // =========================================================================

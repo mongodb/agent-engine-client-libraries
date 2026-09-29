@@ -122,6 +122,24 @@ export class NodeExecutionLogger extends NullExecutionCallback {
     });
   }
 
+  override onNodeInterrupted(nodeName: string, opts: NodeCallbackOpts): void {
+    // Cooperative cancellation closed the node (per-call stop, run drain,
+    // pod teardown): terminal but not a failure, with the partial duration.
+    const start = this.nodeStartTimes.get(opts.runId);
+    this.nodeStartTimes.delete(opts.runId);
+    const end = new Date();
+    const durationMs =
+      start !== undefined ? end.getTime() - start.getTime() : undefined;
+    void this.sendNodeEvent({
+      nodeName,
+      status: "interrupted",
+      timestamp: end,
+      runId: opts.runId,
+      parentRunId: opts.parentRunId,
+      durationMs,
+    });
+  }
+
   private serializeForJson(obj: unknown): unknown {
     if (obj === null || obj === undefined) return obj;
     const t = typeof obj;
@@ -148,7 +166,7 @@ export class NodeExecutionLogger extends NullExecutionCallback {
 
   private async sendNodeEvent(event: {
     nodeName: string;
-    status: "started" | "success" | "error" | "suspend";
+    status: "started" | "success" | "error" | "suspend" | "interrupted";
     timestamp: Date;
     runId: string;
     parentRunId?: string;

@@ -46,7 +46,15 @@ import {
   reportOeOwnerUrlFailure,
   runWithSuspendRequestContext,
   withExecutionSignal,
+  isExecutionAborted,
 } from "./context.js";
+
+/** The abort surfaced when the execution-wide signal ends a call mid-flight. */
+function executionAbortedError(cause: unknown): Error {
+  const err = new Error("The operation was aborted", { cause });
+  err.name = "AbortError";
+  return err;
+}
 import { getSuspendHandler } from "./hooks.js";
 import {
   fetchPlatform,
@@ -578,6 +586,14 @@ async function requestOeApprovalRaw(
     if (exc instanceof OERetryAfterError) {
       throw exc;
     }
+    // The execution-wide signal firing mid-fetch is a cancel/drain, not an
+    // unreachable OE: the abort arrives here as whatever reason value the
+    // controller carried (not reliably an Error), so key on the signal and
+    // surface a real AbortError — the call settles interrupted rather than
+    // wearing a policy denial it never earned.
+    if (isExecutionAborted()) {
+      throw executionAbortedError(exc);
+    }
     // AbortSignal.any propagates the reason of whichever signal fired, so a
     // TimeoutError is this call's own deadline; an AbortError is the execution
     // being torn down (cancel/interrupt), which is not a timeout. Undici raises
@@ -673,6 +689,12 @@ export async function requestOeApprovalRetryable(
               withExecutionSignal(new AbortController().signal),
             );
             if (!waited) {
+              // The wait only ends early when the execution-wide signal fired:
+              // a cancel/drain, not an unreachable OE — settle interrupted,
+              // never denied.
+              if (isExecutionAborted()) {
+                throw executionAbortedError(err);
+              }
               throw new PolicyDeniedException(
                 "OE unreachable; blocking for safety",
                 null,

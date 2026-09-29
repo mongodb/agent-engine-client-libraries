@@ -2368,7 +2368,8 @@ class AERExecuteResponse(BaseModel)
 
 Response from AER /execute endpoint.
 
-Returned on both normal completion and HITL suspension.
+Returned on normal completion, HITL suspension, or cancellation of the
+handler task by a drain/teardown.
 
 <a id="agent_engine_runner_shared.models.ToolsListResponse"></a>
 

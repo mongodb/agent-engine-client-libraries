@@ -1691,13 +1691,14 @@ class ToolDefinition(BaseModel):
 class AERExecuteResponse(BaseModel):
     """Response from AER /execute endpoint.
 
-    Returned on both normal completion and HITL suspension.
+    Returned on normal completion, HITL suspension, or cancellation of the
+    handler task by a drain/teardown.
     """
 
     status: str = Field(
         ...,
-        description="Execution outcome: 'completed' or 'suspended'",
-        examples=["completed", "suspended"],
+        description="Execution outcome: 'completed', 'suspended', or 'cancelled'",
+        examples=["completed", "suspended", "cancelled"],
     )
     result: Optional[str] = Field(
         default=None,

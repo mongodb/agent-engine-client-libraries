@@ -8,6 +8,11 @@ Release notes for the Python SDK packages. Per-package historical changelogs:
 
 <!-- New entries go at the top. -->
 
+## v0.1.115
+
+- Add generated API-reference docs pipeline for agent-engine-runner-shared
+
+
 ## v0.1.114
 
 - **Per-call interrupt for in-runtime tool calls**: Clicking Stop on an individual tool call now correctly interrupts tools running inside the agent runtime — previously, the interrupt was silently ignored and the tool ran to completion.

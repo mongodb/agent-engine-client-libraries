@@ -1689,10 +1689,11 @@ export type ToolDefinition = z.infer<typeof ToolDefinitionSchema>;
 /**
  * Response from AER /execute endpoint.
  *
- * Returned on both normal completion and HITL suspension.
+ * Returned on normal completion, HITL suspension, or cancellation of the
+ * handler by a drain/teardown.
  */
 export const AERExecuteResponseSchema = z.object({
-  /** Execution outcome: 'completed' or 'suspended'. */
+  /** Execution outcome: 'completed', 'suspended', or 'cancelled'. */
   status: z.string(),
   /** Final agent response text (present when status is 'completed'). */
   result: z.string().optional(),

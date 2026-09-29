@@ -227,6 +227,36 @@ class TestOnNodeSuspend:
             assert payload["duration_ms"] is not None
             assert payload["duration_ms"] > 0
 
+
+class TestOnNodeInterrupted:
+    """Tests for on_node_interrupted."""
+
+    def test_sends_interrupted_payload_with_partial_duration(self):
+        """Interrupted is terminal-not-failure: partial duration, no error."""
+        logger = NodeExecutionLogger(oe_url="http://oe:8080", execution_id="exec-1")
+        logger._node_start_times["run-123"] = datetime.now(timezone.utc) - timedelta(
+            milliseconds=150
+        )
+
+        with patch(
+            "agent_engine_runner_shared.node_logger.create_httpx_client_with_tls"
+        ) as mock_client_cls:
+            mock_client = MagicMock()
+            mock_client_cls.return_value.__enter__ = MagicMock(return_value=mock_client)
+            mock_client_cls.return_value.__exit__ = MagicMock(return_value=False)
+
+            logger.on_node_interrupted(
+                node_name="agent_node",
+                run_id="run-123",
+            )
+
+            payload = mock_client.post.call_args[1]["json"]
+            assert payload["status"] == "interrupted"
+            assert payload["node_name"] == "agent_node"
+            assert "error" not in payload
+            assert payload["duration_ms"] >= 100
+            assert "run-123" not in logger._node_start_times
+
     def test_duration_none_when_no_start_time(self):
         """duration_ms is absent from the payload when no start time was recorded."""
         logger = NodeExecutionLogger(oe_url="http://oe:8080", execution_id="exec-1")

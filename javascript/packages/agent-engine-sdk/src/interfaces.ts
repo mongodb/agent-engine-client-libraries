@@ -159,4 +159,13 @@ export class NullExecutionCallback implements BaseExecutionCallback {
       metadata?: Record<string, unknown>;
     },
   ): void {}
+
+  onNodeInterrupted(
+    _nodeName: string,
+    _opts: {
+      runId: string;
+      parentRunId?: string;
+      metadata?: Record<string, unknown>;
+    },
+  ): void {}
 }

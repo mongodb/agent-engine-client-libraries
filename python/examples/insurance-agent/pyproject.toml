@@ -7,7 +7,7 @@ requires-python = ">=3.11"
 license = {text = "Apache-2.0"}
 dependencies = [
     "agent-engine-runner-shared[mongodb,tracing]",
-    "agent-engine-sdk-langgraph",
+    "agent-engine-sdk-langgraph>=0.11",
     "python-dotenv>=1.2.3",
     "langchain-anthropic>=1.4.0",
     "langchain-cerebras>=0.8.2",

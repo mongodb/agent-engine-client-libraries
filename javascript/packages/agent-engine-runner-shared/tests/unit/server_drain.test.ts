@@ -580,8 +580,12 @@ describe("AERServer drain wiring", () => {
       });
       expect(drained.statusCode).toBe(202);
 
-      const finished = await execute; // the abort unwinds the turn into an error
-      expect(finished.statusCode).toBeGreaterThanOrEqual(500);
+      // The drain's controller reason, not the unwound error's shape, owns
+      // the answer: the OE's cancel path settles the run Cancelled, so the
+      // held /execute answers cleanly rather than racing it with a 500.
+      const finished = await execute;
+      expect(finished.statusCode).toBe(200);
+      expect(JSON.parse(finished.body)).toEqual({ status: "cancelled" });
 
       expect(
         (await settled(server.drainRegistry, makeRequest())).body.outcome,
@@ -660,8 +664,9 @@ describe("AERServer drain wiring", () => {
           platform_api_url: "http://127.0.0.1:9",
         },
       });
-      expect(finished.statusCode).not.toBe(504);
-      expect(finished.body).toContain("drained");
+      // The clean cancelled acknowledgement, never the timeout path.
+      expect(finished.statusCode).toBe(200);
+      expect(JSON.parse(finished.body)).toEqual({ status: "cancelled" });
       expect(
         sendStreamChunk.mock.calls.some((call) =>
           JSON.stringify(call).includes('"error_code":"timeout"'),

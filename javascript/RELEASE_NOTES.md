@@ -8,6 +8,11 @@ Release notes for the JavaScript SDK packages. Per-package historical changelogs
 
 <!-- New entries go at the top. -->
 
+## v0.1.115
+
+No user-facing changes.
+
+
 ## v0.1.114
 
 - **Per-call tool interrupt support in the TypeScript LangGraph SDK**: Tools wrapped with the new `withCallInterruptSupport(...)` function now receive a per-call `AbortController`; read the abort signal inside your tool body via `getCallAbortSignal()` to stop at your own checkpoints when a user clicks Stop on an individual tool call.

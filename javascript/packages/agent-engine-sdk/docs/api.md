@@ -51,6 +51,7 @@
   - [NullExecutionCallback](#api-nullexecutioncallback)
     - [onNodeEnd()](#api-onnodeend)
     - [onNodeError()](#api-onnodeerror)
+    - [onNodeInterrupted()](#api-onnodeinterrupted)
     - [onNodeStart()](#api-onnodestart)
     - [onNodeSuspend()](#api-onnodesuspend)
 - **Interfaces**
@@ -1717,6 +1718,28 @@ onNodeError(
 **Implementation of**
 
 [`BaseExecutionCallback`](#api-baseexecutioncallback).[`onNodeError`](#api-onnodeerror-1)
+
+<a id="api-onnodeinterrupted"></a>
+
+##### onNodeInterrupted()
+
+```ts
+onNodeInterrupted(_nodeName, _opts): void;
+```
+
+**Parameters**
+
+| Parameter | Type |
+| :------ | :------ |
+| `_nodeName` | `string` |
+| `_opts` | \{ `metadata?`: `Record`\<`string`, `unknown`\>; `parentRunId?`: `string`; `runId`: `string`; \} |
+| `_opts.metadata?` | `Record`\<`string`, `unknown`\> |
+| `_opts.parentRunId?` | `string` |
+| `_opts.runId` | `string` |
+
+**Returns**
+
+`void`
 
 <a id="api-onnodestart"></a>
 

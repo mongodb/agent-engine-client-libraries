@@ -296,6 +296,32 @@ describe("NodeExecutionLogger.onNodeSuspend", () => {
 });
 
 // ---------------------------------------------------------------------------
+// onNodeInterrupted
+// ---------------------------------------------------------------------------
+
+describe("NodeExecutionLogger.onNodeInterrupted", () => {
+  test("sends interrupted status with partial duration and no error field", () => {
+    // test_sends_interrupted_payload_with_partial_duration
+    const fetchSpy = vi.fn().mockResolvedValue(emptyResponse());
+    vi.stubGlobal("fetch", fetchSpy);
+
+    const logger = makeLogger();
+    const map = (logger as unknown as { nodeStartTimes: Map<string, Date> })
+      .nodeStartTimes;
+    map.set("run-123", new Date(Date.now() - 150));
+
+    logger.onNodeInterrupted("agent_node", { runId: "run-123" });
+
+    const [{ payload }] = captureCalls(fetchSpy);
+    expect(payload["status"]).toBe("interrupted");
+    expect(payload["node_name"]).toBe("agent_node");
+    expect(payload).not.toHaveProperty("error");
+    expect(payload["duration_ms"]).toBeGreaterThanOrEqual(100);
+    expect(map.has("run-123")).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // HTTP failure silence
 // ---------------------------------------------------------------------------
 

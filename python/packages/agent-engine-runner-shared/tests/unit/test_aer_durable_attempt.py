@@ -176,6 +176,44 @@ async def test_native_execute_cleans_up_before_callback(
     assert settlement_order == ["wrapper-close", "callback"]
 
 
+async def test_execute_cancelled_mid_run_returns_cancelled_not_500() -> None:
+    """A drain cancels the /execute handler task itself: the CancelledError
+    must not escape to a 500 (the invoke path would race the cancel settlement
+    and mark the run ERROR). The held request answers cancelled; the OE's own
+    cancel path owns the terminal settlement, so no ERROR callback is staged.
+    """
+    server = _make_server()
+    server.runtime._memory_writer = None
+    server._start_durable_attempt = AsyncMock(return_value=None)
+
+    started = asyncio.Event()
+
+    async def _block(
+        _agent: Any, _ctx: Any, _agent_input: Any, _oe_url: Any, _execution_id: Any
+    ) -> Any:
+        started.set()
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    server._execute_via_agent_stream = _block
+
+    task = asyncio.create_task(
+        server._handle_execute(
+            ExecuteRequest(
+                execution_id="execution-1",
+                message="hi",
+                platform_api_url="http://oe:8000",
+            )
+        )
+    )
+    await asyncio.wait_for(started.wait(), timeout=5)
+    task.cancel()  # what the drain does to the handler task
+    response = await task
+
+    assert response.status == "cancelled"
+    server._send_callback_body.assert_not_called()
+
+
 async def test_durable_execute_binds_context_and_heartbeat(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

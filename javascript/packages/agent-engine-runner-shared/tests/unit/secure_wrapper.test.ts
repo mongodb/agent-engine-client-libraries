@@ -489,13 +489,49 @@ describe("requestOeApproval", () => {
       );
       await Promise.resolve();
       execController.abort();
-      await expect(pending).rejects.toThrow(
-        /OE unreachable; blocking for safety/,
-      );
+      // The wait ended because the execution is being torn down — the call
+      // must surface as an abort (settles interrupted upstream), not a policy
+      // denial it never earned.
+      const err = await pending.catch((e: unknown) => e);
+      expect((err as Error).name).toBe("AbortError");
+      expect(err).not.toBeInstanceOf(PolicyDeniedException);
       expect(fetchSpy).toHaveBeenCalledTimes(1);
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  test("requestOeApproval surfaces an execution abort as AbortError, not a denial", async () => {
+    // A drain/cancel aborts the in-flight approval fetch; the failure is the
+    // run being torn down, not an unreachable OE — a PolicyDeniedException
+    // here would paint a policy-denied ERROR row onto a user-cancelled run.
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockRejectedValue(new Error("fetch failed: socket closed")),
+    );
+    const execController = new AbortController();
+
+    const pending = runWithExecutionContext(
+      {
+        executionId: "exec-123",
+        wrapper: null,
+        oeUrl: "http://localhost:8080",
+        signal: execController.signal,
+      },
+      () =>
+        requestOeApproval({
+          oeUrl: "http://localhost:8080",
+          executionId: "exec-123",
+          toolName: "demo_tool",
+          arguments: { value: 1 },
+          step: 1,
+        }),
+    );
+    execController.abort();
+
+    const err = await pending.catch((e: unknown) => e);
+    expect((err as Error).name).toBe("AbortError");
+    expect(err).not.toBeInstanceOf(PolicyDeniedException);
   });
 
   test("requestOeApproval denies HTTP 503 with Retry-After", async () => {
@@ -658,10 +694,13 @@ describe("requestOeApproval", () => {
 
     execController.abort();
 
-    // The fetch is aborted, so requestOeApproval fails safe (OE unreachable).
-    await expect(pending).rejects.toThrow(
-      /OE unreachable; blocking for safety/,
-    );
+    // The fetch dies because the execution is being torn down — the outcome
+    // is an abort (interrupted settlement upstream), never a policy denial.
+    // (An AER execution timeout takes the same path; the AER's own catch
+    // tells it apart from a drain by the controller reason.)
+    const err = await pending.catch((e: unknown) => e);
+    expect((err as Error).name).toBe("AbortError");
+    expect(err).not.toBeInstanceOf(PolicyDeniedException);
     expect(capturedSignal?.aborted).toBe(true);
   });
 

@@ -19,6 +19,7 @@ import {
   POLICY_DENIED_ERROR_CODE,
   TIMEOUT_ERROR_CODE,
 } from "../../src/server/chunk_types.js";
+import type { DrainRegistry } from "../../src/server/drain.js";
 
 interface AerPrivates {
   runtime: {
@@ -32,6 +33,7 @@ interface AerPrivates {
   doHandleExecute: (request: ExecuteRequest) => Promise<unknown>;
   chunkSeq: Map<string, number>;
   ownerCallbackUrl: Map<string, string>;
+  drainRegistry: DrainRegistry;
 }
 
 function makeServer(): AerPrivates {
@@ -51,6 +53,80 @@ function makeRequest(executionId: string): ExecuteRequest {
     platform_api_url: "http://oe:8000",
   } as ExecuteRequest;
 }
+
+describe("AER drain boundary", () => {
+  test("a drain-aborted execution answers cancelled, not a 500", async () => {
+    // Drive the real registry the way POST /drain does: admission registers
+    // the execution, apply() aborts the attached execution-wide controller
+    // with DRAIN_ABORT_REASON, and the mocked stream rejects with the
+    // AbortError a real abort delivers — the inner catch then wraps it in a
+    // plain Error, so only the controller reason identifies the drain. The
+    // OE's cancel path owns the terminal Cancelled settlement; a 500 here
+    // would race it and mark the run ERROR.
+    const server = makeServer();
+    server.drainRegistry.beginWork("exec-drained");
+    let enteredStream!: () => void;
+    const streamEntered = new Promise<void>((resolve) => {
+      enteredStream = resolve;
+    });
+    server.executeViaAgentStream = vi.fn(
+      (_agent: unknown, ctx: { signal: AbortSignal }) =>
+        new Promise((_, reject) => {
+          enteredStream();
+          const onAbort = () => {
+            const err = new Error("The operation was aborted");
+            err.name = "AbortError";
+            reject(err);
+          };
+          if (ctx.signal.aborted) {
+            onAbort();
+            return;
+          }
+          ctx.signal.addEventListener("abort", onAbort);
+        }),
+    ) as unknown as typeof server.executeViaAgentStream;
+
+    const pending = server.doHandleExecute(makeRequest("exec-drained"));
+    await streamEntered;
+    const verdict = server.drainRegistry.apply({
+      request_id: "req-drain-1",
+      execution_id: "exec-drained",
+      reason: "execution_cancelled",
+      deadline_at_ms: Date.now() + 5000,
+    });
+    expect(verdict.status).toBe(202);
+
+    const response = await pending;
+    expect(response).toEqual({ status: "cancelled" });
+    expect(
+      server.sendStreamChunk.mock.calls.filter((c) => c[2] === "error"),
+    ).toHaveLength(0);
+    expect(server.reportCallback).not.toHaveBeenCalled();
+    server.drainRegistry.endWork("exec-drained");
+  });
+
+  test("a bare AbortError with no drain in flight is an error, not a cancellation", async () => {
+    // Agent code can throw an AbortError for its own reasons. With the
+    // execution-wide controller untouched there is no OE cancel path owning
+    // settlement, so the request must follow the normal error path — a clean
+    // cancelled ack would return 200 with no terminal callback and leave the
+    // execution pending forever.
+    const server = makeServer();
+    server.executeViaAgentStream = vi.fn(async () => {
+      const err = new Error("Agent execution aborted");
+      err.name = "AbortError";
+      throw err;
+    }) as unknown as typeof server.executeViaAgentStream;
+
+    const err = (await server
+      .doHandleExecute(makeRequest("exec-stray-abort"))
+      .catch((e: unknown) => e)) as Error & { statusCode?: number };
+
+    expect(err.statusCode).toBe(500);
+    expect(server.reportCallback).toHaveBeenCalledTimes(1);
+    expect(server.reportCallback.mock.calls[0]?.[2]).toBe("ERROR");
+  });
+});
 
 describe("AER tool-timeout structured signal", () => {
   test("a timeout emits ERROR chunk + callback tagged timeout, and 504", async () => {

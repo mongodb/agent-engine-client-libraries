@@ -1292,6 +1292,17 @@ class AERServer(BaseServer):
                 metadata=llm_meta,
             )
             raise HTTPException(status_code=500, detail=str(e))
+        except asyncio.CancelledError:
+            # The drain (or pod teardown) cancelled this handler task: the
+            # OE's cancel path owns the terminal Cancelled settlement, so the
+            # held /execute must answer cleanly — a 500 here races that
+            # settlement and marks the run ERROR. No terminal callback is
+            # staged for the same reason.
+            logger.debug(
+                "AER: execution %s cancelled (drain or teardown)",
+                request.execution_id[:8],
+            )
+            return AERExecuteResponse(status="cancelled")
         except Exception as e:
             log_execution_callback(request.execution_id, "ERROR", error=str(e), prefix="AER")
             stage_callback(

@@ -131,6 +131,30 @@ class NodeExecutionLogger(BaseExecutionCallback):
             duration_ms=duration_ms,
         )
 
+    def on_node_interrupted(
+        self,
+        node_name: str,
+        *,
+        run_id: str,
+        parent_run_id: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        # Cooperative cancellation closed the node (per-call stop, run drain,
+        # pod teardown): terminal but not a failure, with the partial duration.
+        start_time = self._node_start_times.pop(run_id, None)
+        end_time = datetime.now(timezone.utc)
+        duration_ms = (
+            (end_time - start_time).total_seconds() * 1000 if start_time is not None else None
+        )
+        self._send_node_event(
+            node_name=node_name,
+            status="interrupted",
+            timestamp=end_time,
+            run_id=run_id,
+            parent_run_id=parent_run_id,
+            duration_ms=duration_ms,
+        )
+
     def _serialize_for_json(self, obj: Any) -> Any:
         """Serialize an object for JSON transmission."""
         if hasattr(obj, "dict"):

@@ -1,5 +1,6 @@
 """Tests for LangGraphCallbackAdapter."""
 
+import asyncio
 import logging
 from typing import Any
 from unittest.mock import MagicMock
@@ -78,7 +79,8 @@ class TestLangGraphCallbackAdapterDelegation:
     """Tests for LangGraphCallbackAdapter delegation to BaseExecutionCallback."""
 
     def test_on_chain_start_delegates_with_node_name(self):
-        """on_chain_start extracts node name and delegates to callback."""
+        """on_chain_start extracts node name and delegates to callback. A real
+        node task run carries pregel's graph:step tag alongside the metadata."""
         mock_callback = MagicMock()
         adapter = LangGraphCallbackAdapter(mock_callback)
         run_id = UUID("12345678-1234-5678-1234-567812345678")
@@ -88,7 +90,7 @@ class TestLangGraphCallbackAdapterDelegation:
             inputs={"key": "value"},
             run_id=run_id,
             parent_run_id=None,
-            tags=None,
+            tags=["graph:step:1"],
             metadata={"langgraph_node": "agent_node"},
         )
 
@@ -204,6 +206,7 @@ class TestLangGraphCallbackAdapterDelegation:
             inputs={},
             run_id=run_id,
             parent_run_id=parent_id,
+            tags=["graph:step:1"],
             metadata={"langgraph_node": "node"},
         )
 
@@ -318,3 +321,179 @@ class TestConditionalEdgeRouterRuns:
         ended_ids = [c.kwargs["run_id"] for c in callback.on_node_end.call_args_list]
         assert sorted(ended_ids) == sorted(started_ids)
         assert callback.on_node_error.call_count == 0
+
+
+class TestNestedChainRuns:
+    """A nested chain inside a node inherits the node's langgraph_node
+    metadata on start but carries only seq:step tags — it is not a node
+    execution and must never open a duplicate row for the node. The orphan
+    starts read as "—" rows that never close, and a run cancel stamped each
+    one as a giant Stopped bar."""
+
+    def test_nested_chain_start_is_skipped(self):
+        """metadata.langgraph_node without a graph:step tag = nested chain."""
+        mock_callback = MagicMock()
+        adapter = LangGraphCallbackAdapter(mock_callback)
+
+        adapter.on_chain_start(
+            serialized={},
+            inputs={},
+            run_id=UUID("12345678-1234-5678-1234-567812345678"),
+            tags=["seq:step:1"],
+            metadata={"langgraph_node": "agent"},
+        )
+
+        mock_callback.on_node_start.assert_not_called()
+
+    def test_node_run_with_graph_step_tag_is_kept(self):
+        """A real node task run carries the graph:step tag pregel stamps."""
+        mock_callback = MagicMock()
+        adapter = LangGraphCallbackAdapter(mock_callback)
+
+        adapter.on_chain_start(
+            serialized={},
+            inputs={},
+            run_id=UUID("12345678-1234-5678-1234-567812345678"),
+            tags=["graph:step:1"],
+            metadata={"langgraph_node": "agent"},
+        )
+
+        mock_callback.on_node_start.assert_called_once()
+        assert mock_callback.on_node_start.call_args[1]["node_name"] == "agent"
+
+    def test_skipped_nested_run_never_emits_end_or_error(self):
+        """A skipped start must drop that run's terminal events too — an
+        end-only row is as much a ghost as a never-closing start."""
+        mock_callback = MagicMock()
+        adapter = LangGraphCallbackAdapter(mock_callback)
+        run_id = UUID("12345678-1234-5678-1234-567812345678")
+
+        adapter.on_chain_start(
+            serialized={},
+            inputs={},
+            run_id=run_id,
+            tags=["seq:step:1"],
+            metadata={"langgraph_node": "agent"},
+        )
+        adapter.on_chain_end({}, run_id=run_id, tags=["seq:step:1"])
+        adapter.on_chain_error(ValueError("boom"), run_id=run_id, tags=["seq:step:1"])
+
+        mock_callback.on_node_start.assert_not_called()
+        mock_callback.on_node_end.assert_not_called()
+        mock_callback.on_node_error.assert_not_called()
+
+    def test_router_evaluation_with_custom_tag_is_fully_dropped(self):
+        """A nested run whose only tag is author-added must not leak an
+        end-only row either: the start-skip tracks the run id."""
+        mock_callback = MagicMock()
+        adapter = LangGraphCallbackAdapter(mock_callback)
+        run_id = UUID("12345678-1234-5678-1234-567812345678")
+
+        adapter.on_chain_start(
+            serialized={},
+            inputs={},
+            run_id=run_id,
+            tags=["author_tag"],
+            metadata={"langgraph_node": "agent"},
+        )
+        adapter.on_chain_end({}, run_id=run_id, tags=["author_tag"])
+
+        mock_callback.on_node_start.assert_not_called()
+        mock_callback.on_node_end.assert_not_called()
+
+
+class TestCancellationClosesNodeAsInterrupted:
+    """A cancelled graph surfaces asyncio.CancelledError at on_chain_error —
+    plain cancels carry an empty message, and langgraph's background executor
+    cancels leftovers with a bare object() sentinel whose str() is an opaque
+    address. Neither is a node failure: the node was interrupted."""
+
+    def test_terminal_events_carry_the_start_events_node_name(self):
+        """LangChain Python passes no metadata to terminal callbacks: the node
+        name is recovered from the start event by run_id, never read off the
+        internal graph:step tag."""
+        mock_callback = MagicMock()
+        adapter = LangGraphCallbackAdapter(mock_callback)
+
+        adapter.on_chain_start(
+            serialized={},
+            inputs={},
+            run_id=UUID("12345678-1234-5678-1234-567812345678"),
+            tags=["graph:step:2"],
+            metadata={"langgraph_node": "tools"},
+        )
+        adapter.on_chain_end(
+            {},
+            run_id=UUID("12345678-1234-5678-1234-567812345678"),
+            tags=["graph:step:2"],
+        )
+        assert mock_callback.on_node_end.call_args[1]["node_name"] == "tools"
+
+        adapter.on_chain_start(
+            serialized={},
+            inputs={},
+            run_id=UUID("22345678-1234-5678-1234-567812345678"),
+            tags=["graph:step:3"],
+            metadata={"langgraph_node": "agent"},
+        )
+        adapter.on_chain_error(
+            asyncio.CancelledError(),
+            run_id=UUID("22345678-1234-5678-1234-567812345678"),
+            tags=["graph:step:3"],
+            metadata=None,
+        )
+
+        mock_callback.on_node_error.assert_not_called()
+        assert mock_callback.on_node_interrupted.call_args[1]["node_name"] == "agent"
+
+    def test_cancelled_error_routes_to_interrupt_not_error(self):
+        mock_callback = MagicMock()
+        adapter = LangGraphCallbackAdapter(mock_callback)
+        run_id = UUID("12345678-1234-5678-1234-567812345678")
+
+        adapter.on_chain_error(
+            error=asyncio.CancelledError(),
+            run_id=run_id,
+            tags=["graph:step:2"],
+            metadata=None,
+        )
+
+        mock_callback.on_node_error.assert_not_called()
+        mock_callback.on_node_interrupted.assert_called_once()
+        call_kwargs = mock_callback.on_node_interrupted.call_args[1]
+        assert call_kwargs["run_id"] == "12345678-1234-5678-1234-567812345678"
+
+    def test_cancelled_error_with_sentinel_message_carries_no_opaque_text(self):
+        mock_callback = MagicMock()
+        adapter = LangGraphCallbackAdapter(mock_callback)
+
+        adapter.on_chain_error(
+            error=asyncio.CancelledError(object()),
+            run_id=UUID("12345678-1234-5678-1234-567812345678"),
+            tags=["graph:step:2"],
+            metadata=None,
+        )
+
+        mock_callback.on_node_error.assert_not_called()
+        mock_callback.on_node_interrupted.assert_called_once()
+
+    def test_cancelled_error_falls_back_to_on_node_end_without_interrupt(self, caplog):
+        """Callbacks predating on_node_interrupted close the timing with
+        on_node_end (same compat pattern as on_node_suspend) plus a warning."""
+        mock_callback = MagicMock(
+            spec=["on_node_start", "on_node_end", "on_node_error"]
+        )
+        adapter = LangGraphCallbackAdapter(mock_callback)
+        adapter_logger = "agent_engine_sdk_langgraph.node_logger_adapter"
+
+        with caplog.at_level(logging.WARNING, logger=adapter_logger):
+            adapter.on_chain_error(
+                error=asyncio.CancelledError(),
+                run_id=UUID("12345678-1234-5678-1234-567812345678"),
+                tags=["graph:step:2"],
+                metadata=None,
+            )
+
+        mock_callback.on_node_end.assert_called_once()
+        mock_callback.on_node_error.assert_not_called()
+        assert "does not implement on_node_interrupted" in caplog.text

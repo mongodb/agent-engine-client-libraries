@@ -9,7 +9,7 @@ description = "MTA subway service alerts agent"
 requires-python = ">=3.11"
 dependencies = [
     "agent-engine-runner-shared[tracing]",
-    "agent-engine-sdk-langgraph",
+    "agent-engine-sdk-langgraph>=0.11",
     "grpcio>=1.76.0",
     "grpcio-health-checking>=1.76.0",
     "langchain-openai>=0.2",
