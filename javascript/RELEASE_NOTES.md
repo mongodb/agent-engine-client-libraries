@@ -8,6 +8,16 @@ Release notes for the JavaScript SDK packages. Per-package historical changelogs
 
 <!-- New entries go at the top. -->
 
+## v0.1.117
+
+No user-facing changes.
+
+
+## v0.1.116
+
+- Close node rows honestly — skip nested-chain ghost starts, map cancellation to interrupted
+
+
 ## v0.1.115
 
 No user-facing changes.

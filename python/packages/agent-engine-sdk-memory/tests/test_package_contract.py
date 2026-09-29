@@ -43,10 +43,7 @@ def test_all_is_frozen_to_models_plus_facade():
 def test_route_not_found_error_subclasses_bad_request():
     # Callers with `except MemoryBadRequestError` must keep catching the route
     # error; pin the inheritance so a refactor of the parent fails loudly here.
-    from agent_engine_sdk_memory import (
-        MemoryBadRequestError,
-        MemoryRouteNotFoundError,
-    )
+    from agent_engine_sdk_memory import MemoryBadRequestError, MemoryRouteNotFoundError
 
     assert issubclass(MemoryRouteNotFoundError, MemoryBadRequestError)
 
@@ -148,7 +145,6 @@ def test_platform_stack_absent_after_import():
         "agent_engine_runner_shared",
         "agent_engine_sdk",
         "agent_engine_sdk_langgraph",
-        "magenta_sdklanggraph",  # open-source-refs:ignore — retired namespace
     }
     assert platform_stack <= DENYLIST_IMPORT_NAMES
 

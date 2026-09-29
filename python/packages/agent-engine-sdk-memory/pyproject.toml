@@ -9,7 +9,7 @@ only-include = ["agent_engine_sdk_memory", "README.md", "LICENSE"]
 
 [project]
 name = "agent-engine-sdk-memory"
-version = "0.11.4"
+version = "0.11.6"
 description = "Slim public Memory facade and models for Atlas Agent Engine"
 readme = "README.md"
 license = {text = "Apache-2.0"}

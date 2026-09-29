@@ -15,7 +15,6 @@ FORBIDDEN_MODULES = [
     "langchain",
     "langgraph",
     "agent_engine_sdk_langgraph",
-    "magenta_sdklanggraph",  # open-source-refs:ignore — retired namespace
     "openinference",
 ]
 

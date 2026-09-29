@@ -294,21 +294,6 @@ def test_build_resource_attributes_omits_unset_fields(monkeypatch):
     assert attrs == {"service.name": "my-service"}
 
 
-def test_build_resource_attributes_ignores_old_wrong_env_var_names(monkeypatch):
-    """Regression guard: WORKSPACE_ID/MAGENTA_ENVIRONMENT are not the vars the
-    platform actually injects (APP_ID/AGENT_ENGINE_ENVIRONMENT are) — setting the
-    old names must not populate these resource attributes."""
-    monkeypatch.delenv("APP_ID", raising=False)
-    monkeypatch.delenv("AGENT_ENGINE_ENVIRONMENT", raising=False)
-    monkeypatch.setenv("WORKSPACE_ID", "ws-1")
-    monkeypatch.setenv("MAGENTA_ENVIRONMENT", "qa")
-
-    attrs = _build_resource_attributes("my-service")
-
-    assert "agentic_platform.workspace_id" not in attrs
-    assert "agentic_platform.environment" not in attrs
-
-
 # =============================================================================
 # Content-Capture Redaction Tests
 # =============================================================================

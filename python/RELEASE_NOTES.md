@@ -8,6 +8,20 @@ Release notes for the Python SDK packages. Per-package historical changelogs:
 
 <!-- New entries go at the top. -->
 
+## v0.1.117
+
+- Reverting naming from tests
+
+
+## v0.1.116
+
+Based on the commit log and diff, I have sufficient information to write the release notes.
+
+- **Accurate trace timelines for stopped and cancelled runs**: Stopping or cancelling a run no longer produces phantom open node rows, full-length "Stopped" bars for already-finished nodes, or spurious error rows with unreadable messages like `CancelledError:` — cancelled nodes now close cleanly with their partial duration and a "Stopped" status.
+- **Clean cancellation handling during drain and teardown**: When a server drain or pod teardown cancels an in-flight execution, the run now settles as `cancelled` instead of incorrectly surfacing as an error, preventing races that could mark operator-cancelled runs as failed.
+- **New `on_node_interrupted` callback for LangGraph agents**: The `NodeExecutionLogger` now exposes an `on_node_interrupted` method that fires when cooperative cancellation closes a node, giving custom callback implementations a dedicated hook to handle interrupted nodes separately from errors.
+
+
 ## v0.1.115
 
 - Add generated API-reference docs pipeline for agent-engine-runner-shared
