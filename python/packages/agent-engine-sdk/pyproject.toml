@@ -9,7 +9,7 @@ only-include = ["agent_engine_sdk", "README.md", "LICENSE"]
 
 [project]
 name = "agent-engine-sdk"
-version = "0.11.6"
+version = "0.11.7"
 description = "Core protocols and models for Atlas Agent Engine"
 readme = "README.md"
 license = {text = "Apache-2.0"}

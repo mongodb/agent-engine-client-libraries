@@ -1,12 +1,13 @@
 #
-# SDK package release. Tests first, then one publish job per package in
-# dependency order. A failed job skips its dependents. The skip-if-exists
+# SDK package release. One publish job per package in dependency order. SDK
+# tests run in the monorepo's CI, not here: they read fixtures that live
+# outside the published snapshot. A failed job skips its dependents. The skip-if-exists
 # check only bites against a persistent registry — the loopback rehearsal
 # registries start empty in each job, so a rehearsal run always publishes
 # everything. needs: still serializes the chain so it matches the real-publish
 # graph and dependents are skipped on failure; it does not order uploads in
 # rehearsal. JavaScript still uses build-first for the local workspace build.
-# Python and JavaScript chains run in parallel after tests.
+# Python and JavaScript chains run in parallel after resolve-mode.
 #
 # Every run rehearses against loopback registries unless it is explicitly told
 # otherwise, and the resolve-mode job is the only place that decision is made.
@@ -71,65 +72,9 @@ jobs:
           user="$(NPM_CONFIG_USERCONFIG="$npmrc" npm whoami --registry "$NPM_REGISTRY_URL")"
           echo "npm credentials verified for ${user}"
 
-  test-python:
-    name: test-python
-    needs: [resolve-mode]
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - uses: astral-sh/setup-uv@ae62891fec2bb8e7d6c99fc78c9fec3a63790f8d # v10.0.0
-        with:
-          version: "0.10.2"
-          python-version: "3.11"
-          enable-cache: true
-          cache-dependency-glob: "python/**/pyproject.toml"
-
-      - name: Run Python SDK tests
-        id: sdk-tests
-        continue-on-error: true
-        run: ./scripts/run-sdk-tests.sh --python
-
-      - name: Require passing tests for real publishing
-        if: >-
-          needs.resolve-mode.outputs.start-mock != 'true' &&
-          steps.sdk-tests.outcome != 'success'
-        run: exit 1
-
-  test-javascript:
-    name: test-javascript
-    needs: [resolve-mode]
-    runs-on: ubuntu-latest
-    services:
-      mongodb:
-        image: mongo:7.0@sha256:9854f7139445d766a9523571d6f047530c45547460ffcf8259eb2bf4264632ca
-        ports:
-          - 27017:27017
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-        with:
-          node-version: "24"
-          cache: npm
-          cache-dependency-path: javascript/package-lock.json
-
-      - name: Run JavaScript SDK tests
-        id: sdk-tests
-        continue-on-error: true
-        env:
-          TEST_MONGO_URI: mongodb://127.0.0.1:27017
-        run: ./scripts/run-sdk-tests.sh --javascript
-
-      - name: Require passing tests for real publishing
-        if: >-
-          needs.resolve-mode.outputs.start-mock != 'true' &&
-          steps.sdk-tests.outcome != 'success'
-        run: exit 1
-
   publish-python-core:
     name: publish-python / agent-engine-sdk
-    needs: [resolve-mode, test-python, test-javascript]
+    needs: [resolve-mode]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -240,7 +185,7 @@ jobs:
 
   publish-js-core:
     name: publish-javascript / agent-engine-sdk-ts
-    needs: [resolve-mode, test-python, test-javascript]
+    needs: [resolve-mode]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
