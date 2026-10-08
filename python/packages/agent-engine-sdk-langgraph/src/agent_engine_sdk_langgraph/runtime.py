@@ -36,6 +36,7 @@ from agent_engine_runner_shared import (
     SessionFinishStatus,
     SuspendPayload,
     TenantRuntime,
+    ToolExecutionError,
     request_session_finish,
 )
 from agent_engine_runner_shared.context import get_current_wrapper
@@ -52,10 +53,7 @@ from agent_engine_runner_shared.utils import (
     get_env_float,
     normalize_optional_str,
 )
-from agent_engine_runner_shared.workflow import (
-    DurableActivitySuspended,
-    current_attempt_context,
-)
+from agent_engine_runner_shared.workflow import current_attempt_context
 from agent_engine_runner_shared.workflow.context import current_step_ordinal
 
 logger = logging.getLogger(__name__)
@@ -229,13 +227,6 @@ def _adapter_version() -> str:
         return "0.0.0"
 
 
-class _LangGraphDurableActivitySuspended(
-    DurableActivitySuspended,
-    GraphBubbleUp,
-):
-    """Durable wait that LangGraph must propagate past tool error handling."""
-
-
 def _suspend(payload: Any) -> Any:
     """Route native waits through LangGraph in both execution modes."""
     from langgraph.types import interrupt
@@ -244,11 +235,13 @@ def _suspend(payload: Any) -> Any:
 
 
 def _suspend_durable_activity(payload: dict[str, Any]) -> None:
-    """Exit a supported tool activity after its wait has been recorded by OE."""
-    suspension = SuspendPayload.model_validate(payload)
-    raise _LangGraphDurableActivitySuspended(
-        suspension.suspend_reason,
-        suspension.suspend_context,
+    """Reject the legacy app.suspend() wait on a durable activity.
+
+    Durable waits are framework-native interrupts finalized at the step
+    boundary, so ``app.suspend()`` is deliberately unsupported here.
+    """
+    raise ToolExecutionError(
+        "app.suspend() is not supported; use langgraph.types.interrupt() instead"
     )
 
 
@@ -1442,6 +1435,10 @@ class App(BaseApp):
     def suspend(self, reason: str, context: dict[str, Any]) -> str:
         """Generates a suspend command. If a tool should suspend, return the result
         of this function.
+
+        Not supported on durable workflow sessions: use LangGraph's native
+        ``interrupt()`` instead. A tool that returns this payload on a durable
+        session fails with a clear error before the wait is recorded.
         """
         return SuspendPayload(
             suspend_reason=reason,

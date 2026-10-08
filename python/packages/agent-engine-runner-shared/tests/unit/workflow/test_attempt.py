@@ -13,7 +13,7 @@ from agent_engine_runner_shared.generated.workflow.v1.common_pb2 import (
 )
 from agent_engine_runner_shared.generated.workflow.v1.runtime_pb2 import AttemptContext
 from agent_engine_runner_shared.models import ExecuteRequest
-from agent_engine_runner_shared.workflow import WorkflowClientError, attempt_context_scope
+from agent_engine_runner_shared.workflow import attempt_context_scope
 from agent_engine_runner_shared.workflow.attempt import (
     attempt_start_request_from_execute,
     finalize_current_step_suspensions_command,
@@ -22,11 +22,6 @@ from agent_engine_runner_shared.workflow.attempt import (
     workflow_identity_from_execute_request,
 )
 from agent_engine_runner_shared.workflow.context import record_observed_activity
-from agent_engine_runner_shared.workflow.reconnect import (
-    execution_id_from_attempt,
-    is_pre_execution_id_retry,
-    require_reconnect_identity,
-)
 
 
 def _execute_request(**overrides: object) -> ExecuteRequest:
@@ -167,25 +162,3 @@ class TestFinalizeStepSuspensionsCommand:
                     attempt,
                     [StepSuspensionEntry(position=ActivityPosition(step_ordinal=2))],
                 )
-
-
-class TestReconnectIdentity:
-    def test_execution_id_is_the_reconnect_key(self) -> None:
-        attempt = AttemptContext(
-            attempt_id="attempt-1",
-            workflow_identity=WorkflowIdentity(execution_id="execution-1"),
-        )
-        assert execution_id_from_attempt(attempt) == "execution-1"
-
-    def test_missing_execution_id_is_a_stable_error(self) -> None:
-        with pytest.raises(WorkflowClientError):
-            require_reconnect_identity(WorkflowIdentity())
-
-    @pytest.mark.parametrize(
-        ("execution_id", "expected"),
-        [(None, True), ("", True), ("execution-1", False)],
-    )
-    def test_pre_execution_id_retry_detection(
-        self, execution_id: str | None, expected: bool
-    ) -> None:
-        assert is_pre_execution_id_retry(execution_id) is expected

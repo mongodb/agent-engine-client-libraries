@@ -52,6 +52,7 @@
   - [DurableActivityDeniedError](#api-durableactivitydeniederror)
   - [DurableActivityInterrupted](#api-durableactivityinterrupted)
   - [DurableMemoryState](#api-durablememorystate)
+    - [acknowledge()](#api-acknowledge)
     - [synchronizeLlm()](#api-synchronizellm)
     - [synchronizeTool()](#api-synchronizetool)
   - [ExternalAPICallError](#api-externalapicallerror)
@@ -207,25 +208,15 @@
   - [AgentFeatureConfig](#api-agentfeatureconfig)
   - [AgentResumeRequest](#api-agentresumerequest)
   - [AgentResumeResponse](#api-agentresumeresponse)
-  - [AgentStartStreamRequest](#api-agentstartstreamrequest)
   - [AttemptContext](#api-attemptcontext)
   - [AttemptHeartbeatRequest](#api-attemptheartbeatrequest)
   - [AttemptStartRequest](#api-attemptstartrequest)
   - [AttemptStartResponse](#api-attemptstartresponse)
   - [BranchLineage](#api-branchlineage)
   - [CompleteExecutionCommand](#api-completeexecutioncommand)
-  - [CostByModel](#api-costbymodel)
-  - [CostByWorkspace](#api-costbyworkspace)
-  - [CostDashboardResponse](#api-costdashboardresponse)
-  - [CostSummary](#api-costsummary)
-  - [DailyCostEntry](#api-dailycostentry)
   - [ElicitationInfo](#api-elicitationinfo)
   - [ExecuteRequest](#api-executerequest)
   - [Execution](#api-execution)
-  - [ExecutionDetailQueryResponse](#api-executiondetailqueryresponse)
-  - [ExecutionDocument](#api-executiondocument)
-  - [ExecutionLogsQueryResponse](#api-executionlogsqueryresponse)
-  - [ExecutionsListQueryResponse](#api-executionslistqueryresponse)
   - [ExecutionStatus](#api-executionstatus)
   - [ExecutionStatusResponse](#api-executionstatusresponse)
   - [ExecutionStep](#api-executionstep)
@@ -240,6 +231,8 @@
   - [GuardrailCheckRequest](#api-guardrailcheckrequest)
   - [GuardrailCheckResponse](#api-guardrailcheckresponse)
   - [GuardrailMeta](#api-guardrailmeta)
+  - [GuardrailReviewHalt](#api-guardrailreviewhalt)
+  - [GuardrailReviewPolicy](#api-guardrailreviewpolicy)
   - [GuardrailRuntimePolicy](#api-guardrailruntimepolicy)
   - [GuardrailRuntimeStage](#api-guardrailruntimestage)
   - [HealthResponse](#api-healthresponse)
@@ -256,8 +249,6 @@
   - [LLMPodInvokeResponse](#api-llmpodinvokeresponse)
   - [LLMPodStreamEvent](#api-llmpodstreamevent)
   - [MemoryWrite](#api-memorywrite)
-  - [NodeExecutionRequest](#api-nodeexecutionrequest)
-  - [NodeExecutionsQueryResponse](#api-nodeexecutionsqueryresponse)
   - [OperationPath](#api-operationpath)
   - [OperationPathResolver](#api-operationpathresolver)
   - [OperationPathSegment](#api-operationpathsegment)
@@ -269,10 +260,6 @@
   - [SecretsConfigInput](#api-secretsconfiginput)
   - [ServerToolFn](#api-servertoolfn)
   - [SessionFinishStatus](#api-sessionfinishstatus)
-  - [SessionInfo](#api-sessioninfo)
-  - [SessionMessage](#api-sessionmessage)
-  - [SessionMessagesQueryResponse](#api-sessionmessagesqueryresponse)
-  - [SessionsQueryResponse](#api-sessionsqueryresponse)
   - [StartActivityResult](#api-startactivityresult)
   - [StateSnapshot](#api-statesnapshot)
   - [StepActivityEntry](#api-stepactivityentry)
@@ -312,7 +299,6 @@
   - [AgentFeatureConfigSchema](#api-agentfeatureconfigschema)
   - [AgentResumeRequestSchema](#api-agentresumerequestschema)
   - [AgentResumeResponseSchema](#api-agentresumeresponseschema)
-  - [AgentStartStreamRequestSchema](#api-agentstartstreamrequestschema)
   - [AttemptContextSchema](#api-attemptcontextschema)
   - [AttemptHeartbeatRequestSchema](#api-attemptheartbeatrequestschema)
   - [AttemptStartRequestSchema](#api-attemptstartrequestschema)
@@ -325,21 +311,12 @@
   - [BUILTIN\_TOOL\_NAMES](#api-builtin_tool_names)
   - [CALL\_INTERRUPTED\_ARTIFACT\_KEY](#api-call_interrupted_artifact_key)
   - [CompleteExecutionCommandSchema](#api-completeexecutioncommandschema)
-  - [CostByModelSchema](#api-costbymodelschema)
-  - [CostByWorkspaceSchema](#api-costbyworkspaceschema)
-  - [CostDashboardResponseSchema](#api-costdashboardresponseschema)
-  - [CostSummarySchema](#api-costsummaryschema)
-  - [DailyCostEntrySchema](#api-dailycostentryschema)
   - [DEFAULT\_MCP\_OAUTH\_CLIENT\_NAME](#api-default_mcp_oauth_client_name)
   - [DEFAULT\_MCP\_OAUTH\_REDIRECT\_URI](#api-default_mcp_oauth_redirect_uri)
   - [DEFAULT\_PORTS](#api-default_ports)
   - [ElicitationInfoSchema](#api-elicitationinfoschema)
   - [ExecuteRequestSchema](#api-executerequestschema)
-  - [ExecutionDetailQueryResponseSchema](#api-executiondetailqueryresponseschema)
-  - [ExecutionDocumentSchema](#api-executiondocumentschema)
-  - [ExecutionLogsQueryResponseSchema](#api-executionlogsqueryresponseschema)
   - [ExecutionSchema](#api-executionschema)
-  - [ExecutionsListQueryResponseSchema](#api-executionslistqueryresponseschema)
   - [ExecutionStatus](#api-executionstatus-1)
   - [ExecutionStatusResponseSchema](#api-executionstatusresponseschema)
   - [ExecutionStatusSchema](#api-executionstatusschema)
@@ -355,6 +332,8 @@
   - [FinalizeStepCommandSchema](#api-finalizestepcommandschema)
   - [FinalizeStepResponseSchema](#api-finalizestepresponseschema)
   - [GRAPH\_BUILD](#api-graph_build)
+  - [GUARDRAIL\_REVIEW\_PROTOCOL\_VERSION](#api-guardrail_review_protocol_version)
+  - [GUARDRAIL\_REVIEW\_WAIT\_KEY](#api-guardrail_review_wait_key)
   - [GuardrailCheckContextSchema](#api-guardrailcheckcontextschema)
   - [GuardrailCheckDecision](#api-guardrailcheckdecision-1)
   - [GuardrailCheckDecisionSchema](#api-guardrailcheckdecisionschema)
@@ -363,6 +342,8 @@
   - [GuardrailCheckRequestSchema](#api-guardrailcheckrequestschema)
   - [GuardrailCheckResponseSchema](#api-guardrailcheckresponseschema)
   - [GuardrailMetaSchema](#api-guardrailmetaschema)
+  - [GuardrailReviewHaltSchema](#api-guardrailreviewhaltschema)
+  - [GuardrailReviewPolicySchema](#api-guardrailreviewpolicyschema)
   - [GuardrailRuntimePolicySchema](#api-guardrailruntimepolicyschema)
   - [GuardrailRuntimeStage](#api-guardrailruntimestage-1)
   - [GuardrailRuntimeStageSchema](#api-guardrailruntimestageschema)
@@ -388,8 +369,6 @@
   - [MessageRoleSchema](#api-messageroleschema)
   - [MODEL\_REQUEST\_PREPARE](#api-model_request_prepare)
   - [MODEL\_RESPONSE\_PROCESS](#api-model_response_process)
-  - [NodeExecutionRequestSchema](#api-nodeexecutionrequestschema)
-  - [NodeExecutionsQueryResponseSchema](#api-nodeexecutionsqueryresponseschema)
   - [OE\_DISPATCH\_RETRY\_MAX\_WAIT\_MS](#api-oe_dispatch_retry_max_wait_ms)
   - [OE\_DISPATCH\_TAKEOVER\_RETRY\_DELAY\_MS](#api-oe_dispatch_takeover_retry_delay_ms)
   - [OE\_RETRYABLE\_MAX\_ATTEMPTS](#api-oe_retryable_max_attempts)
@@ -403,10 +382,6 @@
   - [RuntimeMCPConfigSchema](#api-runtimemcpconfigschema)
   - [RuntimeMCPServerConfigSchema](#api-runtimemcpserverconfigschema)
   - [SecretsConfigSchema](#api-secretsconfigschema)
-  - [SessionInfoSchema](#api-sessioninfoschema)
-  - [SessionMessageSchema](#api-sessionmessageschema)
-  - [SessionMessagesQueryResponseSchema](#api-sessionmessagesqueryresponseschema)
-  - [SessionsQueryResponseSchema](#api-sessionsqueryresponseschema)
   - [SKILLS\_MIDDLEWARE\_BEFORE\_AGENT](#api-skills_middleware_before_agent)
   - [StateSnapshotSchema](#api-statesnapshotschema)
   - [StepActivityEntrySchema](#api-stepactivityentryschema)
@@ -522,12 +497,14 @@
   - [getTracePath()](#api-gettracepath)
   - [getTracer()](#api-gettracer)
   - [getWorkflowAdapter()](#api-getworkflowadapter)
+  - [guardrailReviewWaitId()](#api-guardrailreviewwaitid)
   - [hasNamedLlms()](#api-hasnamedllms)
   - [initErrorReporting()](#api-initerrorreporting)
   - [installStructuredLogging()](#api-installstructuredlogging)
   - [interruptedActivities()](#api-interruptedactivities)
   - [isConfiguredMcpSdkToolName()](#api-isconfiguredmcpsdktoolname)
   - [isExecutionAborted()](#api-isexecutionaborted)
+  - [isGuardrailReviewWait()](#api-isguardrailreviewwait)
   - [isLlmCredentialRejection()](#api-isllmcredentialrejection)
   - [isPlatformEnvVar()](#api-isplatformenvvar)
   - [isRetryableError()](#api-isretryableerror)
@@ -536,7 +513,6 @@
   - [loadRuntimeAgentConfig()](#api-loadruntimeagentconfig)
   - [logCachedResult()](#api-logcachedresult)
   - [logExecutionCallback()](#api-logexecutioncallback)
-  - [logExecutionStart()](#api-logexecutionstart)
   - [logLLMMessages()](#api-logllmmessages)
   - [logLLMResponse()](#api-logllmresponse)
   - [logPolicyBlocked()](#api-logpolicyblocked)
@@ -548,18 +524,21 @@
   - [makeMcpOauthAuth()](#api-makemcpoauthauth)
   - [makeMcpSdkToolName()](#api-makemcpsdktoolname)
   - [makeMcpToolCallable()](#api-makemcptoolcallable)
+  - [markInterruptedActivitiesAnswered()](#api-markinterruptedactivitiesanswered)
   - [materializeMcpOauthSecretCache()](#api-materializemcpoauthsecretcache)
   - [mcpOauthCacheDir()](#api-mcpoauthcachedir)
   - [mcpOauthCacheName()](#api-mcpoauthcachename)
   - [mcpServerNetworkHosts()](#api-mcpservernetworkhosts)
   - [mergeTokenUsage()](#api-mergetokenusage)
   - [newDurabilityOwnerId()](#api-newdurabilityownerid)
+  - [nextScopedCallIndex()](#api-nextscopedcallindex)
   - [normalizeContent()](#api-normalizecontent)
   - [normalizeLLMPodInvokeResponse()](#api-normalizellmpodinvokeresponse)
   - [normalizeMcpToolResult()](#api-normalizemcptoolresult)
   - [normalizeOptionalStr()](#api-normalizeoptionalstr)
   - [normalizeToolCallArgs()](#api-normalizetoolcallargs)
   - [noteCheckpointWireWorkspaceId()](#api-notecheckpointwireworkspaceid)
+  - [noteGuardrailReviewWait()](#api-noteguardrailreviewwait)
   - [observedActivityPositions()](#api-observedactivitypositions)
   - [oeStreamRetryDelayMs()](#api-oestreamretrydelayms)
   - [preallocateActivityOrdinals()](#api-preallocateactivityordinals)
@@ -2176,6 +2155,31 @@ new DurableMemoryState(pendingUserMessage?): DurableMemoryState;
 
 #### Methods
 
+<a id="api-acknowledge"></a>
+
+##### acknowledge()
+
+```ts
+acknowledge(client, context): Promise<void>;
+```
+
+Close an activity in Memory that contributes nothing to the conversation.
+
+Every completed activity needs an acknowledged Memory batch before its
+step can commit. The pending user input is left pending: it belongs with
+the first activity that carries conversation content.
+
+**Parameters**
+
+| Parameter | Type |
+| :------ | :------ |
+| `client` | `WorkflowMemoryClient` |
+| `context` | [`ActivityContext`](#api-activitycontext) |
+
+**Returns**
+
+`Promise`\<`void`\>
+
 <a id="api-synchronizellm"></a>
 
 ##### synchronizeLlm()
@@ -2451,7 +2455,7 @@ new LLMInvocationOptions(data): LLMInvocationOptions;
 
 | Parameter | Type |
 | :------ | :------ |
-| `data` | \{ \[`key`: `string`\]: `unknown`; `frequency_penalty?`: `number`; `max_tokens?`: `number`; `parallel_tool_calls?`: `boolean`; `presence_penalty?`: `number`; `reasoning_effort?`: `string`; `response_format?`: [`JsonValue`](#api-jsonvalue); `seed?`: `number`; `timeout?`: `number`; `top_k?`: `number`; `top_p?`: `number`; \} |
+| `data` | \{ \[`key`: `string`\]: `unknown`; `frequency_penalty?`: `number`; `max_tokens?`: `number`; `parallel_tool_calls?`: `boolean`; `presence_penalty?`: `number`; `reasoning_effort?`: `string`; `response_format?`: [`JsonValue`](#api-jsonvalue); `seed?`: `number`; `timeout?`: `number`; `top_k?`: `number`; `top_p?`: `number`; `verbosity?`: `string`; \} |
 | `data.frequency_penalty?` | `number` |
 | `data.max_tokens?` | `number` |
 | `data.parallel_tool_calls?` | `boolean` |
@@ -2462,6 +2466,7 @@ new LLMInvocationOptions(data): LLMInvocationOptions;
 | `data.timeout?` | `number` |
 | `data.top_k?` | `number` |
 | `data.top_p?` | `number` |
+| `data.verbosity?` | `string` |
 
 **Returns**
 
@@ -2482,6 +2487,7 @@ new LLMInvocationOptions(data): LLMInvocationOptions;
 | <a id="api-property-timeout"></a> `timeout?` | `readonly` | `number` | - |
 | <a id="api-property-topk"></a> `topK?` | `readonly` | `number` | - |
 | <a id="api-property-topp"></a> `topP?` | `readonly` | `number` | - |
+| <a id="api-property-verbosity"></a> `verbosity?` | `readonly` | `string` | - |
 
 #### Methods
 
@@ -2767,12 +2773,13 @@ new LLMTokenUsage(data): LLMTokenUsage;
 
 | Parameter | Type |
 | :------ | :------ |
-| `data` | \{ `completion_tokens?`: `number`; `input_tokens?`: `number`; `model?`: `string`; `output_tokens?`: `number`; `prompt_tokens?`: `number`; `total_tokens?`: `number`; \} |
+| `data` | \{ `completion_tokens?`: `number`; `input_tokens?`: `number`; `model?`: `string`; `output_tokens?`: `number`; `prompt_tokens?`: `number`; `reasoning_tokens?`: `number`; `total_tokens?`: `number`; \} |
 | `data.completion_tokens?` | `number` |
 | `data.input_tokens?` | `number` |
 | `data.model?` | `string` |
 | `data.output_tokens?` | `number` |
 | `data.prompt_tokens?` | `number` |
+| `data.reasoning_tokens?` | `number` |
 | `data.total_tokens?` | `number` |
 
 **Returns**
@@ -2781,14 +2788,15 @@ new LLMTokenUsage(data): LLMTokenUsage;
 
 #### Properties
 
-| Property | Modifier | Type |
-| :------ | :------ | :------ |
-| <a id="api-property-completiontokens"></a> `completionTokens?` | `readonly` | `number` |
-| <a id="api-property-inputtokens"></a> `inputTokens?` | `readonly` | `number` |
-| <a id="api-property-model"></a> `model?` | `readonly` | `string` |
-| <a id="api-property-outputtokens"></a> `outputTokens?` | `readonly` | `number` |
-| <a id="api-property-prompttokens"></a> `promptTokens?` | `readonly` | `number` |
-| <a id="api-property-totaltokens"></a> `totalTokens?` | `public` | `number` |
+| Property | Modifier | Type | Description |
+| :------ | :------ | :------ | :------ |
+| <a id="api-property-completiontokens"></a> `completionTokens?` | `readonly` | `number` | - |
+| <a id="api-property-inputtokens"></a> `inputTokens?` | `readonly` | `number` | - |
+| <a id="api-property-model"></a> `model?` | `readonly` | `string` | - |
+| <a id="api-property-outputtokens"></a> `outputTokens?` | `readonly` | `number` | - |
+| <a id="api-property-prompttokens"></a> `promptTokens?` | `readonly` | `number` | - |
+| <a id="api-property-reasoningtokens"></a> `reasoningTokens?` | `readonly` | `number` | Output tokens the model spent reasoning; part of the output count. |
+| <a id="api-property-totaltokens"></a> `totalTokens?` | `public` | `number` | - |
 
 #### Methods
 
@@ -3706,7 +3714,7 @@ Return the explicit feature value from `agent.yaml`, if it exists.
 
 | Parameter | Type |
 | :------ | :------ |
-| `name` | \| `"memory"` \| `"guardrails"` \| `"playground"` \| `"deep_agent"` \| `"use_custom_parser"` \| `"durable_workflow"` |
+| `name` | \| `"guardrails"` \| `"memory"` \| `"playground"` \| `"deep_agent"` \| `"use_custom_parser"` \| `"durable_workflow"` |
 
 **Returns**
 
@@ -3726,7 +3734,7 @@ Return a feature flag value, falling back to `defaultValue` when omitted.
 
 | Parameter | Type | Default value |
 | :------ | :------ | :------ |
-| `name` | \| `"memory"` \| `"guardrails"` \| `"playground"` \| `"deep_agent"` \| `"use_custom_parser"` \| `"durable_workflow"` | `undefined` |
+| `name` | \| `"guardrails"` \| `"memory"` \| `"playground"` \| `"deep_agent"` \| `"use_custom_parser"` \| `"durable_workflow"` | `undefined` |
 | `defaultValue` | `boolean` | `false` |
 
 **Returns**
@@ -3751,11 +3759,12 @@ new SecureLLMProxy(args): SecureLLMProxy;
 
 | Parameter | Type |
 | :------ | :------ |
-| `args` | \{ `boundToolChoice?`: `unknown`; `boundTools?`: `unknown`[] \| `null`; `durableMemory?`: [`DurableMemoryState`](#api-durablememorystate) \| `null`; `executionId`: `string`; `llmId?`: `string`; `modelName?`: `string`; `oeUrl`: `string`; `operationalSteps?`: [`OperationalStepSource`](#api-operationalstepsource); \} |
+| `args` | \{ `boundToolChoice?`: `unknown`; `boundTools?`: `unknown`[] \| `null`; `durableMemory?`: [`DurableMemoryState`](#api-durablememorystate) \| `null`; `executionId`: `string`; `guardrailReviewProtocol?`: `boolean`; `llmId?`: `string`; `modelName?`: `string`; `oeUrl`: `string`; `operationalSteps?`: [`OperationalStepSource`](#api-operationalstepsource); \} |
 | `args.boundToolChoice?` | `unknown` |
 | `args.boundTools?` | `unknown`[] \| `null` |
 | `args.durableMemory?` | [`DurableMemoryState`](#api-durablememorystate) \| `null` |
 | `args.executionId` | `string` |
+| `args.guardrailReviewProtocol?` | `boolean` |
 | `args.llmId?` | `string` |
 | `args.modelName?` | `string` |
 | `args.oeUrl` | `string` |
@@ -3773,6 +3782,7 @@ new SecureLLMProxy(args): SecureLLMProxy;
 | <a id="api-property-boundtools"></a> `boundTools` | `readonly` | `unknown`[] \| `null` | - |
 | <a id="api-property-durablememory"></a> `durableMemory` | `readonly` | [`DurableMemoryState`](#api-durablememorystate) \| `null` | - |
 | <a id="api-property-executionid"></a> `executionId` | `readonly` | `string` | - |
+| <a id="api-property-guardrailreviewprotocol"></a> `guardrailReviewProtocol` | `readonly` | `boolean` | Set by an adapter whose framework can pause after a model call and re-run the calling code: under a durable attempt the proxy then follows OE's review protocol instead of pausing inside the call. |
 | <a id="api-property-lastdurationms"></a> `lastDurationMs` | `public` | `number` | - |
 | <a id="api-property-lastfromcache"></a> `lastFromCache` | `public` | `boolean` | - |
 | <a id="api-property-lastlateststepnumber"></a> `lastLatestStepNumber` | `public` | `number` \| `null` | - |
@@ -3840,7 +3850,8 @@ stream(
    messages,
    step?,
    stop?,
-   options?
+   options?,
+   activityKey?
 ): AsyncGenerator<LLMStreamChunk>;
 ```
 
@@ -3858,6 +3869,7 @@ SSE connection.
 | `step?` | `number` \| `null` |
 | `stop?` | `string`[] \| `null` |
 | `options?` | [`LLMInvocationOptions`](#api-llminvocationoptions) \| `null` |
+| `activityKey?` | `string` \| `null` |
 
 **Returns**
 
@@ -5115,7 +5127,7 @@ Given a list of session_ids, return a SessionsSummaryResponse.
 
 ### ExtractedUsage
 
-Normalized usage shape returned by `extractUsage` / `extractPodUsage`.
+Normalized usage shape returned by `extractUsage`.
 Mirrors Python's dict-shaped return so downstream consumers can pass these
 fields straight into `reportOeResult`.
 
@@ -5635,6 +5647,8 @@ Public options for `registerAndRun`.
 | <a id="api-property-oeurl-5"></a> `oeUrl` | `string` | - |
 | <a id="api-property-providertype"></a> `providerType?` | `string` \| `null` | - |
 | <a id="api-property-redactfields"></a> `redactFields?` | readonly `string`[] | Top-level tool argument names to redact from execution logs. |
+| <a id="api-property-reviewid"></a> `reviewId?` | `string` \| `null` | Asks OE to answer this invoke_llm call from a decided guardrail review. |
+| <a id="api-property-reviewprotocol"></a> `reviewProtocol?` | `number` \| `null` | Set by callers that pause for the guardrail review a halt names and then resolve the call with `reviewId`. |
 | <a id="api-property-scopes"></a> `scopes?` | readonly `string`[] | - |
 | <a id="api-property-step-1"></a> `step` | `number` | - |
 | <a id="api-property-timeoutms"></a> `timeoutMs?` | `number` | Overall request deadline in milliseconds. Defaults to `getToolReadTimeout()`. The LLM proxy passes a longer value (`LLM_READ_TIMEOUT`) for `invoke_llm`, because OE holds `/tool/execute` open while the LLM call completes — the analog of Python's `httpx.Timeout(get_request_timeout(), read=LLM_READ_TIMEOUT)`. |
@@ -6033,16 +6047,6 @@ type AgentResumeResponse = z.infer<typeof AgentResumeResponseSchema>;
 
 ***
 
-<a id="api-agentstartstreamrequest"></a>
-
-### AgentStartStreamRequest
-
-```ts
-type AgentStartStreamRequest = z.infer<typeof AgentStartStreamRequestSchema>;
-```
-
-***
-
 <a id="api-attemptcontext"></a>
 
 ### AttemptContext
@@ -6195,56 +6199,6 @@ from message mongodb.agentic.workflow.v1.CompleteExecutionCommand
 
 ***
 
-<a id="api-costbymodel"></a>
-
-### CostByModel
-
-```ts
-type CostByModel = z.infer<typeof CostByModelSchema>;
-```
-
-***
-
-<a id="api-costbyworkspace"></a>
-
-### CostByWorkspace
-
-```ts
-type CostByWorkspace = z.infer<typeof CostByWorkspaceSchema>;
-```
-
-***
-
-<a id="api-costdashboardresponse"></a>
-
-### CostDashboardResponse
-
-```ts
-type CostDashboardResponse = z.infer<typeof CostDashboardResponseSchema>;
-```
-
-***
-
-<a id="api-costsummary"></a>
-
-### CostSummary
-
-```ts
-type CostSummary = z.infer<typeof CostSummarySchema>;
-```
-
-***
-
-<a id="api-dailycostentry"></a>
-
-### DailyCostEntry
-
-```ts
-type DailyCostEntry = z.infer<typeof DailyCostEntrySchema>;
-```
-
-***
-
 <a id="api-elicitationinfo"></a>
 
 ### ElicitationInfo
@@ -6271,46 +6225,6 @@ type ExecuteRequest = z.infer<typeof ExecuteRequestSchema>;
 
 ```ts
 type Execution = z.infer<typeof ExecutionSchema>;
-```
-
-***
-
-<a id="api-executiondetailqueryresponse"></a>
-
-### ExecutionDetailQueryResponse
-
-```ts
-type ExecutionDetailQueryResponse = z.infer<typeof ExecutionDetailQueryResponseSchema>;
-```
-
-***
-
-<a id="api-executiondocument"></a>
-
-### ExecutionDocument
-
-```ts
-type ExecutionDocument = z.infer<typeof ExecutionDocumentSchema>;
-```
-
-***
-
-<a id="api-executionlogsqueryresponse"></a>
-
-### ExecutionLogsQueryResponse
-
-```ts
-type ExecutionLogsQueryResponse = z.infer<typeof ExecutionLogsQueryResponseSchema>;
-```
-
-***
-
-<a id="api-executionslistqueryresponse"></a>
-
-### ExecutionsListQueryResponse
-
-```ts
-type ExecutionsListQueryResponse = z.infer<typeof ExecutionsListQueryResponseSchema>;
 ```
 
 ***
@@ -6486,6 +6400,26 @@ type GuardrailCheckResponse = z.infer<typeof GuardrailCheckResponseSchema>;
 
 ```ts
 type GuardrailMeta = z.infer<typeof GuardrailMetaSchema>;
+```
+
+***
+
+<a id="api-guardrailreviewhalt"></a>
+
+### GuardrailReviewHalt
+
+```ts
+type GuardrailReviewHalt = z.infer<typeof GuardrailReviewHaltSchema>;
+```
+
+***
+
+<a id="api-guardrailreviewpolicy"></a>
+
+### GuardrailReviewPolicy
+
+```ts
+type GuardrailReviewPolicy = z.infer<typeof GuardrailReviewPolicySchema>;
 ```
 
 ***
@@ -6689,26 +6623,6 @@ from message mongodb.agentic.workflow.v1.MemoryWrite
 
 ***
 
-<a id="api-nodeexecutionrequest"></a>
-
-### NodeExecutionRequest
-
-```ts
-type NodeExecutionRequest = z.infer<typeof NodeExecutionRequestSchema>;
-```
-
-***
-
-<a id="api-nodeexecutionsqueryresponse"></a>
-
-### NodeExecutionsQueryResponse
-
-```ts
-type NodeExecutionsQueryResponse = z.infer<typeof NodeExecutionsQueryResponseSchema>;
-```
-
-***
-
 <a id="api-operationpath"></a>
 
 ### OperationPath
@@ -6859,46 +6773,6 @@ Tool function signature — receives the full arguments Record, may return a Pro
 
 ```ts
 type SessionFinishStatus = "requested" | "already_requested" | "unavailable";
-```
-
-***
-
-<a id="api-sessioninfo"></a>
-
-### SessionInfo
-
-```ts
-type SessionInfo = z.infer<typeof SessionInfoSchema>;
-```
-
-***
-
-<a id="api-sessionmessage"></a>
-
-### SessionMessage
-
-```ts
-type SessionMessage = z.infer<typeof SessionMessageSchema>;
-```
-
-***
-
-<a id="api-sessionmessagesqueryresponse"></a>
-
-### SessionMessagesQueryResponse
-
-```ts
-type SessionMessagesQueryResponse = z.infer<typeof SessionMessagesQueryResponseSchema>;
-```
-
-***
-
-<a id="api-sessionsqueryresponse"></a>
-
-### SessionsQueryResponse
-
-```ts
-type SessionsQueryResponse = z.infer<typeof SessionsQueryResponseSchema>;
 ```
 
 ***
@@ -7491,23 +7365,6 @@ Response from resuming an execution.
 
 ***
 
-<a id="api-agentstartstreamrequestschema"></a>
-
-### AgentStartStreamRequestSchema
-
-```ts
-const AgentStartStreamRequestSchema: ZodObject<{
-  message: ZodString;
-  org_id: ZodOptional<ZodString>;
-  session_id: ZodOptional<ZodString>;
-  user_id: ZodOptional<ZodString>;
-}, $strip>;
-```
-
-Request to start an agent execution with streaming response.
-
-***
-
 <a id="api-attemptcontextschema"></a>
 
 ### AttemptContextSchema
@@ -7659,119 +7516,6 @@ Use `create(CompleteExecutionCommandSchema)` to create a new message.
 
 ***
 
-<a id="api-costbymodelschema"></a>
-
-### CostByModelSchema
-
-```ts
-const CostByModelSchema: ZodObject<{
-  call_count: ZodDefault<ZodNumber>;
-  model: ZodString;
-  percentage: ZodDefault<ZodNumber>;
-  total_cost_usd: ZodDefault<ZodNumber>;
-  total_tokens: ZodDefault<ZodNumber>;
-}, $strip>;
-```
-
-Cost breakdown for a single model.
-
-***
-
-<a id="api-costbyworkspaceschema"></a>
-
-### CostByWorkspaceSchema
-
-```ts
-const CostByWorkspaceSchema: ZodObject<{
-  call_count: ZodDefault<ZodNumber>;
-  percentage: ZodDefault<ZodNumber>;
-  total_cost_usd: ZodDefault<ZodNumber>;
-  total_tokens: ZodDefault<ZodNumber>;
-  workspace_id: ZodString;
-}, $strip>;
-```
-
-Cost breakdown for a single workspace.
-
-***
-
-<a id="api-costdashboardresponseschema"></a>
-
-### CostDashboardResponseSchema
-
-```ts
-const CostDashboardResponseSchema: ZodObject<{
-  by_model: ZodDefault<ZodArray<ZodObject<{
-     call_count: ZodDefault<ZodNumber>;
-     model: ZodString;
-     percentage: ZodDefault<ZodNumber>;
-     total_cost_usd: ZodDefault<ZodNumber>;
-     total_tokens: ZodDefault<ZodNumber>;
-  }, $strip>>>;
-  by_workspace: ZodDefault<ZodArray<ZodObject<{
-     call_count: ZodDefault<ZodNumber>;
-     percentage: ZodDefault<ZodNumber>;
-     total_cost_usd: ZodDefault<ZodNumber>;
-     total_tokens: ZodDefault<ZodNumber>;
-     workspace_id: ZodString;
-  }, $strip>>>;
-  daily_trend: ZodDefault<ZodArray<ZodObject<{
-     call_count: ZodDefault<ZodNumber>;
-     date: ZodString;
-     total_cost_usd: ZodDefault<ZodNumber>;
-     total_tokens: ZodDefault<ZodNumber>;
-  }, $strip>>>;
-  summary: ZodDefault<ZodObject<{
-     total_completion_tokens: ZodDefault<ZodNumber>;
-     total_cost_usd: ZodDefault<ZodNumber>;
-     total_llm_calls: ZodDefault<ZodNumber>;
-     total_prompt_tokens: ZodDefault<ZodNumber>;
-     total_tokens: ZodDefault<ZodNumber>;
-     unpriced_llm_calls: ZodDefault<ZodNumber>;
-  }, $strip>>;
-}, $strip>;
-```
-
-Response for cost dashboard aggregation (used by API Gateway proxy).
-
-***
-
-<a id="api-costsummaryschema"></a>
-
-### CostSummarySchema
-
-```ts
-const CostSummarySchema: ZodObject<{
-  total_completion_tokens: ZodDefault<ZodNumber>;
-  total_cost_usd: ZodDefault<ZodNumber>;
-  total_llm_calls: ZodDefault<ZodNumber>;
-  total_prompt_tokens: ZodDefault<ZodNumber>;
-  total_tokens: ZodDefault<ZodNumber>;
-  unpriced_llm_calls: ZodDefault<ZodNumber>;
-}, $strip>;
-```
-
-Aggregate cost metrics for the requested period.
-
-***
-
-<a id="api-dailycostentryschema"></a>
-
-### DailyCostEntrySchema
-
-```ts
-const DailyCostEntrySchema: ZodObject<{
-  call_count: ZodDefault<ZodNumber>;
-  date: ZodString;
-  total_cost_usd: ZodDefault<ZodNumber>;
-  total_tokens: ZodDefault<ZodNumber>;
-}, $strip>;
-```
-
-Cost data for a single day.
-
-***
-
 <a id="api-default_mcp_oauth_client_name"></a>
 
 ### DEFAULT\_MCP\_OAUTH\_CLIENT\_NAME
@@ -7850,79 +7594,6 @@ Request to execute an agent in AER.
 
 ***
 
-<a id="api-executiondetailqueryresponseschema"></a>
-
-### ExecutionDetailQueryResponseSchema
-
-```ts
-const ExecutionDetailQueryResponseSchema: ZodObject<{
-  error: ZodOptional<ZodString>;
-  execution: ZodOptional<ZodObject<{
-     created_at: ZodOptional<ZodString>;
-     error: ZodOptional<ZodString>;
-     execution_id: ZodString;
-     message: ZodDefault<ZodString>;
-     org_id: ZodDefault<ZodString>;
-     project_id: ZodDefault<ZodNullable<ZodString>>;
-     result: ZodOptional<ZodUnknown>;
-     session_id: ZodDefault<ZodString>;
-     status: ZodDefault<ZodString>;
-     suspend_context: ZodOptional<ZodRecord<ZodString, ZodUnknown>>;
-     suspend_reason: ZodOptional<ZodString>;
-     updated_at: ZodOptional<ZodString>;
-     user_id: ZodDefault<ZodString>;
-     workspace_id: ZodDefault<ZodNullable<ZodString>>;
-  }, $strip>>;
-  success: ZodDefault<ZodBoolean>;
-}, $strip>;
-```
-
-Response for single execution detail query (used by API Gateway proxy).
-
-***
-
-<a id="api-executiondocumentschema"></a>
-
-### ExecutionDocumentSchema
-
-```ts
-const ExecutionDocumentSchema: ZodObject<{
-  created_at: ZodOptional<ZodString>;
-  error: ZodOptional<ZodString>;
-  execution_id: ZodString;
-  message: ZodDefault<ZodString>;
-  org_id: ZodDefault<ZodString>;
-  project_id: ZodDefault<ZodNullable<ZodString>>;
-  result: ZodOptional<ZodUnknown>;
-  session_id: ZodDefault<ZodString>;
-  status: ZodDefault<ZodString>;
-  suspend_context: ZodOptional<ZodRecord<ZodString, ZodUnknown>>;
-  suspend_reason: ZodOptional<ZodString>;
-  updated_at: ZodOptional<ZodString>;
-  user_id: ZodDefault<ZodString>;
-  workspace_id: ZodDefault<ZodNullable<ZodString>>;
-}, $strip>;
-```
-
-An execution document as stored in the platform database.
-
-***
-
-<a id="api-executionlogsqueryresponseschema"></a>
-
-### ExecutionLogsQueryResponseSchema
-
-```ts
-const ExecutionLogsQueryResponseSchema: ZodObject<{
-  count: ZodDefault<ZodNumber>;
-  logs: ZodDefault<ZodArray<ZodRecord<ZodString, ZodUnknown>>>;
-}, $strip>;
-```
-
-Response for execution logs query (used by API Gateway proxy).
-
-***
-
 <a id="api-executionschema"></a>
 
 ### ExecutionSchema
@@ -7957,37 +7628,6 @@ const ExecutionSchema: ZodObject<{
 ```
 
 Execution record stored in TenantDB.
-
-***
-
-<a id="api-executionslistqueryresponseschema"></a>
-
-### ExecutionsListQueryResponseSchema
-
-```ts
-const ExecutionsListQueryResponseSchema: ZodObject<{
-  count: ZodDefault<ZodNumber>;
-  executions: ZodDefault<ZodArray<ZodObject<{
-     created_at: ZodOptional<ZodString>;
-     error: ZodOptional<ZodString>;
-     execution_id: ZodString;
-     message: ZodDefault<ZodString>;
-     org_id: ZodDefault<ZodString>;
-     project_id: ZodDefault<ZodNullable<ZodString>>;
-     result: ZodOptional<ZodUnknown>;
-     session_id: ZodDefault<ZodString>;
-     status: ZodDefault<ZodString>;
-     suspend_context: ZodOptional<ZodRecord<ZodString, ZodUnknown>>;
-     suspend_reason: ZodOptional<ZodString>;
-     updated_at: ZodOptional<ZodString>;
-     user_id: ZodDefault<ZodString>;
-     workspace_id: ZodDefault<ZodNullable<ZodString>>;
-  }, $strip>>>;
-  success: ZodDefault<ZodBoolean>;
-}, $strip>;
-```
-
-Response for executions list query (used by API Gateway proxy).
 
 ***
 
@@ -8238,6 +7878,26 @@ const GRAPH_BUILD: "graph.build" = "graph.build";
 
 ***
 
+<a id="api-guardrail_review_protocol_version"></a>
+
+### GUARDRAIL\_REVIEW\_PROTOCOL\_VERSION
+
+```ts
+const GUARDRAIL_REVIEW_PROTOCOL_VERSION: 1 = 1;
+```
+
+***
+
+<a id="api-guardrail_review_wait_key"></a>
+
+### GUARDRAIL\_REVIEW\_WAIT\_KEY
+
+```ts
+const GUARDRAIL_REVIEW_WAIT_KEY: "guardrail_review" = "guardrail_review";
+```
+
+***
+
 <a id="api-guardrailcheckcontextschema"></a>
 
 ### GuardrailCheckContextSchema
@@ -8406,6 +8066,43 @@ const GuardrailMetaSchema: ZodObject<{
 ```
 
 Identity of the policy that caused a guardrail block or require_review halt.
+
+***
+
+<a id="api-guardrailreviewhaltschema"></a>
+
+### GuardrailReviewHaltSchema
+
+```ts
+const GuardrailReviewHaltSchema: ZodObject<{
+  allowed_decisions: ZodDefault<ZodArray<ZodString>>;
+  guardrails: ZodDefault<ZodArray<ZodObject<{
+     category: ZodOptional<ZodNullable<ZodString>>;
+     id: ZodString;
+     name: ZodOptional<ZodNullable<ZodString>>;
+  }, $strip>>>;
+  reason: ZodOptional<ZodNullable<ZodString>>;
+  review_id: ZodString;
+}, $strip>;
+```
+
+The review OE opened for a require_review halt of a review_protocol call.
+
+***
+
+<a id="api-guardrailreviewpolicyschema"></a>
+
+### GuardrailReviewPolicySchema
+
+```ts
+const GuardrailReviewPolicySchema: ZodObject<{
+  category: ZodOptional<ZodNullable<ZodString>>;
+  id: ZodString;
+  name: ZodOptional<ZodNullable<ZodString>>;
+}, $strip>;
+```
+
+One policy that required a guardrail review.
 
 ***
 
@@ -8658,6 +8355,7 @@ const InvokeLLMRequestArgumentsSchema: ZodPreprocess<ZodObject<{
      timeout: ZodOptional<ZodNumber>;
      top_k: ZodOptional<ZodNumber>;
      top_p: ZodOptional<ZodNumber>;
+     verbosity: ZodOptional<ZodString>;
    }, $loose>, ZodTransform<LLMInvocationOptions, {
    [x: string]: unknown;
      frequency_penalty?: number;
@@ -8670,6 +8368,7 @@ const InvokeLLMRequestArgumentsSchema: ZodPreprocess<ZodObject<{
      timeout?: number;
      top_k?: number;
      top_p?: number;
+     verbosity?: string;
   }>>>>;
   stop_sequences: ZodOptional<ZodArray<ZodString>>;
   stream: ZodDefault<ZodBoolean>;
@@ -8839,6 +8538,7 @@ const LLMPodInvokeRequestSchema: ZodPreprocess<ZodObject<{
         timeout: ...;
         top_k: ...;
         top_p: ...;
+        verbosity: ...;
       }, $loose>, ZodTransform<LLMInvocationOptions, {
       [x: ...]: ...;
         frequency_penalty?: ...;
@@ -8851,6 +8551,7 @@ const LLMPodInvokeRequestSchema: ZodPreprocess<ZodObject<{
         timeout?: ...;
         top_k?: ...;
         top_p?: ...;
+        verbosity?: ...;
      }>>>>;
      stop_sequences: ZodOptional<ZodArray<ZodString>>;
      stream: ZodDefault<ZodBoolean>;
@@ -8912,6 +8613,7 @@ const LLMPodInvokeResponseSchema: ZodObject<{
      model: ZodOptional<ZodString>;
      output_tokens: ZodOptional<ZodNumber>;
      prompt_tokens: ZodOptional<ZodNumber>;
+     reasoning_tokens: ZodOptional<ZodNumber>;
      total_tokens: ZodOptional<ZodNumber>;
    }, $strip>, ZodTransform<LLMTokenUsage, {
      completion_tokens?: number;
@@ -8919,6 +8621,7 @@ const LLMPodInvokeResponseSchema: ZodObject<{
      model?: string;
      output_tokens?: number;
      prompt_tokens?: number;
+     reasoning_tokens?: number;
      total_tokens?: number;
   }>>>>;
 }, $strip>;
@@ -8967,6 +8670,7 @@ const LLMPodStreamEventSchema: ZodObject<{
      model: ZodOptional<ZodString>;
      output_tokens: ZodOptional<ZodNumber>;
      prompt_tokens: ZodOptional<ZodNumber>;
+     reasoning_tokens: ZodOptional<ZodNumber>;
      total_tokens: ZodOptional<ZodNumber>;
    }, $strip>, ZodTransform<LLMTokenUsage, {
      completion_tokens?: number;
@@ -8974,6 +8678,7 @@ const LLMPodStreamEventSchema: ZodObject<{
      model?: string;
      output_tokens?: number;
      prompt_tokens?: number;
+     reasoning_tokens?: number;
      total_tokens?: number;
   }>>>>;
 }, $strip>;
@@ -9002,6 +8707,7 @@ const LLMResultSchema: ZodObject<{
      model: ZodOptional<ZodString>;
      output_tokens: ZodOptional<ZodNumber>;
      prompt_tokens: ZodOptional<ZodNumber>;
+     reasoning_tokens: ZodOptional<ZodNumber>;
      total_tokens: ZodOptional<ZodNumber>;
    }, $strip>, ZodTransform<LLMTokenUsage, {
      completion_tokens?: number;
@@ -9009,6 +8715,7 @@ const LLMResultSchema: ZodObject<{
      model?: string;
      output_tokens?: number;
      prompt_tokens?: number;
+     reasoning_tokens?: number;
      total_tokens?: number;
   }>>>>;
 }, $loose>;
@@ -9070,50 +8777,6 @@ const MODEL_REQUEST_PREPARE: "request.prepare" = "request.prepare";
 ```ts
 const MODEL_RESPONSE_PROCESS: "response.process" = "response.process";
 ```
-
-***
-
-<a id="api-nodeexecutionrequestschema"></a>
-
-### NodeExecutionRequestSchema
-
-```ts
-const NodeExecutionRequestSchema: ZodObject<{
-  duration_ms: ZodOptional<ZodNumber>;
-  error: ZodOptional<ZodString>;
-  execution_id: ZodString;
-  inputs: ZodOptional<ZodRecord<ZodString, ZodUnknown>>;
-  node_name: ZodString;
-  org_id: ZodOptional<ZodString>;
-  outputs: ZodOptional<ZodRecord<ZodString, ZodUnknown>>;
-  parent_run_id: ZodOptional<ZodString>;
-  project_id: ZodOptional<ZodString>;
-  run_id: ZodString;
-  session_id: ZodOptional<ZodString>;
-  span_id: ZodOptional<ZodNullable<ZodString>>;
-  status: ZodString;
-  timestamp: ZodCoercedDate<unknown>;
-  trace_id: ZodOptional<ZodNullable<ZodString>>;
-  user_id: ZodOptional<ZodString>;
-}, $strip>;
-```
-
-Report node execution event (AER → OE for logging).
-
-***
-
-<a id="api-nodeexecutionsqueryresponseschema"></a>
-
-### NodeExecutionsQueryResponseSchema
-
-```ts
-const NodeExecutionsQueryResponseSchema: ZodObject<{
-  count: ZodDefault<ZodNumber>;
-  executions: ZodDefault<ZodArray<ZodRecord<ZodString, ZodUnknown>>>;
-}, $strip>;
-```
-
-Response for node executions query (used by API Gateway proxy).
 
 ***
 
@@ -9343,113 +9006,6 @@ const SecretsConfigSchema: ZodObject<{
   tools: ZodDefault<ZodRecord<ZodString, ZodArray<ZodString>>>;
 }, $strip>;
 ```
-
-***
-
-<a id="api-sessioninfoschema"></a>
-
-### SessionInfoSchema
-
-```ts
-const SessionInfoSchema: ZodObject<{
-  created_at: ZodString;
-  last_activity: ZodString;
-  last_message_preview: ZodDefault<ZodString>;
-  message_count: ZodDefault<ZodNumber>;
-  project_id: ZodDefault<ZodString>;
-  session_id: ZodString;
-  user_id: ZodDefault<ZodString>;
-  visibility: ZodDefault<ZodString>;
-  workspace_id: ZodDefault<ZodString>;
-}, $strip>;
-```
-
-A single session entry returned by /query/sessions.
-
-***
-
-<a id="api-sessionmessageschema"></a>
-
-### SessionMessageSchema
-
-```ts
-const SessionMessageSchema: ZodObject<{
-  content: ZodString;
-  id: ZodString;
-  name: ZodOptional<ZodString>;
-  role: ZodString;
-  session_id: ZodString;
-  timestamp: ZodString;
-  tool_call_id: ZodOptional<ZodNullable<ZodString>>;
-  tool_calls: ZodOptional<ZodNullable<ZodArray<ZodPipe<ZodObject<{
-     args: ZodOptional<ZodType<JsonValue, unknown, $ZodTypeInternals<..., ...>>>;
-     arguments: ZodOptional<ZodType<JsonValue, unknown, $ZodTypeInternals<..., ...>>>;
-     id: ZodOptional<ZodString>;
-     index: ZodOptional<ZodNumber>;
-     name: ZodOptional<ZodString>;
-     type: ZodOptional<ZodString>;
-   }, $strip>, ZodTransform<LLMToolCall, {
-     args?: JsonValue;
-     arguments?: JsonValue;
-     id?: string;
-     index?: number;
-     name?: string;
-     type?: string;
-  }>>>>>;
-}, $strip>;
-```
-
-A single message within a session.
-
-***
-
-<a id="api-sessionmessagesqueryresponseschema"></a>
-
-### SessionMessagesQueryResponseSchema
-
-```ts
-const SessionMessagesQueryResponseSchema: ZodObject<{
-  messages: ZodDefault<ZodArray<ZodObject<{
-     content: ZodString;
-     id: ZodString;
-     name: ZodOptional<ZodString>;
-     role: ZodString;
-     session_id: ZodString;
-     timestamp: ZodString;
-     tool_call_id: ZodOptional<ZodNullable<ZodString>>;
-     tool_calls: ZodOptional<ZodNullable<ZodArray<ZodPipe<ZodObject<..., ...>, ZodTransform<..., ...>>>>>;
-  }, $strip>>>;
-}, $strip>;
-```
-
-Response for session messages query (used by API Gateway proxy).
-
-***
-
-<a id="api-sessionsqueryresponseschema"></a>
-
-### SessionsQueryResponseSchema
-
-```ts
-const SessionsQueryResponseSchema: ZodObject<{
-  limit: ZodDefault<ZodNumber>;
-  offset: ZodDefault<ZodNumber>;
-  sessions: ZodDefault<ZodArray<ZodObject<{
-     created_at: ZodString;
-     last_activity: ZodString;
-     last_message_preview: ZodDefault<ZodString>;
-     message_count: ZodDefault<ZodNumber>;
-     project_id: ZodDefault<ZodString>;
-     session_id: ZodString;
-     user_id: ZodDefault<ZodString>;
-     visibility: ZodDefault<ZodString>;
-     workspace_id: ZodDefault<ZodString>;
-  }, $strip>>>;
-  total_count: ZodDefault<ZodNumber>;
-}, $strip>;
-```
-
-Response for sessions list query (used by API Gateway proxy).
 
 ***
 
@@ -9693,6 +9249,8 @@ const ToolExecuteRequestSchema: ZodObject<{
   metadata: ZodDefault<ZodRecord<ZodString, ZodUnknown>>;
   provider_type: ZodOptional<ZodNullable<ZodString>>;
   redact_fields: ZodDefault<ZodArray<ZodString>>;
+  review_id: ZodOptional<ZodNullable<ZodString>>;
+  review_protocol: ZodOptional<ZodNullable<ZodNumber>>;
   scopes: ZodDefault<ZodArray<ZodString>>;
   span_id: ZodOptional<ZodNullable<ZodString>>;
   step_number: ZodNumber;
@@ -9726,6 +9284,16 @@ const ToolExecuteResponseSchema: ZodPreprocess<ZodObject<{
   guardrail_meta: ZodOptional<ZodNullable<ZodObject<{
      guardrail_category: ZodString;
      guardrail_id: ZodString;
+  }, $strip>>>;
+  guardrail_review: ZodOptional<ZodNullable<ZodObject<{
+     allowed_decisions: ZodDefault<ZodArray<ZodString>>;
+     guardrails: ZodDefault<ZodArray<ZodObject<{
+        category: ...;
+        id: ...;
+        name: ...;
+     }, $strip>>>;
+     reason: ZodOptional<ZodNullable<ZodString>>;
+     review_id: ZodString;
   }, $strip>>>;
   latest_step_number: ZodOptional<ZodNullable<ZodNumber>>;
   pod_name: ZodOptional<ZodNullable<ZodString>>;
@@ -12108,6 +11676,32 @@ function getWorkflowAdapter(): WorkflowAdapter | null;
 
 ***
 
+<a id="api-guardrailreviewwaitid"></a>
+
+### guardrailReviewWaitId()
+
+```ts
+function guardrailReviewWaitId(value): string | null;
+```
+
+The review a pause value names, when this attempt paused for that review.
+
+The answer to such a pause is the platform's review decision, not part of
+the conversation. An application's own pause is never one, whatever its
+value looks like: only a review the proxy recorded a halt for counts.
+
+#### Parameters
+
+| Parameter | Type |
+| :------ | :------ |
+| `value` | `unknown` |
+
+#### Returns
+
+`string` \| `null`
+
+***
+
 <a id="api-hasnamedllms"></a>
 
 ### hasNamedLlms()
@@ -12192,14 +11786,22 @@ Behaves like the Python SDK's `install_structured_logging`:
 ### interruptedActivities()
 
 ```ts
-function interruptedActivities(stepOrdinal): InterruptedActivity[];
+function interruptedActivities(stepOrdinal, options?): InterruptedActivity[];
 ```
+
+Framework-interrupted activities observed in one workflow step.
+
+Answered activities are excluded unless requested. One LangGraph task can
+pause several times and every pause carries the same native interrupt id,
+so only the pauses still waiting may claim that id.
 
 #### Parameters
 
 | Parameter | Type |
 | :------ | :------ |
 | `stepOrdinal` | `number` |
+| `options` | \{ `includeAnswered?`: `boolean`; \} |
+| `options.includeAnswered?` | `boolean` |
 
 #### Returns
 
@@ -12244,6 +11846,28 @@ drain, or teardown). Lets a catch block tell "the run is being torn down"
 apart from a genuine failure of the call it was making — the abort reason
 itself arrives as whichever value the controller was aborted with, which is
 not reliably an Error.
+
+#### Returns
+
+`boolean`
+
+***
+
+<a id="api-isguardrailreviewwait"></a>
+
+### isGuardrailReviewWait()
+
+```ts
+function isGuardrailReviewWait(reviewId): boolean;
+```
+
+Whether this attempt paused for that review.
+
+#### Parameters
+
+| Parameter | Type |
+| :------ | :------ |
+| `reviewId` | `unknown` |
 
 #### Returns
 
@@ -12455,34 +12079,6 @@ Log an execution callback (completion/suspension/error).
 | `result` | `unknown` | `null` |
 | `error` | `string` \| `null` | `null` |
 | `suspendReason` | `string` \| `null` | `null` |
-| `prefix` | `string` | `"OE"` |
-
-#### Returns
-
-`void`
-
-***
-
-<a id="api-logexecutionstart"></a>
-
-### logExecutionStart()
-
-```ts
-function logExecutionStart(
-   executionId,
-   inputKeys,
-   prefix?
-): void;
-```
-
-Log the start of an execution.
-
-#### Parameters
-
-| Parameter | Type | Default value |
-| :------ | :------ | :------ |
-| `executionId` | `string` | `undefined` |
-| `inputKeys` | `string`[] | `undefined` |
 | `prefix` | `string` | `"OE"` |
 
 #### Returns
@@ -12814,6 +12410,28 @@ Create the async callable used to invoke a discovered MCP tool.
 
 ***
 
+<a id="api-markinterruptedactivitiesanswered"></a>
+
+### markInterruptedActivitiesAnswered()
+
+```ts
+function markInterruptedActivitiesAnswered(positions): void;
+```
+
+Record that these interrupted activities received their answer in this attempt.
+
+#### Parameters
+
+| Parameter | Type |
+| :------ | :------ |
+| `positions` | readonly [`ActivityPosition`](#api-activityposition)[] |
+
+#### Returns
+
+`void`
+
+***
+
 <a id="api-materializemcpoauthsecretcache"></a>
 
 ### materializeMcpOauthSecretCache()
@@ -12959,6 +12577,33 @@ function newDurabilityOwnerId(): string;
 #### Returns
 
 `string`
+
+***
+
+<a id="api-nextscopedcallindex"></a>
+
+### nextScopedCallIndex()
+
+```ts
+function nextScopedCallIndex(scope): number;
+```
+
+The 1-based index of this call within `scope` for the current attempt.
+
+An adapter passes the framework object that lives for one run of a unit the
+framework may re-run, such as one run of a graph task. The index restarts
+for each run, so a key built from it names the same call on every run and
+its recorded activity replays.
+
+#### Parameters
+
+| Parameter | Type |
+| :------ | :------ |
+| `scope` | `object` |
+
+#### Returns
+
+`number`
 
 ***
 
@@ -13147,6 +12792,28 @@ path falls back to the most recently observed wire value.
 | Parameter | Type |
 | :------ | :------ |
 | `wireWorkspaceId?` | `string` \| `null` |
+
+#### Returns
+
+`void`
+
+***
+
+<a id="api-noteguardrailreviewwait"></a>
+
+### noteGuardrailReviewWait()
+
+```ts
+function noteGuardrailReviewWait(reviewId): void;
+```
+
+Record that this attempt pauses for a review the platform halted a call for.
+
+#### Parameters
+
+| Parameter | Type |
+| :------ | :------ |
+| `reviewId` | `string` |
 
 #### Returns
 
@@ -13723,6 +13390,13 @@ function requestOeApproval(args): Promise<{
      guardrail_id: string;
    }
      | null;
+  guardrail_review?:   | {
+     allowed_decisions: string[];
+     guardrails: object[];
+     reason?: string | null;
+     review_id: string;
+   }
+     | null;
   latest_step_number?: number | null;
   pod_name?: string | null;
   proceed: boolean;
@@ -13770,6 +13444,13 @@ Any HTTP or network error becomes PolicyDeniedException — fail-safe.
   `guardrail_meta?`:   \| \{
      `guardrail_category`: `string`;
      `guardrail_id`: `string`;
+   \}
+     \| `null`;
+  `guardrail_review?`:   \| \{
+     `allowed_decisions`: `string`[];
+     `guardrails`: `object`[];
+     `reason?`: `string` \| `null`;
+     `review_id`: `string`;
    \}
      \| `null`;
   `latest_step_number?`: `number` \| `null`;

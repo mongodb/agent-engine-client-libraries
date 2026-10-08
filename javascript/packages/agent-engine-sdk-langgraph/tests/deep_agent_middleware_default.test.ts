@@ -8,7 +8,13 @@
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { ChatOpenAI } from "@langchain/openai";
-import { MemorySaver } from "@langchain/langgraph";
+import {
+  END,
+  MemorySaver,
+  MessagesAnnotation,
+  START,
+  StateGraph,
+} from "@langchain/langgraph";
 import { create } from "@bufbuild/protobuf";
 import {
   AttemptContextSchema,
@@ -137,6 +143,55 @@ describe("createAgentEngineDeepAgent middleware defaults", () => {
           ),
       ),
     ).rejects.toThrow(/checkpointer=None/);
+    expect(handlerCalled).toBe(false);
+  });
+
+  it("rejects a durable task dispatch for a compiled subagent that sets a retry policy", async () => {
+    const subagent = new StateGraph(MessagesAnnotation)
+      .addNode("work", async () => ({ messages: [] }), {
+        retryPolicy: { maxAttempts: 2 },
+      })
+      .addEdge(START, "work")
+      .addEdge("work", END)
+      .compile();
+    createAgentEngineDeepAgent(model(), undefined, {
+      subagents: [
+        {
+          name: "research",
+          description: "research specialist",
+          runnable: subagent,
+        } as never,
+      ],
+    });
+
+    let handlerCalled = false;
+    await expect(
+      runWithExecutionContext(
+        { executionId: "execution", wrapper: null, oeUrl: "http://oe" },
+        () =>
+          runWithAttemptContext(attempt(), async () =>
+            (
+              durableMiddleware().wrapToolCall as (
+                request: never,
+                handler: never,
+              ) => Promise<unknown>
+            )(
+              {
+                toolCall: {
+                  name: "task",
+                  id: "call_task_1",
+                  args: { subagent_type: "research", description: "go" },
+                },
+                state: {},
+              } as never,
+              (() => {
+                handlerCalled = true;
+                return { content: "done", tool_call_id: "call_task_1" };
+              }) as never,
+            ),
+          ),
+      ),
+    ).rejects.toThrow(/sets a retry policy/);
     expect(handlerCalled).toBe(false);
   });
 });

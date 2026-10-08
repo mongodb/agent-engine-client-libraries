@@ -35,7 +35,9 @@ import {
   getCurrentOeUrl,
   getCurrentUserId,
   getCurrentWrapper,
+  guardrailReviewWaitId,
   interruptedActivities,
+  markInterruptedActivitiesAnswered,
   recordInterruptedActivity,
   recordObservedActivity,
   setActivityReconstructionIds,
@@ -48,6 +50,8 @@ import {
   type SecureToolWrapper,
 } from "@mongodb-js/agent-engine-runner-shared";
 
+import { rejectNodeRetryPolicies } from "./durable_subgraphs.js";
+import { takeRaisedInterruptIds } from "./raised_interrupts.js";
 import {
   ExecutionSession,
   type PreparedRun,
@@ -109,37 +113,48 @@ function uniqueInterrupts(captured: readonly Interrupt[]): PublicInterrupt[] {
   return [...byId.values()];
 }
 
-function pendingInterrupts(state: StateSnapshotLike): PublicInterrupt[] {
-  // Parent snapshots can repeat a subgraph interrupt, so visit children first
-  // and keep each native id only once.
-  const pending: PublicInterrupt[] = [];
-  const valueById = new Map<string, PublicInterrupt["value"]>();
-  const visit = (snapshot: StateSnapshotLike): void => {
-    for (const task of snapshot.tasks ?? []) {
-      const taskState = task.state;
-      if (
-        taskState !== undefined &&
-        taskState !== null &&
-        typeof taskState === "object" &&
-        "tasks" in taskState
-      ) {
-        visit(taskState as StateSnapshotLike);
-      }
-      for (const interrupt of uniqueInterrupts(task.interrupts ?? [])) {
-        const previous = valueById.get(interrupt.id);
-        if (previous === undefined) {
-          valueById.set(interrupt.id, interrupt.value);
-          pending.push(interrupt);
-        } else if (!isDeepStrictEqual(previous, interrupt.value)) {
-          throw new UnsupportedDurableGraphError(
-            "LangGraph returned conflicting values for an interrupt id",
-          );
-        }
-      }
+type SnapshotTask = NonNullable<StateSnapshotLike["tasks"]>[number];
+
+/**
+ * The direct interrupts one root task is waiting on, including those raised
+ * by tasks of a compiled child it runs. LangGraph JS projects only one of a
+ * child's parallel interrupts to the parent task, so the child's own snapshot
+ * is the complete source. Children come first, in a path order that is the
+ * same on every attempt, and each native id appears once.
+ */
+function taskInterrupts(task: SnapshotTask): PublicInterrupt[] {
+  const collected: Interrupt[] = [];
+  const visit = (current: SnapshotTask): void => {
+    const state = current.state;
+    if (
+      state !== undefined &&
+      state !== null &&
+      typeof state === "object" &&
+      "tasks" in state
+    ) {
+      // Ordinals need the same order on every attempt, not a meaningful one,
+      // so a string comparison of the paths is enough.
+      const children = [...((state as StateSnapshotLike).tasks ?? [])].sort(
+        (left, right) => {
+          const leftPath = JSON.stringify(left.path ?? []);
+          const rightPath = JSON.stringify(right.path ?? []);
+          return leftPath < rightPath ? -1 : leftPath > rightPath ? 1 : 0;
+        },
+      );
+      for (const child of children) visit(child);
     }
+    collected.push(...(current.interrupts ?? []));
   };
-  visit(state);
-  return pending;
+  visit(task);
+  return uniqueInterrupts(collected);
+}
+
+function pendingInterrupts(state: StateSnapshotLike): PublicInterrupt[] {
+  // A parent snapshot can repeat a subgraph interrupt, so keep each native id
+  // once across the root tasks.
+  return uniqueInterrupts(
+    (state.tasks ?? []).flatMap((task) => taskInterrupts(task)),
+  );
 }
 
 function isDirectInterruptActivity(activity: InterruptedActivity): boolean {
@@ -151,13 +166,24 @@ function isDirectInterruptActivity(activity: InterruptedActivity): boolean {
   );
 }
 
+function directInterruptId(activity: InterruptedActivity): string | undefined {
+  return isGraphInterrupt(activity.controlFlow)
+    ? activity.controlFlow.interrupts[0]?.id
+    : undefined;
+}
+
 function recordDirectInterrupts(
   attempt: AttemptContext,
   state: StateSnapshotLike,
+  isLeftover: (interrupt: PublicInterrupt) => boolean,
 ): void {
-  const currentActivities = interruptedActivities(currentStepOrdinal());
+  const stepOrdinal = currentStepOrdinal();
+  const waiting = interruptedActivities(stepOrdinal);
+  const waitingKeys = new Set(
+    waiting.map((activity) => positionKey(activity.command.position)),
+  );
   const localIds = new Set(
-    currentActivities
+    waiting
       .filter((activity) => !isDirectInterruptActivity(activity))
       .flatMap((activity) =>
         isGraphInterrupt(activity.controlFlow)
@@ -167,14 +193,22 @@ function recordDirectInterrupts(
   );
   // Registered local tools already carry their admitted ActivityCommand.
   // Do not synthesize a second root interrupt activity for the checkpoint view.
-  const existing = new Map(
-    currentActivities
-      .filter(isDirectInterruptActivity)
-      .map((activity) => [positionKey(activity.command.position), activity]),
-  );
-  const previouslySettled = new Set(existing.keys());
+  // Answered pauses stay listed so a task that pauses again takes the next
+  // ordinal: every pause in one task shares one native id.
+  const recordedByTask = new Map<string, InterruptedActivity[]>();
+  for (const activity of interruptedActivities(stepOrdinal, {
+    includeAnswered: true,
+  }).filter(isDirectInterruptActivity)) {
+    const segment =
+      activity.command.position?.operationPath?.segments[0]?.name ?? "";
+    recordedByTask.set(segment, [
+      ...(recordedByTask.get(segment) ?? []),
+      activity,
+    ]);
+  }
   for (const task of state.tasks ?? []) {
-    if (!task.interrupts?.length) continue;
+    const owned = taskInterrupts(task);
+    if (owned.length === 0) continue;
     const path = task.path;
     if (
       !path?.length ||
@@ -190,49 +224,49 @@ function recordDirectInterrupts(
     }
     // JS putWrites receives only the regenerated task ID. The quiescent
     // snapshot exposes the stable path Python receives at its write boundary.
-    const direct = uniqueInterrupts(task.interrupts).filter(
-      (interrupt) => !localIds.has(interrupt.id),
+    const direct = owned.filter(
+      (interrupt) => !localIds.has(interrupt.id) && !isLeftover(interrupt),
     );
-    for (const [index, interrupt] of direct.entries()) {
+    const segmentName = `langgraph.task:${JSON.stringify(path)}`;
+    const recorded = recordedByTask.get(segmentName) ?? [];
+    for (const interrupt of direct) {
+      const waitingHere = recorded.filter((activity) =>
+        waitingKeys.has(positionKey(activity.command.position)),
+      );
+      const same = waitingHere.find(
+        (activity) => directInterruptId(activity) === interrupt.id,
+      );
+      if (same !== undefined) {
+        if (
+          !isGraphInterrupt(same.controlFlow) ||
+          !isDeepStrictEqual(
+            same.controlFlow.interrupts[0]?.value,
+            interrupt.value,
+          )
+        ) {
+          throw new UnsupportedDurableGraphError(
+            "LangGraph returned conflicting values for a waiting durable interrupt",
+          );
+        }
+        continue;
+      }
       const command = buildActivityCommand({
         attempt,
         kind: ActivityKind.TOOL,
         name: DIRECT_INTERRUPT_ACTIVITY_NAME,
-        activityOrdinal: index + 1,
+        // `recorded` gains this activity below, so the next pause takes the
+        // next ordinal.
+        activityOrdinal: recorded.length + 1,
         operationPath: create(OperationPathSchema, {
           segments: [
             create(OperationPathSegmentSchema, {
-              name: `langgraph.task:${JSON.stringify(path)}`,
+              name: segmentName,
               ordinal: 1n,
             }),
           ],
         }),
         semanticInput: { value: interrupt.value },
       });
-      const key = positionKey(command.position);
-      if (previouslySettled.has(key)) {
-        // A second graph iteration reached another interrupt before this task
-        // finished. Native IDs and even payloads may be identical at both calls.
-        throw new UnsupportedDurableGraphError(
-          "durable workflow does not support multiple sequential direct interrupts in one graph task",
-        );
-      }
-      const previous = existing.get(key);
-      if (previous) {
-        if (
-          !isGraphInterrupt(previous.controlFlow) ||
-          previous.controlFlow.interrupts[0]?.id !== interrupt.id ||
-          !isDeepStrictEqual(
-            previous.controlFlow.interrupts[0]?.value,
-            interrupt.value,
-          )
-        ) {
-          throw new UnsupportedDurableGraphError(
-            "durable workflow does not support multiple sequential direct interrupts in one graph task",
-          );
-        }
-        continue;
-      }
       const controlFlow = new GraphInterrupt([interrupt]);
       if (command.position === undefined) {
         throw new UnsupportedDurableGraphError(
@@ -241,7 +275,10 @@ function recordDirectInterrupts(
       }
       recordObservedActivity(command.position);
       recordInterruptedActivity(command, controlFlow);
-      existing.set(key, { command, controlFlow });
+      const activity = { command, controlFlow };
+      recorded.push(activity);
+      recordedByTask.set(segmentName, recorded);
+      waitingKeys.add(positionKey(command.position));
     }
   }
 }
@@ -366,6 +403,7 @@ export class DurableSession extends ExecutionSession {
     this.attempt = execution.attempt;
     this.checkpointer = execution.checkpointer;
     this.executionId = execution.executionId;
+    rejectNodeRetryPolicies(graph);
     this.durableSubgraphs?.validate();
     this.resumed = ctx.resume === true;
     if (this.resumed) {
@@ -430,8 +468,9 @@ export class DurableSession extends ExecutionSession {
     config: RunnableConfig,
     response: string,
     messages: readonly unknown[],
+    raised: readonly Interrupt[],
   ): Promise<Command | AgentOutput | null> {
-    const result = await this.settlePendingInterrupts(config, []);
+    const result = await this.settlePendingInterrupts(config, raised);
     if (result === null || result instanceof Command) return result;
     return invokeSuspendOutput({
       response,
@@ -470,7 +509,33 @@ export class DurableSession extends ExecutionSession {
       ): Promise<StateSnapshotLike>;
     };
     const state = await graph.getState(config, { subgraphs: true });
-    const pending = pendingInterrupts(state);
+    // LangGraph's state keeps the interrupt of a task that has since received
+    // its answer and finished, until the whole superstep completes. Such a
+    // leftover carries only an answered pause's id and did not fire in the
+    // latest run; a task that paused again did.
+    const raisedIds = new Set([
+      ...captured.map((interrupt) => interrupt.id),
+      ...takeRaisedInterruptIds(this.attempt),
+    ]);
+    const waitingIds = new Set(
+      interruptedActivities(currentStepOrdinal())
+        .map(directInterruptId)
+        .filter((id): id is string => id !== undefined),
+    );
+    const answeredIds = new Set(
+      interruptedActivities(currentStepOrdinal(), { includeAnswered: true })
+        .map(directInterruptId)
+        .filter((id) => id !== undefined && !waitingIds.has(id)),
+    );
+    const isLeftover = (interrupt: PublicInterrupt): boolean =>
+      answeredIds.has(interrupt.id) && !raisedIds.has(interrupt.id);
+    const reported = pendingInterrupts(state);
+    const pending = reported.filter((interrupt) => !isLeftover(interrupt));
+    if (reported.length > 0 && pending.length === 0) {
+      throw new UnsupportedDurableGraphError(
+        "durable graph reported only already-answered interrupts",
+      );
+    }
     if (pending.length === 0) {
       if ((state.next?.length ?? 0) > 0 || captured.length > 0) {
         throw new UnsupportedDurableGraphError(
@@ -481,7 +546,7 @@ export class DurableSession extends ExecutionSession {
       return null;
     }
 
-    recordDirectInterrupts(this.attempt, state);
+    recordDirectInterrupts(this.attempt, state, isLeftover);
     const activitiesByNativeId = new Map<string, InterruptedActivity>();
     for (const activity of interruptedActivities(currentStepOrdinal())) {
       if (!isGraphInterrupt(activity.controlFlow)) continue;
@@ -588,14 +653,21 @@ export class DurableSession extends ExecutionSession {
         if (activity === undefined || !isDirectInterruptActivity(activity)) {
           continue;
         }
+        const context = create(ActivityContextSchema, {
+          workflowIdentity: outcome.workflowIdentity,
+          activityId: outcome.activityId,
+          attemptId: outcome.attemptId,
+          fencingToken: outcome.fencingToken,
+        });
+        if (guardrailReviewWaitId(interrupt.value) !== null) {
+          // The answer is the platform's review decision, not something the
+          // user or a tool said.
+          await durableMemory.acknowledge(memoryClient, context);
+          continue;
+        }
         await durableMemory.synchronizeTool(
           memoryClient,
-          create(ActivityContextSchema, {
-            workflowIdentity: outcome.workflowIdentity,
-            activityId: outcome.activityId,
-            attemptId: outcome.attemptId,
-            fencingToken: outcome.fencingToken,
-          }),
+          context,
           unwrapActivityOutcome(outcome),
           getCurrentUserId(),
           `${DIRECT_INTERRUPT_ACTIVITY_NAME}:${outcome.activityId}`,
@@ -603,6 +675,13 @@ export class DurableSession extends ExecutionSession {
         );
       }
     }
+    markInterruptedActivitiesAnswered(
+      settled.flatMap(({ interrupt }) => {
+        const position = activitiesByNativeId.get(interrupt.id)?.command
+          .position;
+        return position === undefined ? [] : [position];
+      }),
+    );
     return new Command({
       resume: Object.fromEntries(
         settled.map(({ interrupt, outcome }) => [

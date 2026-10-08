@@ -27,7 +27,6 @@ import {
   LLMTokenUsage,
   LLMTokenUsageSchema,
   LLMToolCall,
-  LLMToolCallSchema,
   LLMToolSchema,
   LLMToolSchemaValidator,
   MessageSchema,
@@ -304,6 +303,13 @@ export const ToolExecuteRequestSchema = z.object({
   trace_id: z.string().nullish(),
   /** Active OTel span ID, for OE execution-log correlation. */
   span_id: z.string().nullish(),
+  /**
+   * Set by callers that pause for the guardrail review a halt names and then
+   * resolve the call with `review_id`.
+   */
+  review_protocol: z.number().int().nullish(),
+  /** Asks OE to answer this invoke_llm call from a decided guardrail review. */
+  review_id: z.string().nullish(),
 });
 export type ToolExecuteRequest = z.infer<typeof ToolExecuteRequestSchema>;
 
@@ -324,6 +330,30 @@ export const GuardrailMetaSchema = z.object({
   guardrail_category: z.string(),
 });
 export type GuardrailMeta = z.infer<typeof GuardrailMetaSchema>;
+
+/** One policy that required a guardrail review. */
+export const GuardrailReviewPolicySchema = z.object({
+  /** Policy ID. */
+  id: z.string(),
+  /** Policy name. */
+  name: z.string().nullish(),
+  /** Policy category. */
+  category: z.string().nullish(),
+});
+export type GuardrailReviewPolicy = z.infer<typeof GuardrailReviewPolicySchema>;
+
+/** The review OE opened for a require_review halt of a review_protocol call. */
+export const GuardrailReviewHaltSchema = z.object({
+  /** ID of the review to pause for. */
+  review_id: z.string().min(1),
+  /** Decisions a reviewer may give. */
+  allowed_decisions: z.array(z.string()).default([]),
+  /** Why the output needs review. */
+  reason: z.string().nullish(),
+  /** Every policy that required review. */
+  guardrails: z.array(GuardrailReviewPolicySchema).default([]),
+});
+export type GuardrailReviewHalt = z.infer<typeof GuardrailReviewHaltSchema>;
 
 /** Response from OE for tool execution request. */
 const ToolExecuteResponseObjectSchema = z.object({
@@ -357,6 +387,8 @@ const ToolExecuteResponseObjectSchema = z.object({
   pod_name: z.string().nullish(),
   /** Policy identity when a guardrail halt fires. */
   guardrail_meta: GuardrailMetaSchema.nullish(),
+  /** The review to pause for, on a require_review halt of a review_protocol call. */
+  guardrail_review: GuardrailReviewHaltSchema.nullish(),
   /** Structured external API failure classification. */
   tool_api_error: ToolAPIErrorSchema.nullish(),
 });
@@ -1139,6 +1171,7 @@ export function mergeTokenUsage(
     input_tokens: prompt,
     output_tokens: completion,
     total_tokens: total,
+    reasoning_tokens: next.reasoningTokens ?? existing.reasoningTokens,
     model,
   });
 }
@@ -1218,10 +1251,15 @@ export function addTokenUsage(
   } else {
     total = prompt + completion;
   }
+  const reasoning =
+    existing.reasoningTokens !== undefined || next.reasoningTokens !== undefined
+      ? (existing.reasoningTokens ?? 0) + (next.reasoningTokens ?? 0)
+      : undefined;
   return new LLMTokenUsage({
     input_tokens: prompt,
     output_tokens: completion,
     total_tokens: total,
+    reasoning_tokens: reasoning,
     model,
   });
 }
@@ -1501,7 +1539,7 @@ export const ExecutionSchema = z.object({
   /** Tool HTTP endpoint for this agent; overrides default TOOL_URL. */
   tool_url: z.string().optional(),
   // Timestamps. ISO strings are coerced to Date, matching Pydantic and the
-  // other datetime fields in this file (ExecutionStatusResponse, NodeExecutionRequest).
+  // other datetime fields in this file (ExecutionStatusResponse).
   created_at: z.coerce.date().default(() => new Date()),
   updated_at: z.coerce.date().default(() => new Date()),
 });
@@ -1748,237 +1786,6 @@ export const StreamChunkSchema = z.object({
   step_number: z.number().int().optional(),
 });
 export type StreamChunk = z.infer<typeof StreamChunkSchema>;
-
-/** Request to start an agent execution with streaming response. */
-export const AgentStartStreamRequestSchema = z.object({
-  /** User message. */
-  message: z.string(),
-  /** Session ID for conversation continuity. */
-  session_id: z.string().optional(),
-  /** Organization ID for multi-tenant isolation. */
-  org_id: z.string().optional(),
-  /** User ID for personalization. */
-  user_id: z.string().optional(),
-});
-export type AgentStartStreamRequest = z.infer<
-  typeof AgentStartStreamRequestSchema
->;
-
-// =============================================================================
-// Query Response Models — Execution Logs & Node Executions
-// =============================================================================
-
-/** Response for execution logs query (used by API Gateway proxy). */
-export const ExecutionLogsQueryResponseSchema = z.object({
-  logs: z.array(z.record(z.string(), z.unknown())).default([]),
-  count: z.number().int().default(0),
-});
-export type ExecutionLogsQueryResponse = z.infer<
-  typeof ExecutionLogsQueryResponseSchema
->;
-
-/** Response for node executions query (used by API Gateway proxy). */
-export const NodeExecutionsQueryResponseSchema = z.object({
-  executions: z.array(z.record(z.string(), z.unknown())).default([]),
-  count: z.number().int().default(0),
-});
-export type NodeExecutionsQueryResponse = z.infer<
-  typeof NodeExecutionsQueryResponseSchema
->;
-
-// =============================================================================
-// Query Response Models — Sessions
-// =============================================================================
-
-/** A single session entry returned by /query/sessions. */
-export const SessionInfoSchema = z.object({
-  session_id: z.string(),
-  last_activity: z.string(),
-  created_at: z.string(),
-  message_count: z.number().int().default(0),
-  last_message_preview: z.string().default(""),
-  visibility: z.string().default("PRIVATE"),
-  user_id: z.string().default(""),
-  project_id: z.string().default(""),
-  workspace_id: z.string().default(""),
-});
-export type SessionInfo = z.infer<typeof SessionInfoSchema>;
-
-/** Response for sessions list query (used by API Gateway proxy). */
-export const SessionsQueryResponseSchema = z.object({
-  sessions: z.array(SessionInfoSchema).default([]),
-  total_count: z.number().int().default(0),
-  offset: z.number().int().default(0),
-  limit: z.number().int().default(50),
-});
-export type SessionsQueryResponse = z.infer<typeof SessionsQueryResponseSchema>;
-
-/** A single message within a session. */
-export const SessionMessageSchema = z.object({
-  id: z.string(),
-  role: z.string(),
-  content: z.string(),
-  timestamp: z.string(),
-  session_id: z.string(),
-  name: z.string().optional(),
-  tool_calls: z.array(LLMToolCallSchema).nullable().optional(),
-  tool_call_id: z.string().nullable().optional(),
-});
-export type SessionMessage = z.infer<typeof SessionMessageSchema>;
-
-/** Response for session messages query (used by API Gateway proxy). */
-export const SessionMessagesQueryResponseSchema = z.object({
-  messages: z.array(SessionMessageSchema).default([]),
-});
-export type SessionMessagesQueryResponse = z.infer<
-  typeof SessionMessagesQueryResponseSchema
->;
-
-// =============================================================================
-// Cost Dashboard Query Response Models
-// =============================================================================
-
-/** Aggregate cost metrics for the requested period. */
-export const CostSummarySchema = z.object({
-  total_cost_usd: z.number().default(0.0),
-  total_tokens: z.number().int().default(0),
-  total_prompt_tokens: z.number().int().default(0),
-  total_completion_tokens: z.number().int().default(0),
-  total_llm_calls: z.number().int().default(0),
-  unpriced_llm_calls: z.number().int().default(0),
-});
-export type CostSummary = z.infer<typeof CostSummarySchema>;
-
-/** Cost breakdown for a single workspace. */
-export const CostByWorkspaceSchema = z.object({
-  workspace_id: z.string(),
-  total_cost_usd: z.number().default(0.0),
-  total_tokens: z.number().int().default(0),
-  call_count: z.number().int().default(0),
-  percentage: z.number().default(0.0),
-});
-export type CostByWorkspace = z.infer<typeof CostByWorkspaceSchema>;
-
-/** Cost breakdown for a single model. */
-export const CostByModelSchema = z.object({
-  model: z.string(),
-  total_cost_usd: z.number().default(0.0),
-  total_tokens: z.number().int().default(0),
-  call_count: z.number().int().default(0),
-  percentage: z.number().default(0.0),
-});
-export type CostByModel = z.infer<typeof CostByModelSchema>;
-
-/** Cost data for a single day. */
-export const DailyCostEntrySchema = z.object({
-  date: z.string(),
-  total_cost_usd: z.number().default(0.0),
-  total_tokens: z.number().int().default(0),
-  call_count: z.number().int().default(0),
-});
-export type DailyCostEntry = z.infer<typeof DailyCostEntrySchema>;
-
-/** Response for cost dashboard aggregation (used by API Gateway proxy). */
-export const CostDashboardResponseSchema = z.object({
-  summary: CostSummarySchema.default({
-    total_cost_usd: 0.0,
-    total_tokens: 0,
-    total_prompt_tokens: 0,
-    total_completion_tokens: 0,
-    total_llm_calls: 0,
-    unpriced_llm_calls: 0,
-  }),
-  by_workspace: z.array(CostByWorkspaceSchema).default([]),
-  by_model: z.array(CostByModelSchema).default([]),
-  daily_trend: z.array(DailyCostEntrySchema).default([]),
-});
-export type CostDashboardResponse = z.infer<typeof CostDashboardResponseSchema>;
-
-// =============================================================================
-// Executions Query Response Models
-// =============================================================================
-
-/** An execution document as stored in the platform database. */
-export const ExecutionDocumentSchema = z.object({
-  execution_id: z.string(),
-  status: z.string().default(""),
-  message: z.string().default(""),
-  session_id: z.string().default(""),
-  user_id: z.string().default(""),
-  org_id: z.string().default(""),
-  project_id: z.string().nullable().default(""),
-  workspace_id: z.string().nullable().default(""),
-  result: z.unknown().optional(),
-  error: z.string().optional(),
-  suspend_reason: z.string().optional(),
-  suspend_context: z.record(z.string(), z.unknown()).optional(),
-  created_at: z.string().optional(),
-  updated_at: z.string().optional(),
-});
-export type ExecutionDocument = z.infer<typeof ExecutionDocumentSchema>;
-
-/** Response for executions list query (used by API Gateway proxy). */
-export const ExecutionsListQueryResponseSchema = z.object({
-  success: z.boolean().default(true),
-  executions: z.array(ExecutionDocumentSchema).default([]),
-  count: z.number().int().default(0),
-});
-export type ExecutionsListQueryResponse = z.infer<
-  typeof ExecutionsListQueryResponseSchema
->;
-
-/** Response for single execution detail query (used by API Gateway proxy). */
-export const ExecutionDetailQueryResponseSchema = z.object({
-  success: z.boolean().default(true),
-  execution: ExecutionDocumentSchema.optional(),
-  error: z.string().optional(),
-});
-export type ExecutionDetailQueryResponse = z.infer<
-  typeof ExecutionDetailQueryResponseSchema
->;
-
-// =============================================================================
-// Node Execution (AER → OE)
-// =============================================================================
-
-/**
- * Report node execution event (AER → OE for logging).
- */
-export const NodeExecutionRequestSchema = z.object({
-  /** Execution identifier. */
-  execution_id: z.string(),
-  /** Name of the framework node. */
-  node_name: z.string(),
-  /** Node status: started, success, error, suspend. */
-  status: z.string(),
-  /** Event timestamp. ISO strings are coerced to Date, matching Pydantic. */
-  timestamp: z.coerce.date(),
-  /** Framework run ID for this node execution. */
-  run_id: z.string(),
-  /** Parent run ID if nested. */
-  parent_run_id: z.string().optional(),
-  /** Session ID for correlation. */
-  session_id: z.string().optional(),
-  /** User ID for personalization. */
-  user_id: z.string().optional(),
-  /** Node inputs (for started status). */
-  inputs: z.record(z.string(), z.unknown()).optional(),
-  /** Node outputs (for success status). */
-  outputs: z.record(z.string(), z.unknown()).optional(),
-  /** Error message (for error status). */
-  error: z.string().optional(),
-  /** Execution duration in milliseconds. */
-  duration_ms: z.number().optional(),
-  /** Organization ID. */
-  org_id: z.string().optional(),
-  /** Project ID. */
-  project_id: z.string().optional(),
-  /** Active OTel trace ID, for OE execution-log correlation. */
-  trace_id: z.string().nullish(),
-  /** Active OTel span ID, for OE execution-log correlation. */
-  span_id: z.string().nullish(),
-});
-export type NodeExecutionRequest = z.infer<typeof NodeExecutionRequestSchema>;
 
 // Re-export commonly-needed sdk-core types so consumers can import them
 // from agent-engine-runner-shared without dropping down to agent-engine-sdk directly.

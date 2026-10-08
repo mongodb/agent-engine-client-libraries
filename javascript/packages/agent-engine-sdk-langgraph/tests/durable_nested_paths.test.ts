@@ -438,6 +438,7 @@ describe("durable nested suspension replay", () => {
               suspensions?: {
                 position: {
                   operation_path?: { segments?: { name: string }[] };
+                  activity_ordinal?: string | number;
                 };
               }[];
             }
@@ -445,6 +446,8 @@ describe("durable nested suspension replay", () => {
           expect(
             position?.operation_path?.segments?.map((segment) => segment.name),
           ).toEqual(['langgraph.task:["__pregel_pull","nested"]']);
+          // A single pause inside a compiled child is the task's first.
+          expect(Number(position?.activity_ordinal)).toBe(1);
         }),
     );
 

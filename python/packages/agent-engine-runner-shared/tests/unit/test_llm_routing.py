@@ -493,6 +493,32 @@ class TestAddTokenUsage:
         assert added.total_tokens == 23
 
 
+class TestReasoningTokensSurviveAggregation:
+    def test_additive_deltas_sum_the_reasoning_count(self):
+        first = LLMTokenUsage(input_tokens=18, output_tokens=1, reasoning_tokens=3)
+        second = LLMTokenUsage(input_tokens=0, output_tokens=4, reasoning_tokens=2)
+        added = add_token_usage(first, second)
+        assert added is not None and added.reasoning_tokens == 5
+
+    def test_a_later_snapshot_without_the_count_keeps_the_earlier_one(self):
+        first = LLMTokenUsage(input_tokens=10, output_tokens=2, reasoning_tokens=7)
+        second = LLMTokenUsage(input_tokens=10, output_tokens=3)
+        merged = merge_token_usage(first, second)
+        assert merged is not None and merged.reasoning_tokens == 7
+
+    def test_a_later_snapshot_with_the_count_wins(self):
+        first = LLMTokenUsage(input_tokens=10, output_tokens=2, reasoning_tokens=7)
+        second = LLMTokenUsage(input_tokens=10, output_tokens=3, reasoning_tokens=9)
+        merged = merge_token_usage(first, second)
+        assert merged is not None and merged.reasoning_tokens == 9
+
+    def test_usage_that_never_carried_the_count_still_has_none(self):
+        first = LLMTokenUsage(input_tokens=10, output_tokens=2)
+        second = LLMTokenUsage(input_tokens=10, output_tokens=3)
+        assert merge_token_usage(first, second).reasoning_tokens is None
+        assert add_token_usage(first, second).reasoning_tokens is None
+
+
 class TestAccumulateStreamUsage:
     def test_takes_last_cumulative_snapshot(self):
         first = LLMTokenUsage(input_tokens=10, output_tokens=1, total_tokens=11)

@@ -1,6 +1,6 @@
 [project]
 name = "agent-engine-runner-shared"
-version = "0.11.7"
+version = "0.11.8"
 description = "Runner SDK - Framework-agnostic agent runtime"
 readme = "README.md"
 license = {text = "Apache-2.0"}
@@ -23,9 +23,9 @@ dependencies = [
     "jsonschema>=4.26.0",
     "sentry-sdk>=2.27.0",
     # BaseAgent protocol and AgentInput/AgentEvent models
-    "agent-engine-sdk==0.11.7",
+    "agent-engine-sdk==0.11.8",
     # Memory models and the MemoryClient HTTP client
-    "agent-engine-sdk-memory==0.11.7",
+    "agent-engine-sdk-memory==0.11.8",
     # Required for checkpoint message decoding (query/sessions endpoints)
     "msgpack>=1.0.0",
     # Required by guardrails_evaluator/regex.py for advanced regex matching
@@ -53,6 +53,14 @@ dev = [
     "msgpack>=1.0.0",
     "pymongo>=4.0.0",
     "mongomock>=4.1.0",
+    "debugpy>=1.8.0",
+]
+# Local-Kind-only debug hook. Not installed by default so
+# production/CI images never pull in a debugger; local debug-mode tooling
+# installs this extra explicitly when building an agent/tool image with
+# debugging enabled.
+debug = [
+    "debugpy>=1.8.0",
 ]
 
 [build-system]

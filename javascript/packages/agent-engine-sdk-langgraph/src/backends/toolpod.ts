@@ -258,6 +258,7 @@ export class AgentEngineToolPodBackend implements SandboxBackendProtocolV2 {
     pattern: string,
     path?: string | null,
     glob?: string | null,
+    maxCount?: number | null,
   ): Promise<GrepResult> {
     const args: Record<string, unknown> = { pattern };
     if (path != null) args["path"] = path;
@@ -275,7 +276,7 @@ export class AgentEngineToolPodBackend implements SandboxBackendProtocolV2 {
         error: `${NON_RETRYABLE} filesystem_grep protocol violation: 'matches' not an array`,
       };
     }
-    const matches: GrepMatch[] = [];
+    let matches: GrepMatch[] = [];
     for (const m of raw) {
       // Validate each element rather than coercing — an unchecked
       // `Number(o["line"])` / `String(o["path"])` would silently yield `NaN` /
@@ -293,14 +294,20 @@ export class AgentEngineToolPodBackend implements SandboxBackendProtocolV2 {
       }
       matches.push({ path: m["path"], line: m["line"], text: m["text"] });
     }
-    return { matches };
+    // The handler caps its own walk and reports truncated; maxCount is the
+    // protocol's caller-side total cap, enforced after the call.
+    let truncated = result["truncated"] === true;
+    if (maxCount != null && matches.length > maxCount) {
+      matches = matches.slice(0, maxCount);
+      truncated = true;
+    }
+    return { matches, truncated };
   }
 
-  async glob(pattern: string, path = "/"): Promise<GlobResult> {
-    const outcome = await this.call("filesystem_glob", {
-      pattern,
-      path,
-    });
+  async glob(pattern: string, path?: string): Promise<GlobResult> {
+    const args: Record<string, unknown> = { pattern };
+    if (path !== undefined) args["path"] = path;
+    const outcome = await this.call("filesystem_glob", args);
     if (!outcome.ok) return { error: outcome.error };
     const { result } = outcome;
     const handlerErr = handlerError(result);
@@ -312,13 +319,20 @@ export class AgentEngineToolPodBackend implements SandboxBackendProtocolV2 {
         error: `${NON_RETRYABLE} filesystem_glob protocol violation: 'matches' not an array`,
       };
     }
-    return mapFileInfos(raw, "filesystem_glob", "match");
+    const mapped = mapFileInfos(raw, "filesystem_glob", "match");
+    if ("error" in mapped) return mapped;
+    return { files: mapped.files, truncated: result["truncated"] === true };
   }
 
   // ------------------------------------------------------------------
   // Write operations
   // ------------------------------------------------------------------
 
+  /**
+   * Create a new file. The Tool Pod handler is create-only — it opens the path
+   * with `wx` and returns an already-exists error rather than overwriting — so
+   * use {@link edit} to modify an existing file.
+   */
   async write(filePath: string, content: string): Promise<WriteResult> {
     const outcome = await this.call("filesystem_write", {
       file_path: filePath,

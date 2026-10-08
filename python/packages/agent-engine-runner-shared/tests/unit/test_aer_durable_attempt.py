@@ -766,6 +766,40 @@ async def test_durable_memory_identity_fails_before_heartbeat_and_tenant_executi
     server._execute_via_agent_stream.assert_not_awaited()
 
 
+async def test_a2a_propagated_user_id_passes_durable_memory_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # An A2A child execution never traverses the Gateway, so the only end-user
+    # identity it has is what OE propagated from the parent. A fully populated
+    # workflow identity plus that user_id must proceed past the durable-memory
+    # validator (companion to the fail-closed test above).
+    import agent_engine_runner_shared.server.aer as aer_module
+
+    _FakeHeartbeat.instances = []
+    monkeypatch.setattr(aer_module, "AttemptHeartbeat", _FakeHeartbeat)
+
+    server = _make_server()
+    server.runtime.memory_enabled = True
+    server._start_durable_attempt = AsyncMock(return_value=_attempt())
+    server._execute_via_agent_stream = AsyncMock(
+        return_value=StreamingResult(content="done", messages=[])
+    )
+
+    await server._handle_execute(
+        ExecuteRequest(
+            execution_id="execution-1",
+            message="hi",
+            platform_api_url="http://oe:8000",
+            user_id="user-1",
+        )
+    )
+
+    server._execute_via_agent_stream.assert_awaited_once()
+    (heartbeat,) = _FakeHeartbeat.instances
+    assert heartbeat.started is True
+    assert heartbeat.stopped is True
+
+
 async def test_payload_only_durable_tool_omits_empty_user_memory_turn(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

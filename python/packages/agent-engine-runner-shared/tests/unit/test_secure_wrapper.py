@@ -940,6 +940,131 @@ class TestSecureToolWrapper:
         mock_report.assert_called_once()
         assert mock_report.call_args.kwargs["status"] == "suspend"
 
+    def test_durable_local_suspend_rejects_before_suspended_settlement(self) -> None:
+        """A durable local app.suspend() fails before OE sees a suspension.
+
+        The audited tool history must record the same terminal error the
+        durable activity records, not a suspended result OE never commits.
+        """
+        from unittest.mock import Mock
+
+        from agent_engine_runner_shared import hooks
+        from agent_engine_runner_shared.generated.workflow.v1.activity_pb2 import (
+            ActivityContext,
+        )
+        from agent_engine_runner_shared.generated.workflow.v1.common_pb2 import (
+            WORKFLOW_ERROR_CODE_OUTCOME_UNKNOWN,
+            WorkflowIdentity,
+        )
+        from agent_engine_runner_shared.generated.workflow.v1.runtime_pb2 import (
+            AttemptContext,
+        )
+        from agent_engine_runner_shared.models import SuspendPayload, ToolExecuteResponse
+        from agent_engine_runner_shared.secure_wrapper import (
+            SecureToolWrapper,
+            ToolExecutionError,
+        )
+        from agent_engine_runner_shared.workflow import (
+            DurableActivitySuspended,
+            ReplayedActivityFailedError,
+            attempt_context_scope,
+        )
+
+        identity = WorkflowIdentity(session_id="session-1", execution_id="exec-123")
+        attempt = AttemptContext(
+            attempt_id="attempt-1",
+            fencing_token=1,
+            owner_id="aer-1",
+            workflow_identity=identity,
+        )
+        context = ActivityContext(
+            workflow_identity=identity,
+            activity_id="activity-1",
+            attempt_id="attempt-1",
+            fencing_token=1,
+        )
+        wrapper = SecureToolWrapper(oe_url="http://localhost:8080", execution_id="exec-123")
+        guidance = "app.suspend() is not supported; use the framework's native interrupt instead"
+        hooks.register_durable_activity_suspend_handler(
+            Mock(side_effect=ToolExecutionError(guidance))
+        )
+        outcomes: list[str] = []
+        recorded_failures: list[str] = []
+
+        def fake_run_serial_activity(*, execute, **_kwargs):
+            try:
+                return execute(context)
+            except DurableActivitySuspended:
+                # Tripwire: settling the legacy wait as suspended before the
+                # rejection must fail this test.
+                outcomes.append("suspended")
+                raise
+            except Exception as error:
+                outcomes.append("failed")
+                recorded_failures.append(str(error))
+                raise
+
+        executor = Mock(
+            side_effect=lambda: SuspendPayload(
+                suspend_reason="awaiting_human_review",
+                suspend_context={"claim_id": "c1"},
+            ).to_json()
+        )
+
+        try:
+            with attempt_context_scope(attempt):
+                with (
+                    patch(
+                        "agent_engine_runner_shared.secure_wrapper.request_oe_approval",
+                        return_value=ToolExecuteResponse(proceed=True, route_to="callback"),
+                    ),
+                    patch(
+                        "agent_engine_runner_shared.secure_wrapper.report_oe_result"
+                    ) as mock_report,
+                    patch(
+                        "agent_engine_runner_shared.secure_wrapper.run_serial_activity",
+                        side_effect=fake_run_serial_activity,
+                    ),
+                    pytest.raises(ToolExecutionError) as live,
+                ):
+                    wrapper.execute_tool(
+                        "review_claim",
+                        {"claim_id": "c1"},
+                        is_local=True,
+                        local_executor=executor,
+                    )
+
+            assert live.value.error == guidance
+            assert "app.suspend()" in live.value.error
+            assert "native interrupt" in live.value.error
+            # The rejection precedes the settlement: OE sees exactly one error
+            # report, and the activity is never reported as a suspension.
+            assert [call.kwargs["status"] for call in mock_report.call_args_list] == ["error"]
+            assert outcomes == ["failed"]
+
+            with attempt_context_scope(attempt):
+                with (
+                    patch(
+                        "agent_engine_runner_shared.secure_wrapper.run_serial_activity",
+                        side_effect=ReplayedActivityFailedError(
+                            WORKFLOW_ERROR_CODE_OUTCOME_UNKNOWN,
+                            recorded_failures[0],
+                        ),
+                    ),
+                    pytest.raises(ToolExecutionError) as replayed,
+                ):
+                    wrapper.execute_tool(
+                        "review_claim",
+                        {"claim_id": "c1"},
+                        is_local=True,
+                        local_executor=executor,
+                    )
+        finally:
+            hooks.reset_hooks()
+
+        assert replayed.value.error == live.value.error
+        executor.assert_called_once_with()
+
     def test_local_suspend_marker_does_not_leak_to_next_call(self) -> None:
         from unittest.mock import Mock
 
@@ -2898,6 +3023,86 @@ class TestDurableTimeoutOutcome:
         assert result == {"decision": "approved"}
         local_executor.assert_called_once_with()
         execute_native.assert_not_called()
+
+    def test_durable_reconstruction_rejects_legacy_suspend_payload(self) -> None:
+        """A resumed local tool that returns app.suspend() is rejected too.
+
+        The reconstructed callback bypasses the fresh-call settlement path, so
+        the legacy wait must be rejected here as well: the caller gets the
+        guidance, no payload escapes as tool content, and the already resolved
+        activity reports no second outcome.
+        """
+        from unittest.mock import Mock
+
+        from agent_engine_runner_shared import hooks
+        from agent_engine_runner_shared.generated.workflow.v1.activity_pb2 import (
+            ACTIVITY_OUTCOME_KIND_COMPLETED,
+            ActivityOutcome,
+        )
+        from agent_engine_runner_shared.generated.workflow.v1.common_pb2 import WorkflowIdentity
+        from agent_engine_runner_shared.generated.workflow.v1.runtime_pb2 import AttemptContext
+        from agent_engine_runner_shared.models import SuspendPayload
+        from agent_engine_runner_shared.secure_wrapper import (
+            SecureToolWrapper,
+            ToolExecutionError,
+        )
+        from agent_engine_runner_shared.workflow import attempt_context_scope
+        from agent_engine_runner_shared.workflow.client import ActivityReplay
+        from agent_engine_runner_shared.workflow.context import set_activity_reconstruction_ids
+        from agent_engine_runner_shared.workflow.protojson import json_to_proto_value
+
+        identity = WorkflowIdentity(session_id="session-1", execution_id="exec-123")
+        attempt = AttemptContext(
+            attempt_id="attempt-2",
+            fencing_token=2,
+            owner_id="aer-2",
+            workflow_identity=identity,
+        )
+        wrapper = SecureToolWrapper("http://localhost:8080", "exec-123")
+        wrapper._workflow = MagicMock()
+        wrapper._workflow.start_activity.return_value = ActivityReplay(
+            outcome=ActivityOutcome(
+                workflow_identity=identity,
+                activity_id="activity-1",
+                attempt_id="attempt-2",
+                fencing_token=2,
+                outcome_kind=ACTIVITY_OUTCOME_KIND_COMPLETED,
+                result=json_to_proto_value({"decision": "approved"}),
+            )
+        )
+        guidance = "app.suspend() is not supported; use langgraph.types.interrupt() instead"
+        hooks.register_durable_activity_suspend_handler(
+            Mock(side_effect=ToolExecutionError(guidance))
+        )
+        local_executor = Mock(
+            side_effect=lambda: SuspendPayload(
+                suspend_reason="awaiting_human_review",
+                suspend_context={"claim_id": "c1"},
+            ).to_json()
+        )
+
+        try:
+            with attempt_context_scope(attempt):
+                set_activity_reconstruction_ids(("activity-1",))
+                with (
+                    patch.object(wrapper, "_execute_tool_native") as execute_native,
+                    pytest.raises(ToolExecutionError) as raised,
+                ):
+                    wrapper.execute_tool(
+                        "review_claim",
+                        {"claim_id": "c1"},
+                        is_local=True,
+                        local_executor=local_executor,
+                    )
+        finally:
+            hooks.reset_hooks()
+
+        assert raised.value.error == guidance
+        assert "app.suspend()" in raised.value.error
+        assert "langgraph.types.interrupt()" in raised.value.error
+        execute_native.assert_not_called()
+        local_executor.assert_called_once_with()
+        wrapper._workflow.report_outcome.assert_not_called()
 
 
 class TestDurableToolMemory:

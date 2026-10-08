@@ -1,0 +1,45 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "agent-engine-sdk-openai-agents"
+version = "0.11.8"
+description = "OpenAI Agents SDK adapter for Atlas Agent Engine"
+readme = "README.md"
+license = {text = "Apache-2.0"}
+requires-python = ">=3.11"
+dependencies = [
+    "agent-engine-sdk==0.11.8",
+    "agent-engine-runner-shared[mongodb,tracing]==0.11.8",
+    # Durable state stores this SDK's native input items; change the pin only
+    # together with the Python Lite profile lock and the item validation.
+    "openai-agents==0.22.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=9.1.1",
+    "pytest-asyncio>=0.23",
+    "pyright>=1.1.414",
+    "ruff>=0.9",
+]
+
+[tool.hatch.build.targets.wheel]
+only-include = ["src/agent_engine_sdk_openai_agents", "README.md", "LICENSE"]
+sources = ["src"]
+
+[tool.pyright]
+pythonVersion = "3.11"
+pythonPlatform = "All"
+include = ["src"]
+strict = ["src"]
+typeCheckingMode = "strict"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.uv.sources]
+agent-engine-sdk = { workspace = true }
+agent-engine-runner-shared = { workspace = true }

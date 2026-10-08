@@ -25,6 +25,8 @@ import type { BaseCheckpointSaver } from "@langchain/langgraph";
 import { validateSubagentTree } from "./subagents.js";
 import { checkpointerForDeepAgent } from "./deep_agent_checkpointer.js";
 import { createDurableDeepAgentMiddleware } from "./durable_deep_agent.js";
+import { rejectNodeRetryPolicies } from "./durable_subgraphs.js";
+import { UnsupportedDurableGraphError } from "./platform_checkpointer.js";
 
 /** Names of compiled subagent specs whose runnable carries its own checkpointer. */
 function compiledSubagentCheckpointerNames(
@@ -37,6 +39,27 @@ function compiledSubagentCheckpointerNames(
       (spec as { runnable?: { checkpointer?: unknown } }).runnable
         ?.checkpointer != null
     ) {
+      names.add((spec as { name: string }).name);
+    }
+  }
+  return names;
+}
+
+/**
+ * Name the compiled subagents whose graphs set a retry policy. A compiled
+ * subagent runs inside the Deep Agent's task tool, not as a node of the agent
+ * graph, so the durable session's own check never reaches it.
+ */
+function compiledSubagentRetryPolicyNames(
+  subagents: readonly AnySubAgent[] | undefined,
+): Set<string> {
+  const names = new Set<string>();
+  for (const spec of subagents ?? []) {
+    if (!("runnable" in spec)) continue;
+    try {
+      rejectNodeRetryPolicies((spec as { runnable?: unknown }).runnable);
+    } catch (error) {
+      if (!(error instanceof UnsupportedDurableGraphError)) throw error;
       names.add((spec as { name: string }).name);
     }
   }
@@ -65,7 +88,7 @@ export interface CreateAgentEngineDeepAgentOptions {
   skillsBaseDir?: string;
 }
 
-function loadSkillPaths(paths: string[], baseDir?: string): string[] {
+function loadSkillPaths(paths: readonly string[], baseDir?: string): string[] {
   if (baseDir === undefined) return [...paths];
   return paths.map((skillPath) =>
     path.isAbsolute(skillPath) ? skillPath : path.join(baseDir, skillPath),
@@ -85,7 +108,7 @@ function loadSubagentSkillPaths(
     if ("runnable" in spec || "graphId" in spec || !("skills" in spec)) {
       return spec;
     }
-    const skills = (spec as { skills?: string[] }).skills;
+    const skills = (spec as { skills?: readonly string[] }).skills;
     if (skills === undefined) return spec;
     return { ...spec, skills: loadSkillPaths(skills, baseDir) };
   });
@@ -149,6 +172,9 @@ export function createAgentEngineDeepAgent(
     middleware: [
       createDurableDeepAgentMiddleware({
         unsupportedSubagentNames: compiledSubagentCheckpointerNames(
+          options.subagents,
+        ),
+        retryPolicySubagentNames: compiledSubagentRetryPolicyNames(
           options.subagents,
         ),
       }),

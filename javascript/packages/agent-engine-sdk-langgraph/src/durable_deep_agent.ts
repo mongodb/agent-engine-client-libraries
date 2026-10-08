@@ -104,9 +104,12 @@ function stampTaskResultMessageId(
 
 export function createDurableDeepAgentMiddleware(options: {
   unsupportedSubagentNames?: ReadonlySet<string>;
+  retryPolicySubagentNames?: ReadonlySet<string>;
 }) {
   const unsupportedSubagentNames =
     options.unsupportedSubagentNames ?? new Set();
+  const retryPolicySubagentNames =
+    options.retryPolicySubagentNames ?? new Set();
 
   const boundaryFromTask = (
     toolCall: unknown,
@@ -128,6 +131,13 @@ export function createDurableDeepAgentMiddleware(options: {
         `compiled Deep Agent subagent '${taskCall.subagentName}' must use ` +
           "checkpointer=None; independent child checkpointers are not supported " +
           "during durable execution",
+      );
+    }
+    if (retryPolicySubagentNames.has(taskCall.subagentName)) {
+      throw new UnsupportedDurableGraphError(
+        `compiled Deep Agent subagent '${taskCall.subagentName}' sets a ` +
+          "retry policy; node retry policies are not supported during " +
+          "durable execution",
       );
     }
     return {

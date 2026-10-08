@@ -24,21 +24,10 @@ import threading
 import time
 from collections import defaultdict
 from contextlib import contextmanager
-from dataclasses import dataclass, field
-from datetime import datetime
+from dataclasses import dataclass
 from typing import Any, Dict, Generator, List, Optional
 
 logger = logging.getLogger(__name__)
-
-
-@dataclass
-class MetricPoint:
-    """Single metric data point."""
-
-    name: str
-    value: float
-    timestamp: datetime = field(default_factory=datetime.utcnow)
-    labels: Dict[str, str] = field(default_factory=dict)
 
 
 @dataclass

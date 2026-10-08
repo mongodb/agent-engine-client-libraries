@@ -198,10 +198,16 @@ export abstract class ExecutionSession {
 
   abstract prepareRun(): Promise<PreparedRun>;
 
+  /**
+   * `raised` holds the interrupts the latest graph run reported. Durable
+   * settlement uses it to tell a live pause from an answered interrupt that
+   * LangGraph's state still lists for a task that has since finished.
+   */
   abstract invokeInterrupt(
     config: RunnableConfig,
     response: string,
     messages: readonly unknown[],
+    raised: readonly Interrupt[],
   ): Promise<Command | AgentOutput | null>;
 
   abstract streamInterrupt(

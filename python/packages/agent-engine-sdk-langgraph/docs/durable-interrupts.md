@@ -70,15 +70,17 @@ A direct graph node does not cross the secure Tool wrapper and therefore has no
 pre-existing activity. When LangGraph writes the typed `Interrupt` to the root
 checkpoint, `PlatformCheckpointer` records a synthetic
 `langgraph.interrupt` activity. Its position uses the root `task_path`, which is
-stable across replacement attempts, plus the interrupt's order in that root
-checkpoint write. The attempt-local native interrupt id is never used as the
-durable position. Nested checkpoint writes are ignored until LangGraph projects
-the interrupt to the root checkpoint, preventing duplicate synthetic
-activities. If a resumed task reaches another direct `interrupt()` before it
-can commit a root checkpoint, the adapter rejects it explicitly because one
-graph-task invocation does not yet assign stable positions to sequential direct
-interrupts. This is separate from a later durable activity establishing a new
-suspension frontier in the same open root step.
+stable across replacement attempts, plus the interrupt's order among that
+task's direct pauses. Every pause in one task carries the same attempt-local
+native interrupt id, so that id is never used as the durable position. Answers
+consumed by an interrupting tool in the same task do not count: a later attempt
+replays that tool without re-entering its interrupt. Nested checkpoint writes
+are ignored until LangGraph projects the interrupt to the root checkpoint,
+preventing duplicate synthetic activities. A task that pauses again after its answer therefore
+records its next pause at the next position, and a replacement attempt feeds
+the recorded answers back one pause at a time. This is separate from a later
+durable activity establishing a new suspension frontier in the same open root
+step.
 
 LangGraph catches the exception, pauses the task, and writes its native
 interrupt to scratch. The durable session uses synchronous checkpoint
@@ -171,9 +173,11 @@ iteration before the next iteration invokes the resume command.
 - Each interrupted durable activity invocation must raise one native interrupt.
   If its callback reaches another interrupt after the recorded answer is
   supplied, reconstruction fails before another frontier or outcome is written.
-- A graph task may expose only one sequential direct interrupt before its root
-  checkpoint commits. Reaching another after consuming a resume value fails
-  explicitly rather than extending the recorded suspension frontier.
+- A graph task may call `interrupt()` several times in sequence. Each pause is
+  its own suspension frontier, answered separately, and each receives only its
+  own recorded answer on replay. LangGraph's state keeps a finished parallel
+  task's answered interrupt until the superstep completes; settlement does not
+  offer it again.
 - A later graph task, including another node in the same compiled child graph,
   may establish another suspension frontier in the still-open root step after
   the earlier frontier resolves.
@@ -182,8 +186,12 @@ iteration before the next iteration invokes the resume command.
   exactly across the protobuf boundary.
 - Remote Tool Pod interrupts and static `interrupt_before` /
   `interrupt_after` pauses are rejected for durable workflows.
-- The legacy `app.suspend` path remains separate while migration to framework
-  native interrupts is in progress.
+- The legacy `app.suspend()` wait is rejected on durable activities: a tool
+  that returns its payload fails with guidance to use `interrupt()`. Every
+  rejection shares the `app.suspend() is not supported` prefix; the tail names
+  `langgraph.types.interrupt()` in the adapter and "the framework's native
+  interrupt" in the Orchestration Engine. The legacy path remains available on
+  native-checkpoint sessions until its retirement.
 
 ## Call-site map
 

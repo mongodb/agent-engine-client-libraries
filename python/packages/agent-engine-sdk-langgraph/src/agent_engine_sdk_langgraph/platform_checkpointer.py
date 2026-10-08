@@ -452,10 +452,10 @@ class PlatformCheckpointer(BaseCheckpointSaver[str]):
             for interrupt in activity.control_flow.args[0]
         )
         direct_interrupts = [
-            (index, interrupt)
+            interrupt
             for channel, value in writes
             if channel == "__interrupt__" and isinstance(value, (list, tuple))
-            for index, interrupt in enumerate(value)
+            for interrupt in value
             if isinstance(interrupt, Interrupt)
             and interrupt.id not in owned_interrupt_ids
         ]
@@ -468,25 +468,22 @@ class PlatformCheckpointer(BaseCheckpointSaver[str]):
 
         # Interrupt.id is regenerated with the replacement task namespace, so
         # it cannot be the durable position. The task path is stable within its
-        # durable operation boundary across attempts.
-        resume_count = max(
-            (
-                len(value) if isinstance(value, (list, tuple)) else 1
-                for channel, value in writes
-                if channel == "__resume__"
-            ),
-            default=0,
-        )
-        if resume_count:
-            raise UnsupportedDurableGraphError(
-                "durable workflow does not support multiple sequential direct "
-                "interrupts in one graph task"
-            )
-        existing_positions = {
+        # durable operation boundary across attempts. Every pause in one task
+        # shares one native id, so a task that pauses again takes the next
+        # ordinal after the direct pauses it already recorded. Answers consumed
+        # by an interrupting tool in the same task are not counted: a later
+        # attempt replays that tool without re-entering its interrupt.
+        step_ordinal = current_step_ordinal()
+        waiting_positions = {
             activity.command.position.SerializeToString(deterministic=True)
-            for activity in interrupted_activities(current_step_ordinal())
+            for activity in interrupted_activities(step_ordinal)
         }
-        for index, interrupt in direct_interrupts:
+        recorded_direct = [
+            activity
+            for activity in interrupted_activities(step_ordinal, include_answered=True)
+            if is_direct_interrupt_activity(activity)
+        ]
+        for interrupt in direct_interrupts:
             operation_path = OperationPath()
             if configurable.get("checkpoint_ns"):
                 # The namespace identifies an attempt-local child invocation,
@@ -501,20 +498,55 @@ class PlatformCheckpointer(BaseCheckpointSaver[str]):
                     ordinal=1,
                 )
             )
+            same_task = [
+                activity
+                for activity in recorded_direct
+                if activity.command.position.operation_path == operation_path
+            ]
+            waiting = [
+                activity
+                for activity in same_task
+                if activity.command.position.SerializeToString(deterministic=True)
+                in waiting_positions
+            ]
+            same = next(
+                (
+                    activity
+                    for activity in waiting
+                    if isinstance(activity.control_flow, GraphInterrupt)
+                    and activity.control_flow.args[0][0].id == interrupt.id
+                ),
+                None,
+            )
+            if same is not None:
+                # The same waiting pause written again. Its recorded input is
+                # the first value, so a different one cannot be reported.
+                if same.control_flow.args[0][0].value != interrupt.value:
+                    raise UnsupportedDurableGraphError(
+                        "LangGraph returned conflicting values for a waiting "
+                        "durable interrupt"
+                    )
+                continue
+            if waiting:
+                raise UnsupportedDurableGraphError(
+                    "durable graph task paused again before its waiting "
+                    "interrupt was answered"
+                )
             command = build_activity_command(
                 attempt=attempt,
                 kind=ACTIVITY_KIND_TOOL,
                 name=_DIRECT_INTERRUPT_ACTIVITY_NAME,
-                activity_ordinal=index + 1,
+                activity_ordinal=len(same_task) + 1,
                 operation_path=operation_path,
                 semantic_input={"value": interrupt.value},
             )
-            position_key = command.position.SerializeToString(deterministic=True)
-            if position_key in existing_positions:
-                continue
+            control_flow = GraphInterrupt((interrupt,))
             record_observed_activity(command.position)
-            record_interrupted_activity(command, GraphInterrupt((interrupt,)))
-            existing_positions.add(position_key)
+            record_interrupted_activity(command, control_flow)
+            recorded_direct.append(InterruptedActivity(command, control_flow))
+            waiting_positions.add(
+                command.position.SerializeToString(deterministic=True)
+            )
 
     # ----- BaseCheckpointSaver: sync -----
 

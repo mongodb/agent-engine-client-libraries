@@ -19,6 +19,7 @@ import {
   BaseChatModel as _BaseChatModel,
 } from "@langchain/core/language_models/chat_models";
 import type { BaseChatModelCallOptions } from "@langchain/core/language_models/chat_models";
+import type { BaseLanguageModelInput } from "@langchain/core/language_models/base";
 import { ChatGenerationChunk, type ChatResult } from "@langchain/core/outputs";
 import {
   convertToOpenAITool,
@@ -29,7 +30,11 @@ import {
   LLMInvocationOptions,
   LLMToolSchema,
 } from "@mongodb-js/agent-engine-sdk";
+import type { RunnableConfig } from "@langchain/core/runnables";
+import { AsyncLocalStorageProviderSingleton } from "@langchain/core/singletons";
+import { getConfig } from "@langchain/langgraph";
 import {
+  currentAttemptContext,
   type DurableMemoryState,
   getLogger,
   getTracer,
@@ -40,6 +45,7 @@ import {
   logPolicyBlocked,
   logSeparator,
   Metrics,
+  nextScopedCallIndex,
   MODEL_REQUEST_PREPARE,
   MODEL_RESPONSE_PROCESS,
   OPENINFERENCE_SPAN_KIND,
@@ -55,6 +61,59 @@ import {
 import { stampDeepAgentMessageIds } from "./durable_deep_agent.js";
 
 const logger = getLogger("agent_engine_sdk_langgraph.secure_llm");
+
+/**
+ * Name a wrapped LLM call by its graph task and its index in this run.
+ *
+ * LangGraph re-executes a node from the top, in the same attempt, each time one
+ * of its interrupts is answered. The task id is the same on every such run and
+ * each run gets a new scratchpad, so counting calls per scratchpad names the
+ * same call every time and its recorded activity replays instead of being
+ * dispatched again. Node retry policies, the other way a node re-runs in
+ * place, are rejected for durable graphs.
+ *
+ * Outside a durable attempt or a graph task there is nothing to re-execute,
+ * and the proxy keeps its operational-step key.
+ */
+function taskRunActivityKey(taskConfig?: RunnableConfig): string | null {
+  if (currentAttemptContext() === null) return null;
+  let config: RunnableConfig | undefined = taskConfig;
+  if (config === undefined) {
+    try {
+      config = getConfig();
+    } catch {
+      return null;
+    }
+  }
+  const configurable = config?.configurable;
+  const taskId = configurable?.["__pregel_task_id"];
+  const scratchpad = configurable?.["__pregel_scratchpad"];
+  if (
+    typeof taskId !== "string" ||
+    taskId === "" ||
+    typeof scratchpad !== "object" ||
+    scratchpad === null
+  ) {
+    return null;
+  }
+  return `llm:${taskId}:${nextScopedCallIndex(scratchpad)}`;
+}
+
+/**
+ * Call option that carries the activity key into the streaming generator.
+ *
+ * `Runnable.stream` consumes the generator outside the graph task's async
+ * context, so the task config is only visible where `_streamIterator` receives
+ * it as an argument.
+ */
+const ACTIVITY_KEY_OPTION = "agentEngineActivityKey";
+
+function callActivityKey(options: unknown): string | null {
+  const supplied = (options as Record<string, unknown> | undefined)?.[
+    ACTIVITY_KEY_OPTION
+  ];
+  return typeof supplied === "string" ? supplied : taskRunActivityKey();
+}
 
 // Re-export for backward compatibility (tests import from here)
 export { LLMInvocationError, PolicyDeniedException };
@@ -330,6 +389,7 @@ export class SecureWrappedLLM extends _BaseChatModel {
     const wrapper = this.getWrapperOrRaise();
     const tracer = getTracer("agent-engine-sdk-langgraph.secure_llm");
 
+    const activityKey = callActivityKey(options);
     const { step, platformMessages, stop, invocationOptions, proxy } =
       tracer.startActiveSpan(
         MODEL_REQUEST_PREPARE,
@@ -363,6 +423,7 @@ export class SecureWrappedLLM extends _BaseChatModel {
               boundToolChoice: this.boundToolChoice,
               operationalSteps: wrapper.operationalSteps,
               durableMemory: wrapper.durableMemory,
+              guardrailReviewProtocol: true,
             });
 
             return { step, platformMessages, stop, invocationOptions, proxy };
@@ -386,6 +447,7 @@ export class SecureWrappedLLM extends _BaseChatModel {
         step,
         stop !== undefined ? [...stop] : null,
         invocationOptions ?? null,
+        activityKey,
       )) {
         chunks.push(chunk);
       }
@@ -439,6 +501,47 @@ export class SecureWrappedLLM extends _BaseChatModel {
     );
   }
 
+  override async *_streamIterator(
+    input: BaseLanguageModelInput,
+    options?: Partial<this["ParsedCallOptions"]>,
+  ): AsyncGenerator<AIMessageChunk> {
+    // LangGraph passes the full task config here, so it is a RunnableConfig.
+    const config = options as RunnableConfig | undefined;
+    const activityKey = taskRunActivityKey(config);
+    const keyed: Partial<this["ParsedCallOptions"]> | undefined =
+      activityKey === null
+        ? options
+        : ({ ...options, [ACTIVITY_KEY_OPTION]: activityKey } as Partial<
+            this["ParsedCallOptions"]
+          >);
+    const inner = super._streamIterator(input, keyed);
+    if (config === undefined) {
+      yield* inner;
+      return;
+    }
+    // `Runnable.stream` advances this generator outside the graph task's async
+    // context, so a pause raised while streaming (a guardrail review after a
+    // durable activity) would not find LangGraph's config. Restore the task
+    // config around every advancement so `interrupt()` can suspend and resume.
+    try {
+      while (true) {
+        const next = await AsyncLocalStorageProviderSingleton.runWithConfig(
+          config,
+          () => inner.next(),
+        );
+        if (next.done === true) return;
+        yield next.value;
+      }
+    } finally {
+      // Closing the consumer must close the inner stream as `yield*`
+      // delegation would: it cancels an in-flight SSE reader and lets a
+      // durable activity settle as abandoned.
+      await AsyncLocalStorageProviderSingleton.runWithConfig(config, () =>
+        inner.return(undefined),
+      );
+    }
+  }
+
   override async *_streamResponseChunks(
     messages: BaseMessage[],
     options: this["ParsedCallOptions"],
@@ -473,6 +576,7 @@ export class SecureWrappedLLM extends _BaseChatModel {
 
     const tracer = getTracer("agent-engine-sdk-langgraph.secure_llm");
 
+    const activityKey = callActivityKey(options);
     const { step, platformMessages, stop, invocationOptions, proxy } =
       tracer.startActiveSpan(
         MODEL_REQUEST_PREPARE,
@@ -506,6 +610,7 @@ export class SecureWrappedLLM extends _BaseChatModel {
               boundToolChoice: this.boundToolChoice,
               operationalSteps: wrapper.operationalSteps,
               durableMemory: wrapper.durableMemory,
+              guardrailReviewProtocol: true,
             });
 
             return { step, platformMessages, stop, invocationOptions, proxy };
@@ -531,6 +636,7 @@ export class SecureWrappedLLM extends _BaseChatModel {
         step,
         stop !== undefined ? [...stop] : null,
         invocationOptions ?? null,
+        activityKey,
       )) {
         yield llmStreamChunkToGenerationChunk(
           sdkChunk as Parameters<typeof llmStreamChunkToGenerationChunk>[0],
@@ -601,6 +707,7 @@ function extractKwargs(
     "control",
     "durability",
     "executionInfo",
+    ACTIVITY_KEY_OPTION,
   ]);
   const result: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(

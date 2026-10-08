@@ -519,40 +519,6 @@ def record_current_memory_metadata(
 
 
 # =========================================================================
-# Validation Context (for passing execution identity to guardrails)
-# =========================================================================
-
-
-@dataclass(frozen=True)
-class ValidationContext:
-    """Execution identity passed to guardrails for audit logging."""
-
-    session_id: str = ""
-    execution_id: str = ""
-    user_id: str = ""
-    workspace_id: str = ""
-
-    def to_dict(self) -> Dict[str, str]:
-        """Serialize to a dict for inclusion in HTTP payloads."""
-        return {
-            "session_id": self.session_id,
-            "execution_id": self.execution_id,
-            "user_id": self.user_id,
-            "workspace_id": self.workspace_id,
-        }
-
-
-def get_validation_context() -> ValidationContext:
-    """Build a ValidationContext from the current execution contextvars."""
-    return ValidationContext(
-        session_id=current_session_id.get() or "",
-        execution_id=current_execution_id.get() or "",
-        user_id=current_user_id.get() or "",
-        workspace_id=current_workspace_id.get() or "",
-    )
-
-
-# =========================================================================
 # Customer-origin logging (causal attribution, not security provenance)
 # =========================================================================
 

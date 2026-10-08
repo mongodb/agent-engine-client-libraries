@@ -490,7 +490,7 @@ new LLMInvocationOptions(data): LLMInvocationOptions;
 
 | Parameter | Type |
 | :------ | :------ |
-| `data` | \{ \[`key`: `string`\]: `unknown`; `frequency_penalty?`: `number`; `max_tokens?`: `number`; `parallel_tool_calls?`: `boolean`; `presence_penalty?`: `number`; `reasoning_effort?`: `string`; `response_format?`: [`JsonValue`](#api-jsonvalue); `seed?`: `number`; `timeout?`: `number`; `top_k?`: `number`; `top_p?`: `number`; \} |
+| `data` | \{ \[`key`: `string`\]: `unknown`; `frequency_penalty?`: `number`; `max_tokens?`: `number`; `parallel_tool_calls?`: `boolean`; `presence_penalty?`: `number`; `reasoning_effort?`: `string`; `response_format?`: [`JsonValue`](#api-jsonvalue); `seed?`: `number`; `timeout?`: `number`; `top_k?`: `number`; `top_p?`: `number`; `verbosity?`: `string`; \} |
 | `data.frequency_penalty?` | `number` |
 | `data.max_tokens?` | `number` |
 | `data.parallel_tool_calls?` | `boolean` |
@@ -501,6 +501,7 @@ new LLMInvocationOptions(data): LLMInvocationOptions;
 | `data.timeout?` | `number` |
 | `data.top_k?` | `number` |
 | `data.top_p?` | `number` |
+| `data.verbosity?` | `string` |
 
 **Returns**
 
@@ -521,6 +522,7 @@ new LLMInvocationOptions(data): LLMInvocationOptions;
 | <a id="api-property-timeout"></a> `timeout?` | `readonly` | `number` | - |
 | <a id="api-property-topk"></a> `topK?` | `readonly` | `number` | - |
 | <a id="api-property-topp"></a> `topP?` | `readonly` | `number` | - |
+| <a id="api-property-verbosity"></a> `verbosity?` | `readonly` | `string` | - |
 
 #### Methods
 
@@ -642,12 +644,13 @@ new LLMTokenUsage(data): LLMTokenUsage;
 
 | Parameter | Type |
 | :------ | :------ |
-| `data` | \{ `completion_tokens?`: `number`; `input_tokens?`: `number`; `model?`: `string`; `output_tokens?`: `number`; `prompt_tokens?`: `number`; `total_tokens?`: `number`; \} |
+| `data` | \{ `completion_tokens?`: `number`; `input_tokens?`: `number`; `model?`: `string`; `output_tokens?`: `number`; `prompt_tokens?`: `number`; `reasoning_tokens?`: `number`; `total_tokens?`: `number`; \} |
 | `data.completion_tokens?` | `number` |
 | `data.input_tokens?` | `number` |
 | `data.model?` | `string` |
 | `data.output_tokens?` | `number` |
 | `data.prompt_tokens?` | `number` |
+| `data.reasoning_tokens?` | `number` |
 | `data.total_tokens?` | `number` |
 
 **Returns**
@@ -656,14 +659,15 @@ new LLMTokenUsage(data): LLMTokenUsage;
 
 #### Properties
 
-| Property | Modifier | Type |
-| :------ | :------ | :------ |
-| <a id="api-property-completiontokens"></a> `completionTokens?` | `readonly` | `number` |
-| <a id="api-property-inputtokens"></a> `inputTokens?` | `readonly` | `number` |
-| <a id="api-property-model"></a> `model?` | `readonly` | `string` |
-| <a id="api-property-outputtokens"></a> `outputTokens?` | `readonly` | `number` |
-| <a id="api-property-prompttokens"></a> `promptTokens?` | `readonly` | `number` |
-| <a id="api-property-totaltokens"></a> `totalTokens?` | `public` | `number` |
+| Property | Modifier | Type | Description |
+| :------ | :------ | :------ | :------ |
+| <a id="api-property-completiontokens"></a> `completionTokens?` | `readonly` | `number` | - |
+| <a id="api-property-inputtokens"></a> `inputTokens?` | `readonly` | `number` | - |
+| <a id="api-property-model"></a> `model?` | `readonly` | `string` | - |
+| <a id="api-property-outputtokens"></a> `outputTokens?` | `readonly` | `number` | - |
+| <a id="api-property-prompttokens"></a> `promptTokens?` | `readonly` | `number` | - |
+| <a id="api-property-reasoningtokens"></a> `reasoningTokens?` | `readonly` | `number` | Output tokens the model spent reasoning; part of the output count. |
+| <a id="api-property-totaltokens"></a> `totalTokens?` | `public` | `number` | - |
 
 #### Methods
 
@@ -3165,6 +3169,7 @@ const LLMInvocationOptionsSchema: ZodPreprocess<ZodPipe<ZodObject<{
   timeout: ZodOptional<ZodNumber>;
   top_k: ZodOptional<ZodNumber>;
   top_p: ZodOptional<ZodNumber>;
+  verbosity: ZodOptional<ZodString>;
 }, $loose>, ZodTransform<LLMInvocationOptions, {
 [key: string]: unknown;
   frequency_penalty?: number;
@@ -3177,6 +3182,7 @@ const LLMInvocationOptionsSchema: ZodPreprocess<ZodPipe<ZodObject<{
   timeout?: number;
   top_k?: number;
   top_p?: number;
+  verbosity?: string;
 }>>>;
 ```
 
@@ -3216,6 +3222,7 @@ const LLMTokenUsageSchema: ZodPreprocess<ZodPipe<ZodObject<{
   model: ZodOptional<ZodString>;
   output_tokens: ZodOptional<ZodNumber>;
   prompt_tokens: ZodOptional<ZodNumber>;
+  reasoning_tokens: ZodOptional<ZodNumber>;
   total_tokens: ZodOptional<ZodNumber>;
 }, $strip>, ZodTransform<LLMTokenUsage, {
   completion_tokens?: number;
@@ -3223,6 +3230,7 @@ const LLMTokenUsageSchema: ZodPreprocess<ZodPipe<ZodObject<{
   model?: string;
   output_tokens?: number;
   prompt_tokens?: number;
+  reasoning_tokens?: number;
   total_tokens?: number;
 }>>>;
 ```

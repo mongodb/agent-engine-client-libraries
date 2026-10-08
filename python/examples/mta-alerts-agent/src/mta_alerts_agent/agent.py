@@ -1257,7 +1257,7 @@ def _build_llm():
 
         kwargs: dict = {
             "api_key": openai_key,
-            "model": os.environ.get("OPENAI_MODEL", "gpt-5.4-mini"),
+            "model": os.environ.get("OPENAI_MODEL", "gpt-5.6-luna"),
         }
         if openai_base_url:
             if "grove-foundry" in openai_base_url:

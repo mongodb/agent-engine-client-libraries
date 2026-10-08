@@ -10,7 +10,10 @@ from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 
-from agent_engine_sdk_langgraph.durable_subgraphs import DurableSubgraphResolver
+from agent_engine_sdk_langgraph.durable_subgraphs import (
+    DurableSubgraphResolver,
+    reject_node_retry_policies,
+)
 from agent_engine_sdk_langgraph.platform_checkpointer import (
     UnsupportedDurableGraphError,
 )
@@ -88,6 +91,61 @@ def test_rejects_child_owned_checkpointer_only_when_validated() -> None:
 
     with pytest.raises(UnsupportedDurableGraphError, match="checkpointer=None"):
         resolver.validate()
+
+
+def test_rejects_a_node_retry_policy_at_any_depth() -> None:
+    from langgraph.types import RetryPolicy
+
+    def graph_with_retry() -> StateGraph:
+        builder = StateGraph(_State)
+        builder.add_node(
+            "review_policy", lambda state: state, retry_policy=RetryPolicy()
+        )
+        builder.add_edge(START, "review_policy")
+        builder.add_edge("review_policy", END)
+        return builder
+
+    with pytest.raises(
+        UnsupportedDurableGraphError, match="'review_policy' sets a retry policy"
+    ):
+        reject_node_retry_policies(graph_with_retry().compile())
+
+    with pytest.raises(
+        UnsupportedDurableGraphError,
+        match="'case_investigation/review_policy' sets a retry policy",
+    ):
+        reject_node_retry_policies(
+            _compiled_node("case_investigation", graph_with_retry().compile())
+        )
+
+    # A compiled graph's own policy is the default for all its nodes.
+    defaulted = StateGraph(_State)
+    defaulted.add_node("review_policy", lambda state: state)
+    defaulted.add_edge(START, "review_policy")
+    defaulted.add_edge("review_policy", END)
+    compiled = defaulted.compile()
+    compiled.retry_policy = (RetryPolicy(),)
+    with pytest.raises(
+        UnsupportedDurableGraphError, match="'root' sets a default retry policy"
+    ):
+        reject_node_retry_policies(compiled)
+
+    # So is a policy every node inherits from the builder's node defaults.
+    inherited = StateGraph(_State)
+    inherited.set_node_defaults(retry_policy=RetryPolicy())
+    inherited.add_node("review_policy", lambda state: state)
+    inherited.add_edge(START, "review_policy")
+    inherited.add_edge("review_policy", END)
+    with pytest.raises(
+        UnsupportedDurableGraphError, match="'review_policy' sets a retry policy"
+    ):
+        reject_node_retry_policies(inherited.compile())
+
+    plain = StateGraph(_State)
+    plain.add_node("review_policy", lambda state: state)
+    plain.add_edge(START, "review_policy")
+    plain.add_edge("review_policy", END)
+    reject_node_retry_policies(plain.compile())
 
 
 def test_rejects_per_thread_child_checkpointer_with_actionable_error() -> None:

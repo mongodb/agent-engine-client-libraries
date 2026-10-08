@@ -13,16 +13,8 @@ from agent_engine_runner_shared.context import (
     get_current_session_id,
     get_current_trace_id,
 )
-from agent_engine_runner_shared.logging import ExecutionStatus
 from agent_engine_runner_shared.server import LLMRegistryLoadError, ToolServer
 from agent_engine_runner_shared.utils import format_llm_error
-
-
-def test_execution_status_values():
-    """Test ExecutionStatus enum values."""
-    assert ExecutionStatus.STARTED == "started"
-    assert ExecutionStatus.SUCCESS == "success"
-    assert ExecutionStatus.ERROR == "error"
 
 
 class TestToolServerOnStartup:

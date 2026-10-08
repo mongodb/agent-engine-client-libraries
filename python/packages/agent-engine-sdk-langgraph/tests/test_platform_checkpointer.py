@@ -9,6 +9,7 @@ from typing import Annotated, Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from google.protobuf import json_format
 from google.protobuf.struct_pb2 import Value
 from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.runnables import RunnableConfig
@@ -272,6 +273,30 @@ class TestDirectInterruptActivity:
                 ("child", 1),
                 ("langgraph.task:~__pregel_pull, review", 1),
             ]
+
+    def test_waiting_interrupt_written_again_must_keep_its_value(self) -> None:
+        with attempt_context_scope(_attempt()):
+            attempt = current_attempt_context()
+            assert attempt is not None
+            task_path = "~__pregel_pull, review"
+
+            def write(value: str) -> None:
+                PlatformCheckpointer._record_direct_interrupts(
+                    attempt,
+                    _config("ignored"),
+                    [("__interrupt__", (Interrupt(value=value, id="native-1"),))],
+                    task_path,
+                )
+
+            write("wait")
+            write("wait")
+            assert len(interrupted_activities(1)) == 1
+
+            with pytest.raises(
+                UnsupportedDurableGraphError, match="conflicting values"
+            ):
+                write("changed")
+            assert len(interrupted_activities(1)) == 1
 
     def test_deepest_write_owns_interrupt_through_every_ancestor(self) -> None:
         with attempt_context_scope(_attempt()):
@@ -1242,8 +1267,18 @@ class TestAgentDurableLifecycle:
         ] == ["source answer", "branch question", "branch answer"]
 
     @pytest.mark.anyio
+    @pytest.mark.parametrize(
+        "pause_value",
+        [
+            {"suspend_reason": "approve?"},
+            # An application may pause with any value. One that looks like the
+            # platform's guardrail review wait is still the application's own
+            # pause, and its answer is still part of the conversation.
+            {"guardrail_review": {"review_id": "review-1"}},
+        ],
+    )
     async def test_direct_interrupt_suspends_resumes_and_closes_memory_once(
-        self, monkeypatch: pytest.MonkeyPatch
+        self, monkeypatch: pytest.MonkeyPatch, pause_value: dict[str, Any]
     ) -> None:
         from langgraph.graph import MessagesState
         from langgraph.types import interrupt
@@ -1265,7 +1300,7 @@ class TestAgentDurableLifecycle:
         graph: StateGraph[Any] = StateGraph(MessagesState)
 
         def node(state: Any) -> Any:
-            decision = interrupt({"suspend_reason": "approve?"})
+            decision = interrupt(pause_value)
             return {"messages": [AIMessage(content=f"decision:{decision}")]}
 
         graph.add_node("node", node)
@@ -1296,7 +1331,7 @@ class TestAgentDurableLifecycle:
             assert suspended.response["interrupts"] == [
                 {
                     "id": "activity-1",
-                    "value": {"suspend_reason": "approve?"},
+                    "value": pause_value,
                 }
             ]
             assert memory_workflow.commands == []
@@ -1354,7 +1389,317 @@ class TestAgentDurableLifecycle:
         }
 
     @pytest.mark.anyio
-    async def test_second_direct_interrupt_in_one_task_fails_explicitly(
+    @pytest.mark.parametrize("method", ["invoke", "stream"])
+    @pytest.mark.parametrize("compiled_child", [False, True])
+    async def test_one_task_interrupts_several_times_across_attempts(
+        self, monkeypatch: pytest.MonkeyPatch, method: str, compiled_child: bool
+    ) -> None:
+        from langgraph.graph import MessagesState
+        from langgraph.types import interrupt
+        from agent_engine_sdk import AgentInput
+        from agent_engine_sdk_langgraph import durable_session as durable_session_module
+        from agent_engine_sdk_langgraph import (
+            platform_checkpointer as checkpointer_module,
+        )
+        from agent_engine_sdk_langgraph.durable_subgraphs import DurableSubgraphResolver
+
+        client = _InterruptWorkflowClient()
+        monkeypatch.setattr(
+            checkpointer_module, "AsyncWorkflowClient", lambda _: client
+        )
+        monkeypatch.setattr(
+            durable_session_module, "AsyncWorkflowClient", lambda _: client
+        )
+        node_runs = 0
+        received: list[list[Any]] = []
+
+        def node(state: Any) -> Any:
+            nonlocal node_runs
+            node_runs += 1
+            first = interrupt({"pause": 1})
+            second = interrupt({"pause": 2, "first": first})
+            third = interrupt({"pause": 3, "second": second})
+            received.append([first, second, third])
+            return {"messages": [AIMessage(content=f"{first}|{second}|{third}")]}
+
+        inner: StateGraph[Any] = StateGraph(MessagesState)
+        inner.add_node("node", node)
+        inner.add_edge(START, "node")
+        inner.add_edge("node", END)
+        if compiled_child:
+            root: StateGraph[Any] = StateGraph(MessagesState)
+            root.add_node("child", inner.compile())
+            root.add_edge(START, "child")
+            root.add_edge("child", END)
+        else:
+            root = inner
+        compiled = root.compile(
+            checkpointer=PlatformCheckpointer(native=InMemorySaver())
+        )
+        agent = LangGraphBaseAgent(
+            compiled,
+            durable_subgraphs=(
+                DurableSubgraphResolver(compiled) if compiled_child else None
+            ),
+        )
+        ctx = RequestContext(user_id="user-1", session_id="session-1")
+        agent_input = AgentInput(payload={"message": "hi"})
+
+        async def run(
+            attempt: AttemptContext, resume: dict[str, str] | None = None
+        ) -> dict[str, Any]:
+            run_ctx = ctx
+            if resume is not None:
+                run_ctx = ctx.model_copy(update={"resume": True, "resume_data": resume})
+            with attempt_context_scope(attempt):
+                if method == "invoke":
+                    output = await agent.invoke(run_ctx, agent_input)
+                    assert isinstance(output.response, dict)
+                    return output.response
+                events = [event async for event in agent.stream(run_ctx, agent_input)]
+                assert len(events) == 1
+                assert events[0].event in {"suspend", "result"}
+                assert isinstance(events[0].data, dict)
+                return events[0].data
+
+        url_token = current_oe_url.set("http://oe")
+        try:
+            result = await run(_attempt())
+            answered: list[str] = []
+            for pause in (1, 2, 3):
+                (pending,) = cast(list[dict[str, Any]], result["interrupts"])
+                assert pending["value"]["pause"] == pause
+                pause_id = cast(str, pending["id"])
+                assert pause_id not in answered
+                answer = f"answer-{pause}"
+                client.resolved_values[pause_id] = answer
+                answered.append(pause_id)
+                # Each answer arrives on a fresh attempt: nothing survives from
+                # the previous process except OE history.
+                replacement = _attempt(
+                    attempt_id=f"attempt-{pause + 1}", fencing_token=pause + 1
+                )
+                replacement.replay_mode = True
+                result = await run(replacement, {pause_id: answer})
+        finally:
+            current_oe_url.reset(url_token)
+
+        if method == "invoke":
+            assert result["status"] == "completed"
+        assert result["response"] == "answer-1|answer-2|answer-3"
+        # Every completed run of the node saw each pause's own answer.
+        assert received
+        assert all(run == ["answer-1", "answer-2", "answer-3"] for run in received)
+        # 1 run per pause on the first attempt path, plus the replays that walk
+        # back to each later pause: the node body is side-effect free here.
+        assert node_runs >= 4
+        suspensions = [
+            command.suspensions[0] for command in client.commits if command.suspensions
+        ]
+        by_position: dict[bytes, int] = {}
+        for suspension in suspensions:
+            value = json.loads(json_format.MessageToJson(suspension.suspension.context))
+            key = suspension.position.SerializeToString(deterministic=True)
+            assert (
+                by_position.setdefault(key, value["value"]["pause"])
+                == (value["value"]["pause"])
+            )
+        # Three pauses, three distinct durable positions in one task.
+        assert sorted(by_position.values()) == [1, 2, 3]
+        paths = {
+            tuple(
+                (segment.name, segment.ordinal)
+                for segment in suspension.position.operation_path.segments
+            )
+            for suspension in suspensions
+        }
+        assert len(paths) == 1
+        assert sorted(
+            {suspension.position.activity_ordinal for suspension in suspensions}
+        ) == [1, 2, 3]
+
+    @pytest.mark.anyio
+    @pytest.mark.parametrize("method", ["invoke", "stream"])
+    async def test_direct_pause_keeps_its_position_around_an_interrupting_tool(
+        self, monkeypatch: pytest.MonkeyPatch, method: str
+    ) -> None:
+        from langchain_core.messages import BaseMessage
+        from langgraph.graph import MessagesState
+        from langgraph.types import interrupt
+        from agent_engine_sdk import AgentInput
+        from agent_engine_sdk_langgraph import durable_session as durable_session_module
+        from agent_engine_sdk_langgraph import (
+            platform_checkpointer as checkpointer_module,
+        )
+        from agent_engine_sdk_langgraph.runtime import App
+        from agent_engine_runner_shared import RuntimeMode, hooks
+        from agent_engine_runner_shared.context import (
+            clear_execution_context,
+            set_execution_context,
+        )
+        from agent_engine_runner_shared.generated.workflow.v1.activity_pb2 import (
+            ACTIVITY_OUTCOME_KIND_COMPLETED,
+            ActivityContext,
+            ActivityOutcome,
+        )
+        from agent_engine_runner_shared.models import ToolExecuteResponse
+        from agent_engine_runner_shared.secure_wrapper import SecureToolWrapper
+        from agent_engine_runner_shared.workflow.client import (
+            ActivityDispatch,
+            ActivityReplay,
+        )
+
+        client = _InterruptWorkflowClient()
+
+        class ToolActivities:
+            """Tool activities sharing OE's activity ids with the frontier."""
+
+            def __init__(self) -> None:
+                self.positions: dict[str, bytes] = {}
+                self.recorded: dict[bytes, ActivityOutcome] = {}
+
+            def start_activity(self, command: Any) -> Any:
+                position = command.position.SerializeToString(deterministic=True)
+                if position in self.recorded:
+                    return ActivityReplay(outcome=self.recorded[position])
+                activity_id = client.activity_ids.setdefault(
+                    position, f"activity-{len(client.activity_ids) + 1}"
+                )
+                self.positions[activity_id] = position
+                return ActivityDispatch(
+                    context=ActivityContext(
+                        workflow_identity=command.workflow_identity,
+                        activity_id=activity_id,
+                        attempt_id=command.attempt_id,
+                        fencing_token=command.fencing_token,
+                    )
+                )
+
+            def resolve(self, activity_id: str, value: str) -> None:
+                # The replacement named by the resume map re-enters the tool;
+                # later attempts replay this answer without re-entering it.
+                outcome = ActivityOutcome(
+                    activity_id=activity_id,
+                    outcome_kind=ACTIVITY_OUTCOME_KIND_COMPLETED,
+                )
+                outcome.result.string_value = value
+                self.recorded[self.positions[activity_id]] = outcome
+
+            def report_outcome(self, outcome: ActivityOutcome) -> None:
+                recorded = ActivityOutcome()
+                recorded.CopyFrom(outcome)
+                self.recorded[self.positions[outcome.activity_id]] = recorded
+
+        monkeypatch.setattr(
+            checkpointer_module, "AsyncWorkflowClient", lambda _: client
+        )
+        monkeypatch.setattr(
+            durable_session_module, "AsyncWorkflowClient", lambda _: client
+        )
+        app = App(app_name="durable mixed pauses")
+        app._runtime.mode = RuntimeMode.AER
+        app._register_hooks()
+        tool_runs: list[str] = []
+
+        @app.tool(is_local=True)
+        def review_claim(claim_id: str) -> Any:
+            """Pause inside a durable tool."""
+            tool_runs.append(claim_id)
+            return interrupt({"pause": "tool", "claim_id": claim_id})
+
+        wrapped_tool = app.get_tools()[0]
+        tool_activities = ToolActivities()
+        wrapper = SecureToolWrapper("http://oe", "execution-1")
+        wrapper._workflow = tool_activities
+        received: list[list[Any]] = []
+
+        def node(state: Any) -> Any:
+            first = interrupt({"pause": "first"})
+            result = wrapped_tool.func(claim_id="claim-1", tool_call_id="call-1")
+            value = result[0] if isinstance(result, tuple) else result
+            tool = value.content if isinstance(value, BaseMessage) else value
+            second = interrupt({"pause": "second"})
+            received.append([first, tool, second])
+            return {"messages": [AIMessage(content=f"{first}|{tool}|{second}")]}
+
+        graph: StateGraph[Any] = StateGraph(MessagesState)
+        graph.add_node("node", node)
+        graph.add_edge(START, "node")
+        agent = LangGraphBaseAgent(
+            graph.compile(checkpointer=PlatformCheckpointer(native=InMemorySaver()))
+        )
+        ctx = RequestContext(user_id="user-1", session_id="session-1")
+        approval = ToolExecuteResponse(
+            proceed=True, route_to="callback", latest_step_number=1
+        )
+        execution_tokens = set_execution_context(
+            execution_id="execution-1", wrapper=wrapper, oe_url="http://oe"
+        )
+
+        async def run(
+            attempt: AttemptContext, resume: dict[str, str] | None
+        ) -> dict[str, Any]:
+            run_ctx = (
+                ctx
+                if resume is None
+                else ctx.model_copy(update={"resume": True, "resume_data": resume})
+            )
+            agent_input = AgentInput(payload={"message": "hi"})
+            with attempt_context_scope(attempt):
+                if method == "invoke":
+                    output = await agent.invoke(run_ctx, agent_input)
+                    return cast(dict[str, Any], output.response)
+                events = [event async for event in agent.stream(run_ctx, agent_input)]
+                return cast(dict[str, Any], events[-1].data)
+
+        positions: dict[str, bytes] = {}
+        url_token = current_oe_url.set("http://oe")
+        try:
+            with (
+                patch(
+                    "agent_engine_runner_shared.secure_wrapper.request_oe_approval",
+                    return_value=approval,
+                ),
+                patch("agent_engine_runner_shared.secure_wrapper.report_oe_result"),
+            ):
+                result = await run(_attempt(), None)
+                for number, pause in enumerate(("first", "tool", "second"), 1):
+                    (waiting,) = cast(list[dict[str, Any]], result["interrupts"])
+                    assert waiting["value"]["pause"] == pause
+                    answer = f"answer-{pause}"
+                    client.resolved_values[waiting["id"]] = answer
+                    if pause == "tool":
+                        tool_activities.resolve(waiting["id"], answer)
+                    replacement = _attempt(
+                        attempt_id=f"attempt-{number + 1}", fencing_token=number + 1
+                    )
+                    replacement.replay_mode = True
+                    result = await run(replacement, {waiting["id"]: answer})
+        finally:
+            current_oe_url.reset(url_token)
+            clear_execution_context(execution_tokens)
+            hooks.reset_hooks()
+
+        if method == "invoke":
+            assert result["status"] == "completed"
+        assert result["response"] == "answer-first|answer-tool|answer-second"
+        assert received == [["answer-first", "answer-tool", "answer-second"]]
+        for command in client.commits:
+            for suspension in command.suspensions:
+                value = json.loads(
+                    json_format.MessageToJson(suspension.suspension.context)
+                )["value"]
+                key = suspension.position.SerializeToString(deterministic=True)
+                # A replayed pause must come back at the position it was
+                # recorded at, whether or not the tool re-entered its callback.
+                assert positions.setdefault(value["pause"], key) == key
+        assert len(set(positions.values())) == 3
+        # Dispatched once, re-entered twice to reconstruct and answer its own
+        # pause, then replayed without re-entry while the second pause resumes.
+        assert tool_runs == ["claim-1", "claim-1", "claim-1"]
+
+    @pytest.mark.anyio
+    async def test_task_pauses_again_while_parallel_task_waits_alongside(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         from langgraph.graph import MessagesState
@@ -1372,51 +1717,78 @@ class TestAgentDurableLifecycle:
         monkeypatch.setattr(
             durable_session_module, "AsyncWorkflowClient", lambda _: client
         )
-        saver = PlatformCheckpointer(native=InMemorySaver())
+
+        def twice(state: Any) -> Any:
+            first = interrupt({"task": "twice", "pause": 1})
+            second = interrupt({"task": "twice", "pause": 2})
+            return {"messages": [AIMessage(content=f"twice:{first}|{second}")]}
+
+        once_answers: list[str] = []
+
+        def once(state: Any) -> Any:
+            answer = interrupt({"task": "once", "pause": 1})
+            once_answers.append(answer)
+            return {"messages": [AIMessage(content=f"once:{answer}")]}
+
         graph: StateGraph[Any] = StateGraph(MessagesState)
-
-        def node(state: Any) -> Any:
-            first = interrupt({"suspend_reason": "first"})
-            second = interrupt({"suspend_reason": "second", "first": first})
-            return {"messages": [AIMessage(content=f"decision:{second}")]}
-
-        graph.add_node("node", node)
-        graph.add_edge(START, "node")
-        agent = LangGraphBaseAgent(graph.compile(checkpointer=saver))
+        graph.add_node("twice", twice)
+        graph.add_node("once", once)
+        graph.add_edge(START, "twice")
+        graph.add_edge(START, "once")
+        graph.add_edge("twice", END)
+        graph.add_edge("once", END)
+        agent = LangGraphBaseAgent(
+            graph.compile(checkpointer=PlatformCheckpointer(native=InMemorySaver()))
+        )
         ctx = RequestContext(user_id="user-1", session_id="session-1")
+        agent_input = AgentInput(payload={"message": "hi"})
+
+        async def run(
+            attempt: AttemptContext, resume: dict[str, str] | None = None
+        ) -> dict[str, Any]:
+            run_ctx = ctx
+            if resume is not None:
+                run_ctx = ctx.model_copy(update={"resume": True, "resume_data": resume})
+            with attempt_context_scope(attempt):
+                output = await agent.invoke(run_ctx, agent_input)
+            assert isinstance(output.response, dict)
+            return output.response
+
+        def pending(result: dict[str, Any]) -> dict[tuple[str, int], str]:
+            return {
+                (item["value"]["task"], item["value"]["pause"]): item["id"]
+                for item in cast(list[dict[str, Any]], result["interrupts"])
+            }
 
         url_token = current_oe_url.set("http://oe")
         try:
-            initial_attempt = _attempt()
-            with attempt_context_scope(initial_attempt):
-                suspended = await agent.invoke(
-                    ctx, AgentInput(payload={"message": "hi"})
-                )
-            assert isinstance(suspended.response, dict)
-            assert suspended.response["status"] == "suspended"
-            interrupts = suspended.response["interrupts"]
-            assert isinstance(interrupts, list)
-            first_interrupt = interrupts[0]
-            assert isinstance(first_interrupt, dict)
-            assert first_interrupt["id"] == "activity-1"
-
-            client.resolved_values["activity-1"] = "approved"
+            first = pending(await run(_attempt()))
+            assert set(first) == {("twice", 1), ("once", 1)}
+            answers = {
+                first[("twice", 1)]: "t1",
+                first[("once", 1)]: "o1",
+            }
+            client.resolved_values.update(answers)
             replacement = _attempt(attempt_id="attempt-2", fencing_token=2)
             replacement.replay_mode = True
-            resume_ctx = ctx.model_copy(
-                update={
-                    "resume": True,
-                    "resume_data": {"activity-1": "approved"},
-                }
-            )
-            with attempt_context_scope(replacement):
-                with pytest.raises(
-                    UnsupportedDurableGraphError,
-                    match="multiple sequential direct interrupts",
-                ):
-                    await agent.invoke(resume_ctx, AgentInput(payload={"message": ""}))
+            second = pending(await run(replacement, answers))
+            # Only the task that pauses again is waiting; its answered pause and
+            # the finished parallel task are not re-offered.
+            assert set(second) == {("twice", 2)}
+            assert second[("twice", 2)] not in answers
+            client.resolved_values[second[("twice", 2)]] = "t2"
+            final_attempt = _attempt(attempt_id="attempt-3", fencing_token=3)
+            final_attempt.replay_mode = True
+            completed = await run(final_attempt, {second[("twice", 2)]: "t2"})
         finally:
             current_oe_url.reset(url_token)
+
+        assert completed["status"] == "completed"
+        assert completed["response"] == "twice:t1|t2"
+        # Human input plus one message from each task.
+        assert completed["message_count"] == 3
+        # The parallel task only ever receives its own answer.
+        assert set(once_answers) == {"o1"}
 
     @pytest.mark.anyio
     @pytest.mark.parametrize("method", ["invoke", "stream"])

@@ -23,5 +23,15 @@ class AgentExecutionResult:
         return self._invoke().__await__()
 
     async def __aiter__(self) -> AsyncIterator[StreamEvent]:
-        async for event in self._stream():
-            yield event
+        # When the caller closes this iterator, close the adapter's stream now
+        # rather than at garbage collection, so its cleanup (cancelling
+        # framework work, releasing resources) runs while the request is live.
+        stream = self._stream()
+        try:
+            async for event in stream:
+                yield event
+        finally:
+            # An async generator has aclose(); a plain async iterator need not.
+            aclose = getattr(stream, "aclose", None)
+            if aclose is not None:
+                await aclose()

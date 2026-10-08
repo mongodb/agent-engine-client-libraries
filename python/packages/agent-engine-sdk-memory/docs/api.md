@@ -1226,7 +1226,9 @@ The wire shape the server emits (per-source builder serializes its internal
 ``SourceOutcome`` dataclass to this dict). Enum-valued fields arrive as their
 string values. ``error`` is ``None`` unless the source failed; a
 ``requested_mode``/``effective_mode`` mismatch flags a source that ran in a
-degraded mode.
+degraded mode. ``retryable`` is true only for a first-use lazy index
+build — retry shortly rather than treat the empty contribution as
+"no memories". Absent from older servers, so treat a missing key as false.
 
 <a id="agent_engine_sdk_memory.models.ContextMetadata"></a>
 

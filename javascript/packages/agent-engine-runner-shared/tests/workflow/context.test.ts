@@ -16,6 +16,8 @@ import {
   currentPendingChildOperationBatch,
   currentStepOrdinal,
   interruptedActivities,
+  markInterruptedActivitiesAnswered,
+  nextScopedCallIndex,
   observedActivityPositions,
   preallocateActivityOrdinals,
   preallocateChildOperationOrdinals,
@@ -161,6 +163,36 @@ describe("interrupted activity snapshots", () => {
       });
       expect(captured[0]?.controlFlow).toBe(controlFlow);
       expect(interruptedActivities(2)).toHaveLength(1);
+    });
+  });
+
+  test("drops answered activities from the waiting view within one attempt", () => {
+    const record = (ordinal: number) => {
+      const command = create(ActivityCommandSchema, {
+        activityName: "langgraph.interrupt",
+        position: position(ordinal),
+      });
+      recordInterruptedActivity(command, new Error(`pause ${ordinal}`));
+      if (command.position === undefined) throw new Error("missing position");
+      return command.position;
+    };
+    runWithAttemptContext(attempt(), () => {
+      markInterruptedActivitiesAnswered([record(1)]);
+      record(2);
+
+      expect(
+        interruptedActivities(1).map((item) => item.command.position),
+      ).toMatchObject([{ activityOrdinal: 2n }]);
+      expect(
+        interruptedActivities(1, { includeAnswered: true }).map(
+          (item) => item.command.position?.activityOrdinal,
+        ),
+      ).toEqual([1n, 2n]);
+    });
+    // Answers are attempt-local: a new attempt starts with nothing answered.
+    runWithAttemptContext(attempt(), () => {
+      record(1);
+      expect(interruptedActivities(1)).toHaveLength(1);
     });
   });
 
@@ -319,6 +351,25 @@ describe("branch lineage", () => {
     expect(() => runWithAttemptContext(malformed, () => undefined)).toThrow(
       /immutable source cutoff/,
     );
+  });
+});
+
+describe("scoped call index", () => {
+  test("restarts for a new scope and a new attempt", () => {
+    const firstRun = {};
+    const secondRun = {};
+    runWithAttemptContext(attempt(), () => {
+      expect([1, 2, 3].map(() => nextScopedCallIndex(firstRun))).toEqual([
+        1, 2, 3,
+      ]);
+      // A re-run of the same unit is a new scope: its calls count from 1
+      // again, so they name the calls the first run already made.
+      expect([1, 2].map(() => nextScopedCallIndex(secondRun))).toEqual([1, 2]);
+      expect(nextScopedCallIndex(firstRun)).toBe(4);
+    });
+    runWithAttemptContext(attempt(), () => {
+      expect(nextScopedCallIndex(firstRun)).toBe(1);
+    });
   });
 });
 

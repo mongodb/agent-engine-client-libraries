@@ -218,46 +218,6 @@ def extract_usage(response: Any, fallback_model: Optional[str] = None) -> Dict[s
     return result
 
 
-def _extract_pod_usage(
-    usage: Optional[Dict[str, Any]], fallback_model: Optional[str] = None
-) -> Dict[str, Any]:
-    """Extract token usage from a tool-pod usage dict into report_oe_result kwargs.
-
-    Uses ``is not None`` checks instead of ``or`` so that a valid 0 token count
-    is not treated as missing.  Computes total_tokens when the provider omits it.
-    """
-    if not usage:
-        return {
-            "prompt_tokens": None,
-            "completion_tokens": None,
-            "total_tokens": None,
-            "model": fallback_model,
-        }
-
-    prompt = usage.get("input_tokens")
-    if prompt is None:
-        prompt = usage.get("prompt_tokens")
-
-    completion = usage.get("output_tokens")
-    if completion is None:
-        completion = usage.get("completion_tokens")
-
-    total = usage.get("total_tokens")
-    if total is None and prompt is not None and completion is not None:
-        total = prompt + completion
-
-    model = usage.get("model")
-    if not model:
-        model = fallback_model
-
-    return {
-        "prompt_tokens": prompt,
-        "completion_tokens": completion,
-        "total_tokens": total,
-        "model": model,
-    }
-
-
 # =============================================================================
 # Exceptions
 # =============================================================================
@@ -469,6 +429,9 @@ class LLMInvocationError(Exception):
     on the failure (e.g. a provider credential rejection), when it did. It
     travels to the OE/UI on the ERROR chunk metadata instead of the generic
     invocation code so consumers can classify without string-matching prose.
+    It is ``GUARDRAIL_REVIEW_INVALID`` when OE refused to answer a call from
+    a guardrail review: the review is unknown or undecided, or the call is not
+    the reviewed one.
     """
 
     def __init__(
@@ -489,6 +452,20 @@ class LLMInvocationError(Exception):
 # =============================================================================
 
 
+GUARDRAIL_REVIEW_INVALID_CODE = "GUARDRAIL_REVIEW_INVALID"
+
+
+def _is_guardrail_review_refusal(response: httpx.Response) -> bool:
+    """Whether OE refused a resolving call: the review cannot answer this request."""
+    if response.status_code != 409:
+        return False
+    try:
+        body = response.json()
+    except ValueError:
+        return False
+    return isinstance(body, dict) and body.get("code") == GUARDRAIL_REVIEW_INVALID_CODE
+
+
 def request_oe_approval(
     oe_url: str,
     execution_id: str,
@@ -505,6 +482,8 @@ def request_oe_approval(
     tool_call_id: Optional[str] = None,
     custom_headers: Optional[Dict[str, str]] = None,
     timeout: float | httpx.Timeout | None = None,
+    review_protocol: Optional[int] = None,
+    review_id: Optional[str] = None,
 ) -> ToolExecuteResponse:
     """
     Request approval from OE before executing a tool/LLM call.
@@ -531,6 +510,8 @@ def request_oe_approval(
             tool_call_id=tool_call_id,
             custom_headers=custom_headers,
             timeout=timeout,
+            review_protocol=review_protocol,
+            review_id=review_id,
         )
     except OERetryAfterError as e:
         raise PolicyDeniedException("OE unreachable; blocking for safety") from e
@@ -557,6 +538,8 @@ def _request_oe_approval(
     tool_call_id: Optional[str] = None,
     custom_headers: Optional[Dict[str, str]] = None,
     timeout: float | httpx.Timeout | None = None,
+    review_protocol: Optional[int] = None,
+    review_id: Optional[str] = None,
 ) -> ToolExecuteResponse:
     """
     Request approval from OE before executing a tool/LLM call.
@@ -583,7 +566,15 @@ def _request_oe_approval(
         custom_headers=custom_headers,
         trace_id=trace_id,
         span_id=span_id,
+        review_protocol=review_protocol,
+        review_id=review_id,
     )
+    payload = request.model_dump()
+    # Sent only by callers that follow the review protocol, so every other
+    # request stays byte-for-byte what it was.
+    for review_field in ("review_protocol", "review_id"):
+        if payload[review_field] is None:
+            del payload[review_field]
 
     # A short connect budget is right — an unreachable OE should fail fast — but the
     # read has to outlast the tool itself, since the OE keeps the response open until
@@ -596,7 +587,7 @@ def _request_oe_approval(
     started = time.monotonic()
     with create_httpx_client_with_tls(oe_url, client_timeout) as client:
         try:
-            resp = client.post(f"{oe_url}/tool/execute", json=request.model_dump())
+            resp = client.post(f"{oe_url}/tool/execute", json=payload)
             resp.raise_for_status()
             return ToolExecuteResponse(**resp.json())
         except httpx.ReadTimeout as e:
@@ -617,6 +608,12 @@ def _request_oe_approval(
                 retry_after_s = parse_retry_after_seconds(e.response.headers.get("Retry-After"))
                 if retry_after_s is not None:
                     raise OERetryAfterError(retry_after_s) from e
+            if _is_guardrail_review_refusal(e.response):
+                logger.error(f"Step {step}: OE refused to resolve the guardrail review")
+                raise LLMInvocationError(
+                    "Guardrail review could not resolve this call",
+                    error_code=GUARDRAIL_REVIEW_INVALID_CODE,
+                ) from e
             logger.error(f"Step {step}: Failed to request OE approval: {e}", exc_info=True)
             raise PolicyDeniedException("OE unreachable; blocking for safety") from e
         except httpx.HTTPError as e:
@@ -1068,8 +1065,15 @@ class SecureToolWrapper:
                     # ResolveActivities already authorized this exact activity
                     # position. Re-enter its captured callback directly so the
                     # framework can recreate interrupt(); the tool-execute cache
-                    # still contains the earlier interrupted invocation.
-                    result = local_executor()
+                    # still contains the earlier interrupted invocation. The
+                    # isolated suspend scope keeps a legacy app.suspend() marker
+                    # from leaking past this callback, and the durable rejection
+                    # below still sees it after the recorded answer is resumed.
+                    with local_suspend_request_context():
+                        result = local_executor()
+                        suspend_marker = get_requested_suspend()
+                    if suspend_marker is not None and current_attempt_context() is not None:
+                        self._handle_suspend(json.dumps(suspend_marker))
                 else:
                     result = self._execute_tool_native(
                         tool_name=tool_name,
@@ -1345,6 +1349,13 @@ class SecureToolWrapper:
                     with customer_origin_scope():
                         result = local_executor()
                         suspend_marker = get_requested_suspend()
+                if suspend_marker is not None and current_attempt_context() is not None:
+                    # A durable activity owns waits through the framework's
+                    # native interrupt. Reject the legacy app.suspend() wait
+                    # before the settlement report below, so the audited tool
+                    # history records the same terminal error as the durable
+                    # activity outcome instead of a suspension OE never commits.
+                    self._handle_suspend(json.dumps(suspend_marker))
                 if (
                     registry is not None
                     and handle is not None
@@ -1472,9 +1483,10 @@ class SecureToolWrapper:
     def _handle_suspend(self, result: Any) -> Any:
         """Fire the HITL interrupt for an OE-confirmed suspend.
 
-        Validates the payload against ``SuspendPayload``. Durable activities
-        commit the wait to OE; native executions call the framework suspend
-        handler and use its resumed value as the tool result.
+        Validates the payload against ``SuspendPayload``. A durable activity
+        hands the wait to the framework's durable handler, which owns whether
+        the wait is recorded or rejected; native executions call the framework
+        suspend handler and use its resumed value as the tool result.
         """
         parsed = result
         if isinstance(result, str):

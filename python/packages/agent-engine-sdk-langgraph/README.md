@@ -261,6 +261,13 @@ deepagents validates skill frontmatter at runtime. It skips unreadable or unpars
 >   deep_agent: true
 > ```
 
+> **Dependency:** deep-agent graphs need the optional runtime extra:
+> `pip install "agent-engine-sdk-langgraph[deepagents]"` (or
+> `uv add "agent-engine-sdk-langgraph[deepagents]"`). The extra pins the tested
+> `deepagents` version so applications track SDK releases instead of the
+> upstream library. Applications that never call `App.deep_agent()` don't
+> install it.
+
 ```python
 from langchain_openai import ChatOpenAI
 from agent_engine_sdk_langgraph import App

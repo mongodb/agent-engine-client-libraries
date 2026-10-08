@@ -74,7 +74,7 @@ DEFAULT_MODELS = {
     "anthropic": "claude-sonnet-5",
     "cerebras": "gpt-oss-120b",
     "gemini": "gemini-3-flash-preview",
-    "openai": "gpt-5.4-mini",
+    "openai": "gpt-5.6-luna",
 }
 
 
@@ -154,10 +154,16 @@ def _build_runtime_llm(
         from langchain_openai import ChatOpenAI
 
         model_name = DEFAULT_MODELS["openai"]
+        # GPT-5 and GPT-6 families reject sampling params except the
+        # gpt-5-chat variants.
+        if model_name.startswith(("gpt-5", "gpt-6")) and "chat" not in model_name:
+            llm_options.pop("temperature", None)
+        # Say the omission out loud; a bare None reads like a missing value.
+        temperature_display = llm_options.get("temperature", "omitted (reasoning model)")
         logger.info(
             "Using OpenAI LLM: %s, temperature=%s",
             model_name,
-            effective_temperature,
+            temperature_display,
         )
         openai_base_url = _configured_openai_base_url()
         if openai_base_url and "grove-foundry" in openai_base_url:

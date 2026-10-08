@@ -3,7 +3,7 @@ members = ["packages/*", "examples/*"]
 
 [tool.ruff]
 line-length = 88
-src = ["packages/agent-engine-sdk-langgraph/src", "packages/agent-engine-sdk-adk/src", "packages/agent-engine-runner-shared/src", "examples/test-agent/src", "examples/insurance-agent/src", "examples/mta-alerts-agent/src"]
+src = ["packages/agent-engine-sdk-langgraph/src", "packages/agent-engine-sdk-adk/src", "packages/agent-engine-sdk-openai-agents/src", "packages/agent-engine-runner-shared/src", "examples/test-agent/src", "examples/insurance-agent/src", "examples/mta-alerts-agent/src"]
 extend-exclude = ["packages/agent-engine-runner-shared/src/agent_engine_runner_shared/generated"]
 
 [tool.ruff.lint]

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextvars
+import json
 import threading
 from collections.abc import Iterator
 from types import SimpleNamespace
@@ -583,3 +584,427 @@ def test_real_secure_llm_wrapper_replays_children_after_start_order_changes(
         "work for billing_investigation",
         "work for access_investigation",
     ]
+
+
+class _FrontierClient:
+    """Finalizes suspension frontiers, answering waits recorded in ``answers``."""
+
+    def __init__(self) -> None:
+        self.answers: dict[str, str] = {}
+        self._activity_ids: dict[bytes, str] = {}
+
+    async def __aenter__(self) -> _FrontierClient:
+        return self
+
+    async def __aexit__(self, *exc_info: object) -> None:
+        pass
+
+    async def complete_execution(self, command: Any) -> None:
+        del command
+
+    async def finalize_step(self, command: Any) -> list[Any]:
+        from agent_engine_runner_shared.generated.workflow.v1.activity_pb2 import (
+            ACTIVITY_OUTCOME_KIND_COMPLETED,
+            ACTIVITY_OUTCOME_KIND_SUSPENDED,
+            StepActivityEntry,
+        )
+
+        entries = []
+        for suspension in command.suspensions:
+            key = suspension.position.SerializeToString(deterministic=True)
+            activity_id = self._activity_ids.setdefault(
+                key, f"wait-{len(self._activity_ids) + 1}"
+            )
+            answer = self.answers.get(activity_id)
+            outcome = ActivityOutcome(
+                workflow_identity=command.workflow_identity,
+                activity_id=activity_id,
+                attempt_id=command.attempt_id,
+                fencing_token=command.fencing_token,
+                outcome_kind=(
+                    ACTIVITY_OUTCOME_KIND_SUSPENDED
+                    if answer is None
+                    else ACTIVITY_OUTCOME_KIND_COMPLETED
+                ),
+            )
+            if answer is None:
+                outcome.suspension.CopyFrom(suspension.suspension)
+            else:
+                outcome.result.string_value = answer
+            entries.append(
+                StepActivityEntry(position=suspension.position, outcome=outcome)
+            )
+        return entries
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("method", ["invoke", "stream"])
+@pytest.mark.parametrize("call", ["invoke", "stream"])
+@pytest.mark.parametrize(
+    "layout",
+    [
+        "pause-model",
+        "model-pause",
+        "pause-model-pause",
+        "model-pause-model",
+    ],
+)
+async def test_model_calls_around_pauses_are_dispatched_once_across_attempts(
+    monkeypatch: pytest.MonkeyPatch, method: str, call: str, layout: str
+) -> None:
+    from langgraph.checkpoint.memory import InMemorySaver
+    from langgraph.graph import MessagesState
+    from langgraph.types import interrupt
+    from agent_engine_sdk import AgentInput, RequestContext
+    from agent_engine_sdk_langgraph import LangGraphBaseAgent, PlatformCheckpointer
+    from agent_engine_sdk_langgraph import durable_session as durable_session_module
+    from agent_engine_sdk_langgraph import (
+        platform_checkpointer as checkpointer_module,
+    )
+    from agent_engine_runner_shared.context import current_oe_url
+
+    activities = _ReplayClient()
+    dispatched: list[str] = []
+    wrapper, llm = _wrapped_llm(monkeypatch, activities, dispatched)
+    frontier = _FrontierClient()
+    monkeypatch.setattr(checkpointer_module, "AsyncWorkflowClient", lambda _: frontier)
+    monkeypatch.setattr(
+        durable_session_module, "AsyncWorkflowClient", lambda _: frontier
+    )
+
+    steps = layout.split("-")
+    pauses = steps.count("pause")
+    replies: list[tuple[int, str]] = []
+
+    def model_reply(prompt: str) -> str:
+        messages = [HumanMessage(content=prompt)]
+        if call == "invoke":
+            return str(llm.invoke(messages).content)
+        return "".join(str(chunk.content) for chunk in llm.stream(messages))
+
+    def review(state: Any) -> Any:
+        # Each step sees the previous step's output, so a model call's prompt
+        # records which answers reached the node before it.
+        seen = "start"
+        for index, step in enumerate(steps):
+            if step == "pause":
+                seen = interrupt({"pause": index})
+            else:
+                seen = model_reply(f"call-{index} after {seen}")
+                replies.append((index, seen))
+        return {"messages": [AIMessage(content=str(seen))]}
+
+    graph: StateGraph[Any] = StateGraph(MessagesState)
+    graph.add_node("review", review)
+    graph.add_edge(START, "review")
+    graph.add_edge("review", END)
+    agent = LangGraphBaseAgent(
+        graph.compile(checkpointer=PlatformCheckpointer(native=InMemorySaver()))
+    )
+    ctx = RequestContext(user_id="user-1", session_id="support-session")
+    agent_input = AgentInput(payload={"message": "hi"})
+
+    async def run(attempt: AttemptContext, resume: dict[str, str] | None) -> Any:
+        # Each attempt is a fresh process: operational steps restart.
+        wrapper.operational_steps = OperationalStepAllocator()
+        run_ctx = (
+            ctx
+            if resume is None
+            else ctx.model_copy(update={"resume": True, "resume_data": resume})
+        )
+        with attempt_context_scope(attempt):
+            if method == "invoke":
+                return (await agent.invoke(run_ctx, agent_input)).response
+            events = [event async for event in agent.stream(run_ctx, agent_input)]
+            return events[-1].data
+
+    url_token = current_oe_url.set("http://oe")
+    try:
+        result = await run(_attempt("attempt-1", 1, replay=False), None)
+        for number in range(1, pauses + 1):
+            (waiting,) = result["interrupts"]
+            frontier.answers[waiting["id"]] = f"answer-{number}"
+            result = await run(
+                _attempt(f"attempt-{number + 1}", number + 1, replay=True),
+                {waiting["id"]: f"answer-{number}"},
+            )
+    finally:
+        current_oe_url.reset(url_token)
+
+    # Replay the node's logic with the recorded answers to get the one prompt
+    # each model call must have been dispatched with.
+    expected_prompts: list[str] = []
+    seen, answered = "start", 0
+    expected_replies: dict[int, str] = {}
+    for index, step in enumerate(steps):
+        if step == "pause":
+            answered += 1
+            seen = f"answer-{answered}"
+        elif step == "model":
+            prompt = f"call-{index} after {seen}"
+            expected_prompts.append(prompt)
+            seen = f"resolved:{prompt}"
+            expected_replies[index] = seen
+    assert result["response"] == seen
+    # Every execution of the node, live or replayed, received the one recorded
+    # reply for each model call.
+    assert {index for index, _ in replies} == set(expected_replies)
+    assert all(reply == expected_replies[index] for index, reply in replies)
+    first_call = min(expected_replies)
+    if any(step != "model" for step in steps[first_call + 1 :]):
+        # A pause after a model call re-executes the node, so that
+        # call's reply was observed again from the recorded activity.
+        assert len(replies) > len(expected_replies)
+    # Every model call is a recorded activity: later attempts and re-entries
+    # of the node after an answer replay it instead of dispatching again, and
+    # separate calls in the node stay separate activities.
+    assert dispatched == expected_prompts
+    llm_positions = [
+        (command.position.step_ordinal, command.position.activity_ordinal)
+        for command in activities.commands
+    ]
+    assert len(set(llm_positions)) == len(expected_prompts)
+
+
+class _ReviewFrontierClient(_FrontierClient):
+    """A frontier whose answers are JSON objects, as a review's answer is."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.review_answers: dict[str, dict[str, Any]] = {}
+
+    async def finalize_step(self, command: Any) -> list[Any]:
+        from google.protobuf import json_format
+        from agent_engine_runner_shared.generated.workflow.v1.activity_pb2 import (
+            ACTIVITY_OUTCOME_KIND_COMPLETED,
+        )
+
+        entries = await super().finalize_step(command)
+        for entry in entries:
+            answer = self.review_answers.get(entry.outcome.activity_id)
+            if answer is not None:
+                entry.outcome.outcome_kind = ACTIVITY_OUTCOME_KIND_COMPLETED
+                entry.outcome.ClearField("suspension")
+                json_format.ParseDict(answer, entry.outcome.result)
+        return entries
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("method", ["invoke", "stream"])
+@pytest.mark.parametrize("call", ["invoke", "stream"])
+@pytest.mark.parametrize("decision", ["approve", "deny"])
+async def test_reviewed_model_call_pauses_after_its_activity_and_resolves_from_oe(
+    monkeypatch: pytest.MonkeyPatch, method: str, call: str, decision: str
+) -> None:
+    from langgraph.checkpoint.memory import InMemorySaver
+    from langgraph.graph import MessagesState
+    from agent_engine_sdk import AgentInput, RequestContext
+    from agent_engine_sdk_langgraph import LangGraphBaseAgent, PlatformCheckpointer
+    from agent_engine_sdk_langgraph import durable_session as durable_session_module
+    from agent_engine_sdk_langgraph import (
+        platform_checkpointer as checkpointer_module,
+    )
+    from agent_engine_runner_shared.context import current_oe_url
+    from agent_engine_runner_shared.models import (
+        GuardrailReviewHalt,
+        ToolExecuteResponse,
+    )
+    from agent_engine_runner_shared.secure_wrapper import (
+        PolicyDeniedException,
+        raise_for_oe_rejection,
+    )
+
+    from langgraph.types import interrupt
+
+    # The runtime registers the framework's interrupt as the pause at startup.
+    monkeypatch.setattr("agent_engine_runner_shared.hooks._suspend_handler", interrupt)
+
+    from agent_engine_runner_shared.context import current_user_id, current_wrapper
+    from agent_engine_runner_shared.generated.workflow.v1.common_pb2 import TenantScope
+    from agent_engine_runner_shared.workflow.memory import DurableMemoryState
+
+    # Durable memory is on: every completed activity must be closed in memory,
+    # and only conversation content may be written to it.
+    memory_batches: list[list[tuple[str, str]]] = []
+    memory_commands: list[Any] = []
+
+    def ensure_memory_written(command: Any) -> None:
+        memory_commands.append(command)
+        turns = [json.loads(write.payload_json) for write in command.memory_writes]
+        memory_batches.append([(turn["role"], turn["content"]) for turn in turns])
+
+    def wait_acknowledgements(activity_id: str) -> list[tuple[str, int, int]]:
+        return [
+            (command.attempt_id, command.fencing_token, len(command.memory_writes))
+            for command in memory_commands
+            if command.activity_id == activity_id
+        ]
+
+    activities = _ReplayClient()
+    activities.ensure_memory_written = ensure_memory_written  # type: ignore[attr-defined]
+    requests: list[tuple[int, str | None, bool]] = []
+
+    class _ReviewingOEProxy(SecureLLMProxy):
+        """Stands in for OE: halts the call for review, then answers the review."""
+
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            super().__init__(*args, **kwargs)
+            self._workflow = activities
+
+        def _request_oe_execution(
+            self,
+            invoke_request: Any,
+            step: int | None = None,
+            review_id: str | None = None,
+        ) -> ToolExecuteResponse:
+            step = self._allocate_step(step)
+            requests.append((step, review_id, self._follows_review_protocol()))
+            if review_id is None:
+                return ToolExecuteResponse(
+                    proceed=False,
+                    status="require_review",
+                    reason="output needs human review",
+                    guardrail_review=GuardrailReviewHalt(review_id="review-1"),
+                )
+            if decision == "approve":
+                return ToolExecuteResponse(
+                    proceed=True,
+                    status="success",
+                    result={"content": "the held answer"},
+                )
+            raise_for_oe_rejection("guardrail review denied by reviewer")
+            raise AssertionError("unreachable")
+
+    monkeypatch.setattr(
+        "agent_engine_sdk_langgraph.secure_llm.SecureLLMProxy", _ReviewingOEProxy
+    )
+    monkeypatch.setattr(
+        "agent_engine_sdk_langgraph.secure_llm.Metrics.record_latency", MagicMock()
+    )
+    monkeypatch.setattr(
+        "agent_engine_sdk_langgraph.secure_llm.Metrics.record_error", MagicMock()
+    )
+    wrapper = SimpleNamespace(
+        oe_url="http://oe:8000",
+        execution_id="support-execution",
+        operational_steps=OperationalStepAllocator(),
+        durable_memory=None,
+        workflow=SimpleNamespace(ensure_memory_written=ensure_memory_written),
+    )
+    wrapper.next_operational_step = lambda: wrapper.operational_steps.next()
+    llm = SecureWrappedLLM(
+        llm=MagicMock(),
+        get_wrapper=lambda: wrapper,
+        llm_id="support-model",
+        model_name="test-model",
+    )
+    frontier = _ReviewFrontierClient()
+    monkeypatch.setattr(checkpointer_module, "AsyncWorkflowClient", lambda _: frontier)
+    monkeypatch.setattr(
+        durable_session_module, "AsyncWorkflowClient", lambda _: frontier
+    )
+
+    def answer_claim(state: Any) -> Any:
+        messages = [HumanMessage(content="summarize the claim")]
+        if call == "invoke":
+            content = str(llm.invoke(messages).content)
+        else:
+            content = "".join(str(chunk.content) for chunk in llm.stream(messages))
+        return {"messages": [AIMessage(content=content)]}
+
+    graph: StateGraph[Any] = StateGraph(MessagesState)
+    graph.add_node("answer_claim", answer_claim)
+    graph.add_edge(START, "answer_claim")
+    graph.add_edge("answer_claim", END)
+    agent = LangGraphBaseAgent(
+        graph.compile(checkpointer=PlatformCheckpointer(native=InMemorySaver()))
+    )
+    ctx = RequestContext(user_id="user-1", session_id="support-session")
+    agent_input = AgentInput(payload={"message": "hi"})
+
+    def scoped(attempt: AttemptContext) -> AttemptContext:
+        attempt.workflow_identity.tenant_scope.CopyFrom(
+            TenantScope(
+                org_id="org-1", project_id="project-1", workspace_id="workspace-1"
+            )
+        )
+        return attempt
+
+    async def run(attempt: AttemptContext, resume: dict[str, Any] | None) -> Any:
+        # Each attempt is a fresh process: operational steps restart, and the
+        # turn's user input is pending again until memory has it.
+        wrapper.operational_steps = OperationalStepAllocator()
+        wrapper.durable_memory = DurableMemoryState("summarize the claim")
+        attempt = scoped(attempt)
+        run_ctx = (
+            ctx
+            if resume is None
+            else ctx.model_copy(update={"resume": True, "resume_data": resume})
+        )
+        with attempt_context_scope(attempt):
+            if method == "invoke":
+                return (await agent.invoke(run_ctx, agent_input)).response
+            events = [event async for event in agent.stream(run_ctx, agent_input)]
+            return events[-1].data
+
+    url_token = current_oe_url.set("http://oe")
+    wrapper_token = current_wrapper.set(wrapper)
+    user_token = current_user_id.set("user-1")
+    try:
+        # Attempt 1: OE halts the call. The halt is the LLM activity's result
+        # and the node pauses for the review it names.
+        paused = await run(_attempt("attempt-1", 1, replay=False), None)
+        (waiting,) = paused["interrupts"]
+        assert waiting["value"] == {"guardrail_review": {"review_id": "review-1"}}
+        assert requests == [(1, None, True)]
+        # The halt is closed in memory with nothing written.
+        assert memory_batches == [[]]
+
+        # The reviewer answers, and a new attempt picks the turn up.
+        answer = {"guardrail_review": {"review_id": "review-1", "decision": decision}}
+        frontier.review_answers[waiting["id"]] = answer
+        resumed = run(_attempt("attempt-2", 2, replay=True), {waiting["id"]: answer})
+        if decision == "deny":
+            with pytest.raises(PolicyDeniedException, match="denied by reviewer"):
+                await resumed
+        else:
+            result = await resumed
+            assert result["response"] == "the held answer"
+
+        # The halted call replayed from its recorded result. Only the resolving
+        # call reached OE, naming the review, at a step after the halted one.
+        (halted, resolving) = requests
+        assert resolving[1:] == ("review-1", True)
+        assert resolving[0] > halted[0]
+        assert (
+            len({activities._position(command) for command in activities.commands}) == 2
+        )
+
+        # The answered wait is closed in memory under the attempt that
+        # resumed it, with nothing written.
+        assert wait_acknowledgements(waiting["id"]) == [("attempt-2", 2, 0)]
+
+        # Neither the halt nor the reviewer's decision is conversation: the
+        # only content memory ever receives is the user's input with the
+        # released response.
+        written = [batch for batch in memory_batches if batch]
+        if decision == "approve":
+            assert written == [
+                [("user", "summarize the claim"), ("assistant", "the held answer")]
+            ]
+        else:
+            assert written == []
+
+        if decision == "approve":
+            # A later attempt replays the halt, the answer, and the released
+            # response without reaching OE.
+            replayed = await run(
+                _attempt("attempt-3", 3, replay=True), {waiting["id"]: answer}
+            )
+            assert replayed["response"] == "the held answer"
+            assert len(requests) == 2
+            assert wait_acknowledgements(waiting["id"])[-1] == ("attempt-3", 3, 0)
+    finally:
+        current_user_id.reset(user_token)
+        current_wrapper.reset(wrapper_token)
+        current_oe_url.reset(url_token)

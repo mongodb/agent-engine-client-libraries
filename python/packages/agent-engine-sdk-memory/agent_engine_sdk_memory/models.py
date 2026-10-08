@@ -14,7 +14,10 @@ from enum import Enum
 from typing import Any
 
 from pydantic import BaseModel, Field
-from typing_extensions import TypedDict  # Pydantic requires this on Python < 3.12
+from typing_extensions import (  # Pydantic requires this on Python < 3.12
+    NotRequired,
+    TypedDict,
+)
 
 TagScalar = str | int | float | bool
 
@@ -361,7 +364,9 @@ class SourceOutcome(TypedDict):
     ``SourceOutcome`` dataclass to this dict). Enum-valued fields arrive as their
     string values. ``error`` is ``None`` unless the source failed; a
     ``requested_mode``/``effective_mode`` mismatch flags a source that ran in a
-    degraded mode.
+    degraded mode. ``retryable`` is true only for a first-use lazy index
+    build — retry shortly rather than treat the empty contribution as
+    "no memories". Absent from older servers, so treat a missing key as false.
     """
 
     source: str
@@ -369,6 +374,7 @@ class SourceOutcome(TypedDict):
     effective_mode: str
     count: int
     error: str | None
+    retryable: NotRequired[bool]
 
 
 class ContextMetadata(BaseModel):

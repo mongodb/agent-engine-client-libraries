@@ -981,17 +981,6 @@ export function logPolicyBlocked(
   );
 }
 
-/** Log the start of an execution. */
-export function logExecutionStart(
-  executionId: string,
-  inputKeys: string[],
-  prefix = "OE",
-): void {
-  logSection();
-  logger.info(`${prefix}: Starting execution ${executionId.slice(0, 8)}...`);
-  logger.debug(`${prefix}: Input keys: ${inputKeys.join(", ")}`);
-}
-
 /** Log an execution callback (completion/suspension/error). */
 export function logExecutionCallback(
   executionId: string,

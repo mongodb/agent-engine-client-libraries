@@ -1690,20 +1690,11 @@ class TestAppSuspend:
         mock_payload.to_json.assert_called_once()
         assert result == '{"suspend_reason": "needs_approval"}'
 
-    def test_supported_tool_wait_becomes_durable_activity_suspension(self):
+    def test_durable_tool_wait_is_rejected_with_native_interrupt_guidance(self):
         from agent_engine_sdk_langgraph.runtime import _suspend_durable_activity
-        from agent_engine_runner_shared.generated.workflow.v1.runtime_pb2 import (
-            AttemptContext,
-        )
-        from agent_engine_runner_shared.workflow import (
-            DurableActivitySuspended,
-            attempt_context_scope,
-        )
+        from agent_engine_runner_shared import ToolExecutionError
 
-        with (
-            attempt_context_scope(AttemptContext(attempt_id="attempt-1")),
-            pytest.raises(DurableActivitySuspended) as raised,
-        ):
+        with pytest.raises(ToolExecutionError) as raised:
             _suspend_durable_activity(
                 {
                     "suspend_reason": "awaiting_human_review",
@@ -1714,11 +1705,8 @@ class TestAppSuspend:
                 }
             )
 
-        assert raised.value.reason == "awaiting_human_review"
-        assert raised.value.context == {
-            "allowed_decisions": ["approve", "reject"],
-            "claim_id": "claim-1",
-        }
+        assert "app.suspend()" in raised.value.error
+        assert "langgraph.types.interrupt()" in raised.value.error
 
     def test_native_suspend_is_available_in_a_durable_attempt(self):
         from agent_engine_sdk_langgraph.runtime import _suspend
@@ -1740,22 +1728,14 @@ class TestAppSuspend:
         interrupt.assert_called_once_with(payload)
 
     @pytest.mark.anyio
-    async def test_async_tool_node_does_not_convert_durable_suspension_to_tool_error(
-        self,
-    ):
+    async def test_durable_tool_wait_rejection_survives_the_default_tool_node(self):
         from langchain_core.messages import AIMessage
         from langchain_core.tools import tool
         from langgraph.prebuilt import ToolNode
         from langgraph.prebuilt.tool_node import ToolRuntime
 
         from agent_engine_sdk_langgraph.runtime import _suspend_durable_activity
-        from agent_engine_runner_shared.generated.workflow.v1.runtime_pb2 import (
-            AttemptContext,
-        )
-        from agent_engine_runner_shared.workflow import (
-            DurableActivitySuspended,
-            attempt_context_scope,
-        )
+        from agent_engine_runner_shared import ToolExecutionError
 
         @tool
         async def wait_for_review() -> str:
@@ -1768,7 +1748,12 @@ class TestAppSuspend:
             )
             return "unreachable"
 
-        node = ToolNode([wait_for_review], handle_tool_errors=True)
+        # The default ToolNode handler only converts ToolInvocationError;
+        # every other exception, including this ToolExecutionError, is
+        # re-raised, so the turn fails with the guidance instead of a
+        # synthetic tool message. A pinned langgraph bump that changes that
+        # default must revisit this test.
+        node = ToolNode([wait_for_review])
         call: ToolCall = {
             "name": "wait_for_review",
             "args": {},
@@ -1784,11 +1769,11 @@ class TestAppSuspend:
             store=None,
         )
 
-        with (
-            attempt_context_scope(AttemptContext(attempt_id="attempt-1")),
-            pytest.raises(DurableActivitySuspended),
-        ):
+        with pytest.raises(ToolExecutionError) as raised:
             await node._arun_one(call, "dict", runtime)
+
+        assert "app.suspend()" in raised.value.error
+        assert "langgraph.types.interrupt()" in raised.value.error
 
 
 class TestAppLlm:

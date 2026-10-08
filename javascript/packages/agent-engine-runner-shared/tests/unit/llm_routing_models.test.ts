@@ -734,6 +734,43 @@ describe("accumulateStreamUsage", () => {
   });
 });
 
+describe("reasoning tokens survive aggregation", () => {
+  test("additive deltas sum the reasoning count", () => {
+    const added = addTokenUsage(
+      new LLMTokenUsage({
+        input_tokens: 18,
+        output_tokens: 1,
+        reasoning_tokens: 3,
+      }),
+      new LLMTokenUsage({
+        input_tokens: 0,
+        output_tokens: 4,
+        reasoning_tokens: 2,
+      }),
+    );
+    expect(added?.reasoningTokens).toBe(5);
+  });
+
+  test("a later snapshot without the count keeps the earlier one", () => {
+    const merged = mergeTokenUsage(
+      new LLMTokenUsage({
+        input_tokens: 10,
+        output_tokens: 2,
+        reasoning_tokens: 7,
+      }),
+      new LLMTokenUsage({ input_tokens: 10, output_tokens: 3 }),
+    );
+    expect(merged?.reasoningTokens).toBe(7);
+  });
+
+  test("usage that never carried the count still has none", () => {
+    const first = new LLMTokenUsage({ input_tokens: 10, output_tokens: 2 });
+    const second = new LLMTokenUsage({ input_tokens: 10, output_tokens: 3 });
+    expect(mergeTokenUsage(first, second)?.reasoningTokens).toBeUndefined();
+    expect(addTokenUsage(first, second)?.reasoningTokens).toBeUndefined();
+  });
+});
+
 describe("mergeTokenUsage", () => {
   test("merges split input and output chunks", () => {
     const merged = mergeTokenUsage(

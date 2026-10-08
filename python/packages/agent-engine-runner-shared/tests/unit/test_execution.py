@@ -22,3 +22,26 @@ async def test_execution_result_supports_await_and_stream() -> None:
     assert [event async for event in result] == [
         StreamEvent(event="token", data={"content": "hello"})
     ]
+
+
+@pytest.mark.asyncio
+async def test_closing_the_execution_stream_closes_the_adapter_stream() -> None:
+    # The AER closes the iterator it got from execute(); the adapter's cleanup
+    # must run then, not whenever its generator is garbage collected.
+    closed: list[bool] = []
+
+    async def invoke() -> AgentOutput:
+        return AgentOutput(response="unused")
+
+    async def stream() -> AsyncIterator[StreamEvent]:
+        try:
+            yield StreamEvent(event="token", data={"content": "a"})
+            yield StreamEvent(event="token", data={"content": "b"})
+        finally:
+            closed.append(True)
+
+    events = AgentExecutionResult(invoke, stream).__aiter__()
+    await anext(events)
+    await events.aclose()
+
+    assert closed == [True]

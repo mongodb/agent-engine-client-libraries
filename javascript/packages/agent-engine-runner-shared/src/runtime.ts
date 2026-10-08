@@ -261,7 +261,7 @@ export class TenantRuntime implements ITenantRuntime {
     if (typeof this.graphBuilder.getAgent !== "function") {
       throw new Error(
         "Graph builder must be a BaseApp instance with getAgent(). " +
-          "Plain callables are no longer supported.",
+          "Plain callables are not supported.",
       );
     }
     return this.graphBuilder.getAgent(opts);

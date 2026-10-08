@@ -92,6 +92,8 @@ export class LLMTokenUsage {
   readonly promptTokens?: number;
   readonly completionTokens?: number;
   totalTokens?: number;
+  /** Output tokens the model spent reasoning; part of the output count. */
+  readonly reasoningTokens?: number;
   readonly model?: string;
 
   constructor(data: {
@@ -100,6 +102,7 @@ export class LLMTokenUsage {
     prompt_tokens?: number;
     completion_tokens?: number;
     total_tokens?: number;
+    reasoning_tokens?: number;
     model?: string;
   }) {
     this.inputTokens = data.input_tokens;
@@ -107,6 +110,7 @@ export class LLMTokenUsage {
     this.promptTokens = data.prompt_tokens;
     this.completionTokens = data.completion_tokens;
     this.totalTokens = data.total_tokens;
+    this.reasoningTokens = data.reasoning_tokens;
     this.model = data.model;
 
     if (this.totalTokens === undefined) {
@@ -131,6 +135,8 @@ export class LLMTokenUsage {
       result["completion_tokens"] = this.completionTokens;
     if (this.totalTokens !== undefined)
       result["total_tokens"] = this.totalTokens;
+    if (this.reasoningTokens !== undefined)
+      result["reasoning_tokens"] = this.reasoningTokens;
     if (this.model !== undefined) result["model"] = this.model;
     return result;
   }
@@ -162,6 +168,7 @@ export const LLMTokenUsageSchema = z.preprocess(
       prompt_tokens: z.number().optional(),
       completion_tokens: z.number().optional(),
       total_tokens: z.number().optional(),
+      reasoning_tokens: z.number().optional(),
       model: z.string().optional(),
     })
     .transform((data) => new LLMTokenUsage(data)),
@@ -275,6 +282,7 @@ const INVOCATION_KNOWN_KEYS = new Set([
   "timeout",
   "parallel_tool_calls",
   "reasoning_effort",
+  "verbosity",
 ]);
 
 /** Explicit provider/model options passed with an LLM invocation. */
@@ -289,6 +297,7 @@ export class LLMInvocationOptions {
   readonly timeout?: number;
   readonly parallelToolCalls?: boolean;
   readonly reasoningEffort?: string;
+  readonly verbosity?: string;
   /** Provider-specific kwargs not in the standard field set (e.g. temperature). Mirrors Python's extra="allow". */
   readonly extras: Record<string, unknown>;
 
@@ -303,6 +312,7 @@ export class LLMInvocationOptions {
     timeout?: number;
     parallel_tool_calls?: boolean;
     reasoning_effort?: string;
+    verbosity?: string;
     [key: string]: unknown;
   }) {
     this.maxTokens = data.max_tokens;
@@ -315,6 +325,7 @@ export class LLMInvocationOptions {
     this.timeout = data.timeout;
     this.parallelToolCalls = data.parallel_tool_calls;
     this.reasoningEffort = data.reasoning_effort;
+    this.verbosity = data.verbosity;
     this.extras = Object.fromEntries(
       Object.entries(data).filter(
         ([k, v]) => !INVOCATION_KNOWN_KEYS.has(k) && v !== undefined,
@@ -345,6 +356,7 @@ export class LLMInvocationOptions {
       result["parallel_tool_calls"] = this.parallelToolCalls;
     if (this.reasoningEffort !== undefined)
       result["reasoning_effort"] = this.reasoningEffort;
+    if (this.verbosity !== undefined) result["verbosity"] = this.verbosity;
     return result;
   }
 }
@@ -364,6 +376,7 @@ export const LLMInvocationOptionsSchema = z.preprocess(
       timeout: z.number().optional(),
       parallel_tool_calls: z.boolean().optional(),
       reasoning_effort: z.string().optional(),
+      verbosity: z.string().optional(),
     })
     .transform((data) => new LLMInvocationOptions(data)),
 );

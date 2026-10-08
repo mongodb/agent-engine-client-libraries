@@ -14,7 +14,7 @@ import math
 from collections.abc import Mapping
 from datetime import datetime, timezone
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from agent_engine_sdk.models import (
     LLMInvocationOptions,
@@ -28,9 +28,6 @@ from agent_engine_sdk.models import (
 from pydantic import AliasChoices, BaseModel, Field, JsonValue, field_validator, model_validator
 
 from agent_engine_runner_shared.tool_api_error import ToolAPIError
-
-if TYPE_CHECKING:
-    from agent_engine_runner_shared.logging import ExecutionLog, NodeExecutionLog
 
 # =============================================================================
 # Execution Status
@@ -334,70 +331,15 @@ class ToolExecuteRequest(BaseModel):
     span_id: Optional[str] = Field(
         default=None, description="Active OTel span ID, for OE execution-log correlation"
     )
-
-    def to_start_log(self, execution: "Execution") -> "ExecutionLog":
-        """Convert this request to an ExecutionLog for tool start."""
-        from uuid import uuid4
-
-        from agent_engine_runner_shared.logging import ExecutionLog, ExecutionStatus, redact_fields
-
-        inputs = redact_fields(self.arguments, self.redact_fields)
-
-        return ExecutionLog(
-            id=str(uuid4()),
-            execution_id=self.execution_id,
-            tool=self.tool_name,
-            tool_call_id=self.tool_call_id,
-            kind=self.kind,
-            status=ExecutionStatus.STARTED,
-            timestamp=datetime.now(timezone.utc),
-            inputs=inputs,
-            step_number=self.step_number,
-            session_id=execution.session_id,
-            user_id=execution.user_id,
-            org_id=execution.org_id,
-            project_id=execution.project_id,
-            workspace_id=execution.workspace_id,
-            metadata=self.metadata,
-            trace_id=self.trace_id,
-            span_id=self.span_id,
-        )
-
-    def to_cached_log(
-        self,
-        execution: "Execution",
-        cached_result: Any,
-    ) -> "ExecutionLog":
-        """
-        Convert this request to an ExecutionLog for cached result.
-
-        Args:
-            execution: The parent execution context
-            cached_result: The cached result being returned
-        """
-        from uuid import uuid4
-
-        from agent_engine_runner_shared.logging import ExecutionLog, ExecutionStatus
-
-        return ExecutionLog(
-            id=str(uuid4()),
-            execution_id=self.execution_id,
-            tool=self.tool_name,
-            tool_call_id=self.tool_call_id,
-            kind=self.kind,
-            status=ExecutionStatus.CACHED,
-            timestamp=datetime.now(timezone.utc),
-            output=cached_result,
-            step_number=self.step_number,
-            session_id=execution.session_id,
-            user_id=execution.user_id,
-            org_id=execution.org_id,
-            project_id=execution.project_id,
-            workspace_id=execution.workspace_id,
-            metadata={"replay": True, **self.metadata},
-            trace_id=self.trace_id,
-            span_id=self.span_id,
-        )
+    review_protocol: Optional[int] = Field(
+        default=None,
+        description="Set by callers that pause for the guardrail review a halt names "
+        "and then resolve the call with review_id",
+    )
+    review_id: Optional[str] = Field(
+        default=None,
+        description="Asks OE to answer this invoke_llm call from a decided guardrail review",
+    )
 
 
 class ElicitationInfo(BaseModel):
@@ -424,6 +366,23 @@ class GuardrailMeta(BaseModel):
 
     guardrail_id: str = Field(..., description="ID of the policy that caused the halt")
     guardrail_category: str = Field(..., description="Category of the policy that caused the halt")
+
+
+class GuardrailReviewPolicy(BaseModel):
+    """One policy that required a guardrail review."""
+
+    id: str = Field(..., description="Policy ID")
+    name: Optional[str] = Field(default=None, description="Policy name")
+    category: Optional[str] = Field(default=None, description="Policy category")
+
+
+class GuardrailReviewHalt(BaseModel):
+    """The review OE opened for a require_review halt of a review_protocol call."""
+
+    review_id: str = Field(..., min_length=1, description="ID of the review to pause for")
+    allowed_decisions: List[str] = Field(default_factory=list)
+    reason: Optional[str] = Field(default=None, description="Why the output needs review")
+    guardrails: List[GuardrailReviewPolicy] = Field(default_factory=list)
 
 
 class ToolExecuteResponse(BaseModel):
@@ -459,6 +418,10 @@ class ToolExecuteResponse(BaseModel):
     pod_name: Optional[str] = Field(default=None, description="Execution pod name")
     guardrail_meta: Optional[GuardrailMeta] = Field(
         default=None, description="Policy identity when a guardrail halt fires"
+    )
+    guardrail_review: Optional[GuardrailReviewHalt] = Field(
+        default=None,
+        description="The review to pause for, on a require_review halt of a review_protocol call",
     )
     tool_api_error: Optional[ToolAPIError] = Field(
         default=None, description="Structured external API failure classification"
@@ -513,59 +476,6 @@ class ToolResultRequest(BaseModel):
     tool_api_error: Optional[ToolAPIError] = Field(
         default=None, description="Structured external API failure classification"
     )
-
-    def to_log(self, execution: Optional["Execution"] = None) -> "ExecutionLog":
-        """
-        Convert this request to an ExecutionLog for tool result.
-
-        Args:
-            execution: The parent execution context (optional)
-        """
-        from uuid import uuid4
-
-        from agent_engine_runner_shared.logging import ExecutionLog, ExecutionStatus
-
-        exec_status = (
-            ExecutionStatus.SUCCESS
-            if self.status == "success"
-            else ExecutionStatus.SUSPENDED
-            if self.status == "suspend"
-            else ExecutionStatus.ERROR
-            if self.status == "error"
-            else ExecutionStatus.BLOCKED
-            if self.status == "blocked"
-            else ExecutionStatus.CACHED
-            if self.status == "cached"
-            else ExecutionStatus.ERROR
-        )
-
-        return ExecutionLog(
-            id=str(uuid4()),
-            execution_id=self.execution_id,
-            tool=self.tool_name,
-            tool_call_id=self.tool_call_id,
-            kind=self.kind,
-            status=exec_status,
-            timestamp=datetime.now(timezone.utc),
-            output=self.result,
-            error=self.error,
-            duration_ms=self.duration_ms,
-            step_number=self.step_number,
-            session_id=execution.session_id if execution else None,
-            user_id=execution.user_id if execution else None,
-            org_id=execution.org_id if execution else None,
-            project_id=execution.project_id if execution else None,
-            pod_name=self.pod_name,
-            prompt_tokens=self.prompt_tokens,
-            completion_tokens=self.completion_tokens,
-            total_tokens=self.total_tokens,
-            model=self.model,
-            workspace_id=self.workspace_id or (execution.workspace_id if execution else None),
-            metadata=self.metadata,
-            trace_id=self.trace_id,
-            span_id=self.span_id,
-            tool_api_error=self.tool_api_error,
-        )
 
 
 # =============================================================================
@@ -1137,10 +1047,14 @@ def add_token_usage(
         total = (prior.total_tokens or 0) + (next_usage.total_tokens or 0)
     else:
         total = prompt + completion
+    reasoning: Optional[int] = None
+    if prior.reasoning_tokens is not None or next_usage.reasoning_tokens is not None:
+        reasoning = (prior.reasoning_tokens or 0) + (next_usage.reasoning_tokens or 0)
     return LLMTokenUsage(
         input_tokens=prompt,
         output_tokens=completion,
         total_tokens=total,
+        reasoning_tokens=reasoning,
         model=model,
     )
 
@@ -1202,10 +1116,16 @@ def merge_token_usage(
     total = next_usage.total_tokens if next_usage.total_tokens is not None else prior.total_tokens
     if total is None and prompt is not None and completion is not None:
         total = prompt + completion
+    reasoning = (
+        next_usage.reasoning_tokens
+        if next_usage.reasoning_tokens is not None
+        else prior.reasoning_tokens
+    )
     return LLMTokenUsage(
         input_tokens=prompt,
         output_tokens=completion,
         total_tokens=total,
+        reasoning_tokens=reasoning,
         model=model,
     )
 
@@ -1767,207 +1687,3 @@ class StreamChunk(BaseModel):
     # Execution context
     execution_id: Optional[str] = Field(default=None, description="Execution ID")
     step_number: Optional[int] = Field(default=None, description="Step number in execution")
-
-
-class AgentStartStreamRequest(BaseModel):
-    """Request to start an agent execution with streaming response."""
-
-    message: str = Field(..., description="User message")
-    session_id: Optional[str] = Field(
-        default=None, description="Session ID for conversation continuity"
-    )
-    org_id: Optional[str] = Field(
-        default=None, description="Organization ID for multi-tenant isolation"
-    )
-    user_id: Optional[str] = Field(default=None, description="User ID for personalization")
-
-
-# =============================================================================
-# Node Execution (AER → OE)
-# =============================================================================
-
-
-# =============================================================================
-# Query Response Models — Execution Logs & Node Executions
-# =============================================================================
-
-
-class ExecutionLogsQueryResponse(BaseModel):
-    """Response for execution logs query (used by API Gateway proxy)."""
-
-    logs: List[Dict[str, Any]] = Field(default_factory=list, description="Execution log documents")
-    count: int = Field(0, description="Number of logs returned")
-
-
-class NodeExecutionsQueryResponse(BaseModel):
-    """Response for node executions query (used by API Gateway proxy)."""
-
-    executions: List[Dict[str, Any]] = Field(
-        default_factory=list, description="Node execution documents"
-    )
-    count: int = Field(0, description="Number of executions returned")
-
-
-# Cost Dashboard Query Response Models
-# =============================================================================
-
-
-class CostSummary(BaseModel):
-    """Aggregate cost metrics for the requested period."""
-
-    total_cost_usd: float = 0.0
-    total_tokens: int = 0
-    total_prompt_tokens: int = 0
-    total_completion_tokens: int = 0
-    total_llm_calls: int = 0
-    unpriced_llm_calls: int = 0
-
-
-class CostByWorkspace(BaseModel):
-    """Cost breakdown for a single workspace."""
-
-    workspace_id: str
-    total_cost_usd: float = 0.0
-    total_tokens: int = 0
-    call_count: int = 0
-    percentage: float = 0.0
-
-
-class CostByModel(BaseModel):
-    """Cost breakdown for a single model."""
-
-    model: str
-    total_cost_usd: float = 0.0
-    total_tokens: int = 0
-    call_count: int = 0
-    percentage: float = 0.0
-
-
-class DailyCostEntry(BaseModel):
-    """Cost data for a single day."""
-
-    date: str
-    total_cost_usd: float = 0.0
-    total_tokens: int = 0
-    call_count: int = 0
-
-
-class CostDashboardResponse(BaseModel):
-    """Response for cost dashboard aggregation (used by API Gateway proxy)."""
-
-    summary: CostSummary = Field(default_factory=CostSummary)
-    by_workspace: List[CostByWorkspace] = Field(default_factory=list)
-    by_model: List[CostByModel] = Field(default_factory=list)
-    daily_trend: List[DailyCostEntry] = Field(default_factory=list)
-
-
-# =============================================================================
-# Executions Query Response Models
-# =============================================================================
-
-
-class ExecutionDocument(BaseModel):
-    """An execution document as stored in the platform database."""
-
-    execution_id: str
-    status: str = ""
-    message: str = ""
-    session_id: str = ""
-    user_id: str = ""
-    org_id: str = ""
-    project_id: Optional[str] = ""
-    workspace_id: Optional[str] = ""
-    result: Optional[Any] = None
-    error: Optional[str] = None
-    suspend_reason: Optional[str] = None
-    suspend_context: Optional[Dict[str, Any]] = None
-    created_at: Optional[str] = None
-    updated_at: Optional[str] = None
-
-
-class ExecutionsListQueryResponse(BaseModel):
-    """Response for executions list query (used by API Gateway proxy)."""
-
-    success: bool = True
-    executions: List[ExecutionDocument] = Field(default_factory=list)
-    count: int = 0
-
-
-class ExecutionDetailQueryResponse(BaseModel):
-    """Response for single execution detail query (used by API Gateway proxy)."""
-
-    success: bool = True
-    execution: Optional[ExecutionDocument] = None
-    error: Optional[str] = None
-
-
-# =============================================================================
-# Node Execution (AER → OE)
-# =============================================================================
-
-
-class NodeExecutionRequest(BaseModel):
-    """Report node execution event (AER → OE for logging)."""
-
-    execution_id: str = Field(..., description="Execution identifier")
-    node_name: str = Field(..., description="Name of the LangGraph node")
-    status: str = Field(..., description="Node status: started, success, error, suspend")
-    timestamp: datetime = Field(..., description="Event timestamp")
-    run_id: str = Field(..., description="LangChain run ID for this node execution")
-    parent_run_id: Optional[str] = Field(default=None, description="Parent run ID if nested")
-    session_id: Optional[str] = Field(default=None, description="Session ID for correlation")
-    user_id: Optional[str] = Field(default=None, description="User ID for personalization")
-    inputs: Optional[Dict[str, Any]] = Field(
-        default=None, description="Node inputs (for started status)"
-    )
-    outputs: Optional[Dict[str, Any]] = Field(
-        default=None, description="Node outputs (for success status)"
-    )
-    error: Optional[str] = Field(default=None, description="Error message (for error status)")
-    duration_ms: Optional[float] = Field(
-        default=None, description="Execution duration in milliseconds"
-    )
-    org_id: Optional[str] = Field(default=None, description="Organization ID")
-    project_id: Optional[str] = Field(default=None, description="Project ID")
-    trace_id: Optional[str] = Field(
-        default=None, description="Active OTel trace ID, for OE execution-log correlation"
-    )
-    span_id: Optional[str] = Field(
-        default=None, description="Active OTel span ID, for OE execution-log correlation"
-    )
-
-    def to_log(self) -> "NodeExecutionLog":
-        """Convert this request to a NodeExecutionLog for persistence."""
-        from uuid import uuid4
-
-        from agent_engine_runner_shared.logging import NodeExecutionLog, NodeExecutionStatus
-
-        node_status = (
-            NodeExecutionStatus.STARTED
-            if self.status == "started"
-            else NodeExecutionStatus.SUCCESS
-            if self.status == "success"
-            else NodeExecutionStatus.SUSPENDED
-            if self.status == "suspend"
-            else NodeExecutionStatus.ERROR
-        )
-
-        return NodeExecutionLog(
-            id=str(uuid4()),
-            execution_id=self.execution_id,
-            node=self.node_name,
-            status=node_status,
-            timestamp=self.timestamp,
-            run_id=self.run_id,
-            parent_run_id=self.parent_run_id,
-            inputs=self.inputs,
-            outputs=self.outputs,
-            error=self.error,
-            duration_ms=self.duration_ms,
-            session_id=self.session_id,
-            user_id=self.user_id,
-            org_id=self.org_id,
-            project_id=self.project_id,
-            trace_id=self.trace_id,
-            span_id=self.span_id,
-        )

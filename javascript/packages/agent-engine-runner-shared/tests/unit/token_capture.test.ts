@@ -6,11 +6,9 @@
  * Ported from runner-shared — uses a plain object instead of AIMessage
  * since agent-engine-runner-shared has no langchain dependency.
  *
- * Source change to enable parity: `extractUsage` and `_extractPodUsage`
- * were ported from Python's `secure_wrapper.extract_usage` /
- * `_extract_pod_usage`. The original Phase 9 port skipped them because no
- * internal caller exists, but external consumers (downstream framework
- * SDKs) expect them. See AGENTS.md for the rationale.
+ * `extractUsage` is ported from Python's `secure_wrapper.extract_usage` to
+ * keep token-usage extraction in cross-language parity. See AGENTS.md for the
+ * rationale.
  */
 
 import { describe, test, expect } from "vitest";

@@ -53,3 +53,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reverted, since its snapshot is tainted with the other region's
   request-scoped state. Regions entered on a quiet environment (the serialized
   production flow) keep the full snapshot restore.
+
+### Removed
+- Unreferenced query/stream response models — execution logs, node executions,
+  cost dashboard, executions, and sessions — and the `logExecutionStart` and
+  `extractPodUsage` helpers were removed from the public surface. The
+  orchestration-engine query shapes were consumed only by the retired Python
+  orchestration engine, which the Go engine replaced; the session-query shapes
+  and both helpers had no maintained caller.

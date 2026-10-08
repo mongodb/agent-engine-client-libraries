@@ -225,6 +225,34 @@ class TestCreateAgentEngineDeepAgent:
         durable_middleware = mock_create.call_args.kwargs["middleware"][0]
         assert isinstance(durable_middleware, DurableDeepAgentMiddleware)
         assert durable_middleware.unsupported_subagent_names == frozenset({"isolated"})
+        assert durable_middleware.retry_policy_subagent_names == frozenset()
+
+    @patch("agent_engine_sdk_langgraph.deep_agent.create_deep_agent")
+    def test_configures_durable_guard_for_compiled_subagent_retry_policy(
+        self, mock_create
+    ) -> None:
+        from langgraph.graph import END, START, MessagesState, StateGraph
+        from langgraph.types import RetryPolicy
+
+        builder = StateGraph(MessagesState)
+        builder.add_node("work", lambda state: state, retry_policy=RetryPolicy())
+        builder.add_edge(START, "work")
+        builder.add_edge("work", END)
+
+        create_agent_engine_deep_agent(
+            secure_llm=MagicMock(spec=BaseChatModel),
+            backend=MagicMock(),
+            subagents=_specs(
+                {
+                    "name": "retrying",
+                    "description": "One of its nodes retries",
+                    "runnable": builder.compile().with_config({"tags": ["wrapped"]}),
+                }
+            ),
+        )
+
+        durable_middleware = mock_create.call_args.kwargs["middleware"][0]
+        assert durable_middleware.retry_policy_subagent_names == frozenset({"retrying"})
 
 
 # ---------------------------------------------------------------------------

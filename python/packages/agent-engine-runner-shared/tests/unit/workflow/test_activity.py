@@ -449,6 +449,54 @@ class TestRunSerialActivity:
         assert activity.control_flow is control_flow
         assert client.outcomes == []
 
+    def test_scoped_call_index_restarts_for_a_new_scope_and_a_new_attempt(self) -> None:
+        from agent_engine_runner_shared.workflow import attempt_context_scope
+        from agent_engine_runner_shared.workflow.context import next_scoped_call_index
+
+        first_run, second_run = object(), object()
+        with attempt_context_scope(_attempt()):
+            assert [next_scoped_call_index(first_run) for _ in range(3)] == [1, 2, 3]
+            # A re-run of the same unit is a new scope: its calls count from 1
+            # again, so they name the calls the first run already made.
+            assert [next_scoped_call_index(second_run) for _ in range(2)] == [1, 2]
+            assert next_scoped_call_index(first_run) == 4
+        with attempt_context_scope(_attempt()):
+            assert next_scoped_call_index(first_run) == 1
+
+    def test_answered_interrupted_activity_leaves_the_waiting_view(self) -> None:
+        from agent_engine_runner_shared.workflow import attempt_context_scope
+        from agent_engine_runner_shared.workflow.context import (
+            interrupted_activities,
+            mark_interrupted_activities_answered,
+            record_interrupted_activity,
+        )
+
+        def command(ordinal: int) -> Any:
+            return build_activity_command(
+                attempt=_attempt(),
+                kind=ACTIVITY_KIND_TOOL,
+                name="langgraph.interrupt",
+                activity_ordinal=ordinal,
+                semantic_input={"pause": ordinal},
+            )
+
+        with attempt_context_scope(_attempt()):
+            first, second = command(1), command(2)
+            record_interrupted_activity(first, RuntimeError("first"))
+            mark_interrupted_activities_answered([first.position])
+            record_interrupted_activity(second, RuntimeError("second"))
+
+            (waiting,) = interrupted_activities(1)
+            everything = interrupted_activities(1, include_answered=True)
+
+        assert waiting.command.position.activity_ordinal == 2
+        assert [item.command.position.activity_ordinal for item in everything] == [1, 2]
+        # Answers are attempt-local: a new attempt starts with nothing answered.
+        with attempt_context_scope(_attempt()):
+            record_interrupted_activity(command(1), RuntimeError("first"))
+            (replayed,) = interrupted_activities(1)
+        assert replayed.command.position.activity_ordinal == 1
+
     def test_replay_runs_the_same_post_outcome_hook_without_execution(self) -> None:
         from agent_engine_runner_shared.workflow.client import ActivityReplay
 

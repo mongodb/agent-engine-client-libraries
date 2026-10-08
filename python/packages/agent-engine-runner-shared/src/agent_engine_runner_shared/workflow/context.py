@@ -51,6 +51,7 @@ __all__ = [
     "current_pending_child_operation_batch",
     "current_step_ordinal",
     "interrupted_activities",
+    "next_scoped_call_index",
     "operation_path_resolver_scope",
     "preallocate_activity_ordinals",
     "preallocate_child_operation_ordinals",
@@ -120,6 +121,22 @@ def _activity_position_key(
 
 
 @dataclass
+class _GuardrailReviewWaits:
+    """The reviews this attempt paused for, as recorded by the platform's own halts."""
+
+    _lock: threading.Lock = field(default_factory=threading.Lock)
+    _review_ids: set[str] = field(default_factory=set)
+
+    def note(self, review_id: str) -> None:
+        with self._lock:
+            self._review_ids.add(review_id)
+
+    def has(self, review_id: str) -> bool:
+        with self._lock:
+            return review_id in self._review_ids
+
+
+@dataclass
 class _ObservedActivityPositions:
     """Collects activity positions observed by this attempt."""
 
@@ -155,6 +172,7 @@ class _InterruptedActivities:
 
     _lock: threading.Lock = field(default_factory=threading.Lock)
     _items: list[InterruptedActivity] = field(default_factory=list)
+    _answered: set[bytes] = field(default_factory=set)
 
     def record(self, command: ActivityCommand, control_flow: BaseException) -> None:
         command_copy = ActivityCommand()
@@ -162,10 +180,25 @@ class _InterruptedActivities:
         with self._lock:
             self._items.append(InterruptedActivity(command_copy, control_flow))
 
-    def for_step(self, step_ordinal: int) -> list[InterruptedActivity]:
+    def mark_answered(self, positions: Sequence[ActivityPosition]) -> None:
+        with self._lock:
+            self._answered.update(
+                position.SerializeToString(deterministic=True) for position in positions
+            )
+
+    def for_step(
+        self, step_ordinal: int, *, include_answered: bool = False
+    ) -> list[InterruptedActivity]:
         with self._lock:
             return [
-                item for item in self._items if item.command.position.step_ordinal == step_ordinal
+                item
+                for item in self._items
+                if item.command.position.step_ordinal == step_ordinal
+                and (
+                    include_answered
+                    or item.command.position.SerializeToString(deterministic=True)
+                    not in self._answered
+                )
             ]
 
 
@@ -201,6 +234,16 @@ class _ActivityOrdinalAllocator:
     _lock: threading.Lock = field(default_factory=threading.Lock)
     _next_by_path: dict[_OperationPathKey, int] = field(default_factory=dict)
     _by_path_and_key: dict[tuple[_OperationPathKey, str], int] = field(default_factory=dict)
+    # Keyed by id(); the scope object is retained so its id cannot be reused
+    # by another scope while this attempt lives.
+    _calls_by_scope: dict[int, tuple[object, int]] = field(default_factory=dict)
+
+    def next_in_scope(self, scope: object) -> int:
+        """Count calls within one scope object, starting at 1."""
+        with self._lock:
+            _, count = self._calls_by_scope.get(id(scope), (scope, 0))
+            self._calls_by_scope[id(scope)] = (scope, count + 1)
+            return count + 1
 
     def preallocate(self, path: _OperationPathKey, keys: Sequence[str]) -> list[int]:
         """Assign ordinals to keys in list order. Idempotent per key."""
@@ -345,6 +388,7 @@ class AttemptContextBinding(NamedTuple):
     observed_positions_token: Token[_ObservedActivityPositions | None]
     interrupted_activities_token: Token[_InterruptedActivities | None]
     activity_reconstruction_token: Token[_ActivityReconstruction | None]
+    guardrail_review_waits_token: Token[_GuardrailReviewWaits | None]
 
 
 _ATTEMPT_CONTEXT: ContextVar[AttemptContext | None] = ContextVar(
@@ -365,6 +409,9 @@ _OPERATION_PATH_RESOLVER: ContextVar[OperationPathResolver | None] = ContextVar(
 )
 _OBSERVED_ACTIVITY_POSITIONS: ContextVar[_ObservedActivityPositions | None] = ContextVar(
     "workflow_observed_activity_positions", default=None
+)
+_GUARDRAIL_REVIEW_WAITS: ContextVar[_GuardrailReviewWaits | None] = ContextVar(
+    "workflow_guardrail_review_waits", default=None
 )
 _INTERRUPTED_ACTIVITIES: ContextVar[_InterruptedActivities | None] = ContextVar(
     "workflow_interrupted_activities", default=None
@@ -449,6 +496,24 @@ def current_step_ordinal() -> int:
     return counter.value
 
 
+def note_guardrail_review_wait(review_id: str) -> None:
+    """Record that this attempt pauses for a review the platform halted a call for."""
+    waits = _GUARDRAIL_REVIEW_WAITS.get()
+    if waits is not None:
+        waits.note(review_id)
+
+
+def is_guardrail_review_wait(review_id: object) -> bool:
+    """Whether this attempt paused for that review.
+
+    A pause is a review wait because the platform recorded the halt behind it,
+    not because of what its value looks like: an application may pause with a
+    value of any shape.
+    """
+    waits = _GUARDRAIL_REVIEW_WAITS.get()
+    return waits is not None and isinstance(review_id, str) and waits.has(review_id)
+
+
 def record_observed_activity(position: ActivityPosition) -> None:
     """Record one activity position encountered by this attempt."""
     observed = _OBSERVED_ACTIVITY_POSITIONS.get()
@@ -469,10 +534,26 @@ def record_interrupted_activity(command: ActivityCommand, control_flow: BaseExce
         interrupted.record(command, control_flow)
 
 
-def interrupted_activities(step_ordinal: int) -> list[InterruptedActivity]:
-    """Return framework-interrupted activities observed in one workflow step."""
+def interrupted_activities(
+    step_ordinal: int, *, include_answered: bool = False
+) -> list[InterruptedActivity]:
+    """Return framework-interrupted activities observed in one workflow step.
+
+    Answered activities are excluded by default. One LangGraph task can pause
+    several times and every pause carries the same native interrupt id, so
+    only the pauses still waiting may claim that id.
+    """
     interrupted = _INTERRUPTED_ACTIVITIES.get()
-    return [] if interrupted is None else interrupted.for_step(step_ordinal)
+    if interrupted is None:
+        return []
+    return interrupted.for_step(step_ordinal, include_answered=include_answered)
+
+
+def mark_interrupted_activities_answered(positions: Sequence[ActivityPosition]) -> None:
+    """Record that these interrupted activities received their answer in this attempt."""
+    interrupted = _INTERRUPTED_ACTIVITIES.get()
+    if interrupted is not None:
+        interrupted.mark_answered(positions)
 
 
 def set_activity_reconstruction_ids(activity_ids: Sequence[str]) -> None:
@@ -567,6 +648,17 @@ def allocate_activity_ordinal(key: str | None = None) -> int:
     return _require_allocator().allocate(_current_operation_path_key(), key)
 
 
+def next_scoped_call_index(scope: object) -> int:
+    """Return the 1-based index of this call within `scope` for the current attempt.
+
+    An adapter passes the framework object that lives for one run of a unit
+    the framework may re-run, such as one run of a graph task. The index
+    restarts for each run, so a key built from it names the same call on every
+    run and its recorded activity replays.
+    """
+    return _require_allocator().next_in_scope(scope)
+
+
 def current_pending_child_operation_batch() -> tuple[ChildOperationBoundary, ...]:
     """Return the attempt-scoped sibling batch, or empty when none is bound."""
     holder = _PENDING_CHILD_BATCH.get()
@@ -617,6 +709,7 @@ def _bind_attempt_holders(context: AttemptContext) -> AttemptContextBinding:
         observed_positions_token=_OBSERVED_ACTIVITY_POSITIONS.set(_ObservedActivityPositions()),
         interrupted_activities_token=_INTERRUPTED_ACTIVITIES.set(_InterruptedActivities()),
         activity_reconstruction_token=_ACTIVITY_RECONSTRUCTION.set(_ActivityReconstruction()),
+        guardrail_review_waits_token=_GUARDRAIL_REVIEW_WAITS.set(_GuardrailReviewWaits()),
     )
 
 
@@ -651,3 +744,4 @@ def reset_attempt_context(binding: AttemptContextBinding) -> None:
     _OBSERVED_ACTIVITY_POSITIONS.reset(binding.observed_positions_token)
     _INTERRUPTED_ACTIVITIES.reset(binding.interrupted_activities_token)
     _ACTIVITY_RECONSTRUCTION.reset(binding.activity_reconstruction_token)
+    _GUARDRAIL_REVIEW_WAITS.reset(binding.guardrail_review_waits_token)

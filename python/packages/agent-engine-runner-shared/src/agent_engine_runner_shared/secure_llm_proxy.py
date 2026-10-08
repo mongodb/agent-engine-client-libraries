@@ -32,6 +32,7 @@ from pydantic import JsonValue
 from agent_engine_runner_shared.context import get_current_user_id
 from agent_engine_runner_shared.generated.workflow.v1.activity_pb2 import ACTIVITY_KIND_LLM
 from agent_engine_runner_shared.models import (
+    GuardrailReviewHalt,
     InvokeLLMRequestArguments,
     LLMPodStreamEvent,
     ToolExecuteResponse,
@@ -61,6 +62,8 @@ from agent_engine_runner_shared.workflow.activity import (
 )
 from agent_engine_runner_shared.workflow.context import (
     allocate_activity_ordinal,
+    is_guardrail_review_wait,
+    note_guardrail_review_wait,
     preallocate_activity_ordinals,
     tool_activity_key,
 )
@@ -77,6 +80,64 @@ def _is_oe_stream_transport_error(exc: BaseException) -> bool:
     terminal — they are not owner-death.
     """
     return isinstance(exc, httpx.TransportError) and not isinstance(exc, httpx.TimeoutException)
+
+
+GUARDRAIL_REVIEW_PROTOCOL_VERSION = 1
+
+# The halt recorded as an LLM activity's result, and the value a framework
+# interrupt carries while the review waits. OE recognizes the wait by this key.
+_REVIEW_HALT_RESULT_KEY = "guardrail_review_halt"
+_REVIEW_HALT_STEP_KEY = "guardrail_review_halt_step"
+GUARDRAIL_REVIEW_WAIT_KEY = "guardrail_review"
+
+
+class _ReviewHalt:
+    """Stands in the chunk stream for a model call OE halted for review.
+
+    It never reaches the proxy's caller: the activity records it as the call's
+    result, and the proxy pauses for the review once the activity is recorded.
+    """
+
+    def __init__(self, review: GuardrailReviewHalt, step: int):
+        self.review = review
+        # The step OE bound the review to. A later attempt can count fewer
+        # steps before this call than the attempt that halted did, and OE only
+        # resolves a review at a step after this one.
+        self.step = step
+
+
+def _model_chunks(chunks: Iterator[LLMStreamChunk | _ReviewHalt]) -> Iterator[LLMStreamChunk]:
+    """The chunks of a stream that has no halt to pause for.
+
+    Only the first call of a protocol-following durable activity may halt.
+    """
+    for chunk in chunks:
+        if isinstance(chunk, _ReviewHalt):
+            raise LLMInvocationError("OE halted a model call that cannot pause for review")
+        yield chunk
+
+
+def guardrail_review_wait_id(value: Any) -> str | None:
+    """The review a pause value names, when this attempt paused for that review.
+
+    The answer to such a pause is the platform's review decision, not part of
+    the conversation. An application's own pause is never one, whatever its
+    value looks like: only a review the proxy recorded a halt for counts.
+    """
+    named = value.get(GUARDRAIL_REVIEW_WAIT_KEY) if isinstance(value, dict) else None
+    review_id = named.get("review_id") if isinstance(named, dict) else None
+    return review_id if is_guardrail_review_wait(review_id) else None
+
+
+def _review_halt_from_result(result: Any) -> _ReviewHalt | None:
+    if not isinstance(result, dict) or _REVIEW_HALT_RESULT_KEY not in result:
+        return None
+    # A recorded result comes back as JSON numbers, which are floats.
+    step = result.get(_REVIEW_HALT_STEP_KEY)
+    return _ReviewHalt(
+        GuardrailReviewHalt.model_validate(result[_REVIEW_HALT_RESULT_KEY]),
+        int(step) if isinstance(step, (int, float)) else 0,
+    )
 
 
 class SecureLLMProxy:
@@ -97,6 +158,7 @@ class SecureLLMProxy:
         operational_steps: OperationalStepAllocator | None = None,
         stable_operation_identity: bool = False,
         durable_memory: DurableMemoryState | None = None,
+        guardrail_review_protocol: bool = False,
     ):
         self.oe_url = oe_url.rstrip("/")
         self.execution_id = execution_id
@@ -108,6 +170,10 @@ class SecureLLMProxy:
         self.llm_id = llm_id
         self.stable_operation_identity = stable_operation_identity
         self.durable_memory = durable_memory
+        # Set by an adapter whose framework can pause after a model call and
+        # re-run the calling code: under a durable attempt the proxy then
+        # follows OE's review protocol instead of pausing inside the call.
+        self.guardrail_review_protocol = guardrail_review_protocol
         # Prefer the wrapper's allocator so tool + LLM share one sequence.
         self.operational_steps = operational_steps or OperationalStepAllocator()
         self.last_duration_ms: float = 0.0
@@ -200,9 +266,15 @@ class SecureLLMProxy:
         self,
         invoke_request: InvokeLLMRequestArguments,
         step: int | None = None,
+        review_id: str | None = None,
     ) -> ToolExecuteResponse:
         """Ask OE to execute invoke_llm and return the final ToolExecuteResponse."""
         step = self._allocate_step(step)
+        review_fields: dict[str, Any] = {}
+        if self._follows_review_protocol():
+            review_fields["review_protocol"] = GUARDRAIL_REVIEW_PROTOCOL_VERSION
+            if review_id is not None:
+                review_fields["review_id"] = review_id
 
         response = request_oe_approval_retryable(
             request_oe_approval,
@@ -213,6 +285,7 @@ class SecureLLMProxy:
             step=step,
             # LLM-output guardrails make /tool/execute wait for the full LLM result.
             timeout=httpx.Timeout(get_request_timeout(), read=LLM_READ_TIMEOUT),
+            **review_fields,
         )
 
         if not response.proceed and response.result is None and response.status != "require_review":
@@ -227,6 +300,36 @@ class SecureLLMProxy:
             self.operational_steps.observe_at_least(response.latest_step_number)
 
         return response
+
+    def _follows_review_protocol(self) -> bool:
+        """Whether this call pauses for a review after its activity is recorded.
+
+        Only a durable attempt records the halt and replays it; elsewhere the
+        proxy keeps pausing inside the call.
+        """
+        return self.guardrail_review_protocol and current_attempt_context() is not None
+
+    def _await_review_decision(self, review: GuardrailReviewHalt) -> None:
+        """Pause for the review and check the answer names it.
+
+        The pause value is built only from the recorded halt, so it is the
+        same on every replay. The answer carries the decision, but OE's record
+        is what the resolving call is answered from.
+        """
+        from agent_engine_runner_shared.hooks import get_suspend_handler
+
+        interrupt = get_suspend_handler()
+        if interrupt is None:
+            raise LLMInvocationError(
+                "Guardrail require_review: no suspend handler registered. "
+                "Human review is required but the agent framework has not registered "
+                "a suspend handler."
+            )
+        note_guardrail_review_wait(review.review_id)
+        answer = interrupt({GUARDRAIL_REVIEW_WAIT_KEY: {"review_id": review.review_id}})
+        named = answer.get(GUARDRAIL_REVIEW_WAIT_KEY) if isinstance(answer, dict) else None
+        if not isinstance(named, dict) or named.get("review_id") != review.review_id:
+            raise LLMInvocationError("Guardrail review was answered for a different review")
 
     def _handle_require_review(self, response: ToolExecuteResponse) -> Iterator[LLMStreamChunk]:
         """Handle a guardrail require_review response by suspending via interrupt().
@@ -692,8 +795,14 @@ class SecureLLMProxy:
         step: int | None = None,
         stop: list[str] | None = None,
         options: LLMInvocationOptions | None = None,
+        activity_key: str | None = None,
     ) -> Iterator[LLMStreamChunk]:
         """Stream invoke_llm chunks through OE approval and OE-owned SSE relay.
+
+        `activity_key` names this call's durable activity. An adapter whose
+        framework re-runs code after a pause supplies a key that is the same
+        on every run; the default, the operational step, only ever increases
+        within an attempt.
 
         Sessions routed to the platform-owned workflow wrap the call in a
         serial LLM activity: a recorded outcome replays without a model call;
@@ -711,40 +820,78 @@ class SecureLLMProxy:
 
         attempt = current_attempt_context()
         if attempt is None:
-            yield from self._stream_llm(invoke_request, resolved_step)
+            yield from _model_chunks(self._stream_llm(invoke_request, resolved_step))
             return
 
-        def _execute() -> Iterator[LLMStreamChunk]:
+        key = activity_key or f"llm:{resolved_step}"
+        halt: _ReviewHalt | None = None
+        for chunk in self._run_llm_activity(invoke_request, resolved_step, key, attempt):
+            if isinstance(chunk, _ReviewHalt):
+                halt = chunk
+                continue
+            yield chunk
+        if halt is None:
+            return
+        review = halt.review
+        # Before the pause, so a sibling call halted in the same superstep has
+        # its step counted before either resolves.
+        self.operational_steps.observe_at_least(halt.step)
+
+        # The halted call is a recorded activity by now, so the pause is
+        # outside it. Once answered, the same request is sent again, naming the
+        # review, as its own activity at a later step: OE answers that one from
+        # its record of the review.
+        self._await_review_decision(review)
+        yield from _model_chunks(
+            self._run_llm_activity(
+                invoke_request,
+                self._allocate_step(None),
+                f"{key}:review:{review.review_id}",
+                attempt,
+                review_id=review.review_id,
+            )
+        )
+
+    def _run_llm_activity(
+        self,
+        invoke_request: InvokeLLMRequestArguments,
+        step: int,
+        activity_key: str,
+        attempt: Any,
+        review_id: str | None = None,
+    ) -> Iterator[LLMStreamChunk | _ReviewHalt]:
+        """Run one invoke_llm request as a durable LLM activity."""
+
+        def _execute() -> Iterator[LLMStreamChunk | _ReviewHalt]:
             try:
-                yield from self._stream_llm(invoke_request, resolved_step)
+                if review_id is None:
+                    yield from self._stream_llm(invoke_request, step)
+                else:
+                    yield from self._stream_review_resolution(invoke_request, step, review_id)
             except PolicyDeniedException as denial:
                 # Record the denial as a DENIED outcome (not FAILED) so a
                 # replay reproduces policy-denial semantics.
                 raise DurableActivityDeniedError(denial.reason) from denial
 
+        semantic_input = invoke_request.model_dump(mode="json", exclude_none=True)
+        if review_id is not None:
+            semantic_input["guardrail_review_id"] = review_id
         try:
             yield from run_streaming_activity(
                 kind=ACTIVITY_KIND_LLM,
                 name=self.model_name,
-                activity_ordinal=allocate_activity_ordinal(f"llm:{resolved_step}"),
-                semantic_input=invoke_request.model_dump(mode="json", exclude_none=True),
+                activity_ordinal=allocate_activity_ordinal(activity_key),
+                semantic_input=semantic_input,
                 execute=_execute,
                 replay=self._chunks_from_replay_result,
                 fold=self._fold_and_preallocate_tools,
-                on_activity_resolved=(
-                    partial(
-                        self.durable_memory.synchronize_llm,
-                        user_id=get_current_user_id(),
-                    )
-                    if self.durable_memory is not None
-                    else None
-                ),
+                on_activity_resolved=self._memory_hook(),
                 client=self._workflow,
                 oe_url=self.oe_url,
                 attempt=attempt,
-                # The platform-owned operational step is the LLM call's stable
-                # call-order identity. Frameworks may begin consuming tool-call
-                # chunks before the provider stream has fully closed.
+                # The activity key is the LLM call's identity, so admission
+                # need not be serialized. Frameworks may begin consuming
+                # tool-call chunks before the provider stream has fully closed.
                 exclusive=False,
             )
         except DurableActivityDeniedError as error:
@@ -754,7 +901,27 @@ class SecureLLMProxy:
                 raise error.__cause__ from None
             raise PolicyDeniedException(str(error)) from error
 
-    def _chunks_from_replay_result(self, result: Any) -> Iterator[LLMStreamChunk]:
+    def _memory_hook(self) -> Any:
+        """The hook that settles a resolved LLM activity in durable memory.
+
+        A halt is not a model response. Its activity is acknowledged with no
+        conversation content, and the turn's pending input stays pending until
+        the review is resolved.
+        """
+        memory = self.durable_memory
+        if memory is None:
+            return None
+        synchronize = partial(memory.synchronize_llm, user_id=get_current_user_id())
+
+        def _settle(client: Any, context: Any, result: Any) -> None:
+            if _review_halt_from_result(result) is not None:
+                memory.acknowledge(client, context)
+            else:
+                synchronize(client, context, result)
+
+        return _settle
+
+    def _chunks_from_replay_result(self, result: Any) -> Iterator[LLMStreamChunk | _ReviewHalt]:
         """Translate a workflow-recorded LLM response back into stream chunks.
 
         This is the replay leg of the LLM activity: OE returned the outcome
@@ -765,6 +932,10 @@ class SecureLLMProxy:
         self.last_from_cache = True
         if isinstance(result, str):
             yield LLMStreamChunk(content=result)
+            return
+        halt = _review_halt_from_result(result)
+        if halt is not None:
+            yield halt
             return
         self._preallocate_tool_calls_from_result(result)
         llm_response = self._convert_result_to_response(result)
@@ -780,9 +951,21 @@ class SecureLLMProxy:
         if llm_response.usage is not None:
             yield LLMStreamChunk(usage=llm_response.usage)
 
-    def _fold_and_preallocate_tools(self, chunks: list[LLMStreamChunk]) -> dict[str, Any]:
+    def _fold_and_preallocate_tools(
+        self, chunks: list[LLMStreamChunk | _ReviewHalt]
+    ) -> dict[str, Any]:
         """Fold the stream and preallocate sibling Tool activity ordinals."""
-        payload = self._response_payload_from_chunks(chunks)
+        model_chunks: list[LLMStreamChunk] = []
+        for chunk in chunks:
+            if isinstance(chunk, _ReviewHalt):
+                # The halt is the call's result: it completes the activity and
+                # is replayed, so the provider is not called again.
+                return {
+                    _REVIEW_HALT_RESULT_KEY: chunk.review.model_dump(mode="json"),
+                    _REVIEW_HALT_STEP_KEY: chunk.step,
+                }
+            model_chunks.append(chunk)
+        payload = self._response_payload_from_chunks(model_chunks)
         self._preallocate_tool_calls_from_result(payload)
         return payload
 
@@ -819,9 +1002,29 @@ class SecureLLMProxy:
         self,
         invoke_request: InvokeLLMRequestArguments,
         resolved_step: int,
-    ) -> Iterator[LLMStreamChunk]:
+    ) -> Iterator[LLMStreamChunk | _ReviewHalt]:
         """Run the actual invoke_llm call: OE approval, then relay or SSE stream."""
         response = self._request_oe_execution(invoke_request, step=resolved_step)
+        yield from self._stream_oe_response(response, resolved_step, resolving=False)
+
+    def _stream_review_resolution(
+        self,
+        invoke_request: InvokeLLMRequestArguments,
+        step: int,
+        review_id: str,
+    ) -> Iterator[LLMStreamChunk | _ReviewHalt]:
+        """Repeat a halted call, naming its review: OE answers from the review."""
+        response = self._request_oe_execution(invoke_request, step=step, review_id=review_id)
+        yield from self._stream_oe_response(response, step, resolving=True)
+
+    def _stream_oe_response(
+        self,
+        response: ToolExecuteResponse,
+        resolved_step: int,
+        *,
+        resolving: bool,
+    ) -> Iterator[LLMStreamChunk | _ReviewHalt]:
+        """Turn OE's answer to an invoke_llm request into stream chunks."""
 
         # Genuine guardrail block: OE returns the substitute string in result
         # instead of LLM content. Yield it as a normal chunk so the agent
@@ -831,7 +1034,14 @@ class SecureLLMProxy:
         # error so we don't leak a Python repr into the conversation.
         if not response.proceed:
             if response.status == "require_review":
-                yield from self._handle_require_review(response)
+                if not self._follows_review_protocol():
+                    yield from self._handle_require_review(response)
+                    return
+                # A resolving call is answered from the review's record; a halt
+                # in its place, or one that names no review, cannot be resolved.
+                if resolving or response.guardrail_review is None:
+                    raise LLMInvocationError("Guardrail require_review response named no review")
+                yield _ReviewHalt(response.guardrail_review, resolved_step)
                 return
             if isinstance(response.result, str):
                 yield LLMStreamChunk(content=response.result)

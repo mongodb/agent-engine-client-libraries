@@ -128,6 +128,34 @@ describe("AgentEngineToolPodBackend wire mapping", () => {
     });
   });
 
+  it("grep enforces maxCount and flags truncated", async () => {
+    await withWrapper(
+      {
+        matches: [
+          { path: "/w/a", line: 1, text: "hit" },
+          { path: "/w/a", line: 2, text: "hit" },
+          { path: "/w/a", line: 3, text: "hit" },
+        ],
+      },
+      async (backend) => {
+        const res = await backend.grep("hit", undefined, undefined, 2);
+        expect(res.matches).toHaveLength(2);
+        expect(res.truncated).toBe(true);
+      },
+    );
+  });
+
+  it("grep propagates the handler truncated flag", async () => {
+    await withWrapper(
+      { matches: [{ path: "/w/a", line: 1, text: "hit" }], truncated: true },
+      async (backend) => {
+        const res = await backend.grep("hit");
+        expect(res.matches).toHaveLength(1);
+        expect(res.truncated).toBe(true);
+      },
+    );
+  });
+
   it("glob → filesystem_glob, maps matches to files", async () => {
     await withWrapper(
       { matches: [{ path: "/w/a.ts", is_dir: false }] },
@@ -138,6 +166,21 @@ describe("AgentEngineToolPodBackend wire mapping", () => {
           args: { pattern: "*.ts", path: "/w" },
         });
         expect(res.files).toEqual([{ path: "/w/a.ts", is_dir: false }]);
+      },
+    );
+  });
+
+  it("glob without a path omits the wire path and propagates truncated", async () => {
+    await withWrapper(
+      { matches: [{ path: "/w/a.ts", is_dir: false }], truncated: true },
+      async (backend, calls) => {
+        const res = await backend.glob("*.ts");
+        expect(calls[0]).toEqual({
+          tool: "filesystem_glob",
+          args: { pattern: "*.ts" },
+        });
+        expect(res.files).toEqual([{ path: "/w/a.ts", is_dir: false }]);
+        expect(res.truncated).toBe(true);
       },
     );
   });

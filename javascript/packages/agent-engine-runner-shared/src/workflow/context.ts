@@ -32,6 +32,7 @@ interface AttemptContextHolder {
   observed: ObservedActivityPositions;
   interrupted: InterruptedActivities;
   reconstruction: ActivityReconstruction;
+  guardrailReviewWaits: GuardrailReviewWaits;
 }
 
 const storage = new AsyncLocalStorage<AttemptContextHolder>();
@@ -131,6 +132,7 @@ export interface InterruptedActivity {
 
 class InterruptedActivities {
   private readonly items: InterruptedActivity[] = [];
+  private readonly answered = new Set<string>();
 
   record(command: ActivityCommand, controlFlow: unknown): void {
     // Settlement needs the command as admitted, even if the caller mutates it.
@@ -143,10 +145,42 @@ class InterruptedActivities {
     });
   }
 
-  forStep(stepOrdinal: number): InterruptedActivity[] {
+  markAnswered(positions: readonly ActivityPosition[]): void {
+    for (const position of positions) {
+      this.answered.add(JSON.stringify(activityPositionKey(position)));
+    }
+  }
+
+  forStep(
+    stepOrdinal: number,
+    includeAnswered: boolean,
+  ): InterruptedActivity[] {
     return this.items.filter(
-      (item) => item.command.position?.stepOrdinal === BigInt(stepOrdinal),
+      (item) =>
+        item.command.position?.stepOrdinal === BigInt(stepOrdinal) &&
+        (includeAnswered ||
+          !this.answered.has(
+            JSON.stringify(activityPositionKey(item.command.position)),
+          )),
     );
+  }
+}
+
+/**
+ * The reviews this attempt paused for, as recorded by the platform's own
+ * halts. A pause is a review wait because the platform recorded the halt
+ * behind it, never because of what its value looks like: an application may
+ * pause with a value of any shape.
+ */
+class GuardrailReviewWaits {
+  private readonly reviewIds = new Set<string>();
+
+  note(reviewId: string): void {
+    this.reviewIds.add(reviewId);
+  }
+
+  has(reviewId: string): boolean {
+    return this.reviewIds.has(reviewId);
   }
 }
 
@@ -175,6 +209,14 @@ class ActivityReconstruction {
 class ActivityOrdinalAllocator {
   private readonly nextByPath = new Map<PathKey, number>();
   private readonly byPathAndKey = new Map<string, number>();
+  private readonly callsByScope = new WeakMap<object, number>();
+
+  /** Count calls within one scope object, starting at 1. */
+  nextInScope(scope: object): number {
+    const count = (this.callsByScope.get(scope) ?? 0) + 1;
+    this.callsByScope.set(scope, count);
+    return count;
+  }
 
   preallocate(path: PathKey, keys: readonly string[]): number[] {
     return keys.map((key) => this.allocate(path, key));
@@ -334,6 +376,7 @@ function bindHolder(attempt: AttemptContext): AttemptContextHolder {
     observed: new ObservedActivityPositions(),
     interrupted: new InterruptedActivities(),
     reconstruction: new ActivityReconstruction(),
+    guardrailReviewWaits: new GuardrailReviewWaits(),
   };
 }
 
@@ -443,10 +486,41 @@ export function recordInterruptedActivity(
   activeHolder()?.interrupted.record(command, controlFlow);
 }
 
+/**
+ * Framework-interrupted activities observed in one workflow step.
+ *
+ * Answered activities are excluded unless requested. One LangGraph task can
+ * pause several times and every pause carries the same native interrupt id,
+ * so only the pauses still waiting may claim that id.
+ */
 export function interruptedActivities(
   stepOrdinal: number,
+  options: { readonly includeAnswered?: boolean } = {},
 ): InterruptedActivity[] {
-  return activeHolder()?.interrupted.forStep(stepOrdinal) ?? [];
+  return (
+    activeHolder()?.interrupted.forStep(
+      stepOrdinal,
+      options.includeAnswered === true,
+    ) ?? []
+  );
+}
+
+/** Record that these interrupted activities received their answer in this attempt. */
+export function markInterruptedActivitiesAnswered(
+  positions: readonly ActivityPosition[],
+): void {
+  activeHolder()?.interrupted.markAnswered(positions);
+}
+
+/** Record that this attempt pauses for a review the platform halted a call for. */
+export function noteGuardrailReviewWait(reviewId: string): void {
+  activeHolder()?.guardrailReviewWaits.note(reviewId);
+}
+
+/** Whether this attempt paused for that review. */
+export function isGuardrailReviewWait(reviewId: unknown): boolean {
+  if (typeof reviewId !== "string") return false;
+  return activeHolder()?.guardrailReviewWaits.has(reviewId) ?? false;
 }
 
 export function setActivityReconstructionIds(
@@ -481,6 +555,18 @@ export function toolActivityKey(toolCallId: string): string {
     throw new Error("tool_call_id must be non-empty");
   }
   return `tool:${toolCallId}`;
+}
+
+/**
+ * The 1-based index of this call within `scope` for the current attempt.
+ *
+ * An adapter passes the framework object that lives for one run of a unit the
+ * framework may re-run, such as one run of a graph task. The index restarts
+ * for each run, so a key built from it names the same call on every run and
+ * its recorded activity replays.
+ */
+export function nextScopedCallIndex(scope: object): number {
+  return requireHolder("activity_ordinal").activityOrdinals.nextInScope(scope);
 }
 
 export function allocateActivityOrdinal(key?: string): number {

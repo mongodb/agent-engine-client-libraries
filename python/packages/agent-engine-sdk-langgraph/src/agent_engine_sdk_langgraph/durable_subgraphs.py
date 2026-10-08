@@ -7,6 +7,8 @@ https://docs.langchain.com/oss/python/langgraph/persistence#checkpoint-namespace
 
 from __future__ import annotations
 
+from typing import Any
+
 from dataclasses import dataclass
 
 from langgraph.config import get_config
@@ -119,6 +121,54 @@ class DurableSubgraphResolver:
             boundaries.append(ChildOperationBoundary(name, occurrence_key))
             topology = child
         return tuple(boundaries)
+
+
+def reject_node_retry_policies(graph: Any) -> None:
+    """Reject a durable graph that sets a retry policy, on a node or as a default.
+
+    A retry re-runs the node from the top. A durable node's side effects are
+    recorded activities, which would be replayed or repeated depending on why
+    the node ran again, and its own logic is deterministic, so there is
+    nothing for a node retry to recover.
+    """
+    seen: set[int] = set()
+
+    def visit(current: Any, current_path: tuple[str, ...]) -> None:
+        nodes = getattr(getattr(current, "builder", None), "nodes", None)
+        if id(current) in seen or not isinstance(nodes, dict):
+            return
+        seen.add(id(current))
+        # A compiled graph's own policy is the default for all its nodes.
+        if _sets_retry_policy(getattr(current, "retry_policy", None)):
+            raise UnsupportedDurableGraphError(
+                f"graph {'/'.join(current_path) or 'root'!r} sets a default retry "
+                "policy; node retry policies are not supported by durable_workflow"
+            )
+        # The compiled node carries the effective policy, which may come from
+        # the builder's node defaults instead of the node's own spec.
+        compiled_nodes = getattr(current, "nodes", None)
+        if not isinstance(compiled_nodes, dict):
+            compiled_nodes = {}
+        for name, node in nodes.items():
+            node_path = (*current_path, name)
+            if _sets_retry_policy(
+                getattr(node, "retry_policy", None)
+            ) or _sets_retry_policy(
+                getattr(compiled_nodes.get(name), "retry_policy", None)
+            ):
+                raise UnsupportedDurableGraphError(
+                    f"node {'/'.join(node_path)!r} sets a retry policy; node "
+                    "retry policies are not supported by durable_workflow"
+                )
+            visit(getattr(node, "runnable", None), node_path)
+
+    visit(graph, ())
+
+
+def _sets_retry_policy(policy: Any) -> bool:
+    # LangGraph stores "none" as None on a node and as an empty sequence on a
+    # compiled graph.
+    return policy is not None and policy != () and policy != []
 
 
 def _discover(

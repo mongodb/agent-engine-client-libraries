@@ -105,6 +105,13 @@ class LLMTokenUsage(MappingCompatModel):
     prompt_tokens: int | None = None
     completion_tokens: int | None = None
     total_tokens: int | None = None
+    reasoning_tokens: int | None = Field(
+        default=None,
+        description=(
+            "Output tokens the model spent reasoning; part of the output count, "
+            "not added to it."
+        ),
+    )
     model: str | None = None
 
     @model_validator(mode="after")
@@ -202,6 +209,7 @@ class LLMInvocationOptions(BaseModel):
     timeout: float | None = None
     parallel_tool_calls: bool | None = None
     reasoning_effort: str | None = None
+    verbosity: str | None = None
 
     def to_model_kwargs(self) -> dict[str, Any]:
         """Convert to kwargs for underlying model invocation."""

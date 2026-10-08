@@ -35,6 +35,7 @@ from agent_engine_runner_shared.generated.workflow.v1.activity_pb2 import (
     StepSuspensionEntry,
 )
 from agent_engine_runner_shared.generated.workflow.v1.runtime_pb2 import AttemptContext
+from agent_engine_runner_shared.secure_llm_proxy import guardrail_review_wait_id
 from agent_engine_runner_shared.workflow import (
     AsyncWorkflowClient,
     finalize_current_step_suspensions_command,
@@ -46,6 +47,7 @@ from agent_engine_runner_shared.workflow.context import (
     InterruptedActivity,
     current_step_ordinal,
     interrupted_activities,
+    mark_interrupted_activities_answered,
     set_activity_reconstruction_ids,
 )
 from agent_engine_runner_shared.workflow.protojson import json_to_proto_struct
@@ -57,6 +59,7 @@ from agent_engine_sdk_langgraph.checkpoint_branch import (
 from agent_engine_sdk_langgraph.durable_errors import UnsupportedDurableGraphError
 from agent_engine_sdk_langgraph.durable_subgraphs import (
     DurableSubgraphResolver,
+    reject_node_retry_policies,
 )
 from agent_engine_sdk_langgraph.execution_session import (
     DurableCheckpointKwargs,
@@ -92,6 +95,8 @@ async def settle_interrupts(
     # Local-tool execution and the checkpointer record the exact command whose
     # native interrupt reached scratch. The regenerated native id joins the
     # checkpoint interrupt to that stable activity position on every attempt.
+    # Only pauses still waiting are candidates: a task that pauses again
+    # reuses the native id of its already-answered pauses.
     activities_by_native_id: dict[str, InterruptedActivity] = {}
     for activity in interrupted_activities(current_step_ordinal()):
         control_flow = activity.control_flow
@@ -102,7 +107,30 @@ async def settle_interrupts(
             raise UnsupportedDurableGraphError(
                 "a durable local tool must raise exactly one native interrupt"
             )
+        if native_interrupts[0].id in activities_by_native_id:
+            raise UnsupportedDurableGraphError(
+                "durable native interrupt has more than one waiting activity"
+            )
         activities_by_native_id[native_interrupts[0].id] = activity
+
+    # LangGraph's state keeps the interrupt of a task that has since received
+    # its answer and finished, until the whole superstep completes. That stale
+    # entry is recognizable by an id that only answered activities carry.
+    answered_native_ids = {
+        interrupt.id
+        for activity in interrupted_activities(
+            current_step_ordinal(), include_answered=True
+        )
+        if isinstance(activity.control_flow, GraphInterrupt)
+        for interrupt in activity.control_flow.args[0]
+    } - activities_by_native_id.keys()
+    interrupts = [
+        interrupt for interrupt in interrupts if interrupt.id not in answered_native_ids
+    ]
+    if not interrupts:
+        raise UnsupportedDurableGraphError(
+            "durable graph reported only already-answered interrupts"
+        )
 
     interrupts_by_position: dict[bytes, Interrupt] = {}
     suspensions: list[StepSuspensionEntry] = []
@@ -159,21 +187,35 @@ async def settle_interrupts(
                 continue
             # Direct graph interrupts bypass SecureToolWrapper, so close their
             # resolved activity in Memory here under OE's winning fence.
+            context = ActivityContext(
+                workflow_identity=outcome.workflow_identity,
+                activity_id=outcome.activity_id,
+                attempt_id=outcome.attempt_id,
+                fencing_token=outcome.fencing_token,
+            )
+            if guardrail_review_wait_id(interrupt.value) is not None:
+                # The answer is the platform's review decision, not something
+                # the user or a tool said.
+                await asyncio.to_thread(
+                    wrapper.durable_memory.acknowledge, wrapper.workflow, context
+                )
+                continue
             await asyncio.to_thread(
                 wrapper.durable_memory.synchronize_tool,
                 wrapper.workflow,
-                ActivityContext(
-                    workflow_identity=outcome.workflow_identity,
-                    activity_id=outcome.activity_id,
-                    attempt_id=outcome.attempt_id,
-                    fencing_token=outcome.fencing_token,
-                ),
+                context,
                 unwrap_activity_outcome(outcome),
                 user_id=get_current_user_id(),
                 tool_call_id=f"{_DIRECT_INTERRUPT_ACTIVITY_NAME}:{outcome.activity_id}",
                 tool_name=_DIRECT_INTERRUPT_ACTIVITY_NAME,
             )
 
+    mark_interrupted_activities_answered(
+        [
+            activities_by_native_id[interrupt.id].command.position
+            for interrupt, _ in settled
+        ]
+    )
     return Command(
         resume={
             interrupt.id: unwrap_activity_outcome(outcome)
@@ -258,6 +300,7 @@ class DurableSession(ExecutionSession):
             attempt=attempt,
             use_custom_parser=use_custom_parser,
         )
+        reject_node_retry_policies(graph)
         if durable_subgraphs is not None:
             durable_subgraphs.validate()
 

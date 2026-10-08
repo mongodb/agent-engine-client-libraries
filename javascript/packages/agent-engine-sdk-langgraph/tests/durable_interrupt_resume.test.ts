@@ -1,5 +1,6 @@
 import { create } from "@bufbuild/protobuf";
-import { AIMessage, ToolMessage } from "@langchain/core/messages";
+import { AIMessage, HumanMessage, ToolMessage } from "@langchain/core/messages";
+import type { BaseChatModel } from "@langchain/core/language_models/chat_models";
 import type { BaseMessage } from "@langchain/core/messages";
 import { tool as lcTool } from "@langchain/core/tools";
 import type { RunnableConfig } from "@langchain/core/runnables";
@@ -22,11 +23,14 @@ import type {
 import {
   AttemptContextSchema,
   DurableMemoryState,
+  PolicyDeniedException,
+  SecureLLMProxy,
   SecureToolWrapper,
   TenantScopeSchema,
   WorkflowIdentitySchema,
   createSecureToolFunction,
   currentAttemptContext,
+  registerSuspendHandler,
   resetHooks,
   runWithAttemptContext,
   runWithExecutionContext,
@@ -40,6 +44,7 @@ import { LangGraphBaseAgent } from "../src/agent.js";
 import type { DurableSession } from "../src/durable_session.js";
 import { withDurableToolResultIdentity } from "../src/durable_tools.js";
 import { PlatformCheckpointer } from "../src/platform_checkpointer.js";
+import { SecureWrappedLLM } from "../src/secure_llm.js";
 import { executionSession } from "../src/session_factory.js";
 import { stateSnapshotToChannelValues } from "../src/workflow_state.js";
 
@@ -157,6 +162,44 @@ function settlementResponse(
   });
 }
 
+function present<T>(value: T | undefined): T {
+  if (value === undefined) throw new Error("expected a value");
+  return value;
+}
+
+function statefulOe() {
+  const ids = new Map<string, string>();
+  const answers = new Map<string, JsonValue>();
+  const bodies: FinalizeBody[] = [];
+  const fetch = vi.fn(async (_request: unknown, init?: RequestInit) => {
+    const body = requestBody(init);
+    bodies.push(body);
+    return jsonResponse({
+      entries: (body.suspensions ?? []).map((suspension) => {
+        const key = JSON.stringify(suspension.position);
+        const activityId = ids.get(key) ?? `wait-${ids.size + 1}`;
+        ids.set(key, activityId);
+        const answer = answers.get(activityId);
+        return {
+          position: suspension.position,
+          outcome: {
+            workflow_identity: body.workflow_identity,
+            activity_id: activityId,
+            attempt_id: body.attempt_id,
+            fencing_token: body.fencing_token,
+            outcome_kind:
+              answer === undefined
+                ? "ACTIVITY_OUTCOME_KIND_SUSPENDED"
+                : "ACTIVITY_OUTCOME_KIND_COMPLETED",
+            ...(answer === undefined ? {} : { result: answer }),
+          },
+        };
+      }),
+    });
+  });
+  return { fetch, answers, bodies };
+}
+
 async function inAttempt<T>(
   current: ReturnType<typeof attempt>,
   fn: () => Promise<T>,
@@ -232,6 +275,9 @@ function suspendedData(
 afterEach(() => {
   resetHooks();
   vi.unstubAllGlobals();
+  // Tests here spy on SecureLLMProxy.prototype to stand in for the provider;
+  // without restoring, the stub leaks into later tests in this file.
+  vi.restoreAllMocks();
 });
 
 describe("durable root interrupt resume", () => {
@@ -589,54 +635,283 @@ describe("durable root interrupt resume", () => {
     expect(clients.completeExecution).toHaveBeenCalledOnce();
   });
 
-  it.each(["first?", "second?"])(
-    "rejects a second same-task interrupt with payload %s",
-    async (secondQuestion) => {
+  it.each([
+    { mode: "invoke", payloads: "distinct", nested: false },
+    { mode: "stream", payloads: "distinct", nested: false },
+    { mode: "invoke", payloads: "identical", nested: false },
+    { mode: "stream", payloads: "identical", nested: false },
+    { mode: "invoke", payloads: "distinct", nested: true },
+    { mode: "stream", payloads: "distinct", nested: true },
+  ] as const)(
+    "$mode resumes each pause of one task with its own answer (payloads=$payloads, nested=$nested)",
+    async ({ mode, payloads, nested }) => {
       const clients = platformClients();
       const saver = new PlatformCheckpointer({
         native: null,
         clientFactory: clients.factory,
       });
-      const graph = new StateGraph(MessagesAnnotation)
-        .addNode("approval", async () => {
-          interrupt({ question: "first?" });
-          interrupt({ question: secondQuestion });
-          return { messages: [new AIMessage("resumed")] };
+      const received: JsonValue[][] = [];
+      const pause = (ordinal: number): JsonValue =>
+        payloads === "identical"
+          ? { question: "approve?" }
+          : { pause: ordinal };
+      const inner = new StateGraph(MessagesAnnotation)
+        .addNode("review", async () => {
+          const first = interrupt(pause(1)) as JsonValue;
+          const second = interrupt(pause(2)) as JsonValue;
+          const third = interrupt(pause(3)) as JsonValue;
+          received.push([first, second, third]);
+          return {
+            messages: [
+              new AIMessage(
+                `${String(first)}|${String(second)}|${String(third)}`,
+              ),
+            ],
+          };
         })
-        .addEdge(START, "approval")
-        .addEdge("approval", END)
-        .compile({ checkpointer: saver as never });
+        .addEdge(START, "review")
+        .addEdge("review", END);
+      const graph = nested
+        ? new StateGraph(MessagesAnnotation)
+            .addNode("child", inner.compile())
+            .addEdge(START, "child")
+            .addEdge("child", END)
+            .compile({ checkpointer: saver as never })
+        : inner.compile({ checkpointer: saver as never });
       const agent = new LangGraphBaseAgent(graph as never);
-      let settlement: "suspended" | "completed" = "suspended";
-      vi.stubGlobal(
-        "fetch",
-        vi.fn(async (_request: string | URL | Request, init?: RequestInit) => {
-          const body = requestBody(init);
-          return settlementResponse(body, settlement, { "wait-1": "approved" });
-        }),
-      );
+      const oe = statefulOe();
+      vi.stubGlobal("fetch", oe.fetch);
 
-      const first = await inAttempt(attempt("attempt-1"), () =>
-        agent.invoke(baseContext, input),
-      );
-      expect(suspendedData(first)["interrupts"]).toEqual([
-        { id: "wait-1", value: { question: "first?" } },
-      ]);
+      const run = (current: ReturnType<typeof attempt>, ctx: RequestContext) =>
+        inAttempt<AgentOutput | StreamEvent[]>(current, () =>
+          mode === "invoke"
+            ? agent.invoke(ctx, input)
+            : collect(agent.stream(ctx, input)),
+        );
 
-      settlement = "completed";
-      await expect(
-        inAttempt(attempt("attempt-2", true), () =>
-          agent.invoke(
-            {
-              ...baseContext,
-              resume: true,
-              resumeData: { "wait-1": "approved" },
-            } as RequestContext,
-            input,
-          ),
+      let result = await run(attempt("attempt-1"), baseContext);
+      const answered: string[] = [];
+      for (const ordinal of [1, 2, 3]) {
+        const interrupts = suspendedData(result)["interrupts"] as {
+          id: string;
+          value: JsonValue;
+        }[];
+        expect(interrupts).toHaveLength(1);
+        const waiting = present(interrupts[0]);
+        expect(waiting.value).toEqual(pause(ordinal));
+        expect(answered).not.toContain(waiting.id);
+        answered.push(waiting.id);
+        oe.answers.set(waiting.id, `answer-${ordinal}`);
+        // Each answer arrives on a fresh attempt; only OE history survives.
+        result = await run(attempt(`attempt-${ordinal + 1}`, true), {
+          ...baseContext,
+          resume: true,
+          resumeData: { [waiting.id]: `answer-${ordinal}` },
+        } as RequestContext);
+      }
+
+      if (Array.isArray(result)) {
+        expect(result.at(-1)).toMatchObject({
+          event: "result",
+          data: { response: "answer-1|answer-2|answer-3" },
+        });
+      } else {
+        expect(result.response).toMatchObject({
+          response: "answer-1|answer-2|answer-3",
+          status: "completed",
+        });
+      }
+      expect(received.at(-1)).toEqual(["answer-1", "answer-2", "answer-3"]);
+      expect(clients.completeExecution).toHaveBeenCalledOnce();
+      // Three pauses, three durable positions in one task.
+      const positions = new Set(
+        oe.bodies.flatMap((body) =>
+          (body.suspensions ?? []).map((item) => JSON.stringify(item.position)),
         ),
-      ).rejects.toThrow("multiple sequential direct interrupts");
-      expect(clients.completeExecution).not.toHaveBeenCalled();
+      );
+      expect(positions.size).toBe(3);
+      expect(
+        new Set(
+          [...positions].map((key) => {
+            const position = JSON.parse(key) as {
+              operation_path?: unknown;
+              activity_ordinal?: string;
+            };
+            return JSON.stringify(position.operation_path);
+          }),
+        ).size,
+      ).toBe(1);
+    },
+  );
+
+  it.each(
+    [false, true].flatMap((nested) =>
+      (["invoke", "stream"] as const).map((mode) => ({ nested, mode })),
+    ),
+  )(
+    "$mode resumes tasks that pause again while a parallel task finishes (nested=$nested)",
+    async ({ nested, mode }) => {
+      const clients = platformClients();
+      const saver = new PlatformCheckpointer({
+        native: null,
+        clientFactory: clients.factory,
+      });
+      const onceAnswers: JsonValue[] = [];
+      const pausesTwice = (task: string) => async () => {
+        const first = interrupt({ task, pause: 1 }) as JsonValue;
+        const second = interrupt({ task, pause: 2 }) as JsonValue;
+        return {
+          messages: [
+            new AIMessage(`${task}:${String(first)}|${String(second)}`),
+          ],
+        };
+      };
+      const parallel = new StateGraph(MessagesAnnotation)
+        .addNode("twice", pausesTwice("twice"))
+        .addNode("again", pausesTwice("again"))
+        .addNode("once", async () => {
+          const answer = interrupt({ task: "once", pause: 1 }) as JsonValue;
+          onceAnswers.push(answer);
+          return { messages: [new AIMessage(`once:${String(answer)}`)] };
+        })
+        .addEdge(START, "twice")
+        .addEdge(START, "again")
+        .addEdge(START, "once")
+        .addEdge("twice", END)
+        .addEdge("again", END)
+        .addEdge("once", END);
+      // Through a compiled child, LangGraph projects only one of the
+      // branches' pauses to the parent task that runs the child.
+      const graph = nested
+        ? new StateGraph(MessagesAnnotation)
+            .addNode("child", parallel.compile())
+            .addEdge(START, "child")
+            .addEdge("child", END)
+            .compile({ checkpointer: saver as never })
+        : parallel.compile({ checkpointer: saver as never });
+      const agent = new LangGraphBaseAgent(graph as never);
+      const oe = statefulOe();
+      vi.stubGlobal("fetch", oe.fetch);
+      const run = async (
+        current: ReturnType<typeof attempt>,
+        ctx: RequestContext,
+      ): Promise<Record<string, unknown>> => {
+        if (mode === "invoke") {
+          const output = await inAttempt(current, () =>
+            agent.invoke(ctx, input),
+          );
+          return output.response as Record<string, unknown>;
+        }
+        const events = await inAttempt(current, () =>
+          collect(agent.stream(ctx, input)),
+        );
+        return present(events.at(-1)).data as Record<string, unknown>;
+      };
+      const waitingByTask = (response: Record<string, unknown>) =>
+        Object.fromEntries(
+          (
+            response["interrupts"] as {
+              id: string;
+              value: { task: string; pause: number };
+            }[]
+          ).map((item) => [`${item.value.task}:${item.value.pause}`, item.id]),
+        );
+
+      const first = waitingByTask(await run(attempt("attempt-1"), baseContext));
+      expect(Object.keys(first).sort()).toEqual([
+        "again:1",
+        "once:1",
+        "twice:1",
+      ]);
+      const answers = {
+        [present(first["twice:1"])]: "t1",
+        [present(first["again:1"])]: "a1",
+        [present(first["once:1"])]: "o1",
+      };
+      for (const [id, answer] of Object.entries(answers))
+        oe.answers.set(id, answer);
+
+      const second = waitingByTask(
+        await run(attempt("attempt-2", true), {
+          ...baseContext,
+          resume: true,
+          resumeData: answers,
+        } as RequestContext),
+      );
+      // Both tasks that paused again wait; no answered pause returns, and
+      // the finished task's leftover interrupt is not offered again.
+      expect(Object.keys(second).sort()).toEqual(["again:2", "twice:2"]);
+      const secondAnswers = {
+        [present(second["twice:2"])]: "t2",
+        [present(second["again:2"])]: "a2",
+      };
+      for (const id of Object.keys(secondAnswers))
+        expect(Object.keys(answers)).not.toContain(id);
+      for (const [id, answer] of Object.entries(secondAnswers))
+        oe.answers.set(id, answer);
+
+      const completed = await run(attempt("attempt-3", true), {
+        ...baseContext,
+        resume: true,
+        resumeData: secondAnswers,
+      } as RequestContext);
+      expect(completed).not.toHaveProperty("interrupts");
+      const messages = publishedMessages(clients.completeExecution).map((m) =>
+        String(m.content),
+      );
+      expect(messages).toContain("twice:t1|t2");
+      expect(messages).toContain("again:a1|a2");
+      expect(messages).toContain("once:o1");
+      expect(new Set(onceAnswers)).toEqual(new Set(["o1"]));
+
+      // Every attempt reported each pause at one position. Under a compiled
+      // child the pauses share the root task that runs the child and take
+      // consecutive ordinals: siblings in path order, then later pauses.
+      const positionsByPause = new Map<string, Set<string>>();
+      for (const body of oe.bodies) {
+        for (const suspension of body.suspensions ?? []) {
+          const value = (
+            suspension.semantic_input as {
+              value: { task: string; pause: number };
+            }
+          ).value;
+          const position = suspension.position as {
+            operation_path?: { segments?: { name: string }[] };
+            activity_ordinal?: string | number;
+          };
+          const key = `${value.task}:${value.pause}`;
+          const at = `${(position.operation_path?.segments ?? [])
+            .map((segment) => segment.name)
+            .join("/")}#${Number(position.activity_ordinal)}`;
+          positionsByPause.set(
+            key,
+            (positionsByPause.get(key) ?? new Set()).add(at),
+          );
+        }
+      }
+      const task = (name: string) =>
+        `langgraph.task:${JSON.stringify(["__pregel_pull", name])}`;
+      expect(
+        Object.fromEntries(
+          [...positionsByPause].map(([key, at]) => [key, [...at]]),
+        ),
+      ).toEqual(
+        nested
+          ? {
+              "again:1": [`${task("child")}#1`],
+              "once:1": [`${task("child")}#2`],
+              "twice:1": [`${task("child")}#3`],
+              "again:2": [`${task("child")}#4`],
+              "twice:2": [`${task("child")}#5`],
+            }
+          : {
+              "again:1": [`${task("again")}#1`],
+              "once:1": [`${task("once")}#1`],
+              "twice:1": [`${task("twice")}#1`],
+              "again:2": [`${task("again")}#2`],
+              "twice:2": [`${task("twice")}#2`],
+            },
+      );
     },
   );
 
@@ -1717,5 +1992,607 @@ describe("durable ToolNode batch parallel tools", () => {
       status: "success",
     });
     await expectScratchReleased(saver, current);
+  });
+});
+
+describe("durable wrapped LLM calls around pauses", () => {
+  it.each(
+    ["invoke", "stream"].flatMap((mode) =>
+      ["invoke", "stream"].flatMap((call) =>
+        [
+          "pause-model",
+          "model-pause",
+          "pause-model-pause",
+          "model-pause-model",
+        ].map((layout) => ({ mode, call, layout })),
+      ),
+    ),
+  )(
+    "$mode dispatches each llm.$call once across attempts (layout=$layout)",
+    async ({ mode, call, layout }) => {
+      const clients = platformClients();
+      const saver = new PlatformCheckpointer({
+        native: null,
+        clientFactory: clients.factory,
+      });
+      // Only the provider round trip is replaced; activity admission, ordinal
+      // allocation, and replay run for real against the fake OE below.
+      const dispatched: string[] = [];
+      vi.spyOn(
+        SecureLLMProxy.prototype as unknown as {
+          streamLlm: (request: unknown) => AsyncGenerator<unknown>;
+        },
+        "streamLlm",
+      ).mockImplementation(async function* (request: unknown) {
+        const messages = (request as { messages: { content: unknown }[] })
+          .messages;
+        const prompt = String(messages.at(-1)?.content);
+        dispatched.push(prompt);
+        yield { content: `resolved:${prompt}` };
+      });
+      let wrapper = new SecureToolWrapper("http://oe", "execution");
+      const llm = new SecureWrappedLLM(
+        // A streaming-capable inner model, so `llm.stream` takes the wrapper's
+        // streaming branch instead of delegating to the generate path.
+        {
+          model: "test-model",
+          stream: () => undefined,
+        } as unknown as BaseChatModel,
+        () => wrapper,
+      );
+      const steps = layout.split("-");
+      const replies: [number, string][] = [];
+      const modelReply = async (prompt: string): Promise<string> => {
+        const messages = [new HumanMessage(prompt)];
+        if (call === "invoke") {
+          return String((await llm.invoke(messages)).content);
+        }
+        let text = "";
+        for await (const chunk of await llm.stream(messages)) {
+          text += String(chunk.content);
+        }
+        return text;
+      };
+      const graph = new StateGraph(MessagesAnnotation)
+        .addNode("review", async () => {
+          // Each step sees the previous step's output, so a model call's
+          // prompt records which answers reached the node before it.
+          let seen = "start";
+          for (const [index, step] of steps.entries()) {
+            if (step === "pause") {
+              seen = String(interrupt({ pause: index }));
+            } else {
+              seen = await modelReply(`call-${index} after ${seen}`);
+              replies.push([index, seen]);
+            }
+          }
+          return { messages: [new AIMessage(seen)] };
+        })
+        .addEdge(START, "review")
+        .addEdge("review", END)
+        .compile({ checkpointer: saver as never });
+      const agent = new LangGraphBaseAgent(graph as never);
+
+      // Fake OE: waits answer through finalize; LLM activities replay by position.
+      const waits = statefulOe();
+      const recorded = new Map<string, Record<string, unknown>>();
+      const positionByActivity = new Map<string, string>();
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+          const url = String(request);
+          if (url.endsWith("/executor/step/finalize")) {
+            return waits.fetch(request, init);
+          }
+          const body = wireBody(init);
+          if (url.endsWith("/executor/activity/start")) {
+            const key = JSON.stringify(body["position"]);
+            const outcome = recorded.get(key);
+            const provenance = {
+              workflow_identity: body["workflow_identity"],
+              attempt_id: body["attempt_id"],
+              fencing_token: body["fencing_token"],
+            };
+            if (outcome !== undefined) {
+              return jsonResponse({ outcome: { ...outcome, ...provenance } });
+            }
+            const activityId = `llm-${positionByActivity.size + 1}`;
+            positionByActivity.set(activityId, key);
+            return jsonResponse({
+              activity_context: { ...provenance, activity_id: activityId },
+            });
+          }
+          if (url.endsWith("/executor/activity/outcome")) {
+            const key = present(
+              positionByActivity.get(String(body["activity_id"])),
+            );
+            recorded.set(key, body);
+            return jsonResponse({});
+          }
+          throw new Error(`unexpected URL: ${url}`);
+        }),
+      );
+
+      const run = (
+        current: ReturnType<typeof attempt>,
+        ctx: RequestContext,
+      ) => {
+        // Each attempt is a fresh process: operational steps restart.
+        wrapper = new SecureToolWrapper("http://oe", "execution");
+        return inToolAttempt<AgentOutput | StreamEvent[]>(
+          current,
+          wrapper,
+          () =>
+            mode === "invoke"
+              ? agent.invoke(ctx, input)
+              : collect(agent.stream(ctx, input)),
+        );
+      };
+
+      let result = await run(attempt("attempt-1"), baseContext);
+      const pauses = steps.filter((step) => step === "pause").length;
+      for (let number = 1; number <= pauses; number += 1) {
+        // A streamed model call before the pause emits token events first.
+        const suspended = Array.isArray(result)
+          ? result.filter((event) => event.event !== "token")
+          : result;
+        const interrupts = suspendedData(suspended)["interrupts"] as {
+          id: string;
+        }[];
+        expect(interrupts).toHaveLength(1);
+        const waiting = present(interrupts[0]);
+        waits.answers.set(waiting.id, `answer-${number}`);
+        result = await run(attempt(`attempt-${number + 1}`, true), {
+          ...baseContext,
+          resume: true,
+          resumeData: { [waiting.id]: `answer-${number}` },
+        } as RequestContext);
+      }
+
+      // Replay the node's logic with the recorded answers to get the one
+      // prompt each model call must have been dispatched with.
+      const expectedPrompts: string[] = [];
+      const expectedReplies = new Map<number, string>();
+      let seen = "start";
+      let answered = 0;
+      for (const [index, step] of steps.entries()) {
+        if (step === "pause") {
+          answered += 1;
+          seen = `answer-${answered}`;
+        } else if (step === "model") {
+          const prompt = `call-${index} after ${seen}`;
+          expectedPrompts.push(prompt);
+          seen = `resolved:${prompt}`;
+          expectedReplies.set(index, seen);
+        }
+      }
+      // Every execution of the node, live or replayed, received the one
+      // recorded reply for each model call.
+      expect(new Set(replies.map(([index]) => index))).toEqual(
+        new Set(expectedReplies.keys()),
+      );
+      for (const [index, reply] of replies) {
+        expect(reply).toBe(expectedReplies.get(index));
+      }
+      const firstCall = Math.min(...expectedReplies.keys());
+      if (steps.slice(firstCall + 1).some((step) => step !== "model")) {
+        // A pause after a model call re-executes the node, so that
+        // call's reply was observed again from the recorded activity.
+        expect(replies.length).toBeGreaterThan(expectedReplies.size);
+      }
+      if (Array.isArray(result)) {
+        expect(result.at(-1)).toMatchObject({
+          event: "result",
+          data: { response: seen },
+        });
+      } else {
+        expect(result.response).toMatchObject({
+          response: seen,
+          status: "completed",
+        });
+      }
+      // Later attempts and re-entries of the node replay each recorded model
+      // call, and separate calls in the node stay separate activities.
+      expect(dispatched).toEqual(expectedPrompts);
+      expect(recorded.size).toBe(expectedPrompts.length);
+    },
+  );
+
+  it("rejects a durable graph whose node sets a retry policy", async () => {
+    const clients = platformClients();
+    const saver = new PlatformCheckpointer({
+      native: null,
+      clientFactory: clients.factory,
+    });
+    const graph = new StateGraph(MessagesAnnotation)
+      .addNode("review", async () => ({ messages: [new AIMessage("done")] }), {
+        retryPolicy: { maxAttempts: 2 },
+      })
+      .addEdge(START, "review")
+      .addEdge("review", END)
+      .compile({ checkpointer: saver as never });
+    const agent = new LangGraphBaseAgent(graph as never);
+    vi.stubGlobal("fetch", statefulOe().fetch);
+
+    await expect(
+      inAttempt(attempt("attempt-1"), () => agent.invoke(baseContext, input)),
+    ).rejects.toThrow(/"review" sets a retry policy/);
+  });
+
+  it("rejects a durable graph whose nodes inherit a retry policy", async () => {
+    const clients = platformClients();
+    const saver = new PlatformCheckpointer({
+      native: null,
+      clientFactory: clients.factory,
+    });
+    const builder = new StateGraph(MessagesAnnotation);
+    builder.setNodeDefaults({ retryPolicy: { maxAttempts: 2 } });
+    const graph = builder
+      .addNode("review", async () => ({ messages: [new AIMessage("done")] }))
+      .addEdge(START, "review")
+      .addEdge("review", END)
+      .compile({ checkpointer: saver as never });
+    const agent = new LangGraphBaseAgent(graph as never);
+    vi.stubGlobal("fetch", statefulOe().fetch);
+
+    await expect(
+      inAttempt(attempt("attempt-1"), () => agent.invoke(baseContext, input)),
+    ).rejects.toThrow(/"review" sets a retry policy/);
+  });
+
+  it("rejects a durable graph that sets a default retry policy", async () => {
+    const clients = platformClients();
+    const saver = new PlatformCheckpointer({
+      native: null,
+      clientFactory: clients.factory,
+    });
+    const graph = new StateGraph(MessagesAnnotation)
+      .addNode("review", async () => ({ messages: [new AIMessage("done")] }))
+      .addEdge(START, "review")
+      .addEdge("review", END)
+      .compile({ checkpointer: saver as never });
+    // A compiled graph's own policy is the default for all its nodes.
+    (graph as { retryPolicy?: unknown }).retryPolicy = { maxAttempts: 2 };
+    const agent = new LangGraphBaseAgent(graph as never);
+    vi.stubGlobal("fetch", statefulOe().fetch);
+
+    await expect(
+      inAttempt(attempt("attempt-1"), () => agent.invoke(baseContext, input)),
+    ).rejects.toThrow(/"root" sets a default retry policy/);
+  });
+});
+
+/** Decode one durable Memory command body into (role, content) turns. */
+function memoryBatch(body: Record<string, unknown>): Array<[string, string]> {
+  const writes = (body["memory_writes"] ?? []) as Record<string, unknown>[];
+  return writes.map((write) => {
+    const payload = JSON.parse(
+      Buffer.from(String(write["payload_json"] ?? ""), "base64").toString(
+        "utf-8",
+      ),
+    ) as Record<string, unknown>;
+    return [String(payload["role"]), String(payload["content"])] as [
+      string,
+      string,
+    ];
+  });
+}
+
+describe("durable guardrail review", () => {
+  it.each([
+    { decision: "approve", call: "invoke" },
+    { decision: "approve", call: "stream" },
+    { decision: "deny", call: "invoke" },
+    { decision: "deny", call: "stream" },
+  ] as const)(
+    "pauses after the halted activity and resolves the review ($decision, $call)",
+    async ({ decision, call }) => {
+      const clients = platformClients();
+      const saver = new PlatformCheckpointer({
+        native: null,
+        clientFactory: clients.factory,
+      });
+      const waits = statefulOe();
+      // The runtime registers LangGraph's interrupt as the pause at startup.
+      registerSuspendHandler(((payload: unknown) =>
+        interrupt(payload as never)) as never);
+
+      const recorded = new Map<string, Record<string, unknown>>();
+      const positionByActivity = new Map<string, string>();
+      const oeRequests: Record<string, unknown>[] = [];
+      const memoryCommands: Record<string, unknown>[] = [];
+
+      // Fake OE: the call halts for review; the resolving call gets the
+      // decided outcome. LLM activities replay by position.
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+          const url = String(request);
+          if (url.endsWith("/executor/step/finalize")) {
+            return waits.fetch(request, init);
+          }
+          const body = wireBody(init);
+          if (url.endsWith("/executor/activity/start")) {
+            const key = JSON.stringify(body["position"]);
+            const outcome = recorded.get(key);
+            const provenance = {
+              workflow_identity: body["workflow_identity"],
+              attempt_id: body["attempt_id"],
+              fencing_token: body["fencing_token"],
+            };
+            if (outcome !== undefined) {
+              return jsonResponse({ outcome: { ...outcome, ...provenance } });
+            }
+            const activityId = `llm-${positionByActivity.size + 1}`;
+            positionByActivity.set(activityId, key);
+            return jsonResponse({
+              activity_context: { ...provenance, activity_id: activityId },
+            });
+          }
+          if (url.endsWith("/executor/activity/outcome")) {
+            const key = present(
+              positionByActivity.get(String(body["activity_id"])),
+            );
+            recorded.set(key, body);
+            return jsonResponse({});
+          }
+          if (url.endsWith("/executor/activity/memory")) {
+            memoryCommands.push(body);
+            return jsonResponse({});
+          }
+          if (url.endsWith("/tool/execute")) {
+            oeRequests.push(body);
+            if (body["review_id"] === undefined) {
+              return jsonResponse({
+                proceed: false,
+                status: "require_review",
+                reason: "output needs human review",
+                guardrail_review: {
+                  review_id: "review-1",
+                  allowed_decisions: ["approve", "deny"],
+                },
+              });
+            }
+            if (decision === "approve") {
+              return jsonResponse({
+                proceed: true,
+                status: "success",
+                result: { content: "the held answer" },
+              });
+            }
+            return jsonResponse({
+              proceed: false,
+              status: "blocked",
+              reason: "guardrail review denied by reviewer",
+            });
+          }
+          throw new Error(`unexpected URL: ${url}`);
+        }),
+      );
+
+      let wrapper = new SecureToolWrapper("http://oe", "execution");
+      const llm = new SecureWrappedLLM(
+        {
+          model: "test-model",
+          stream: () => undefined,
+        } as unknown as BaseChatModel,
+        () => wrapper,
+      );
+      const graph = new StateGraph(MessagesAnnotation)
+        .addNode("answer_claim", async () => {
+          const messages = [new HumanMessage("summarize the claim")];
+          let content = "";
+          if (call === "invoke") {
+            content = String((await llm.invoke(messages)).content);
+          } else {
+            for await (const chunk of await llm.stream(messages)) {
+              content += String(chunk.content);
+            }
+          }
+          return { messages: [new AIMessage(content)] };
+        })
+        .addEdge(START, "answer_claim")
+        .addEdge("answer_claim", END)
+        .compile({ checkpointer: saver as never });
+      const agent = new LangGraphBaseAgent(graph as never);
+
+      const run = (
+        current: ReturnType<typeof attempt>,
+        ctx: RequestContext,
+      ) => {
+        // Each attempt is a fresh process: operational steps restart, and the
+        // turn's user input is pending again until memory has it.
+        wrapper = new SecureToolWrapper("http://oe", "execution");
+        wrapper.durableMemory = new DurableMemoryState("summarize the claim");
+        return inToolAttempt<AgentOutput | StreamEvent[]>(
+          current,
+          wrapper,
+          () => agent.invoke(ctx, input),
+        );
+      };
+
+      // Attempt 1: OE halts the call. The halt is the LLM activity's result
+      // and the node pauses for the review it names.
+      const paused = await run(attempt("attempt-1"), baseContext);
+      const interrupts = suspendedData(paused)["interrupts"] as {
+        id: string;
+        value: unknown;
+      }[];
+      expect(interrupts).toHaveLength(1);
+      const waiting = present(interrupts[0]);
+      expect(waiting.value).toEqual({
+        guardrail_review: { review_id: "review-1" },
+      });
+      expect(oeRequests[0]?.["review_protocol"]).toBe(1);
+      expect(oeRequests[0] ?? {}).not.toHaveProperty("review_id");
+      // The halt is closed in memory with nothing written.
+      expect(memoryCommands.map(memoryBatch)).toEqual([[]]);
+      expect(
+        [...recorded.values()].map((outcome) => outcome["outcome_kind"]),
+      ).toEqual(["ACTIVITY_OUTCOME_KIND_COMPLETED"]);
+
+      // The reviewer answers, and a new attempt picks the turn up.
+      const answer = {
+        guardrail_review: { review_id: "review-1", decision },
+      };
+      waits.answers.set(waiting.id, answer);
+      const resumed = run(attempt("attempt-2", true), {
+        ...baseContext,
+        resume: true,
+        resumeData: { [waiting.id]: answer },
+      } as RequestContext);
+
+      if (decision === "deny") {
+        await expect(resumed).rejects.toBeInstanceOf(PolicyDeniedException);
+      } else {
+        const result = (await resumed) as AgentOutput;
+        expect(result.response).toMatchObject({ response: "the held answer" });
+      }
+
+      // The halted call replayed from its recorded result. Only the resolving
+      // call reached OE, naming the review, at a step after the halted one.
+      expect(oeRequests).toHaveLength(2);
+      const halted = present(oeRequests[0]);
+      const resolving = present(oeRequests[1]);
+      expect(resolving["review_id"]).toBe("review-1");
+      expect(resolving["review_protocol"]).toBe(1);
+      expect(Number(resolving["step_number"])).toBeGreaterThan(
+        Number(halted["step_number"]),
+      );
+      expect(recorded.size).toBe(2);
+
+      // The answered wait is closed in memory under the attempt that resumed
+      // it, with nothing written.
+      expect(
+        memoryCommands
+          .filter((command) => command["activity_id"] === waiting.id)
+          .map(memoryBatch),
+      ).toEqual([[]]);
+
+      // Neither the halt nor the reviewer's decision is conversation: the
+      // only content memory ever receives is the user's input with the
+      // released response.
+      const written = memoryCommands
+        .map(memoryBatch)
+        .filter((batch) => batch.length > 0);
+      if (decision === "approve") {
+        expect(written).toEqual([
+          [
+            ["user", "summarize the claim"],
+            ["assistant", "the held answer"],
+          ],
+        ]);
+      } else {
+        expect(written).toEqual([]);
+      }
+    },
+  );
+});
+
+describe("durable streamed LLM abandonment", () => {
+  it("closing a live streamed call cancels its transport and settles the activity", async () => {
+    const starts: string[] = [];
+    const outcomes: Record<string, unknown>[] = [];
+    let streamOpened = false;
+    let streamCancelled = false;
+    let oeCalls = 0;
+
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+        const url = String(request);
+        if (url.endsWith("/executor/activity/start")) {
+          const body = wireBody(init);
+          const provenance = {
+            workflow_identity: body["workflow_identity"],
+            attempt_id: body["attempt_id"],
+            fencing_token: body["fencing_token"],
+          };
+          const activityId = `llm-${starts.length + 1}`;
+          starts.push(activityId);
+          return jsonResponse({
+            activity_context: { ...provenance, activity_id: activityId },
+          });
+        }
+        if (url.endsWith("/executor/activity/outcome")) {
+          outcomes.push(wireBody(init));
+          return jsonResponse({});
+        }
+        if (url.endsWith("/tool/execute")) {
+          oeCalls += 1;
+          if (oeCalls === 1) {
+            return jsonResponse({
+              proceed: true,
+              status: "success",
+              route_to: "http://oe/live-stream",
+            });
+          }
+          return jsonResponse({
+            proceed: true,
+            status: "success",
+            result: { content: "second answer" },
+          });
+        }
+        if (url === "http://oe/live-stream") {
+          streamOpened = true;
+          const encoder = new TextEncoder();
+          return new Response(
+            new ReadableStream<Uint8Array>({
+              start(controller) {
+                // One visible chunk, then the stream stays open.
+                controller.enqueue(
+                  encoder.encode(
+                    `data: ${JSON.stringify({ content: "partial" })}\n\n`,
+                  ),
+                );
+              },
+              cancel() {
+                streamCancelled = true;
+              },
+            }),
+            { headers: { "Content-Type": "text/event-stream" } },
+          );
+        }
+        throw new Error(`unexpected URL: ${url}`);
+      }),
+    );
+
+    const wrapper = new SecureToolWrapper("http://oe", "execution");
+    const llm = new SecureWrappedLLM(
+      {
+        model: "test-model",
+        stream: () => undefined,
+      } as unknown as BaseChatModel,
+      () => wrapper,
+    );
+
+    await inToolAttempt(attempt("attempt-1"), wrapper, async () => {
+      // Drive the adapter iterator directly. The public `llm.stream()` wrapper
+      // eagerly starts its next pull, and LangChain's IterableReadableStream
+      // queues the consumer's cancel behind that pending pull on an endless
+      // source, so a break there would deadlock regardless of this adapter.
+      const iterator = llm._streamIterator(
+        [new HumanMessage("summarize the claim")] as never,
+        {} as never,
+      );
+      const first = await iterator.next();
+      expect(String(first.value?.content)).toBe("partial");
+      await iterator.return(undefined);
+
+      // The attempt is still usable: a following call dispatches and completes.
+      const answer = await llm.invoke([new HumanMessage("second question")]);
+      expect(String(answer.content)).toBe("second answer");
+    });
+
+    expect(streamOpened).toBe(true);
+    expect(streamCancelled).toBe(true);
+    expect(starts).toHaveLength(2);
+    const abandoned = outcomes.filter(
+      (outcome) =>
+        outcome["outcome_kind"] === "ACTIVITY_OUTCOME_KIND_FAILED" &&
+        JSON.stringify(outcome["error"] ?? "").includes("abandoned"),
+    );
+    expect(abandoned).toHaveLength(1);
+    expect(outcomes).toHaveLength(2);
   });
 });

@@ -24,7 +24,7 @@ LLM_PROVIDER_ENV_VARS = {
     "cerebras": "CEREBRAS_API_KEY",
 }
 DEFAULT_MODELS = {
-    "openai": "gpt-5.4-mini",
+    "openai": "gpt-5.6-luna",
     "anthropic": "claude-sonnet-5",
     "gemini": "gemini-3-flash-preview",
     "cerebras": "gpt-oss-120b",

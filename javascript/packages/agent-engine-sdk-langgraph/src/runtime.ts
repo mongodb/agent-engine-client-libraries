@@ -30,7 +30,6 @@ import {
   AppBoundRuntime,
   clearWorkflowAdapter,
   createSecureToolFunction,
-  currentAttemptContext,
   discoverMcpTools,
   getCurrentWrapper,
   getEnvBool,
@@ -80,10 +79,7 @@ import { AgentEngineToolPodBackend } from "./backends/toolpod.js";
 import { LangChainLLMAdapter } from "./llm_adapter.js";
 import { LangGraphQueryPlugin } from "./query.js";
 import { LangGraphCallbackAdapter } from "./node_logger_adapter.js";
-import {
-  PlatformCheckpointer,
-  UnsupportedDurableGraphError,
-} from "./platform_checkpointer.js";
+import { PlatformCheckpointer } from "./platform_checkpointer.js";
 import { SecureWrappedLLM, type SecureLLMWrapper } from "./secure_llm.js";
 
 const logger = getLogger("agent_engine_sdk_langgraph.runtime");
@@ -759,16 +755,15 @@ export class App extends BaseApp {
    */
   private static registerHooks(): void {
     // Suspend handler — wires LangGraph's `interrupt()` so runner-shared can
-    // pause a graph from inside `SuspendPayload` flows. Lazy import keeps
-    // langgraph out of the cold path for non-AER modes.
-    registerSuspendHandler(((payload: unknown) => {
-      if (currentAttemptContext() !== null) {
-        throw new UnsupportedDurableGraphError(
-          "App.suspend framework suspension is not supported on durable_workflow sessions",
-        );
-      }
-      return langgraphInterrupt(payload as never);
-    }) as never);
+    // pause a graph from inside `SuspendPayload` flows and from a guardrail
+    // review pause after a durable LLM activity. Both modes route through
+    // LangGraph: a durable review pause happens *after* its LLM activity is
+    // recorded (the halt is the activity's result), so there is no durable
+    // refusal here. A legacy `app.suspend()` wait is still rejected on durable
+    // Tool activities by SecureToolWrapper's "reject" interrupt mode.
+    // Lazy import keeps langgraph out of the cold path for non-AER modes.
+    registerSuspendHandler(((payload: unknown) =>
+      langgraphInterrupt(payload as never)) as never);
 
     // LLM adapter factory — runner-shared's Tool Pod /invoke_llm route uses
     // this to construct a LangChainLLMAdapter from the customer's BaseChatModel.

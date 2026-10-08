@@ -206,10 +206,10 @@ Structured glob matching returning FileInfo objects.
 
 **Parameters**
 
-| Parameter | Type | Default value | Description |
-| :------ | :------ | :------ | :------ |
-| `pattern` | `string` | `undefined` | Glob pattern (e.g., `*.py`, `**/*.ts`) |
-| `path` | `string` | `"/"` | Base path to search from (default: "/") |
+| Parameter | Type | Description |
+| :------ | :------ | :------ |
+| `pattern` | `string` | Glob pattern (e.g., `*.py`, `**/*.ts`) |
+| `path?` | `string` | Base path to search from (default: "/") |
 
 **Returns**
 
@@ -231,7 +231,8 @@ SandboxBackendProtocolV2.glob
 grep(
    pattern,
    path?,
-   glob?
+   glob?,
+   maxCount?
 ): Promise<GrepResult>;
 ```
 
@@ -246,6 +247,7 @@ Binary files (determined by MIME type) are skipped.
 | `pattern` | `string` | Literal text pattern to search for |
 | `path?` | `string` \| `null` | Base path to search from (default: null) |
 | `glob?` | `string` \| `null` | Optional glob pattern to filter files (e.g., "*.py") |
+| `maxCount?` | `number` \| `null` | Optional cap on the total number of matches returned. When the cap is hit, results are flagged `truncated: true`. |
 
 **Returns**
 
@@ -393,20 +395,20 @@ SandboxBackendProtocolV2.uploadFiles
 write(filePath, content): Promise<WriteResult>;
 ```
 
-Create a new file.
+Create a new file. The Tool Pod handler is create-only — it opens the path
+with `wx` and returns an already-exists error rather than overwriting — so
+use [edit](#api-edit) to modify an existing file.
 
 **Parameters**
 
-| Parameter | Type | Description |
-| :------ | :------ | :------ |
-| `filePath` | `string` | Absolute file path |
-| `content` | `string` | File content as string |
+| Parameter | Type |
+| :------ | :------ |
+| `filePath` | `string` |
+| `content` | `string` |
 
 **Returns**
 
 `Promise`\<`WriteResult`\>
-
-WriteResult with error populated on failure
 
 **Implementation of**
 
@@ -561,59 +563,7 @@ Release resources held by this App instance.
 ##### deepAgent()
 
 ```ts
-deepAgent(llm, options?): DeepAgent<DeepAgentTypeConfig<ResponseFormatUndefined, undefined, InteropZodObject, readonly [AgentMiddleware<ZodObject<{
-}, "strip", ZodTypeAny, {
-}, {
-}>, undefined, unknown, readonly [DynamicStructuredTool<ZodObject<{
-}, "strip", ZodTypeAny, {
-}, {
-}>, {
-}, {
-}, Command<unknown, {
-}, string>, unknown, "write_todos">]>, AgentMiddleware<StateSchema<{
-}>, undefined, unknown, (
-  | DynamicStructuredTool<ZodObject<{
-}, $strip>, {
-}, {
-}, string, unknown, "ls">
-  | DynamicStructuredTool<ZodObject<{
-}, $strip>, {
-}, {
-}, object[] | object[], unknown, "read_file">
-  | DynamicStructuredTool<ZodObject<{
-}, $strip>, {
-}, {
-},
-  | string
-  | ToolMessage<MessageStructure<MessageToolSet>>
-  | Command<unknown, {
-}, string>, unknown, "write_file">
-  | DynamicStructuredTool<ZodObject<{
-}, $strip>, {
-}, {
-},
-  | string
-  | ToolMessage<MessageStructure<MessageToolSet>>
-  | Command<unknown, {
-}, string>, unknown, "edit_file">
-  | DynamicStructuredTool<ZodObject<{
-}, $strip>, {
-}, {
-}, string, unknown, "glob">
-  | DynamicStructuredTool<ZodObject<{
-}, $strip>, {
-}, {
-}, string, unknown, "grep">
-  | DynamicStructuredTool<ZodObject<{
-}, $strip>, {
-}, {
-}, string, unknown, "execute">)[]>, AgentMiddleware<undefined, undefined, unknown, readonly [DynamicStructuredTool<ZodObject<{
-}, $strip>, {
-}, {
-},
-  | string
-  | Command<unknown, Record<string, unknown>, string>, unknown, "task">]>, AgentMiddleware<ZodObject<{
-}, $strip>, undefined, unknown, readonly (ClientTool | ServerTool)[]>, AgentMiddleware<undefined, undefined, unknown, readonly (ClientTool | ServerTool)[]>, AgentMiddleware<any, any, any, readonly (ClientTool | ServerTool)[]>], readonly (ClientTool | ServerTool)[], readonly AnySubAgent[], readonly () => StreamTransformer<any>[]>>;
+deepAgent(llm, options?): any;
 ```
 
 Build a deepagents graph pre-wired for Atlas Agent Engine AER.
@@ -640,59 +590,7 @@ Mirrors Python `runtime.py:App.deep_agent()`.
 
 **Returns**
 
-`DeepAgent`\<`DeepAgentTypeConfig`\<`ResponseFormatUndefined`, `undefined`, `InteropZodObject`, readonly \[`AgentMiddleware`\<`ZodObject`\<\{
-\}, `"strip"`, `ZodTypeAny`, \{
-\}, \{
-\}\>, `undefined`, `unknown`, readonly \[`DynamicStructuredTool`\<`ZodObject`\<\{
-\}, `"strip"`, `ZodTypeAny`, \{
-\}, \{
-\}\>, \{
-\}, \{
-\}, `Command`\<`unknown`, \{
-\}, `string`\>, `unknown`, `"write_todos"`\>\]\>, `AgentMiddleware`\<`StateSchema`\<\{
-\}\>, `undefined`, `unknown`, (
-  \| `DynamicStructuredTool`\<`ZodObject`\<\{
-\}, `$strip`\>, \{
-\}, \{
-\}, `string`, `unknown`, `"ls"`\>
-  \| `DynamicStructuredTool`\<`ZodObject`\<\{
-\}, `$strip`\>, \{
-\}, \{
-\}, `object`[] \| `object`[], `unknown`, `"read_file"`\>
-  \| `DynamicStructuredTool`\<`ZodObject`\<\{
-\}, `$strip`\>, \{
-\}, \{
-\},
-  \| `string`
-  \| `ToolMessage`\<`MessageStructure`\<`MessageToolSet`\>\>
-  \| `Command`\<`unknown`, \{
-\}, `string`\>, `unknown`, `"write_file"`\>
-  \| `DynamicStructuredTool`\<`ZodObject`\<\{
-\}, `$strip`\>, \{
-\}, \{
-\},
-  \| `string`
-  \| `ToolMessage`\<`MessageStructure`\<`MessageToolSet`\>\>
-  \| `Command`\<`unknown`, \{
-\}, `string`\>, `unknown`, `"edit_file"`\>
-  \| `DynamicStructuredTool`\<`ZodObject`\<\{
-\}, `$strip`\>, \{
-\}, \{
-\}, `string`, `unknown`, `"glob"`\>
-  \| `DynamicStructuredTool`\<`ZodObject`\<\{
-\}, `$strip`\>, \{
-\}, \{
-\}, `string`, `unknown`, `"grep"`\>
-  \| `DynamicStructuredTool`\<`ZodObject`\<\{
-\}, `$strip`\>, \{
-\}, \{
-\}, `string`, `unknown`, `"execute"`\>)[]\>, `AgentMiddleware`\<`undefined`, `undefined`, `unknown`, readonly \[`DynamicStructuredTool`\<`ZodObject`\<\{
-\}, `$strip`\>, \{
-\}, \{
-\},
-  \| `string`
-  \| `Command`\<`unknown`, `Record`\<`string`, `unknown`\>, `string`\>, `unknown`, `"task"`\>\]\>, `AgentMiddleware`\<`ZodObject`\<\{
-\}, `$strip`\>, `undefined`, `unknown`, readonly (`ClientTool` \| `ServerTool`)[]\>, `AgentMiddleware`\<`undefined`, `undefined`, `unknown`, readonly (`ClientTool` \| `ServerTool`)[]\>, `AgentMiddleware`\<`any`, `any`, `any`, readonly (`ClientTool` \| `ServerTool`)[]\>\], readonly (`ClientTool` \| `ServerTool`)[], readonly `AnySubAgent`[], readonly () => `StreamTransformer`\<`any`\>[]\>\>
+`any`
 
 **Throws**
 
@@ -1346,7 +1244,7 @@ getSummariesForSessions(sessionIds): Promise<{
 | Property | Type | Description |
 | :------ | :------ | :------ |
 | <a id="api-property-checkpointer"></a> `checkpointer?` | `boolean` \| `BaseCheckpointSaver`\<`number`\> | LangGraph checkpointer for state persistence, HITL, and multi-turn. |
-| <a id="api-property-middleware"></a> `middleware?` | readonly `AgentMiddleware`\<`any`, `any`, `any`, readonly (`ClientTool` \| `ServerTool`)[]\>[] | Additional middleware, appended after the default durable middleware. |
+| <a id="api-property-middleware"></a> `middleware?` | readonly `AgentMiddleware`\<`any`, `any`, `any`, readonly (`ClientTool` \| `ServerTool`)[], readonly () => `StreamTransformer`\<`any`\>[]\>[] | Additional middleware, appended after the default durable middleware. |
 | <a id="api-property-skills"></a> `skills?` | `string`[] | Parent directories for deepagents' one-level skill discovery. |
 | <a id="api-property-skillsbasedir"></a> `skillsBaseDir?` | `string` | Base directory for relative skill paths (set by `App.deepAgent()`). |
 | <a id="api-property-store"></a> `store?` | `BaseStore` | LangGraph store for skills and shared data. |
@@ -1372,7 +1270,7 @@ Options for [App.deepAgent](#api-deepagent).
 | :------ | :------ | :------ | :------ |
 | <a id="api-property-backend"></a> `backend?` | `AnyBackendProtocol` | Backend for filesystem/shell ops. Defaults to `AgentEngineToolPodBackend`, so every op is OE-audited and sandboxed in the Tool Pod. Pass a custom backend (e.g. deepagents' in-memory `StateBackend`) to override — note that doing so bypasses the OE audit path. | - |
 | <a id="api-property-checkpointer-1"></a> `checkpointer?` | `boolean` \| `BaseCheckpointSaver`\<`number`\> | Checkpointer selection. Omitted (`undefined`) resolves to `app.checkpointer()` (MongoDB when configured, else none). `false` disables checkpointing. A `BaseCheckpointSaver` instance is used directly. Note the mapping differs from Python (`None` disables there): in TS, "disable" is `false`, and "use the default" is simply leaving it out. | - |
-| <a id="api-property-middleware-1"></a> `middleware?` | readonly `AgentMiddleware`\<`any`, `any`, `any`, readonly (`ClientTool` \| `ServerTool`)[]\>[] | Additional middleware, appended after the default durable middleware. | [`CreateAgentEngineDeepAgentOptions`](#api-createagentenginedeepagentoptions).[`middleware`](#api-property-middleware) |
+| <a id="api-property-middleware-1"></a> `middleware?` | readonly `AgentMiddleware`\<`any`, `any`, `any`, readonly (`ClientTool` \| `ServerTool`)[], readonly () => `StreamTransformer`\<`any`\>[]\>[] | Additional middleware, appended after the default durable middleware. | [`CreateAgentEngineDeepAgentOptions`](#api-createagentenginedeepagentoptions).[`middleware`](#api-property-middleware) |
 | <a id="api-property-skills-1"></a> `skills?` | `string`[] | Parent directories for deepagents' one-level skill discovery. | [`CreateAgentEngineDeepAgentOptions`](#api-createagentenginedeepagentoptions).[`skills`](#api-property-skills) |
 | <a id="api-property-store-1"></a> `store?` | `BaseStore` | LangGraph store for skills and shared data. | [`CreateAgentEngineDeepAgentOptions`](#api-createagentenginedeepagentoptions).[`store`](#api-property-store) |
 | <a id="api-property-subagents-1"></a> `subagents?` | readonly `AnySubAgent`[] | SubAgent specs. Plain specs with a `model` field must use a model instance, not a string — string models bypass OE routing. | [`CreateAgentEngineDeepAgentOptions`](#api-createagentenginedeepagentoptions).[`subagents`](#api-property-subagents) |
@@ -1470,59 +1368,7 @@ function createAgentEngineDeepAgent(
    secureLlm,
    backend,
    options?
-): DeepAgent<DeepAgentTypeConfig<ResponseFormatUndefined, undefined, InteropZodObject, readonly [AgentMiddleware<ZodObject<{
-}, "strip", ZodTypeAny, {
-}, {
-}>, undefined, unknown, readonly [DynamicStructuredTool<ZodObject<{
-}, "strip", ZodTypeAny, {
-}, {
-}>, {
-}, {
-}, Command<unknown, {
-}, string>, unknown, "write_todos">]>, AgentMiddleware<StateSchema<{
-}>, undefined, unknown, (
-  | DynamicStructuredTool<ZodObject<{
-}, $strip>, {
-}, {
-}, string, unknown, "ls">
-  | DynamicStructuredTool<ZodObject<{
-}, $strip>, {
-}, {
-}, object[] | object[], unknown, "read_file">
-  | DynamicStructuredTool<ZodObject<{
-}, $strip>, {
-}, {
-},
-  | string
-  | ToolMessage<MessageStructure<MessageToolSet>>
-  | Command<unknown, {
-}, string>, unknown, "write_file">
-  | DynamicStructuredTool<ZodObject<{
-}, $strip>, {
-}, {
-},
-  | string
-  | ToolMessage<MessageStructure<MessageToolSet>>
-  | Command<unknown, {
-}, string>, unknown, "edit_file">
-  | DynamicStructuredTool<ZodObject<{
-}, $strip>, {
-}, {
-}, string, unknown, "glob">
-  | DynamicStructuredTool<ZodObject<{
-}, $strip>, {
-}, {
-}, string, unknown, "grep">
-  | DynamicStructuredTool<ZodObject<{
-}, $strip>, {
-}, {
-}, string, unknown, "execute">)[]>, AgentMiddleware<undefined, undefined, unknown, readonly [DynamicStructuredTool<ZodObject<{
-}, $strip>, {
-}, {
-},
-  | string
-  | Command<unknown, Record<string, unknown>, string>, unknown, "task">]>, AgentMiddleware<ZodObject<{
-}, $strip>, undefined, unknown, readonly (ClientTool | ServerTool)[]>, AgentMiddleware<undefined, undefined, unknown, readonly (ClientTool | ServerTool)[]>, AgentMiddleware<any, any, any, readonly (ClientTool | ServerTool)[]>], readonly (ClientTool | ServerTool)[], readonly AnySubAgent[], readonly () => StreamTransformer<any>[]>>;
+): any;
 ```
 
 Create a deep-agent graph pre-configured for Atlas Agent Engine AER. Resolves relative
@@ -1539,59 +1385,7 @@ skill paths, validates the subagent tree, then delegates to deepagents'
 
 #### Returns
 
-`DeepAgent`\<`DeepAgentTypeConfig`\<`ResponseFormatUndefined`, `undefined`, `InteropZodObject`, readonly \[`AgentMiddleware`\<`ZodObject`\<\{
-\}, `"strip"`, `ZodTypeAny`, \{
-\}, \{
-\}\>, `undefined`, `unknown`, readonly \[`DynamicStructuredTool`\<`ZodObject`\<\{
-\}, `"strip"`, `ZodTypeAny`, \{
-\}, \{
-\}\>, \{
-\}, \{
-\}, `Command`\<`unknown`, \{
-\}, `string`\>, `unknown`, `"write_todos"`\>\]\>, `AgentMiddleware`\<`StateSchema`\<\{
-\}\>, `undefined`, `unknown`, (
-  \| `DynamicStructuredTool`\<`ZodObject`\<\{
-\}, `$strip`\>, \{
-\}, \{
-\}, `string`, `unknown`, `"ls"`\>
-  \| `DynamicStructuredTool`\<`ZodObject`\<\{
-\}, `$strip`\>, \{
-\}, \{
-\}, `object`[] \| `object`[], `unknown`, `"read_file"`\>
-  \| `DynamicStructuredTool`\<`ZodObject`\<\{
-\}, `$strip`\>, \{
-\}, \{
-\},
-  \| `string`
-  \| `ToolMessage`\<`MessageStructure`\<`MessageToolSet`\>\>
-  \| `Command`\<`unknown`, \{
-\}, `string`\>, `unknown`, `"write_file"`\>
-  \| `DynamicStructuredTool`\<`ZodObject`\<\{
-\}, `$strip`\>, \{
-\}, \{
-\},
-  \| `string`
-  \| `ToolMessage`\<`MessageStructure`\<`MessageToolSet`\>\>
-  \| `Command`\<`unknown`, \{
-\}, `string`\>, `unknown`, `"edit_file"`\>
-  \| `DynamicStructuredTool`\<`ZodObject`\<\{
-\}, `$strip`\>, \{
-\}, \{
-\}, `string`, `unknown`, `"glob"`\>
-  \| `DynamicStructuredTool`\<`ZodObject`\<\{
-\}, `$strip`\>, \{
-\}, \{
-\}, `string`, `unknown`, `"grep"`\>
-  \| `DynamicStructuredTool`\<`ZodObject`\<\{
-\}, `$strip`\>, \{
-\}, \{
-\}, `string`, `unknown`, `"execute"`\>)[]\>, `AgentMiddleware`\<`undefined`, `undefined`, `unknown`, readonly \[`DynamicStructuredTool`\<`ZodObject`\<\{
-\}, `$strip`\>, \{
-\}, \{
-\},
-  \| `string`
-  \| `Command`\<`unknown`, `Record`\<`string`, `unknown`\>, `string`\>, `unknown`, `"task"`\>\]\>, `AgentMiddleware`\<`ZodObject`\<\{
-\}, `$strip`\>, `undefined`, `unknown`, readonly (`ClientTool` \| `ServerTool`)[]\>, `AgentMiddleware`\<`undefined`, `undefined`, `unknown`, readonly (`ClientTool` \| `ServerTool`)[]\>, `AgentMiddleware`\<`any`, `any`, `any`, readonly (`ClientTool` \| `ServerTool`)[]\>\], readonly (`ClientTool` \| `ServerTool`)[], readonly `AnySubAgent`[], readonly () => `StreamTransformer`\<`any`\>[]\>\>
+`any`
 
 #### Throws
 

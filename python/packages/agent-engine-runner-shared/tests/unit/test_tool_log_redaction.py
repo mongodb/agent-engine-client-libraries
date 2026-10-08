@@ -6,7 +6,6 @@ Mirrors the TypeScript tests/unit/tool_log_redaction.test.ts.
 Platform debug logs must never emit argument or result bodies:
 serializing them on the invoke path stalls large-payload tools, and the
 catalog redact_fields contract is satisfied by omitting values entirely.
-redact_fields itself is still unit-tested because other callers use it.
 """
 
 import logging
@@ -14,7 +13,6 @@ from unittest.mock import Mock, patch
 
 import pytest
 
-from agent_engine_runner_shared.logging import redact_fields
 from agent_engine_runner_shared.utils import log_tool_request, log_tool_result
 
 _UTILS_LOGGER = "agent_engine_runner_shared.utils"
@@ -22,19 +20,6 @@ _UTILS_LOGGER = "agent_engine_runner_shared.utils"
 
 def _debug_output(caplog) -> str:
     return "\n".join(r.getMessage() for r in caplog.records if r.levelno == logging.DEBUG)
-
-
-class TestRedactFields:
-    def test_listed_fields_masked_unlisted_pass_through(self):
-        out = redact_fields({"card_number": "4111111111111111", "amount": 42}, ["card_number"])
-        assert out == {"card_number": "[REDACTED]", "amount": 42}
-
-    def test_empty_list_returns_input_unchanged(self):
-        args = {"card_number": "4111111111111111"}
-        assert redact_fields(args, []) is args
-
-    def test_missing_keys_ignored(self):
-        assert redact_fields({"amount": 42}, ["card_number", "cvv"]) == {"amount": 42}
 
 
 class TestLogToolRequest:

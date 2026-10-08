@@ -636,6 +636,10 @@ def suspend(reason: str, context: dict[str, Any]) -> str
 Generates a suspend command. If a tool should suspend, return the result
 of this function.
 
+Not supported on durable workflow sessions: use LangGraph's native
+``interrupt()`` instead. A tool that returns this payload on a durable
+session fails with a clear error before the wait is recorded.
+
 <a id="agent_engine_sdk_langgraph.runtime.App.finish_session"></a>
 
 #### finish\_session

@@ -73,6 +73,17 @@ run_python_tests() {
     uv run pyright
     uv run pytest
   )
+
+  log "Python: agent-engine-sdk-openai-agents"
+  (
+    cd "$PYTHON_ROOT"
+    uv sync --package agent-engine-sdk-openai-agents --extra dev
+  )
+  (
+    cd "$PYTHON_ROOT/packages/agent-engine-sdk-openai-agents"
+    uv run pyright
+    uv run pytest
+  )
 }
 
 run_javascript_tests() {

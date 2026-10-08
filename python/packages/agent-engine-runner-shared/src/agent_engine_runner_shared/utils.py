@@ -260,6 +260,14 @@ _PLATFORM_ENV_VARS: frozenset[str] = frozenset(
         # Platform LLM provider credentials. Read by the standalone memory
         # server for extraction-pipeline provider detection, but potentially
         # present in any runtime container.
+        # Debug-mode state: set by the operator's debug mode (and
+        # optionally by tenants in dev up .env files); platform plumbing, not
+        # something tenant-code interpolation should see or substitute.
+        "MDBAE_LOCAL_MODE",
+        "MDBAE_LOCAL_PORT",
+        # Platform LLM provider credentials. Read by the standalone memory
+        # server for extraction-pipeline provider detection, but potentially
+        # present in any runtime container.
         "OPENAI_API_KEY",
         "ANTHROPIC_API_KEY",
         "CEREBRAS_API_KEY",
@@ -1049,17 +1057,6 @@ def log_policy_blocked(
 ) -> None:
     """Log that a tool call was blocked by policy."""
     _log_utils_logger.warning(f"{prefix}: Step {step} - {tool_name} BLOCKED by policy: {reason}")
-
-
-def log_execution_start(
-    execution_id: str,
-    input_keys: List[str],
-    prefix: str = "OE",
-) -> None:
-    """Log the start of an execution."""
-    log_section()
-    _log_utils_logger.info(f"{prefix}: Starting execution {execution_id[:8]}...")
-    _log_utils_logger.debug(f"{prefix}: Input keys: {input_keys}")
 
 
 def log_execution_callback(

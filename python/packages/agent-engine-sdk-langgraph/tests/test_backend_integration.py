@@ -24,16 +24,35 @@ import json
 import threading
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from agent_engine_sdk_langgraph.backends import toolpod
 from agent_engine_sdk_langgraph.backends.toolpod import AgentEngineToolPodBackend
 from agent_engine_runner_shared import toolpod_handlers
 from agent_engine_runner_shared.context import current_wrapper
 from agent_engine_runner_shared.secure_wrapper import SecureToolWrapper
+
+
+@dataclass
+class _LegacyGrepResult:
+    """deepagents 0.5.x GrepResult: no ``truncated`` field."""
+
+    error: str | None = None
+    matches: list[Any] | None = None
+
+
+@dataclass
+class _LegacyGlobResult:
+    """deepagents 0.5.x GlobResult: no ``truncated`` field."""
+
+    error: str | None = None
+    matches: list[Any] | None = None
+
 
 # ---------------------------------------------------------------------------
 # Fake OE — dispatches POST /tool/execute to real toolpod_handlers
@@ -269,6 +288,68 @@ class TestReadOpsAgainstRealFilesystem:
         assert result.matches is not None
         names = {m["path"] for m in result.matches}
         assert names == {str(workspace / "src" / "main.py")}
+
+    def test_grep_max_count_caps_matches_and_flags_truncated(
+        self, workspace: Path, backend: AgentEngineToolPodBackend
+    ) -> None:
+        (workspace / "a.py").write_text("TODO one\nTODO two\nTODO three\n")
+
+        uncapped = backend.grep("TODO")
+        assert uncapped.error is None
+        assert uncapped.matches is not None
+        assert len(uncapped.matches) == 3
+        assert uncapped.truncated is False
+
+        capped = backend.grep("TODO", max_count=1)
+        assert capped.error is None
+        assert capped.matches is not None
+        assert len(capped.matches) == 1
+        assert capped.truncated is True
+
+    def test_glob_without_path_omits_the_wire_path(
+        self, workspace: Path, backend: AgentEngineToolPodBackend, fake_oe: _FakeOE
+    ) -> None:
+        (workspace / "a.py").write_text("x")
+
+        result = backend.glob("*.py")
+
+        assert result.error is None
+        assert result.matches is not None
+        # The protocol treats a missing path as the working directory; the
+        # handler's own default resolves the workspace root.
+        assert "path" not in fake_oe.requests[0]["arguments"]
+
+    def test_grep_tolerates_legacy_result_type(
+        self,
+        workspace: Path,
+        backend: AgentEngineToolPodBackend,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """An agent on deepagents 0.5.x must not crash on a successful grep."""
+        (workspace / "a.py").write_text("TODO one\nTODO two\n")
+        monkeypatch.setattr(toolpod, "GrepResult", _LegacyGrepResult)
+
+        result = backend.grep("TODO", max_count=1)
+
+        assert result.error is None
+        assert result.matches is not None
+        assert len(result.matches) == 1
+
+    def test_glob_tolerates_legacy_result_type(
+        self,
+        workspace: Path,
+        backend: AgentEngineToolPodBackend,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """An agent on deepagents 0.5.x must not crash on a successful glob."""
+        (workspace / "a.py").write_text("x")
+        monkeypatch.setattr(toolpod, "GlobResult", _LegacyGlobResult)
+
+        result = backend.glob("*.py")
+
+        assert result.error is None
+        assert result.matches is not None
+        assert len(result.matches) == 1
 
 
 # ---------------------------------------------------------------------------

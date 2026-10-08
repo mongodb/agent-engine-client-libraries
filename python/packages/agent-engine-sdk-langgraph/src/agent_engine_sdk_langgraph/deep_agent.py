@@ -37,6 +37,8 @@ from agent_engine_sdk_langgraph.deep_agent_checkpointer import (
     checkpointer_for_deep_agent,
 )
 from agent_engine_sdk_langgraph.durable_deep_agent import DurableDeepAgentMiddleware
+from agent_engine_sdk_langgraph.durable_errors import UnsupportedDurableGraphError
+from agent_engine_sdk_langgraph.durable_subgraphs import reject_node_retry_policies
 from agent_engine_sdk_langgraph.subagents import validate_subagent_tree
 
 # Patches SkillsMiddleware.before_agent/abefore_agent to emit a wrapper span.
@@ -93,6 +95,25 @@ def _compiled_subagent_checkpointer_names(
         if "runnable" in spec
         and getattr(spec["runnable"], "checkpointer", None) is not None
     )
+
+
+def _compiled_subagent_retry_policy_names(
+    subagents: Sequence[SubAgentSpec] | None,
+) -> frozenset[str]:
+    """Name the compiled subagents whose graphs set a retry policy.
+
+    A compiled subagent runs inside the Deep Agent's task tool, not as a node
+    of the agent graph, so the durable session's own check never reaches it.
+    """
+    names: set[str] = set()
+    for spec in subagents or ():
+        if "runnable" not in spec:
+            continue
+        try:
+            reject_node_retry_policies(spec["runnable"])
+        except UnsupportedDurableGraphError:
+            names.add(spec["name"])
+    return frozenset(names)
 
 
 def create_agent_engine_deep_agent(
@@ -174,7 +195,10 @@ def create_agent_engine_deep_agent(
         # matching the TypeScript twin.
         middleware=[
             DurableDeepAgentMiddleware(
-                unsupported_subagent_names=unsupported_subagent_names
+                unsupported_subagent_names=unsupported_subagent_names,
+                retry_policy_subagent_names=_compiled_subagent_retry_policy_names(
+                    subagents
+                ),
             ),
             *middleware,
         ],

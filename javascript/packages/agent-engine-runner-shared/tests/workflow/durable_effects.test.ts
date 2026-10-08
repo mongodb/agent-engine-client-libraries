@@ -30,6 +30,7 @@ import {
   WorkflowIdentitySchema,
   preallocateActivityOrdinals,
   runWithAttemptContext,
+  setActivityReconstructionIds,
   toolActivityKey,
 } from "../../src/workflow/index.js";
 
@@ -1108,6 +1109,49 @@ describe("durable Tool effects", () => {
     );
   });
 
+  test("rejects a legacy suspend payload from a reconstructed local callback", async () => {
+    const activityOutcomeBodies: Record<string, unknown>[] = [];
+    const interrupt = vi.fn();
+    registerSuspendHandler(interrupt);
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+        const url = String(input);
+        if (url.endsWith("/executor/activity/start")) {
+          return replayResponse("reconstructed-suspend", {
+            decision: "approved",
+          });
+        }
+        if (url.endsWith("/executor/activity/outcome")) {
+          activityOutcomeBodies.push(requestBody(init));
+          return jsonResponse({});
+        }
+        throw new Error(`unexpected URL: ${url}`);
+      }),
+    );
+
+    await expect(
+      runWithDurableExecution(() => {
+        setActivityReconstructionIds(["reconstructed-suspend"]);
+        return new SecureToolWrapper("http://oe", "execution").executeTool(
+          "review_claim",
+          {},
+          {
+            localExecutor: async () =>
+              suspendPayloadToJson({
+                suspend_reason: "review",
+                suspend_context: {},
+              }),
+          },
+        );
+      }),
+    ).rejects.toThrow("framework adapter must own suspension");
+
+    expect(interrupt).not.toHaveBeenCalled();
+    // The activity is already resolved: no second outcome is reported.
+    expect(activityOutcomeBodies).toEqual([]);
+  });
+
   test("preserves native callback control flow for adapter settlement", async () => {
     const toolResultBodies: Record<string, unknown>[] = [];
     const activityOutcomeBodies: Record<string, unknown>[] = [];
@@ -1589,10 +1633,8 @@ describe("durable LLM effects", () => {
     );
   });
 
-  test("rejects require_review before invoking a framework interrupt", async () => {
+  test("a durable require_review without the protocol is a policy denial", async () => {
     const outcomeBodies: Record<string, unknown>[] = [];
-    const interrupt = vi.fn();
-    registerSuspendHandler(interrupt);
     vi.stubGlobal(
       "fetch",
       vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
@@ -1615,20 +1657,28 @@ describe("durable LLM effects", () => {
       }),
     );
 
-    const consume = runWithAttemptContext(attempt, async () => {
-      for await (const _chunk of new SecureLLMProxy({
-        oeUrl: "http://oe",
-        executionId: "execution",
-      }).stream(messages)) {
-        // The durable activity must fail before yielding review content.
+    const error = await runWithAttemptContext(attempt, async () => {
+      try {
+        for await (const _chunk of new SecureLLMProxy({
+          oeUrl: "http://oe",
+          executionId: "execution",
+        }).stream(messages)) {
+          // A denial yields no chunks.
+        }
+      } catch (caught) {
+        return caught;
       }
+      return null;
     });
 
-    await expect(consume).rejects.toBeInstanceOf(LLMInvocationError);
-    await expect(consume).rejects.toThrow("framework adapter must own review");
-    expect(interrupt).not.toHaveBeenCalled();
+    // No adapter opted in, so no pause is possible: the halt is denied rather
+    // than failed, and no content is released.
+    expect(error).toBeInstanceOf(PolicyDeniedException);
+    expect((error as PolicyDeniedException).message).toContain(
+      "no suspend handler registered",
+    );
     expect(outcomeBodies[0]?.["outcome_kind"]).toBe(
-      "ACTIVITY_OUTCOME_KIND_FAILED",
+      "ACTIVITY_OUTCOME_KIND_DENIED",
     );
   });
 });

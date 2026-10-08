@@ -6,11 +6,11 @@ from typing import Any
 
 import pytest
 from deepagents.middleware.patch_tool_calls import PatchToolCallsMiddleware
-from langchain_core.messages import AIMessage, ToolMessage
+from langchain_core.messages import AIMessage, RemoveMessage, ToolMessage
 from langchain_core.tools import tool
 from langgraph.graph import START, MessagesState, StateGraph
 from langgraph.prebuilt import ToolNode
-from langgraph.types import Command
+from langgraph.types import Command, Overwrite
 
 from agent_engine_sdk_langgraph.agent import LangGraphBaseAgent
 from agent_engine_runner_shared.generated.workflow.v1.common_pb2 import WorkflowIdentity
@@ -189,19 +189,32 @@ def test_stock_tool_node_message_id_is_stable_across_replacement_attempts() -> N
     assert first_tool.tool_call_id == "tool-call-1"
 
 
-@pytest.mark.parametrize("serialized_overwrite", [False, True])
+@pytest.mark.parametrize(
+    "shape",
+    ["native_remove_message", "langgraph_overwrite", "serialized_overwrite_wire"],
+)
 def test_deep_agent_patched_tool_message_id_is_stable_across_attempts(
-    serialized_overwrite: bool,
+    shape: str,
 ) -> None:
-    """Deep Agents overwrites history before a later reducer sees its patch."""
+    """Deep Agents replaces history before a later reducer sees its patch.
+
+    Covers every node-output shape the durable identity wrapper must stamp:
+    the middleware's native update (a RemoveMessage + patched list), an
+    explicit LangGraph ``Overwrite``, and the JSON-serialized
+    ``__overwrite__`` wire form. The two explicit replacement forms bypass the
+    ``add_messages`` reducer that ``RemoveMessage`` only speaks to, so the
+    reducer-only marker is dropped before wrapping.
+    """
     patch_tool_calls = PatchToolCallsMiddleware()
 
     def patch_dangling_tool_call(state: MessagesState) -> dict[str, Any] | None:
         update = patch_tool_calls.before_agent(state, None)  # type: ignore[arg-type]
-        if update is None or not serialized_overwrite:
+        if update is None or shape == "native_remove_message":
             return update
-        overwrite = update["messages"]
-        return {"messages": {"__overwrite__": overwrite.value}}
+        messages = [m for m in update["messages"] if not isinstance(m, RemoveMessage)]
+        if shape == "langgraph_overwrite":
+            return {"messages": Overwrite(messages)}
+        return {"messages": {"__overwrite__": messages}}
 
     builder = StateGraph(MessagesState)
     builder.add_node("patch_tool_calls", patch_dangling_tool_call)

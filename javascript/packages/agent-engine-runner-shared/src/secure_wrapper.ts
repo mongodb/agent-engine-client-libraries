@@ -93,7 +93,7 @@ const DURABLE_TOOL_RESULT_JSON_ERROR =
 // =============================================================================
 
 /**
- * Normalized usage shape returned by `extractUsage` / `extractPodUsage`.
+ * Normalized usage shape returned by `extractUsage`.
  * Mirrors Python's dict-shaped return so downstream consumers can pass these
  * fields straight into `reportOeResult`.
  */
@@ -176,59 +176,6 @@ export function extractUsage(
   result.model = modelName ?? null;
 
   return result;
-}
-
-/**
- * Extract token usage from a tool-pod usage dict into `reportOeResult` kwargs.
- *
- * Uses `!= null` checks instead of truthy `||` so a valid `0` token count is
- * not treated as missing. Computes `total_tokens` when the provider omits it.
- *
- * Mirrors Python's `_extract_pod_usage`. Python keeps the leading underscore
- * as a "private" convention and leaves the function unexported. TS exports
- * this (TS `noUnusedLocals` flags unused module-level functions, and the
- * leading-underscore identifier convention doesn't translate cleanly to TS).
- *
- * @internal — call sites are expected to live inside the agent-engine-runner-shared
- * package or downstream framework SDKs; not part of the stable public API.
- */
-export function extractPodUsage(
-  usage: Record<string, unknown> | null | undefined,
-  fallbackModel: string | null = null,
-): ExtractedUsage {
-  if (!usage || Object.keys(usage).length === 0) {
-    return {
-      prompt_tokens: null,
-      completion_tokens: null,
-      total_tokens: null,
-      model: fallbackModel,
-    };
-  }
-
-  // Note: prefers `input_tokens` over `prompt_tokens` (Anthropic-first),
-  // which is the opposite of `extractUsage`. Matches Python verbatim.
-  let prompt = usage["input_tokens"] as number | null | undefined;
-  if (prompt == null)
-    prompt = usage["prompt_tokens"] as number | null | undefined;
-
-  let completion = usage["output_tokens"] as number | null | undefined;
-  if (completion == null)
-    completion = usage["completion_tokens"] as number | null | undefined;
-
-  let total = usage["total_tokens"] as number | null | undefined;
-  if (total == null && prompt != null && completion != null) {
-    total = prompt + completion;
-  }
-
-  let model = usage["model"] as string | null | undefined;
-  if (!model) model = fallbackModel;
-
-  return {
-    prompt_tokens: prompt ?? null,
-    completion_tokens: completion ?? null,
-    total_tokens: total ?? null,
-    model: model ?? null,
-  };
 }
 
 // =============================================================================
@@ -487,6 +434,32 @@ export interface RequestOeApprovalArgs {
    * analog of Python's `httpx.Timeout(get_request_timeout(), read=LLM_READ_TIMEOUT)`.
    */
   timeoutMs?: number;
+  /**
+   * Set by callers that pause for the guardrail review a halt names and then
+   * resolve the call with `reviewId`.
+   */
+  reviewProtocol?: number | null;
+  /** Asks OE to answer this invoke_llm call from a decided guardrail review. */
+  reviewId?: string | null;
+}
+
+/**
+ * OE refused to answer a resolving call from a guardrail review: the review is
+ * unknown or undecided, or the call is not the reviewed one.
+ */
+export const GUARDRAIL_REVIEW_INVALID_CODE = "GUARDRAIL_REVIEW_INVALID";
+
+/** Whether OE refused a resolving call: the review cannot answer this request. */
+async function isGuardrailReviewRefusal(response: Response): Promise<boolean> {
+  if (response.status !== 409) return false;
+  try {
+    // Read a clone so a malformed body leaves the original intact for the
+    // caller's discard path.
+    const body: unknown = await response.clone().json();
+    return isObject(body) && body["code"] === GUARDRAIL_REVIEW_INVALID_CODE;
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -528,6 +501,8 @@ async function requestOeApprovalRaw(
     toolCallId,
     customHeaders,
     timeoutMs,
+    reviewProtocol,
+    reviewId,
   } = args;
 
   const { traceId, spanId } = getCurrentTraceContext();
@@ -547,6 +522,11 @@ async function requestOeApprovalRaw(
     trace_id: traceId ?? undefined,
     span_id: spanId ?? undefined,
   };
+  // Each review field is sent only when set, matching Python: a resolving
+  // call that names a review without opting in still reaches OE's refusal
+  // instead of silently running as an ordinary model call.
+  if (reviewProtocol != null) body["review_protocol"] = reviewProtocol;
+  if (reviewId != null) body["review_id"] = reviewId;
 
   let resp: Response;
   // The OE keeps /tool/execute open until the tool returns, so this deadline
@@ -573,6 +553,16 @@ async function requestOeApprovalRaw(
       const status = resp.status;
       const statusText = resp.statusText;
       const retryAfter = resp.headers?.get?.("Retry-After") ?? null;
+      if (status === 409 && (await isGuardrailReviewRefusal(resp))) {
+        logger.error(
+          { step, toolName },
+          "OE refused to resolve the guardrail review",
+        );
+        throw new LLMInvocationError(
+          "Guardrail review could not resolve this call",
+          { error_code: GUARDRAIL_REVIEW_INVALID_CODE },
+        );
+      }
       await discardResponseBody(resp);
       if (status === 503) {
         const waitMs = retryAfterWaitMs(retryAfter);
@@ -583,6 +573,14 @@ async function requestOeApprovalRaw(
       throw new Error(`HTTP ${status}: ${statusText}`);
     }
   } catch (exc) {
+    // Only a refused review keeps its own failure type through the fail-safe
+    // conversion below; every other LLMInvocationError stays fail-safe.
+    if (
+      exc instanceof LLMInvocationError &&
+      exc.error_code === GUARDRAIL_REVIEW_INVALID_CODE
+    ) {
+      throw exc;
+    }
     if (exc instanceof OERetryAfterError) {
       throw exc;
     }
@@ -1304,8 +1302,24 @@ export class SecureToolWrapper {
         activityRequiresReconstruction(activityId)
       ) {
         // OE already resolved this exact admitted activity. Re-enter its
-        // captured callback so LangGraph can reconstruct interrupt().
-        return encodeToolActivityResult(await options.localExecutor());
+        // captured callback so LangGraph can reconstruct interrupt(). The
+        // isolated suspend scope keeps a legacy app.suspend() marker from
+        // leaking past this callback, and the durable rejection below still
+        // sees it after the recorded answer is resumed.
+        const localExecutor = options.localExecutor;
+        let suspendMarker: Record<string, unknown> | null = null;
+        const reconstructed = await runWithSuspendRequestContext(async () => {
+          const value = await localExecutor();
+          suspendMarker = getRequestedSuspend();
+          return value;
+        });
+        if (suspendMarker !== null) {
+          throw new ToolExecutionError(
+            "durable Tool activities support terminal outcomes only; " +
+              "the framework adapter must own suspension and resume",
+          );
+        }
+        return encodeToolActivityResult(reconstructed);
       }
       const result = await this.executeToolNative(
         toolName,

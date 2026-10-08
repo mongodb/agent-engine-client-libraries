@@ -76,6 +76,23 @@ class DurableMemoryState:
         projection = DurableMemoryProjection.from_activity(context, user_id)
         self._synchronize(client, context, projection, self._llm_writes(projection, result))
 
+    def acknowledge(self, client: _WorkflowMemoryClient, context: ActivityContext) -> None:
+        """Close an activity in Memory that contributes nothing to the conversation.
+
+        Every completed activity needs an acknowledged Memory batch before its
+        step can commit. The pending user input is left pending: it belongs
+        with the first activity that carries conversation content.
+        """
+        client.ensure_memory_written(
+            ActivityMemoryCommand(
+                workflow_identity=context.workflow_identity,
+                activity_id=context.activity_id,
+                attempt_id=context.attempt_id,
+                fencing_token=context.fencing_token,
+                memory_writes=[],
+            )
+        )
+
     def synchronize_tool(
         self,
         client: _WorkflowMemoryClient,

@@ -11,7 +11,9 @@ from typing import Any
 import httpx
 from pydantic import BaseModel, Field
 
+from agent_engine_runner_shared.context import get_current_authorization
 from agent_engine_runner_shared.error_reporting import _redact_text
+from agent_engine_runner_shared.utils import tenant_env_vars
 
 _MAX_ERROR_CODE_LEN = 128
 _MAX_REASON_LEN = 256
@@ -27,16 +29,12 @@ def request_credential_values() -> list[str]:
 
     Combines the tenant environment secrets with the delegated authorization
     token installed for this execution; both are values a provider can echo.
-    Imported lazily because ``agent_engine_runner_shared.logging`` imports this module.
 
     Reads pod-level tenant env; the Tool Pod runs with secret restriction
     disabled (merge, no restore), so these values persist for the request. If
     per-request apply/restore is ever re-enabled, capture the values inside the
     credential window instead of reading them at classification time.
     """
-    from agent_engine_runner_shared.context import get_current_authorization
-    from agent_engine_runner_shared.utils import tenant_env_vars
-
     values = [value for value in tenant_env_vars().values() if value]
     authorization = get_current_authorization()
     token = getattr(authorization, "token", None) if authorization is not None else None

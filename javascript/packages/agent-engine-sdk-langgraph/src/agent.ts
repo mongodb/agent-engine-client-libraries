@@ -353,10 +353,14 @@ export class LangGraphBaseAgent implements BaseAgent {
         : [];
       const response = findLastAiContent(messages);
 
+      const raised = Array.isArray(result["__interrupt__"])
+        ? (result["__interrupt__"] as Interrupt[])
+        : [];
       const interrupt = await session.invokeInterrupt(
         config,
         response,
         messages,
+        raised,
       );
       if (interrupt instanceof Command) {
         nextInput = interrupt;

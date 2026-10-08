@@ -43,7 +43,7 @@ test("reference titles and index use package identities", () => {
 
 test("public reference excludes declarations marked internal", () => {
   const content = pages.get(resolve(docsDir, "agent-engine-runner-shared/docs/api.md")).replaceAll("\\_", "_");
-  for (const name of ["LoggingStream", "MAX_BUFFER_BYTES", "MAX_TRACEBACK_BYTES", "FALLBACK_EXIT_MS", "extractPodUsage", "populateLlmRegistryFromEntrypoint"]) {
+  for (const name of ["LoggingStream", "MAX_BUFFER_BYTES", "MAX_TRACEBACK_BYTES", "FALLBACK_EXIT_MS", "populateLlmRegistryFromEntrypoint"]) {
     assert.doesNotMatch(content, new RegExp(`^#{1,6} ${name}(?:\\(\\))?$`, "m"));
   }
   assert.match(content, /^### SecureToolWrapper$/m);

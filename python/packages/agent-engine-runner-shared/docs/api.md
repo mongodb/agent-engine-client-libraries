@@ -83,9 +83,6 @@
   * [get\_requested\_suspend](#agent_engine_runner_shared.context.get_requested_suspend)
   * [local\_suspend\_request\_context](#agent_engine_runner_shared.context.local_suspend_request_context)
   * [record\_current\_memory\_metadata](#agent_engine_runner_shared.context.record_current_memory_metadata)
-  * [ValidationContext](#agent_engine_runner_shared.context.ValidationContext)
-    * [to\_dict](#agent_engine_runner_shared.context.ValidationContext.to_dict)
-  * [get\_validation\_context](#agent_engine_runner_shared.context.get_validation_context)
   * [get\_current\_log\_origin](#agent_engine_runner_shared.context.get_current_log_origin)
   * [customer\_origin\_scope](#agent_engine_runner_shared.context.customer_origin_scope)
 * [agent\_engine\_runner\_shared.models](#agent_engine_runner_shared.models)
@@ -99,13 +96,12 @@
   * [InvokeResponse](#agent_engine_runner_shared.models.InvokeResponse)
   * [ExecuteRequest](#agent_engine_runner_shared.models.ExecuteRequest)
   * [ToolExecuteRequest](#agent_engine_runner_shared.models.ToolExecuteRequest)
-    * [to\_start\_log](#agent_engine_runner_shared.models.ToolExecuteRequest.to_start_log)
-    * [to\_cached\_log](#agent_engine_runner_shared.models.ToolExecuteRequest.to_cached_log)
   * [ElicitationInfo](#agent_engine_runner_shared.models.ElicitationInfo)
   * [GuardrailMeta](#agent_engine_runner_shared.models.GuardrailMeta)
+  * [GuardrailReviewPolicy](#agent_engine_runner_shared.models.GuardrailReviewPolicy)
+  * [GuardrailReviewHalt](#agent_engine_runner_shared.models.GuardrailReviewHalt)
   * [ToolExecuteResponse](#agent_engine_runner_shared.models.ToolExecuteResponse)
   * [ToolResultRequest](#agent_engine_runner_shared.models.ToolResultRequest)
-    * [to\_log](#agent_engine_runner_shared.models.ToolResultRequest.to_log)
   * [ToolAuthorization](#agent_engine_runner_shared.models.ToolAuthorization)
   * [ToolPodExecuteRequest](#agent_engine_runner_shared.models.ToolPodExecuteRequest)
     * [validate\_argument\_size](#agent_engine_runner_shared.models.ToolPodExecuteRequest.validate_argument_size)
@@ -147,19 +143,6 @@
   * [AERExecuteResponse](#agent_engine_runner_shared.models.AERExecuteResponse)
   * [ToolsListResponse](#agent_engine_runner_shared.models.ToolsListResponse)
   * [StreamChunk](#agent_engine_runner_shared.models.StreamChunk)
-  * [AgentStartStreamRequest](#agent_engine_runner_shared.models.AgentStartStreamRequest)
-  * [ExecutionLogsQueryResponse](#agent_engine_runner_shared.models.ExecutionLogsQueryResponse)
-  * [NodeExecutionsQueryResponse](#agent_engine_runner_shared.models.NodeExecutionsQueryResponse)
-  * [CostSummary](#agent_engine_runner_shared.models.CostSummary)
-  * [CostByWorkspace](#agent_engine_runner_shared.models.CostByWorkspace)
-  * [CostByModel](#agent_engine_runner_shared.models.CostByModel)
-  * [DailyCostEntry](#agent_engine_runner_shared.models.DailyCostEntry)
-  * [CostDashboardResponse](#agent_engine_runner_shared.models.CostDashboardResponse)
-  * [ExecutionDocument](#agent_engine_runner_shared.models.ExecutionDocument)
-  * [ExecutionsListQueryResponse](#agent_engine_runner_shared.models.ExecutionsListQueryResponse)
-  * [ExecutionDetailQueryResponse](#agent_engine_runner_shared.models.ExecutionDetailQueryResponse)
-  * [NodeExecutionRequest](#agent_engine_runner_shared.models.NodeExecutionRequest)
-    * [to\_log](#agent_engine_runner_shared.models.NodeExecutionRequest.to_log)
 * [agent\_engine\_runner\_shared.progress](#agent_engine_runner_shared.progress)
   * [emit](#agent_engine_runner_shared.progress.emit)
   * [emit\_step](#agent_engine_runner_shared.progress.emit_step)
@@ -183,6 +166,7 @@
   * [register\_guardrail\_policy\_engine](#agent_engine_runner_shared.guardrails_evaluator.core.register_guardrail_policy_engine)
   * [evaluate\_guardrail\_check](#agent_engine_runner_shared.guardrails_evaluator.core.evaluate_guardrail_check)
 * [agent\_engine\_runner\_shared.secure\_llm\_proxy](#agent_engine_runner_shared.secure_llm_proxy)
+  * [guardrail\_review\_wait\_id](#agent_engine_runner_shared.secure_llm_proxy.guardrail_review_wait_id)
   * [SecureLLMProxy](#agent_engine_runner_shared.secure_llm_proxy.SecureLLMProxy)
     * [step\_counter](#agent_engine_runner_shared.secure_llm_proxy.SecureLLMProxy.step_counter)
     * [invoke](#agent_engine_runner_shared.secure_llm_proxy.SecureLLMProxy.invoke)
@@ -216,7 +200,6 @@
   * [LoggingStream](#agent_engine_runner_shared.structured_logging.LoggingStream)
   * [install\_structured\_logging](#agent_engine_runner_shared.structured_logging.install_structured_logging)
 * [agent\_engine\_runner\_shared.metrics](#agent_engine_runner_shared.metrics)
-  * [MetricPoint](#agent_engine_runner_shared.metrics.MetricPoint)
   * [LatencyStats](#agent_engine_runner_shared.metrics.LatencyStats)
     * [record](#agent_engine_runner_shared.metrics.LatencyStats.record)
     * [avg\_ms](#agent_engine_runner_shared.metrics.LatencyStats.avg_ms)
@@ -267,7 +250,6 @@
   * [log\_tool\_result](#agent_engine_runner_shared.utils.log_tool_result)
   * [log\_cached\_result](#agent_engine_runner_shared.utils.log_cached_result)
   * [log\_policy\_blocked](#agent_engine_runner_shared.utils.log_policy_blocked)
-  * [log\_execution\_start](#agent_engine_runner_shared.utils.log_execution_start)
   * [log\_execution\_callback](#agent_engine_runner_shared.utils.log_execution_callback)
 
 TenantRuntime — framework-agnostic platform runtime for tenant agent applications.
@@ -1640,37 +1622,6 @@ def record_current_memory_metadata(*,
 
 Attach explicit memory metadata to the current execution step, if one exists.
 
-<a id="agent_engine_runner_shared.context.ValidationContext"></a>
-
-## ValidationContext
-
-```python
-@dataclass(frozen=True)
-class ValidationContext()
-```
-
-Execution identity passed to guardrails for audit logging.
-
-<a id="agent_engine_runner_shared.context.ValidationContext.to_dict"></a>
-
-#### to\_dict
-
-```python
-def to_dict() -> Dict[str, str]
-```
-
-Serialize to a dict for inclusion in HTTP payloads.
-
-<a id="agent_engine_runner_shared.context.get_validation_context"></a>
-
-#### get\_validation\_context
-
-```python
-def get_validation_context() -> ValidationContext
-```
-
-Build a ValidationContext from the current execution contextvars.
-
 <a id="agent_engine_runner_shared.context.get_current_log_origin"></a>
 
 #### get\_current\_log\_origin
@@ -1833,32 +1784,6 @@ class ToolExecuteRequest(BaseModel)
 
 Request to execute a tool (AER → OE for approval).
 
-<a id="agent_engine_runner_shared.models.ToolExecuteRequest.to_start_log"></a>
-
-#### to\_start\_log
-
-```python
-def to_start_log(execution: "Execution") -> "ExecutionLog"
-```
-
-Convert this request to an ExecutionLog for tool start.
-
-<a id="agent_engine_runner_shared.models.ToolExecuteRequest.to_cached_log"></a>
-
-#### to\_cached\_log
-
-```python
-def to_cached_log(execution: "Execution",
-                  cached_result: Any) -> "ExecutionLog"
-```
-
-Convert this request to an ExecutionLog for cached result.
-
-**Arguments**:
-
-- `execution` - The parent execution context
-- `cached_result` - The cached result being returned
-
 <a id="agent_engine_runner_shared.models.ElicitationInfo"></a>
 
 ## ElicitationInfo
@@ -1882,6 +1807,26 @@ class GuardrailMeta(BaseModel)
 
 Identity of the policy that caused a guardrail block or require_review halt.
 
+<a id="agent_engine_runner_shared.models.GuardrailReviewPolicy"></a>
+
+## GuardrailReviewPolicy
+
+```python
+class GuardrailReviewPolicy(BaseModel)
+```
+
+One policy that required a guardrail review.
+
+<a id="agent_engine_runner_shared.models.GuardrailReviewHalt"></a>
+
+## GuardrailReviewHalt
+
+```python
+class GuardrailReviewHalt(BaseModel)
+```
+
+The review OE opened for a require_review halt of a review_protocol call.
+
 <a id="agent_engine_runner_shared.models.ToolExecuteResponse"></a>
 
 ## ToolExecuteResponse
@@ -1901,20 +1846,6 @@ class ToolResultRequest(BaseModel)
 ```
 
 Report tool execution result (AER → OE).
-
-<a id="agent_engine_runner_shared.models.ToolResultRequest.to_log"></a>
-
-#### to\_log
-
-```python
-def to_log(execution: Optional["Execution"] = None) -> "ExecutionLog"
-```
-
-Convert this request to an ExecutionLog for tool result.
-
-**Arguments**:
-
-- `execution` - The parent execution context (optional)
 
 <a id="agent_engine_runner_shared.models.ToolAuthorization"></a>
 
@@ -2393,136 +2324,6 @@ A chunk of streaming response from the agent.
 
 Used for real-time streaming of agent responses via SSE or gRPC.
 
-<a id="agent_engine_runner_shared.models.AgentStartStreamRequest"></a>
-
-## AgentStartStreamRequest
-
-```python
-class AgentStartStreamRequest(BaseModel)
-```
-
-Request to start an agent execution with streaming response.
-
-<a id="agent_engine_runner_shared.models.ExecutionLogsQueryResponse"></a>
-
-## ExecutionLogsQueryResponse
-
-```python
-class ExecutionLogsQueryResponse(BaseModel)
-```
-
-Response for execution logs query (used by API Gateway proxy).
-
-<a id="agent_engine_runner_shared.models.NodeExecutionsQueryResponse"></a>
-
-## NodeExecutionsQueryResponse
-
-```python
-class NodeExecutionsQueryResponse(BaseModel)
-```
-
-Response for node executions query (used by API Gateway proxy).
-
-<a id="agent_engine_runner_shared.models.CostSummary"></a>
-
-## CostSummary
-
-```python
-class CostSummary(BaseModel)
-```
-
-Aggregate cost metrics for the requested period.
-
-<a id="agent_engine_runner_shared.models.CostByWorkspace"></a>
-
-## CostByWorkspace
-
-```python
-class CostByWorkspace(BaseModel)
-```
-
-Cost breakdown for a single workspace.
-
-<a id="agent_engine_runner_shared.models.CostByModel"></a>
-
-## CostByModel
-
-```python
-class CostByModel(BaseModel)
-```
-
-Cost breakdown for a single model.
-
-<a id="agent_engine_runner_shared.models.DailyCostEntry"></a>
-
-## DailyCostEntry
-
-```python
-class DailyCostEntry(BaseModel)
-```
-
-Cost data for a single day.
-
-<a id="agent_engine_runner_shared.models.CostDashboardResponse"></a>
-
-## CostDashboardResponse
-
-```python
-class CostDashboardResponse(BaseModel)
-```
-
-Response for cost dashboard aggregation (used by API Gateway proxy).
-
-<a id="agent_engine_runner_shared.models.ExecutionDocument"></a>
-
-## ExecutionDocument
-
-```python
-class ExecutionDocument(BaseModel)
-```
-
-An execution document as stored in the platform database.
-
-<a id="agent_engine_runner_shared.models.ExecutionsListQueryResponse"></a>
-
-## ExecutionsListQueryResponse
-
-```python
-class ExecutionsListQueryResponse(BaseModel)
-```
-
-Response for executions list query (used by API Gateway proxy).
-
-<a id="agent_engine_runner_shared.models.ExecutionDetailQueryResponse"></a>
-
-## ExecutionDetailQueryResponse
-
-```python
-class ExecutionDetailQueryResponse(BaseModel)
-```
-
-Response for single execution detail query (used by API Gateway proxy).
-
-<a id="agent_engine_runner_shared.models.NodeExecutionRequest"></a>
-
-## NodeExecutionRequest
-
-```python
-class NodeExecutionRequest(BaseModel)
-```
-
-Report node execution event (AER → OE for logging).
-
-<a id="agent_engine_runner_shared.models.NodeExecutionRequest.to_log"></a>
-
-#### to\_log
-
-```python
-def to_log() -> "NodeExecutionLog"
-```
-
-Convert this request to a NodeExecutionLog for persistence.
-
 emit / emit_step — send a mid-execution chunk from within a tool function.
 
 Tool functions running inside a Tool Pod call these to stream events to the
@@ -2822,6 +2623,20 @@ The proxy packages intercepted invoke_llm requests for the Orchestration Engine
 and unwraps the streamed OE relay back into sdk-core models. The OE owns
 approval, routing, live SSE relay, and final audit/result recording.
 
+<a id="agent_engine_runner_shared.secure_llm_proxy.guardrail_review_wait_id"></a>
+
+#### guardrail\_review\_wait\_id
+
+```python
+def guardrail_review_wait_id(value: Any) -> str | None
+```
+
+The review a pause value names, when this attempt paused for that review.
+
+The answer to such a pause is the platform's review decision, not part of
+the conversation. An application's own pause is never one, whatever its
+value looks like: only a review the proxy recorded a halt for counts.
+
 <a id="agent_engine_runner_shared.secure_llm_proxy.SecureLLMProxy"></a>
 
 ## SecureLLMProxy
@@ -2876,15 +2691,19 @@ Collect streamed sdk-core chunks into a final sdk-core LLMResponse.
 #### stream
 
 ```python
-def stream(
-        messages: list[Message],
-        step: int | None = None,
-        stop: list[str] | None = None,
-        options: LLMInvocationOptions | None = None
-) -> Iterator[LLMStreamChunk]
+def stream(messages: list[Message],
+           step: int | None = None,
+           stop: list[str] | None = None,
+           options: LLMInvocationOptions | None = None,
+           activity_key: str | None = None) -> Iterator[LLMStreamChunk]
 ```
 
 Stream invoke_llm chunks through OE approval and OE-owned SSE relay.
+
+`activity_key` names this call's durable activity. An adapter whose
+framework re-runs code after a pause supplies a key that is the same
+on every run; the default, the operational step, only ever increases
+within an attempt.
 
 Sessions routed to the platform-owned workflow wrap the call in a
 serial LLM activity: a recorded outcome replays without a model call;
@@ -3027,6 +2846,9 @@ uses this same exception type.
 on the failure (e.g. a provider credential rejection), when it did. It
 travels to the OE/UI on the ERROR chunk metadata instead of the generic
 invocation code so consumers can classify without string-matching prose.
+It is ``GUARDRAIL_REVIEW_INVALID`` when OE refused to answer a call from
+a guardrail review: the review is unknown or undecided, or the call is not
+the reviewed one.
 
 <a id="agent_engine_runner_shared.secure_wrapper.request_oe_approval"></a>
 
@@ -3048,7 +2870,9 @@ def request_oe_approval(
         scopes: Optional[list[str]] = None,
         tool_call_id: Optional[str] = None,
         custom_headers: Optional[Dict[str, str]] = None,
-        timeout: float | httpx.Timeout | None = None) -> ToolExecuteResponse
+        timeout: float | httpx.Timeout | None = None,
+        review_protocol: Optional[int] = None,
+        review_id: Optional[str] = None) -> ToolExecuteResponse
 ```
 
 Request approval from OE before executing a tool/LLM call.
@@ -3434,17 +3258,6 @@ Usage:
 
     # Get all metrics
     metrics = Metrics.get_all()
-
-<a id="agent_engine_runner_shared.metrics.MetricPoint"></a>
-
-## MetricPoint
-
-```python
-@dataclass
-class MetricPoint()
-```
-
-Single metric data point.
 
 <a id="agent_engine_runner_shared.metrics.LatencyStats"></a>
 
@@ -4126,18 +3939,6 @@ def log_policy_blocked(tool_name: str,
 ```
 
 Log that a tool call was blocked by policy.
-
-<a id="agent_engine_runner_shared.utils.log_execution_start"></a>
-
-#### log\_execution\_start
-
-```python
-def log_execution_start(execution_id: str,
-                        input_keys: List[str],
-                        prefix: str = "OE") -> None
-```
-
-Log the start of an execution.
 
 <a id="agent_engine_runner_shared.utils.log_execution_callback"></a>
 

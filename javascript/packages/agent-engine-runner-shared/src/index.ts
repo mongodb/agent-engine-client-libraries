@@ -113,7 +113,6 @@ export {
   requestOeApproval,
   reportOeResult,
   extractUsage,
-  extractPodUsage,
   type RequestOeApprovalArgs,
   type ReportOeResultArgs,
   type ExtractedUsage,
@@ -121,7 +120,12 @@ export {
   type OperationalStepSource,
   CALL_INTERRUPTED_ARTIFACT_KEY,
 } from "./secure_wrapper.js";
-export { SecureLLMProxy } from "./secure_llm_proxy.js";
+export {
+  GUARDRAIL_REVIEW_PROTOCOL_VERSION,
+  GUARDRAIL_REVIEW_WAIT_KEY,
+  SecureLLMProxy,
+  guardrailReviewWaitId,
+} from "./secure_llm_proxy.js";
 export {
   initErrorReporting,
   captureException,

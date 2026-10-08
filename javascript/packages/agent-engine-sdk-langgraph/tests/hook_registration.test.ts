@@ -70,19 +70,21 @@ describe("App.run() registers framework hooks", () => {
     expect(getSuspendHandler()).not.toBeNull();
   });
 
-  it("identifies App.suspend as the unsupported durable suspension path", async () => {
+  it("routes the suspend handler through LangGraph inside a durable attempt", async () => {
     const { app } = makeApp();
     await app.run();
     const handler = getSuspendHandler();
     if (handler === null) throw new Error("suspend handler was not registered");
+    // The durable refusal is gone: the handler always delegates to LangGraph,
+    // so a guardrail review can pause after a durable LLM activity. Outside a
+    // running graph that surfaces as LangGraph's own error, not an
+    // adapter-level rejection.
     expect(() =>
       runWithAttemptContext(
         create(AttemptContextSchema, { attemptId: "attempt" }),
         () => handler({ suspend_reason: "review", suspend_context: {} }),
       ),
-    ).toThrow(
-      "App.suspend framework suspension is not supported on durable_workflow sessions",
-    );
+    ).toThrow("outside the context of a graph");
   });
 
   it("registers the LLM adapter factory", async () => {

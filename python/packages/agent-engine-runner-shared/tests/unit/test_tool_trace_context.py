@@ -23,7 +23,6 @@ from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
-from agent_engine_runner_shared.events import _infer_kind
 from agent_engine_runner_shared.server.tool import ToolServer
 from agent_engine_runner_shared.span_kinds import OPENINFERENCE_SPAN_KIND, OpenInferenceSpanKind
 from agent_engine_runner_shared.tracing.setup import get_current_trace_context
@@ -210,21 +209,6 @@ class TestDeclaredSpanKind:
 
         spans = in_memory_tracer.get_finished_spans()
         assert spans[0].attributes[OPENINFERENCE_SPAN_KIND] == OpenInferenceSpanKind.CHAIN.value
-
-    @pytest.mark.parametrize("kind", list(OpenInferenceSpanKind))
-    def test_declared_kinds_are_values_the_platform_inference_recognises(self, kind):
-        """An unrecognised kind silently falls back to name inference upstream,
-        diverging the platform's view of a span from the customer's.
-
-        Asserted against the real inference rather than a copy of its branches,
-        so narrowing ``_infer_kind`` fails here instead of going unnoticed. The
-        span name deliberately trips the *retriever* name rule, a kind this enum
-        never declares: were the attribute ignored, every case would answer
-        RETRIEVER instead of the kind under test.
-        """
-        inferred = _infer_kind("probe.retrieval", {OPENINFERENCE_SPAN_KIND: kind.value})
-
-        assert inferred.value.upper() == kind.value
 
 
 class TestRouteDeclaredSpanKind:

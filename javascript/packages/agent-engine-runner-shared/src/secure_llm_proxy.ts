@@ -26,8 +26,10 @@ import { getLogger } from "./logger.js";
 import { getCurrentUserId, withExecutionSignal } from "./context.js";
 import { getSuspendHandler } from "./hooks.js";
 import {
+  GuardrailReviewHaltSchema,
   LLMPodStreamEventSchema,
   serializeInvokeLLMRequestArguments,
+  type GuardrailReviewHalt,
   type InvokeLLMRequestArguments,
   type LLMPodStreamEvent,
   type ToolExecuteResponse,
@@ -56,12 +58,91 @@ import {
   WorkflowClient,
   allocateActivityOrdinal,
   currentAttemptContext,
+  isGuardrailReviewWait,
+  noteGuardrailReviewWait,
   preallocateActivityOrdinals,
   runStreamingActivity,
   toolActivityKey,
 } from "./workflow/index.js";
 
 const logger = getLogger("agent_engine_runner_shared.secure_llm_proxy");
+
+export const GUARDRAIL_REVIEW_PROTOCOL_VERSION = 1;
+
+// The halt recorded as an LLM activity's result, and the value a framework
+// interrupt carries while the review waits. OE recognizes the wait by this key.
+const REVIEW_HALT_RESULT_KEY = "guardrail_review_halt";
+const REVIEW_HALT_STEP_KEY = "guardrail_review_halt_step";
+export const GUARDRAIL_REVIEW_WAIT_KEY = "guardrail_review";
+
+/**
+ * Stands in the chunk stream for a model call OE halted for review.
+ *
+ * It never reaches the proxy's caller: the activity records it as the call's
+ * result, and the proxy pauses for the review once the activity is recorded.
+ */
+class ReviewHalt {
+  constructor(
+    readonly review: GuardrailReviewHalt,
+    /**
+     * The step OE bound the review to. A later attempt can count fewer steps
+     * before this call than the attempt that halted did, and OE only resolves
+     * a review at a step after this one.
+     */
+    readonly step: number,
+  ) {}
+}
+
+/**
+ * The chunks of a stream that has no halt to pause for.
+ *
+ * Only the first call of a protocol-following durable activity may halt.
+ */
+async function* modelChunks(
+  chunks: AsyncIterable<LLMStreamChunk | ReviewHalt>,
+): AsyncGenerator<LLMStreamChunk> {
+  for await (const chunk of chunks) {
+    if (chunk instanceof ReviewHalt) {
+      throw new LLMInvocationError(
+        "OE halted a model call that cannot pause for review",
+      );
+    }
+    yield chunk;
+  }
+}
+
+/**
+ * The review a pause value names, when this attempt paused for that review.
+ *
+ * The answer to such a pause is the platform's review decision, not part of
+ * the conversation. An application's own pause is never one, whatever its
+ * value looks like: only a review the proxy recorded a halt for counts.
+ */
+export function guardrailReviewWaitId(value: unknown): string | null {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+  const named = (value as Record<string, unknown>)[GUARDRAIL_REVIEW_WAIT_KEY];
+  if (named === null || typeof named !== "object" || Array.isArray(named)) {
+    return null;
+  }
+  const reviewId = (named as Record<string, unknown>)["review_id"];
+  return isGuardrailReviewWait(reviewId) ? (reviewId as string) : null;
+}
+
+function reviewHaltFromResult(result: unknown): ReviewHalt | null {
+  if (result === null || typeof result !== "object" || Array.isArray(result)) {
+    return null;
+  }
+  const record = result as Record<string, unknown>;
+  if (!(REVIEW_HALT_RESULT_KEY in record)) return null;
+  // A recorded result comes back as JSON numbers, which are plain numbers.
+  const step = record[REVIEW_HALT_STEP_KEY];
+  return new ReviewHalt(
+    GuardrailReviewHaltSchema.parse(record[REVIEW_HALT_RESULT_KEY]),
+    typeof step === "number" ? Math.trunc(step) : 0,
+  );
+}
 
 function usageToWireDict(usage: LLMTokenUsage): Record<string, JsonValue> {
   const result: Record<string, JsonValue> = {};
@@ -163,6 +244,12 @@ export class SecureLLMProxy {
   /** Prefer the wrapper's allocator so tool + LLM share one sequence. */
   readonly operationalSteps: OperationalStepSource;
   readonly durableMemory: DurableMemoryState | null;
+  /**
+   * Set by an adapter whose framework can pause after a model call and re-run
+   * the calling code: under a durable attempt the proxy then follows OE's
+   * review protocol instead of pausing inside the call.
+   */
+  readonly guardrailReviewProtocol: boolean;
 
   lastDurationMs: number;
   lastFromCache: boolean;
@@ -178,6 +265,7 @@ export class SecureLLMProxy {
     boundToolChoice?: unknown;
     operationalSteps?: OperationalStepSource;
     durableMemory?: DurableMemoryState | null;
+    guardrailReviewProtocol?: boolean;
   }) {
     this.oeUrl = args.oeUrl.replace(/\/$/, "");
     this.executionId = args.executionId;
@@ -188,6 +276,7 @@ export class SecureLLMProxy {
     this.operationalSteps =
       args.operationalSteps ?? new OperationalStepAllocator();
     this.durableMemory = args.durableMemory ?? null;
+    this.guardrailReviewProtocol = args.guardrailReviewProtocol ?? false;
     this.lastDurationMs = 0.0;
     this.lastFromCache = false;
     this.lastLatestStepNumber = null;
@@ -240,6 +329,10 @@ export class SecureLLMProxy {
     step?: number | null,
     stop?: string[] | null,
     options?: LLMInvocationOptions | null,
+    // Names this call's durable activity. An adapter whose framework re-runs
+    // code after a pause supplies a key that is the same on every run; the
+    // default, the operational step, only ever increases within an attempt.
+    activityKey?: string | null,
   ): AsyncGenerator<LLMStreamChunk> {
     const resolvedStep = this.allocateStep(step);
     const invokeRequest = this.buildInvokeRequest(
@@ -250,40 +343,98 @@ export class SecureLLMProxy {
     );
 
     if (currentAttemptContext() === null) {
-      yield* this.streamNative(invokeRequest, resolvedStep);
+      yield* modelChunks(this.streamLlm(invokeRequest, resolvedStep));
       return;
     }
-    yield* this.streamDurably(invokeRequest, resolvedStep);
+    yield* this.streamDurably(
+      invokeRequest,
+      resolvedStep,
+      activityKey ?? `llm:${resolvedStep}`,
+    );
   }
 
   private async *streamDurably(
     invokeRequest: InvokeLLMRequestArguments,
     resolvedStep: number,
+    activityKey: string,
   ): AsyncGenerator<LLMStreamChunk> {
+    let halt: ReviewHalt | null = null;
+    for await (const item of this.runLlmActivity(
+      invokeRequest,
+      resolvedStep,
+      activityKey,
+      null,
+    )) {
+      if (item instanceof ReviewHalt) {
+        halt = item;
+        continue;
+      }
+      yield item;
+    }
+    if (halt === null) return;
+    const review = halt.review;
+    // Before the pause, so a sibling call halted in the same superstep has
+    // its step counted before either resolves.
+    this.operationalSteps.observeAtLeast(halt.step);
+
+    // The halted call is a recorded activity by now, so the pause is outside
+    // it. Once answered, the same request is sent again, naming the review, as
+    // its own activity at a later step: OE answers that one from its record of
+    // the review.
+    this.awaitReviewDecision(review);
+    yield* modelChunks(
+      this.runLlmActivity(
+        invokeRequest,
+        this.allocateStep(null),
+        `${activityKey}:review:${review.review_id}`,
+        review.review_id,
+      ),
+    );
+  }
+
+  /**
+   * Run one invoke_llm request as a durable LLM activity.
+   *
+   * A halt response is the activity's recorded result, so replay returns it
+   * without a provider call; a resolving call names the review it answers.
+   */
+  private async *runLlmActivity(
+    invokeRequest: InvokeLLMRequestArguments,
+    step: number,
+    activityKey: string,
+    reviewId: string | null,
+  ): AsyncGenerator<LLMStreamChunk | ReviewHalt> {
     const durableMemory = this.durableMemory;
+    const semanticInput = serializeInvokeLLMRequestArguments(invokeRequest);
+    if (reviewId !== null) semanticInput["guardrail_review_id"] = reviewId;
     try {
-      yield* runStreamingActivity({
+      yield* runStreamingActivity<LLMStreamChunk | ReviewHalt>({
         client: new WorkflowClient(this.oeUrl),
         kind: ActivityKind.LLM,
         name: this.modelName,
-        activityOrdinal: allocateActivityOrdinal(`llm:${resolvedStep}`),
-        semanticInput: serializeInvokeLLMRequestArguments(invokeRequest),
-        execute: () => this.streamActivityEffect(invokeRequest, resolvedStep),
-        replay: (result) => this.replayActivityResult(result),
+        activityOrdinal: allocateActivityOrdinal(activityKey),
+        semanticInput,
+        execute: () => this.streamActivityEffect(invokeRequest, step, reviewId),
+        replay: (result) => this.replayActivityResult(result, reviewId),
         fold: (chunks) => this.completeActivityStream(chunks),
         onActivityResolved:
           durableMemory === null
             ? undefined
             : (client, context, result) =>
-                durableMemory.synchronizeLlm(
-                  client as WorkflowClient,
-                  context,
-                  result,
-                  getCurrentUserId(),
-                ),
-        // The platform-owned operational step is the LLM call's stable
-        // call-order identity. Frameworks may consume tool-call chunks before
-        // the provider stream has fully closed.
+                // A halt is not a model response: its activity is acknowledged
+                // with no conversation content, and the turn's pending input
+                // stays pending until the review is resolved.
+                reviewHaltFromResult(result) !== null
+                  ? durableMemory.acknowledge(client as WorkflowClient, context)
+                  : durableMemory.synchronizeLlm(
+                      client as WorkflowClient,
+                      context,
+                      result,
+                      getCurrentUserId(),
+                    ),
+        // The activity key is the LLM call's identity, so admission need not
+        // be serialized. Frameworks may consume tool-call chunks before the
+        // provider stream has fully closed.
         exclusive: false,
       });
     } catch (error) {
@@ -300,12 +451,67 @@ export class SecureLLMProxy {
     }
   }
 
+  /**
+   * Whether this call pauses for a review after its activity is recorded.
+   *
+   * Only a durable attempt records the halt and replays it; elsewhere the
+   * proxy keeps pausing inside the call.
+   */
+  private followsReviewProtocol(): boolean {
+    return this.guardrailReviewProtocol && currentAttemptContext() !== null;
+  }
+
+  /**
+   * Pause for the review and check the answer names it.
+   *
+   * The pause value is built only from the recorded halt, so it is the same on
+   * every replay. The answer carries the decision, but OE's record is what the
+   * resolving call is answered from.
+   */
+  private awaitReviewDecision(review: GuardrailReviewHalt): void {
+    const interrupt = getSuspendHandler();
+    if (interrupt == null) {
+      throw new LLMInvocationError(
+        "Guardrail require_review: no suspend handler registered. " +
+          "Human review is required but the agent framework has not registered " +
+          "a suspend handler.",
+      );
+    }
+    noteGuardrailReviewWait(review.review_id);
+    const answer = interrupt({
+      [GUARDRAIL_REVIEW_WAIT_KEY]: { review_id: review.review_id },
+    });
+    const named =
+      answer !== null && typeof answer === "object" && !Array.isArray(answer)
+        ? (answer as Record<string, unknown>)[GUARDRAIL_REVIEW_WAIT_KEY]
+        : null;
+    if (
+      named === null ||
+      typeof named !== "object" ||
+      Array.isArray(named) ||
+      (named as Record<string, unknown>)["review_id"] !== review.review_id
+    ) {
+      throw new LLMInvocationError(
+        "Guardrail review was answered for a different review",
+      );
+    }
+  }
+
   private async *streamActivityEffect(
     invokeRequest: InvokeLLMRequestArguments,
     resolvedStep: number,
-  ): AsyncGenerator<LLMStreamChunk> {
+    reviewId: string | null,
+  ): AsyncGenerator<LLMStreamChunk | ReviewHalt> {
     try {
-      yield* this.streamNative(invokeRequest, resolvedStep, "reject");
+      if (reviewId === null) {
+        yield* this.streamLlm(invokeRequest, resolvedStep);
+      } else {
+        yield* this.streamReviewResolution(
+          invokeRequest,
+          resolvedStep,
+          reviewId,
+        );
+      }
     } catch (error) {
       // The activity kernel records this error class as DENIED, not FAILED.
       if (error instanceof PolicyDeniedException) {
@@ -315,26 +521,54 @@ export class SecureLLMProxy {
     }
   }
 
-  private async *streamNative(
+  private async *streamLlm(
     invokeRequest: InvokeLLMRequestArguments,
     resolvedStep: number,
-    interruptMode: "framework" | "reject" = "framework",
-  ): AsyncGenerator<LLMStreamChunk> {
-    const response = await this.requestOeExecution(invokeRequest, resolvedStep);
+  ): AsyncGenerator<LLMStreamChunk | ReviewHalt> {
+    const response = await this.requestOeExecution(
+      invokeRequest,
+      resolvedStep,
+      null,
+    );
+    yield* this.streamOeResponse(response, resolvedStep, false);
+  }
 
+  private async *streamReviewResolution(
+    invokeRequest: InvokeLLMRequestArguments,
+    step: number,
+    reviewId: string,
+  ): AsyncGenerator<LLMStreamChunk | ReviewHalt> {
+    const response = await this.requestOeExecution(
+      invokeRequest,
+      step,
+      reviewId,
+    );
+    yield* this.streamOeResponse(response, step, true);
+  }
+
+  private async *streamOeResponse(
+    response: ToolExecuteResponse,
+    resolvedStep: number,
+    resolving: boolean,
+  ): AsyncGenerator<LLMStreamChunk | ReviewHalt> {
     // Guardrail non-proceed responses: require_review suspends for a human;
     // a genuine block returns the substitute *string* in result, which we yield
     // as a clean chunk so the agent gets a response rather than an exception.
     // Any other non-proceed shape is a hard denial.
     if (!response.proceed) {
       if (response.status === "require_review") {
-        if (interruptMode === "reject") {
+        if (!this.followsReviewProtocol()) {
+          yield* this.handleRequireReview(response);
+          return;
+        }
+        // A resolving call is answered from the review's record; a halt in its
+        // place, or one that names no review, cannot be resolved.
+        if (resolving || response.guardrail_review == null) {
           throw new LLMInvocationError(
-            "durable LLM activities support terminal outcomes only; " +
-              "the framework adapter must own review interrupts",
+            "Guardrail require_review response named no review",
           );
         }
-        yield* this.handleRequireReview(response);
+        yield new ReviewHalt(response.guardrail_review, resolvedStep);
         return;
       }
       if (typeof response.result === "string") {
@@ -384,10 +618,26 @@ export class SecureLLMProxy {
     );
   }
 
-  private *replayActivityResult(result: unknown): Generator<LLMStreamChunk> {
+  private *replayActivityResult(
+    result: unknown,
+    reviewId: string | null,
+  ): Generator<LLMStreamChunk | ReviewHalt> {
     this.lastFromCache = true;
     if (typeof result === "string") {
       yield { content: result };
+      return;
+    }
+    const halt = reviewHaltFromResult(result);
+    if (halt !== null) {
+      // A resolving activity is answered from the review's record, so a halt
+      // recorded at its position does not belong to it: fail closed instead
+      // of pausing for a second review.
+      if (reviewId !== null) {
+        throw new LLMInvocationError(
+          "Recorded result for a resolving activity is a guardrail review halt",
+        );
+      }
+      yield halt;
       return;
     }
     this.preallocateToolCallsFromResult(result);
@@ -406,9 +656,29 @@ export class SecureLLMProxy {
   }
 
   private completeActivityStream(
-    chunks: LLMStreamChunk[],
+    chunks: (LLMStreamChunk | ReviewHalt)[],
   ): Record<string, unknown> {
-    const payload = SecureLLMProxy.responsePayloadFromChunks(chunks);
+    const modelStream: LLMStreamChunk[] = [];
+    for (const chunk of chunks) {
+      if (chunk instanceof ReviewHalt) {
+        // A halt today arrives before any content; if one ever follows
+        // streamed chunks, the caller already consumed output that cannot be
+        // recorded as part of the halt, so fail loudly rather than drop it.
+        if (modelStream.length > 0) {
+          throw new LLMInvocationError(
+            "OE halted a model call after streaming content",
+          );
+        }
+        // The halt is the call's result: it completes the activity and is
+        // replayed, so the provider is not called again.
+        return {
+          [REVIEW_HALT_RESULT_KEY]: chunk.review,
+          [REVIEW_HALT_STEP_KEY]: chunk.step,
+        };
+      }
+      modelStream.push(chunk);
+    }
+    const payload = SecureLLMProxy.responsePayloadFromChunks(modelStream);
     this.preallocateToolCallsFromResult(payload);
     return payload;
   }
@@ -750,9 +1020,10 @@ export class SecureLLMProxy {
   private async requestOeExecution(
     invokeRequest: InvokeLLMRequestArguments,
     step: number,
+    reviewId: string | null,
   ): Promise<ToolExecuteResponse> {
-    // The sole caller (`stream()`) always resolves the step before calling in,
-    // so step is required and non-null here. Keep the counter monotonic.
+    // Every caller resolves the step before calling in, so step is required
+    // and non-null here. Keep the counter monotonic.
     this.operationalSteps.observeAtLeast(step);
 
     const response = await requestOeApprovalRetryable({
@@ -772,6 +1043,10 @@ export class SecureLLMProxy {
       // request timeout. Mirrors Python's
       // `httpx.Timeout(get_request_timeout(), read=LLM_READ_TIMEOUT)`.
       timeoutMs: LLM_READ_TIMEOUT * 1000,
+      reviewProtocol: this.followsReviewProtocol()
+        ? GUARDRAIL_REVIEW_PROTOCOL_VERSION
+        : null,
+      reviewId,
     });
 
     // Let require_review and block-substitute (proceed=false with a result

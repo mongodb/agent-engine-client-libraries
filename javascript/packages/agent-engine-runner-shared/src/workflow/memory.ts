@@ -151,6 +151,28 @@ export class DurableMemoryState {
     this.pendingUserMessage = pendingUserMessage;
   }
 
+  /**
+   * Close an activity in Memory that contributes nothing to the conversation.
+   *
+   * Every completed activity needs an acknowledged Memory batch before its
+   * step can commit. The pending user input is left pending: it belongs with
+   * the first activity that carries conversation content.
+   */
+  acknowledge(
+    client: WorkflowMemoryClient,
+    context: ActivityContext,
+  ): Promise<void> {
+    return client.ensureMemoryWritten(
+      create(ActivityMemoryCommandSchema, {
+        workflowIdentity: context.workflowIdentity,
+        activityId: context.activityId,
+        attemptId: context.attemptId,
+        fencingToken: context.fencingToken,
+        memoryWrites: [],
+      }),
+    );
+  }
+
   synchronizeLlm(
     client: WorkflowMemoryClient,
     context: ActivityContext,

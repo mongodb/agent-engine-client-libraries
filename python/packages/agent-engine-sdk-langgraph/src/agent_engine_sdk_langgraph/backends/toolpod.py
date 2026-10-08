@@ -176,6 +176,20 @@ def _get_wrapper() -> Any:
     return wrapper
 
 
+def _build_search_result(
+    result_cls: type[Any], *, matches: list[Any], truncated: bool
+) -> Any:
+    """Build a grep/glob result across deepagents protocol versions.
+
+    ``truncated`` exists from deepagents 0.7; the SDK leaves the framework
+    version to the agent, so an installed 0.5.x result type accepts only
+    ``error``/``matches`` and must not receive the keyword.
+    """
+    if "truncated" in getattr(result_cls, "__dataclass_fields__", {}):
+        return result_cls(matches=matches, truncated=truncated)
+    return result_cls(matches=matches)
+
+
 class AgentEngineToolPodBackend(SandboxBackendProtocol):
     """Backend that routes all operations through Atlas Agent Engine's secure path.
 
@@ -293,6 +307,8 @@ class AgentEngineToolPodBackend(SandboxBackendProtocol):
         pattern: str,
         path: str | None = None,
         glob: str | None = None,
+        *,
+        max_count: int | None = None,
     ) -> GrepResult:
         args: dict[str, Any] = {"pattern": pattern}
         if path is not None:
@@ -331,12 +347,19 @@ class AgentEngineToolPodBackend(SandboxBackendProtocol):
                 error=f"{_NON_RETRYABLE} filesystem_grep protocol violation: "
                 f"match missing required field — {exc}"
             )
-        return GrepResult(matches=matches)
+        # The handler caps its own walk and reports truncated; the protocol's
+        # max_count is a caller-side total cap, so enforce it after the call.
+        truncated = bool(result.get("truncated")) if isinstance(result, dict) else False
+        if max_count is not None and len(matches) > max_count:
+            matches = matches[:max_count]
+            truncated = True
+        return _build_search_result(GrepResult, matches=matches, truncated=truncated)
 
-    def glob(self, pattern: str, path: str = "/") -> GlobResult:
-        result, error = self._safe_call(
-            "filesystem_glob", {"pattern": pattern, "path": path}
-        )
+    def glob(self, pattern: str, path: str | None = None) -> GlobResult:
+        args: dict[str, Any] = {"pattern": pattern}
+        if path is not None:
+            args["path"] = path
+        result, error = self._safe_call("filesystem_glob", args)
         if error is not None:
             return GlobResult(error=error)
 
@@ -367,7 +390,8 @@ class AgentEngineToolPodBackend(SandboxBackendProtocol):
                 error=f"{_NON_RETRYABLE} filesystem_glob protocol violation: "
                 f"match missing required field — {exc}"
             )
-        return GlobResult(matches=file_infos)
+        truncated = bool(result.get("truncated")) if isinstance(result, dict) else False
+        return _build_search_result(GlobResult, matches=file_infos, truncated=truncated)
 
     # ------------------------------------------------------------------
     # Write operations

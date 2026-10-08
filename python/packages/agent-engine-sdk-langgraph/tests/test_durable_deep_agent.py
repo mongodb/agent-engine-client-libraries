@@ -178,6 +178,26 @@ def test_native_task_allows_compiled_subagent_with_checkpointer() -> None:
     assert seen == ["task-a"]
 
 
+def test_durable_task_rejects_compiled_subagent_with_retry_policy() -> None:
+    middleware = DurableDeepAgentMiddleware(retry_policy_subagent_names={"research"})
+    handler_called = False
+
+    def handler(request: ToolCallRequest) -> ToolMessage:
+        nonlocal handler_called
+        handler_called = True
+        return _result(request)
+
+    # Native checkpoints leave the subagent's retry policy alone.
+    middleware.wrap_tool_call(_request(), handler)
+    assert handler_called
+
+    handler_called = False
+    with attempt_context_scope(AttemptContext(attempt_id="attempt-1")):
+        with pytest.raises(UnsupportedDurableGraphError, match="sets a retry policy"):
+            middleware.wrap_tool_call(_request(), handler)
+    assert not handler_called
+
+
 def test_durable_task_rejects_compiled_subagent_with_checkpointer() -> None:
     middleware = DurableDeepAgentMiddleware(unsupported_subagent_names={"research"})
     handler_called = False

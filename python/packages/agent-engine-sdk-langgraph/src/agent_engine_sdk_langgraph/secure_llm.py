@@ -16,6 +16,7 @@ from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, AIMessageChunk, BaseMessage, ToolMessage
 from langchain_core.outputs import ChatGenerationChunk, ChatResult
 from langchain_core.utils.function_calling import convert_to_openai_tool
+from langgraph.config import get_config
 from agent_engine_sdk.models import (
     LLMInvocationOptions,
     LLMTokenUsage,
@@ -47,6 +48,10 @@ from agent_engine_runner_shared.secure_wrapper import (
     LLMInvocationError,
     PolicyDeniedException,
 )
+from agent_engine_runner_shared.workflow.context import (
+    current_attempt_context,
+    next_scoped_call_index,
+)
 from agent_engine_runner_shared.utils import (
     log_cached_result,
     log_llm_messages,
@@ -63,6 +68,32 @@ _MISSING_TOOL_RESULT_TEMPLATE = (
     "Tool execution failed before the platform recorded a result for {tool_name}. "
     "Treat this as a failed tool call and continue with the user request."
 )
+
+
+def _task_run_activity_key() -> str | None:
+    """Name a wrapped LLM call by its graph task and its index in this run.
+
+    LangGraph re-executes a node from the top, in the same attempt, each time
+    one of its interrupts is answered. The task id is the same on every such
+    run and each run gets a new scratchpad, so counting calls per scratchpad
+    names the same call every time and its recorded activity replays instead
+    of being dispatched again. Node retry policies, the other way a node
+    re-runs in place, are rejected for durable graphs.
+
+    Outside a durable attempt or a graph task there is nothing to re-execute,
+    and the caller keeps the operational-step key.
+    """
+    if current_attempt_context() is None:
+        return None
+    try:
+        configurable = get_config().get("configurable") or {}
+    except RuntimeError:
+        return None
+    task_id = configurable.get("__pregel_task_id")
+    scratchpad = configurable.get("__pregel_scratchpad")
+    if not isinstance(task_id, str) or not task_id or scratchpad is None:
+        return None
+    return f"llm:{task_id}:{next_scoped_call_index(scratchpad)}"
 
 
 def _repair_missing_tool_messages(messages: list[BaseMessage]) -> list[BaseMessage]:
@@ -327,6 +358,7 @@ class SecureWrappedLLM(BaseChatModel):
             attributes={OPENINFERENCE_SPAN_KIND: OpenInferenceSpanKind.CHAIN.value},
         ):
             step = wrapper.next_operational_step()
+            activity_key = _task_run_activity_key()
 
             _stamp_deep_agent_message_ids(messages)
             messages = _repair_missing_tool_messages(messages)
@@ -348,6 +380,7 @@ class SecureWrappedLLM(BaseChatModel):
                 bound_tool_choice=self._bound_tool_choice,
                 operational_steps=wrapper.operational_steps,
                 durable_memory=wrapper.durable_memory,
+                guardrail_review_protocol=True,
             )
 
         # proxy.stream() (the provider round trip via OE) is left
@@ -361,6 +394,7 @@ class SecureWrappedLLM(BaseChatModel):
                     step=step,
                     stop=stop,
                     options=options,
+                    activity_key=activity_key,
                 )
             )
             response = proxy.response_from_stream_chunks(stream_chunks)
@@ -428,6 +462,7 @@ class SecureWrappedLLM(BaseChatModel):
             attributes={OPENINFERENCE_SPAN_KIND: OpenInferenceSpanKind.CHAIN.value},
         ):
             step = wrapper.next_operational_step()
+            activity_key = _task_run_activity_key()
 
             _stamp_deep_agent_message_ids(messages)
             messages = _repair_missing_tool_messages(messages)
@@ -449,6 +484,7 @@ class SecureWrappedLLM(BaseChatModel):
                 bound_tool_choice=self._bound_tool_choice,
                 operational_steps=wrapper.operational_steps,
                 durable_memory=wrapper.durable_memory,
+                guardrail_review_protocol=True,
             )
 
         # Gap between request.prepare and response.process is the provider
@@ -466,6 +502,7 @@ class SecureWrappedLLM(BaseChatModel):
                 step=step,
                 stop=stop,
                 options=options,
+                activity_key=activity_key,
             ):
                 if sdk_chunk.usage is not None:
                     last_usage = sdk_chunk.usage

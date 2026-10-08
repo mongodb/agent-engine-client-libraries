@@ -102,8 +102,10 @@ class DurableDeepAgentMiddleware(AgentMiddleware[AgentState, Any]):
         self,
         *,
         unsupported_subagent_names: Collection[str] = (),
+        retry_policy_subagent_names: Collection[str] = (),
     ) -> None:
         self.unsupported_subagent_names = frozenset(unsupported_subagent_names)
+        self.retry_policy_subagent_names = frozenset(retry_policy_subagent_names)
 
     def _boundary_from_task(self, tool_call: Any) -> ChildOperationBoundary | None:
         task_call = parse_task_call(tool_call)
@@ -122,6 +124,12 @@ class DurableDeepAgentMiddleware(AgentMiddleware[AgentState, Any]):
                 f"compiled Deep Agent subagent {task_call.subagent_name!r} must use "
                 "checkpointer=None; independent child checkpointers are not supported "
                 "during durable execution"
+            )
+        if task_call.subagent_name in self.retry_policy_subagent_names:
+            raise UnsupportedDurableGraphError(
+                f"compiled Deep Agent subagent {task_call.subagent_name!r} sets a "
+                "retry policy; node retry policies are not supported during "
+                "durable execution"
             )
         return ChildOperationBoundary(
             name=task_call.subagent_name,

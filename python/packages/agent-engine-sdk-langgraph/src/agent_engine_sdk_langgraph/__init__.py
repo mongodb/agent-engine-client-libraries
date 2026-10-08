@@ -2,9 +2,9 @@
 
 ``AgentEngineToolSandboxBackend`` (deprecated: ``AgentEngineToolPodBackend``) and
 ``create_agent_engine_deep_agent`` are intentionally NOT re-exported at the
-package root. They depend on the optional ``deepagents`` extra and importing
+package root. They require the optional ``deepagents`` extra and importing
 them eagerly from ``__init__.py`` would break any downstream package that
-depends on ``agent-engine-sdk-langgraph`` without also declaring ``deepagents``.
+depends on ``agent-engine-sdk-langgraph`` without installing that extra.
 Import them directly when needed::
 
     from agent_engine_sdk_langgraph.deep_agent import create_agent_engine_deep_agent

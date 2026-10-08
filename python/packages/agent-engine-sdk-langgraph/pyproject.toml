@@ -4,18 +4,18 @@ build-backend = "hatchling.build"
 
 [project]
 name = "agent-engine-sdk-langgraph"
-version = "0.11.7"
+version = "0.11.8"
 description = "Atlas Agent Engine LangGraph SDK for building secure, observable agents."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "agent-engine-sdk==0.11.7",
-    "agent-engine-sdk-memory==0.11.7",
+    "agent-engine-sdk==0.11.8",
+    "agent-engine-sdk-memory==0.11.8",
     "langgraph>=1.2.11,<2",
     "langgraph-checkpoint-mongodb>=0.3.1",
     # Floor required: this package imports agent_engine_runner_shared.memory_appbound at
     # import time.
-    "agent-engine-runner-shared[mongodb,tracing]==0.11.7",
+    "agent-engine-runner-shared[mongodb,tracing]==0.11.8",
     # Tracing instrumentation (moved from agent-engine-runner-shared[tracing])
     "openinference-instrumentation-langchain>=0.1.4",
 ]
@@ -23,21 +23,27 @@ dependencies = [
 # NOTE: ``deepagents`` is an optional runtime dependency. It is only imported
 # lazily by ``App.deep_agent()`` and by ``agent_engine_sdk_langgraph.deep_agent`` /
 # ``.backends.toolpod`` — never from the package root (see ``__init__.py``).
-# Agents that use deep-agent features must declare ``deepagents`` themselves
-# (see Agent Engine examples repository ``agents/code-reviewer-agent`` for a pinned
-# example). The ``dev`` extra pulls it in so type-checking and the skills /
-# deep-agent tests can import ``agent_engine_sdk_langgraph.deep_agent`` directly.
+# Deep-agent applications install ``agent-engine-sdk-langgraph[deepagents]``;
+# the SDK owns the upstream pin so applications track SDK versions instead of
+# the upstream library. The ``dev`` extra pulls the same pin in so type-checking
+# and the skills / deep-agent tests can import
+# ``agent_engine_sdk_langgraph.deep_agent`` directly.
 #
 # ``pydoc-markdown`` is NOT an extra here — its transitive
 # ``docstring-parser<0.12`` pin conflicts with deepagents' modern
 # ``langchain-anthropic`` requirement. The ``Makefile`` runs it via
 # ``uv tool run`` in an isolated environment instead.
 [project.optional-dependencies]
+deepagents = [
+    # Pinned exactly: SkillsMiddleware + reserved tool-name contracts can
+    # shift between minor versions; SDK tests pin compatibility against this.
+    "deepagents==0.7.16",
+]
 dev = [
     "pytest>=9.1.1",
     "pyright>=1.1.414",
     "ruff>=0.9",
-    "deepagents==0.5.3",
+    "agent-engine-sdk-langgraph[deepagents]",
     # Used by tests via ``@pytest.mark.anyio`` and conftest.py's
     # ``pytest_plugins = ("anyio",)``. Currently arrives transitively
     # through langgraph/httpx; declare explicitly so test infra is not

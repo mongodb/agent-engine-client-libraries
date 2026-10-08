@@ -78,6 +78,52 @@ def _resolve_listen_host() -> str:
     return os.environ.get("APP_HOST") or "0.0.0.0"
 
 
+def _maybe_start_debugger() -> None:
+    """Local-Kind-only debug hook.
+
+    Called from ``register_and_run`` — the one place every framework
+    adapter's ``App.run()`` (LangGraph, ADK, ...) funnels through before
+    ``asyncio.run(self._run_async(...))`` binds the real listener — so a
+    single hook here covers every current and future SDK adapter without
+    needing a change in each one.
+
+    A no-op unless ``MDBAE_LOCAL_MODE=true``, which agentic-operator only sets
+    on a container when its local-only ``DebugModeEnabled`` flag is on (see
+    ``containerPodTemplate`` in the operator). The ``MDBAE`` prefix is chosen
+    to be uncommon: it is not a reserved namespace, but no customer is likely
+    to pick an env var of that name, so the stamp will not clash with tenant
+    config. ``debugpy`` is a dev dependency, not bundled in production images,
+    so importing it here is deliberately deferred until the env var confirms
+    it's actually needed.
+
+    Deliberately non-blocking: this calls ``debugpy.listen()`` only, not
+    ``wait_for_client()``. The server starts and serves traffic normally
+    whether or not anything ever attaches — the Java/JDWP ``suspend=n``
+    model, not debugpy's often-demoed "pause until a client connects"
+    pattern. A blocking variant was considered and rejected: on a server
+    process, the only consequence of blocking at startup is that every
+    workspace with ``MDBAE_LOCAL_MODE=true`` hangs indefinitely until someone
+    attaches, which makes a cluster-wide debug-mode flag unsafe by
+    construction. With the non-blocking model, ``MDBAE_LOCAL_MODE=true`` costs
+    nothing on a pod nobody is actively debugging.
+    """
+    if not get_env_bool("MDBAE_LOCAL_MODE"):
+        return
+
+    import debugpy
+
+    port = get_env_int("MDBAE_LOCAL_PORT", 5678)
+    # Loopback only: the debugger is reached via `kubectl port-forward`, which
+    # connects inside the pod's network namespace and so still reaches
+    # 127.0.0.1, while a loopback bind keeps the port off the pod network.
+    debugpy.listen(("127.0.0.1", port))
+    logger.info(
+        "debugpy listening on port %d (non-blocking -- the server starts normally; "
+        "attach at any time to set breakpoints)",
+        port,
+    )
+
+
 class TenantRuntime:
     """
     Tenant Runtime SDK.
@@ -287,7 +333,7 @@ class TenantRuntime:
         if not hasattr(self._graph_builder, "get_agent"):
             raise RuntimeError(
                 "Graph builder must be a BaseApp instance with get_agent(). "
-                "Plain callables are no longer supported."
+                "Plain callables are not supported."
             )
 
         return self._graph_builder.get_agent(callbacks=callbacks)  # type: ignore[union-attr]
@@ -1472,6 +1518,8 @@ class TenantRuntime:
         if graph_builder:
             self._graph_builder = graph_builder
             logger.info("Graph builder registered")
+
+        _maybe_start_debugger()
 
         # Run the server
         asyncio.run(self._run_async(**self._normalize_run_kwargs(kwargs)))

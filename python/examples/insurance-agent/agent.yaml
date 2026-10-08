@@ -40,10 +40,12 @@ features:
   guardrails: false
   memory: false
 
-# The Insurance Agent project is not Atlas-linked, so ECP's atlasegresssync
-# never populates the tenant's Atlas egress allowlist. Declare the agent's Atlas
-# cluster here so the build stamps it onto the TenantEnvironment and the
-# microVM's DNS SRV lookup is allowed through the Cilium L7 DNS proxy.
+# The Demo Agents / Insurance Agent project is not Atlas-linked, so ECP's
+# atlasegresssync never populates its tenant's Atlas egress allowlist. Declare
+# that deployment's Atlas cluster here so the build stamps it onto the
+# TenantEnvironment and the microVM's DNS SRV lookup is allowed through the
+# Cilium L7 DNS proxy. Atlas-linked projects ignore atlas_clusters: their
+# allowlist is only the linked Atlas project's clusters.
 # atlas_clusters is not an outbound-access policy: Gemini traffic still needs
 # network.egress (or egress_mode). deny_all would block the model.
 network:
@@ -52,3 +54,14 @@ network:
   egress:
     - fqdn: generativelanguage.googleapis.com
       ports: [443]
+    # The dev liveness fixture (Canary Testing) is Atlas-linked to a cloud-dev
+    # project whose clusters are reaped, so its database is a cloud.mongodb.com
+    # Flex cluster outside the link. atlas_clusters cannot allowlist that SRV
+    # name there, so the fixture's MONGODB_URI is a non-SRV mongodb:// string
+    # naming these shard hosts, which plain egress rules can allow.
+    - fqdn: ac-koeesec-shard-00-00.fvkjnyf.mongodb.net
+      ports: [27017]
+    - fqdn: ac-koeesec-shard-00-01.fvkjnyf.mongodb.net
+      ports: [27017]
+    - fqdn: ac-koeesec-shard-00-02.fvkjnyf.mongodb.net
+      ports: [27017]

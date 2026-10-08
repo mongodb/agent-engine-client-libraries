@@ -26,6 +26,7 @@ import {
   type AttemptContext,
 } from "@mongodb-js/agent-engine-runner-shared";
 
+import { noteRaisedInterrupts } from "./raised_interrupts.js";
 import {
   channelValuesToStateSnapshot,
   stateSnapshotToChannelValues,
@@ -295,6 +296,7 @@ export class PlatformCheckpointer extends BaseCheckpointSaver<string | number> {
     for (const [channel, value] of writes) {
       this.rejectUnsupportedSendPackets(channel, value);
     }
+    noteRaisedInterrupts(attempt, writes);
     await this.scratch.putWrites(
       this.durableConfig(config, attempt),
       writes,
