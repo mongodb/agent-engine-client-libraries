@@ -29,6 +29,15 @@ DEFAULT_MODELS = {
     "gemini": "gemini-3-flash-preview",
     "cerebras": "gpt-oss-120b",
 }
+# An OpenAI request occasionally stalls without ever responding. Without a
+# timeout the SDK waits 600 s, longer than the integration tests' per-turn
+# budget. The timeout bounds silence between bytes, not the whole response.
+# The platform's tool pod already retries an LLM call that timed out before
+# any output (3 attempts), so the client does not retry as well: retries in
+# both layers would multiply. 3 x 30 s fits inside the 120-180 s per-turn
+# budgets.
+OPENAI_TIMEOUT_S = 30
+OPENAI_MAX_RETRIES = 0
 
 
 def _llm_provider_api_keys() -> dict[str, str]:
@@ -175,7 +184,10 @@ def _build_llm():
     if selected_provider == "openai":
         from langchain_openai import ChatOpenAI
 
-        llm_options: dict[str, Any] = {}
+        llm_options: dict[str, Any] = {
+            "timeout": OPENAI_TIMEOUT_S,
+            "max_retries": OPENAI_MAX_RETRIES,
+        }
         openai_base_url = _configured_openai_base_url()
         if openai_base_url:
             uses_foundry_header = _is_foundry_base_url(openai_base_url)

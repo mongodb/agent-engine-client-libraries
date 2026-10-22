@@ -338,7 +338,7 @@ def _continuation_for_context(context: CallbackContext) -> ReviewContinuation | 
     pending = _CONTINUATIONS.get()
     if not pending:
         return None
-    branch = getattr(context, "_invocation_context").branch
+    branch = context.branch
     answered_ids = {
         response.id
         for event in context.session.events

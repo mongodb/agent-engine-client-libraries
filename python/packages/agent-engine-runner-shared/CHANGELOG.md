@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- Reuse a process-wide keep-alive mTLS client for OE callbacks (tool
+  execute/result, node events, progress and custom events) and drain callback
+  response bodies so connections return to the pool; removes a full TLS
+  handshake per callback.
+
 ### Fixed
 - Uncaught exceptions in agent code now emit one filterable `level=ERROR`
   record instead of only `WARNING`. Ordinary stderr writes with no

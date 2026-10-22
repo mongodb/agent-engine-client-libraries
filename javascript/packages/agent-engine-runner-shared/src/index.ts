@@ -105,6 +105,7 @@ export {
   TerminalExecutionError,
   ToolCallTimeoutError,
   ToolExecutionError,
+  ToolPlatformError,
   ExternalAPICallError,
   LLMInvocationError,
   OperationalStepAllocator,

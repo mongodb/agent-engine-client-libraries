@@ -96,6 +96,7 @@ from agent_engine_runner_shared.secure_wrapper import (
     TerminalExecutionError,
     ToolCallTimeoutError,
     ToolExecutionError,
+    ToolPlatformError,
     extract_usage,
 )
 from agent_engine_runner_shared.structured_logging import (
@@ -190,6 +191,7 @@ __all__ = [
     "TerminalExecutionError",
     "ToolCallTimeoutError",
     "ToolExecutionError",
+    "ToolPlatformError",
     "ExternalAPICallError",
     # Utilities
     "extract_usage",

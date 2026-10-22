@@ -57,6 +57,34 @@ export async function materializeMcpOauthSecretCache({
   return materialized;
 }
 
+/**
+ * Every string inside the not-yet-materialized MCP OAuth secrets.
+ * Materialization removes the env vars, so callers that redact later must
+ * capture these first. Malformed secrets are skipped; materialization reports them.
+ */
+export function mcpOauthSecretValues(): string[] {
+  const values: string[] = [];
+  for (const [envName, encodedCache] of mcpOauthSecretEnv()) {
+    let decoded: DecodedSecret;
+    try {
+      decoded = decodeCacheSecret(envName, encodedCache);
+    } catch {
+      continue;
+    }
+    values.push(decoded.rawCache.toString("utf-8"));
+    const pending: unknown[] = [decoded.payload];
+    while (pending.length) {
+      const item = pending.pop();
+      if (typeof item === "string") {
+        if (item) values.push(item);
+      } else if (Array.isArray(item)) pending.push(...item);
+      else if (item !== null && typeof item === "object")
+        pending.push(...Object.values(item));
+    }
+  }
+  return values;
+}
+
 function mcpOauthSecretEnv(): Array<[string, string]> {
   return Object.entries(process.env)
     .filter(

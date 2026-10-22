@@ -11,7 +11,7 @@ from __future__ import annotations
 import logging
 import threading
 from collections.abc import Callable, Iterator
-from typing import Any, TypeVar
+from typing import Any, Literal, TypeVar, get_args
 
 from google.protobuf import struct_pb2
 
@@ -20,6 +20,9 @@ from agent_engine_runner_shared.generated.workflow.v1.activity_pb2 import (
     ACTIVITY_OUTCOME_KIND_DENIED,
     ACTIVITY_OUTCOME_KIND_FAILED,
     ACTIVITY_OUTCOME_KIND_SUSPENDED,
+    UNKNOWN_OUTCOME_POLICY_FAIL,
+    UNKNOWN_OUTCOME_POLICY_RERUN,
+    UNKNOWN_OUTCOME_POLICY_UNSPECIFIED,
     ActivityCommand,
     ActivityContext,
     ActivityKind,
@@ -49,6 +52,7 @@ from agent_engine_runner_shared.workflow.context import (
     current_attempt_context,
     current_operation_path,
     current_step_ordinal,
+    note_activity_reconstruction_id,
     record_interrupted_activity,
     record_observed_activity,
     record_reconstructed_activity_interrupt,
@@ -80,6 +84,10 @@ __all__ = [
 logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
+
+# Participation belongs to the reason discriminator; the one-value context
+# remains the unchanged public interrupt and response-contract envelope.
+OAUTH_FRONTIER_INTERRUPT_REASON = "agent_interrupt_oauth_frontier"
 ActivityResolvedHook = Callable[[WorkflowClient, ActivityContext, Any], None]
 
 
@@ -122,6 +130,30 @@ def value_to_json(value: struct_pb2.Value) -> Any:
     return proto_value_to_json(value)
 
 
+# What OE does with a tool call whose runner was lost before it reported an
+# outcome: "rerun" runs the tool again on retry (at-least-once execution);
+# "fail" refuses the retry so the tool never runs twice.
+UnknownOutcomePolicy = Literal["fail", "rerun"]
+
+_UNKNOWN_OUTCOME_POLICIES = {
+    None: UNKNOWN_OUTCOME_POLICY_UNSPECIFIED,
+    "fail": UNKNOWN_OUTCOME_POLICY_FAIL,
+    "rerun": UNKNOWN_OUTCOME_POLICY_RERUN,
+}
+
+
+def validate_on_unknown_outcome(value: Any) -> UnknownOutcomePolicy | None:
+    """Return a tool's declared unknown-outcome policy, rejecting other values.
+
+    SDKs call this when a tool is registered so a typo fails at import rather
+    than on the tool's first call.
+    """
+    if value is not None and value not in get_args(UnknownOutcomePolicy):
+        allowed = ", ".join(repr(policy) for policy in get_args(UnknownOutcomePolicy))
+        raise ValueError(f"on_unknown_outcome must be one of {allowed} or None, got {value!r}")
+    return value
+
+
 def build_activity_command(
     *,
     attempt: AttemptContext,
@@ -131,6 +163,7 @@ def build_activity_command(
     semantic_input: Any,
     step_ordinal: int | None = None,
     operation_path: OperationPath | None = None,
+    on_unknown_outcome: UnknownOutcomePolicy | None = None,
 ) -> ActivityCommand:
     """Build one ActivityCommand from an OE-issued attempt context.
 
@@ -169,6 +202,9 @@ def build_activity_command(
         activity_kind=kind,
         activity_name=name,
         semantic_input=semantic_input_from_json(semantic_input),
+        on_unknown_outcome=_UNKNOWN_OUTCOME_POLICIES[
+            validate_on_unknown_outcome(on_unknown_outcome)
+        ],
     )
 
 
@@ -396,6 +432,9 @@ def run_serial_activity(
     attempt: AttemptContext | None = None,
     step_ordinal: int | None = None,
     exclusive: bool = False,
+    on_unknown_outcome: UnknownOutcomePolicy | None = None,
+    operation_path: OperationPath | None = None,
+    replay_local_wait: Callable[[ActivityContext, ActivityOutcome], T] | None = None,
 ) -> T:
     """Start one activity: replay a recorded outcome or dispatch then report.
 
@@ -403,7 +442,11 @@ def run_serial_activity(
     is what lets OE replay a recorded outcome instead of re-running the
     operation. Keyed siblings may run concurrently; pass ``exclusive=True`` for
     starts that lack a stable framework identity. Heartbeats are owned by the
-    runtime lifecycle, not this helper.
+    runtime lifecycle, not this helper. ``operation_path`` can derive a later
+    phase from its original call position without allocating sibling ordinals.
+    ``replay_local_wait`` reconstructs a completed local wait that shared an
+    OAuth frontier, keeping its callback result separately from the answer.
+    Ordinary completed effects and unrelated historical waits remain cached.
     """
     attempt = _require_attempt(attempt, "run_serial_activity")
     command = build_activity_command(
@@ -412,7 +455,9 @@ def run_serial_activity(
         name=name,
         activity_ordinal=activity_ordinal,
         step_ordinal=step_ordinal,
+        operation_path=operation_path,
         semantic_input=semantic_input,
+        on_unknown_outcome=on_unknown_outcome,
     )
     exclusive_guard = _ActivityAdmission(attempt.attempt_id, exclusive=exclusive)
     with exclusive_guard:
@@ -421,6 +466,7 @@ def run_serial_activity(
             command=command,
             execute=execute,
             on_activity_resolved=on_activity_resolved,
+            replay_local_wait=replay_local_wait,
         )
 
 
@@ -430,14 +476,38 @@ def _run_dispatched_activity(
     command: ActivityCommand,
     execute: Callable[[ActivityContext], T],
     on_activity_resolved: ActivityResolvedHook | None,
+    replay_local_wait: Callable[[ActivityContext, ActivityOutcome], T] | None,
 ) -> T:
+    """Dispatch live work or reconstruct an authorized native wait without overwriting its answer.
+
+    Ordinary replay returns the recorded result without executing the callback.
+    """
     started: StartActivityResult = client.start_activity(command)
     record_observed_activity(command.position)
     reconstructing = False
+    dispatch: Callable[[ActivityContext], T] = execute
     if isinstance(started, ActivityReplay):
-        # The current resume batch is the authority for reconstruction. Re-enter
-        # only an activity whose stable id is present there; every other replay
-        # returns its recorded result without running the activity body again.
+        if (
+            replay_local_wait is not None
+            and started.outcome.outcome_kind == ACTIVITY_OUTCOME_KIND_COMPLETED
+            and started.outcome.HasField("suspension")
+            and started.outcome.suspension.reason == OAUTH_FRONTIER_INTERRUPT_REASON
+        ):
+            # This native wait shared a recorded OAuth frontier. Reconstruct
+            # that exact input and position with its sibling consent boundary,
+            # including when the current resume batch answers a later pause.
+            note_activity_reconstruction_id(started.outcome.activity_id)
+            recorded = started.outcome
+            replay = replay_local_wait
+
+            def replay_dispatch(context: ActivityContext) -> T:
+                """Reconstruct this validated shared wait through its captured callback owner."""
+                return replay(context, recorded)
+
+            dispatch = replay_dispatch
+
+        # Resume-map activities and recorded local native waits recreate their
+        # framework pause. Ordinary completed effects never rerun their body.
         reconstructing = activity_requires_reconstruction(started.outcome.activity_id)
         if not reconstructing:
             # Ordinary replay returns the recorded outcome without re-running
@@ -452,7 +522,7 @@ def _run_dispatched_activity(
         context = started.context
 
     try:
-        result = execute(context)
+        result = dispatch(context)
     except DurableActivityDeniedError as error:
         # ResolveActivities already made a reconstructed interrupt terminal.
         # Preserve the callback's denial instead of replacing it with a second,

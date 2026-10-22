@@ -38,12 +38,21 @@ from __future__ import annotations
 import importlib
 import logging
 import os
+import re
 import sys
+import threading
 import traceback
 from typing import NoReturn
+from urllib.parse import urlsplit
+from uuid import UUID
 
 from agent_engine_runner_shared.error_reporting import _redact_text
-from agent_engine_runner_shared.mcp_oauth_secret import materialize_mcp_oauth_secret_cache
+from agent_engine_runner_shared.mcp_oauth_secret import (
+    materialize_mcp_oauth_secret_cache,
+    mcp_oauth_secret_values,
+)
+from agent_engine_runner_shared.startup_state import has_startup_completed, reset_startup_state
+from agent_engine_runner_shared.tool_api_error import is_credential_name
 from agent_engine_runner_shared.utils import get_runtime_mode, setup_logging
 
 logger = logging.getLogger(__name__)
@@ -61,6 +70,93 @@ _TERMINATION_LOG_PATH = "/dev/termination-log"
 # since there's no cross-language shared package for this).
 _TERMINATION_MESSAGE_MAX_BYTES = 4 * 1024
 _TERMINATION_MESSAGE_MAX_LINES = 40
+_STARTUP_REPORT_DEADLINE_SECONDS = 2.0
+_STARTUP_REPORT_MAX_BYTES = 512
+_STARTUP_REPORT_INPUT_BYTES = 4096
+_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029]")
+_startup_secrets: tuple[str, ...] = ()
+
+
+def _snapshot_startup_secrets() -> tuple[str, ...]:
+    """Capture credential values before OAuth materialization removes them from the env."""
+    values = {value for name, value in os.environ.items() if value and is_credential_name(name)}
+    values.update(mcp_oauth_secret_values())
+    values.discard("")
+    # Longest first so a secret containing another is replaced whole.
+    return tuple(sorted(values, key=len, reverse=True))
+
+
+def _startup_report_text(text: str) -> str:
+    # Truncating before scrubbing could cut a credential in half and defeat redaction.
+    if len(text.encode("utf-8", errors="replace")) > _STARTUP_REPORT_INPUT_BYTES:
+        return "Startup error message exceeded the reporting limit"
+    # Known values go first: a pattern that redacts only part of a secret would
+    # leave the rest unmatchable by its exact value.
+    for value in _startup_secrets:
+        text = text.replace(value, "<redacted>")
+    text = _redact_text(text)
+    text = _CONTROL_CHARS.sub(" ", text)
+    return text.encode("utf-8")[:_STARTUP_REPORT_MAX_BYTES].decode("utf-8", errors="ignore")
+
+
+def _boot_error_url() -> str | None:
+    raw_boot_id = os.environ.get("AGENTIC_BOOT_ID", "")
+    oe_url = os.environ.get("OE_URL", "")
+    try:
+        boot_id = UUID(raw_boot_id)
+        origin = urlsplit(oe_url)
+        hostname = origin.hostname
+    except ValueError:
+        return None
+    # Match the TypeScript launcher: only the canonical dashed form is a boot ID.
+    if str(boot_id) != raw_boot_id.lower():
+        return None
+    if origin.scheme not in {"http", "https"} or not hostname:
+        return None
+    if origin.username or origin.password:
+        return None
+    return f"{oe_url.rstrip('/')}/boots/{boot_id}/errors"
+
+
+def _report_startup_error(summary: str, exc: BaseException | None, code: int) -> None:
+    """Best-effort POST of a scrubbed startup error to OE; never raises."""
+    try:
+        _send_startup_report(summary, exc, code)
+    except Exception:
+        logger.debug("Startup report could not be prepared")
+
+
+def _send_startup_report(summary: str, exc: BaseException | None, code: int) -> None:
+    """POST a scrubbed startup error to OE, bounded by one deadline."""
+    if has_startup_completed():
+        return
+    url = _boot_error_url()
+    if url is None:
+        logger.debug("Skipping startup report without a valid boot ID and OE URL")
+        return
+    body = {
+        "sandbox": "tool" if _resolve_runner_mode() == "tool" else "agent",
+        "exitCode": code,
+        "errorType": _startup_report_text(type(exc).__name__ if exc else "StartupError"),
+        "message": _startup_report_text(f"{summary}: {exc}" if exc else summary),
+    }
+
+    def send() -> None:
+        from agent_engine_runner_shared.tls_client import create_httpx_client_with_tls
+
+        try:
+            with create_httpx_client_with_tls(url, _STARTUP_REPORT_DEADLINE_SECONDS) as client:
+                # stream() so the response body is never read.
+                with client.stream("POST", url, json=body, follow_redirects=False) as response:
+                    logger.debug("Startup report returned status %d", response.status_code)
+        except Exception:
+            logger.debug("Startup report could not be delivered")
+
+    # httpx timeouts are per phase; a joined daemon thread bounds the whole
+    # exchange (DNS, TLS, headers) and works even when called from an event loop.
+    worker = threading.Thread(target=send, daemon=True)
+    worker.start()
+    worker.join(timeout=_STARTUP_REPORT_DEADLINE_SECONDS)
 
 
 def _bound_text(
@@ -161,6 +257,7 @@ def _fatal(summary: str, exc: BaseException | None = None, code: int = 1) -> NoR
     else:
         logger.error(summary)
     _write_termination_message(summary, exc)
+    _report_startup_error(summary, exc, code)
     sys.exit(code)
 
 
@@ -207,14 +304,17 @@ def _resolve_entrypoint() -> tuple[str, str]:
 
 def main() -> None:
     """Entry point invoked by ``python -m agent_engine_runner_shared.launcher``."""
+    global _startup_secrets
+    reset_startup_state()
+    _startup_secrets = _snapshot_startup_secrets()
     # Install before any import/entrypoint work. After this, print-to-stderr
     # is captured as WARNING (not ERROR), so failure paths must use the logger.
     setup_logging(app_name="launcher", mode=_resolve_runner_mode())
 
     try:
         materialize_mcp_oauth_secret_cache()
-    except (RuntimeError, OSError) as exc:
-        _fatal("Cannot materialize MCP OAuth credentials", exc)
+    except Exception as exc:
+        _fatal("Cannot materialize MCP OAuth credentials", exc, code=EXIT_STARTUP_CRASH)
 
     module_path, target_name = _resolve_entrypoint()
 

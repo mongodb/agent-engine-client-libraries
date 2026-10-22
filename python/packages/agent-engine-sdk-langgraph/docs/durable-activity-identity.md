@@ -56,6 +56,15 @@ On replacement, the same ordered LLM result reserves the same ordinals. Each
 secure Tool reaches the same OE position and receives the recorded result
 instead of executing again.
 
+A Tool that runs inside a `Send` worker uses the position its model reserved
+for its ToolCall ID anywhere in the graph that started the worker, even when
+the model ran in another task. Its result message ID also includes the
+worker's path. A ToolCall ID reserved more than once within one spawning graph
+fails the turn with `AmbiguousActivityKeyError`, whichever call arrives first;
+the same ID reserved once in each of two graphs resolves in each. A Tool
+outside any `Send` worker is allocated in its own path, as it was before
+`Send` support, so recorded sessions keep their positions.
+
 ## Nested execution models
 
 The adapter supports two distinct ways to identify a nested occurrence:
@@ -78,11 +87,11 @@ One durable graph chooses one nesting model. A mixed graph is rejected because
 the public LangGraph and Deep Agent contracts do not define how their separate
 occurrence identities compose.
 
-Application-authored LangGraph
-[`Send`](https://docs.langchain.com/oss/python/langgraph/graph-api#send) fan-out
-is not a supported durable-workflow API. Graphs created by `app.deep_agent()`
-permit LangChain's internal `Send` routing as an opaque implementation detail;
-the detailed Deep Agent document explains that private compatibility boundary.
+LangGraph [`Send`](https://docs.langchain.com/oss/python/langgraph/graph-api#send)
+workers get their own operation-path segment named by their superstep and
+send index; see
+[Send workers](durable-subgraphs.md#send-workers). Graphs created by
+`app.deep_agent()` keep their existing paths.
 
 ## Root effect call sites
 

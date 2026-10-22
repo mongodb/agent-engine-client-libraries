@@ -16,6 +16,7 @@ import {
   SecureToolWrapper,
   ToolCallTimeoutError,
   ToolExecutionError,
+  ToolPlatformError,
 } from "../../src/secure_wrapper.js";
 import {
   ActivityContextSchema,
@@ -193,6 +194,42 @@ describe("durable Tool effects", () => {
       tool_call_id: "call-1",
     });
   });
+
+  test.each([
+    ["rerun", "UNKNOWN_OUTCOME_POLICY_RERUN"],
+    ["fail", "UNKNOWN_OUTCOME_POLICY_FAIL"],
+    [undefined, undefined],
+  ] as const)(
+    "starts the Tool activity with its declared unknown-outcome policy %s",
+    async (onUnknownOutcome, expected) => {
+      const calls: FetchCall[] = [];
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+          const url = String(input);
+          calls.push({ url, body: requestBody(init) });
+          if (url.endsWith("/executor/activity/start")) {
+            return replayResponse("tool-replay", "refunded");
+          }
+          throw new Error(`unexpected external dispatch: ${url}`);
+        }),
+      );
+
+      await runWithAttemptContext(attempt, () =>
+        new SecureToolWrapper("http://oe", "execution").executeTool(
+          "refund_order",
+          { order: "A1" },
+          { toolCallId: "call-1", onUnknownOutcome },
+        ),
+      );
+
+      expect(calls[0]?.body["on_unknown_outcome"]).toBe(expected);
+      // The policy is not part of the call's identity on replay.
+      expect(calls[0]?.body["semantic_input"]).not.toHaveProperty(
+        "on_unknown_outcome",
+      );
+    },
+  );
 
   test("replayed Tool failure preserves the public error type", async () => {
     vi.stubGlobal(
@@ -527,8 +564,11 @@ describe("durable Tool effects", () => {
         .catch((caught: unknown) => caught),
     );
 
-    expect(error).toBeInstanceOf(WorkflowClientError);
-    expect((error as WorkflowClientError).code).toBe(
+    // A platform failure, so the framework cannot hand it to the model.
+    expect(error).toBeInstanceOf(ToolPlatformError);
+    const cause = (error as Error).cause;
+    expect(cause).toBeInstanceOf(WorkflowClientError);
+    expect((cause as WorkflowClientError).code).toBe(
       WorkflowErrorCode.OUTCOME_UNKNOWN,
     );
     // Fail-closed: the unknown sibling's effect never re-ran and no outcome
@@ -567,15 +607,19 @@ describe("durable Tool effects", () => {
           firstToolCallId === undefined ? {} : { toolCallId: firstToolCallId },
         );
         await firstStarted.promise;
-        await expect(
-          wrapper.executeTool(
+        const conflict = await wrapper
+          .executeTool(
             "second",
             {},
             secondToolCallId === undefined
               ? {}
               : { toolCallId: secondToolCallId },
-          ),
-        ).rejects.toMatchObject({ code: WorkflowErrorCode.CONFLICT });
+          )
+          .catch((caught: unknown) => caught);
+        expect(conflict).toBeInstanceOf(ToolPlatformError);
+        expect((conflict as Error).cause).toMatchObject({
+          code: WorkflowErrorCode.CONFLICT,
+        });
         expect(startCount).toBe(1);
         release.resolve();
         await expect(first).resolves.toEqual({ ok: true });
@@ -980,6 +1024,118 @@ describe("durable Tool effects", () => {
       error: "atlas API call failed: HTTP 429 RATE_LIMITED",
       tool_api_error: expectedToolApiError,
     });
+  });
+
+  test.each([
+    [
+      "an unexpected OE route",
+      async () => jsonResponse({ proceed: true, route_to: "elsewhere" }),
+    ],
+    [
+      "a lost OE response",
+      async (): Promise<Response> => {
+        throw new TypeError("fetch failed");
+      },
+    ],
+  ])(
+    "preserves %s as a platform failure live and on replay",
+    async (_name, toolExecute) => {
+      const activityOutcomeBodies: Record<string, unknown>[] = [];
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+          const url = String(input);
+          if (url.endsWith("/executor/activity/start")) {
+            return dispatchResponse("platform-failure");
+          }
+          if (url.endsWith("/tool/execute")) {
+            return toolExecute();
+          }
+          if (url.endsWith("/executor/activity/outcome")) {
+            activityOutcomeBodies.push(requestBody(init));
+            return jsonResponse({});
+          }
+          throw new Error(`unexpected URL: ${url}`);
+        }),
+      );
+
+      const liveWrapper = new SecureToolWrapper("http://oe", "execution");
+      const live = await runWithDurableExecution(() =>
+        liveWrapper
+          .executeTool("issue_refund", {})
+          .catch((caught: unknown) => caught),
+      );
+
+      expect(live).toBeInstanceOf(ToolPlatformError);
+      expect(() => liveWrapper.throwIfPlatformFailed()).toThrow(live as Error);
+      const recordedMessage = (
+        activityOutcomeBodies[0]?.["error"] as Record<string, unknown>
+      )?.["message"];
+      expect(typeof recordedMessage).toBe("string");
+
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (input: string | URL | Request) => {
+          const url = String(input);
+          if (url.endsWith("/executor/activity/start")) {
+            return failedReplayResponse(
+              "platform-failure",
+              String(recordedMessage),
+            );
+          }
+          throw new Error(`unexpected replay dispatch: ${url}`);
+        }),
+      );
+      const replayWrapper = new SecureToolWrapper("http://oe", "execution");
+      const replayed = await runWithDurableExecution(() =>
+        replayWrapper
+          .executeTool("issue_refund", {})
+          .catch((caught: unknown) => caught),
+      );
+
+      expect(replayed).toBeInstanceOf(ToolPlatformError);
+      expect(replayed).toHaveProperty(
+        "error",
+        (live as ToolPlatformError).error,
+      );
+      expect(() => replayWrapper.throwIfPlatformFailed()).toThrow(
+        replayed as Error,
+      );
+    },
+  );
+
+  test("an outcome OE does not record after the tool ran is a platform failure", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: string | URL | Request) => {
+        const url = String(input);
+        if (url.endsWith("/executor/activity/start")) {
+          return dispatchResponse("unrecorded-outcome");
+        }
+        if (url.endsWith("/tool/execute")) {
+          return jsonResponse({
+            proceed: true,
+            status: "success",
+            result: "refund issued",
+          });
+        }
+        if (url.endsWith("/executor/activity/outcome")) {
+          return jsonResponse({ detail: "fenced" }, 409);
+        }
+        throw new Error(`unexpected URL: ${url}`);
+      }),
+    );
+
+    const wrapper = new SecureToolWrapper("http://oe", "execution");
+    const error = await runWithDurableExecution(() =>
+      wrapper
+        .executeTool("issue_refund", {})
+        .catch((caught: unknown) => caught),
+    );
+
+    expect(error).toBeInstanceOf(ToolPlatformError);
+    expect((error as Error).cause).toBeInstanceOf(WorkflowClientError);
+    expect(() => wrapper.throwIfPlatformFailed()).toThrow(error as Error);
   });
 
   test.each([

@@ -23,13 +23,16 @@ export {
   runSerialActivity,
   runStreamingActivity,
   unwrapActivityOutcome,
+  validateOnUnknownOutcome,
   valueToJson,
 } from "./activity.js";
-export type { ActivityResolvedHook } from "./activity.js";
+export type { ActivityResolvedHook, OnUnknownOutcome } from "./activity.js";
 export {
+  AmbiguousActivityKeyError,
   UnsupportedChildOperationFanOutError,
   activityRequiresReconstruction,
   allocateActivityOrdinal,
+  allocateActivityPosition,
   advanceStepOrdinal,
   childOperationBoundaryScope,
   currentAttemptContext,
@@ -37,6 +40,7 @@ export {
   currentOperationPath,
   currentPendingChildOperationBatch,
   currentStepOrdinal,
+  inSpawnedTask,
   interruptedActivities,
   isGuardrailReviewWait,
   markInterruptedActivitiesAnswered,

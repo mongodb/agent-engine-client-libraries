@@ -23,6 +23,7 @@
     - [registerCommonRoutes()](#api-registercommonroutes)
     - [registerRoutes()](#api-registerroutes)
     - [run()](#api-run)
+  - [AmbiguousActivityKeyError](#api-ambiguousactivitykeyerror)
   - [AppBoundCrudClient](#api-appboundcrudclient)
     - [createCustom()](#api-createcustom)
     - [createEpisodic()](#api-createepisodic)
@@ -116,6 +117,7 @@
     - [executeTool()](#api-executetool)
     - [nextOperationalStep()](#api-nextoperationalstep)
     - [observeOperationalStep()](#api-observeoperationalstep)
+    - [throwIfPlatformFailed()](#api-throwifplatformfailed)
   - [TenantRuntime](#api-tenantruntime)
     - [getAgent()](#api-getagent)
     - [getAgentConfig()](#api-getagentconfig)
@@ -132,6 +134,7 @@
   - [ToolExecutionError](#api-toolexecutionerror)
   - [ToolFunctionRunner](#api-toolfunctionrunner)
     - [run()](#api-run-1)
+  - [ToolPlatformError](#api-toolplatformerror)
   - [ToolServer](#api-toolserver)
     - [close()](#api-close-2)
     - [createApp()](#api-createapp-1)
@@ -250,6 +253,7 @@
   - [LLMPodInvokeResponse](#api-llmpodinvokeresponse)
   - [LLMPodStreamEvent](#api-llmpodstreamevent)
   - [MemoryWrite](#api-memorywrite)
+  - [OnUnknownOutcome](#api-onunknownoutcome)
   - [OperationPath](#api-operationpath)
   - [OperationPathResolver](#api-operationpathresolver)
   - [OperationPathSegment](#api-operationpathsegment)
@@ -414,6 +418,7 @@
   - [addTokenUsage()](#api-addtokenusage)
   - [advanceStepOrdinal()](#api-advancestepordinal)
   - [allocateActivityOrdinal()](#api-allocateactivityordinal)
+  - [allocateActivityPosition()](#api-allocateactivityposition)
   - [appliesToStage()](#api-appliestostage)
   - [attachMongoTracing()](#api-attachmongotracing)
   - [attemptStartRequestFromExecute()](#api-attemptstartrequestfromexecute)
@@ -502,6 +507,7 @@
   - [guardrailReviewWaitId()](#api-guardrailreviewwaitid)
   - [hasNamedLlms()](#api-hasnamedllms)
   - [initErrorReporting()](#api-initerrorreporting)
+  - [inSpawnedTask()](#api-inspawnedtask)
   - [installStructuredLogging()](#api-installstructuredlogging)
   - [interruptedActivities()](#api-interruptedactivities)
   - [isConfiguredMcpSdkToolName()](#api-isconfiguredmcpsdktoolname)
@@ -613,6 +619,7 @@
   - [tracingStatus()](#api-tracingstatus)
   - [unwrapActivityOutcome()](#api-unwrapactivityoutcome)
   - [validateDurableMemoryIdentity()](#api-validatedurablememoryidentity)
+  - [validateOnUnknownOutcome()](#api-validateonunknownoutcome)
   - [valueToJson()](#api-valuetojson)
   - [withExecutionSignal()](#api-withexecutionsignal)
   - [withMetrics()](#api-withmetrics)
@@ -1256,6 +1263,42 @@ BaseServer.run
 
 ***
 
+<a id="api-ambiguousactivitykeyerror"></a>
+
+### AmbiguousActivityKeyError
+
+One key was preallocated at two positions a spawned task could take.
+
+#### Extends
+
+- `Error`
+
+<a id="api-constructor-3"></a>
+
+#### Constructor
+
+```ts
+new AmbiguousActivityKeyError(message): AmbiguousActivityKeyError;
+```
+
+**Parameters**
+
+| Parameter | Type |
+| :------ | :------ |
+| `message` | `string` |
+
+**Returns**
+
+[`AmbiguousActivityKeyError`](#api-ambiguousactivitykeyerror)
+
+**Overrides**
+
+```ts
+Error.constructor
+```
+
+***
+
 <a id="api-appboundcrudclient"></a>
 
 ### AppBoundCrudClient
@@ -1266,7 +1309,7 @@ BaseServer.run
 
 - `MemoryCrudClient`
 
-<a id="api-constructor-3"></a>
+<a id="api-constructor-4"></a>
 
 #### Constructor
 
@@ -1683,7 +1726,7 @@ MemoryCrudClient.retrieveCustom
 
 - `MemoryRuntime`
 
-<a id="api-constructor-4"></a>
+<a id="api-constructor-5"></a>
 
 #### Constructor
 
@@ -1929,7 +1972,7 @@ MemoryRuntime.searchTaxonomic
 
 ### AttemptHeartbeat
 
-<a id="api-constructor-5"></a>
+<a id="api-constructor-6"></a>
 
 #### Constructor
 
@@ -1990,7 +2033,7 @@ never throw — they're surfaced only through `resultCallback`.
 
 - `SpanExporter`
 
-<a id="api-constructor-6"></a>
+<a id="api-constructor-7"></a>
 
 #### Constructor
 
@@ -2088,7 +2131,7 @@ SpanExporter.shutdown
 
 - `Error`
 
-<a id="api-constructor-7"></a>
+<a id="api-constructor-8"></a>
 
 #### Constructor
 
@@ -2123,7 +2166,7 @@ Error.constructor
 
 - `Error`
 
-<a id="api-constructor-8"></a>
+<a id="api-constructor-9"></a>
 
 #### Constructor
 
@@ -2161,7 +2204,7 @@ Error.constructor
 
 Own durable Memory projection, delivery, and pending user input.
 
-<a id="api-constructor-9"></a>
+<a id="api-constructor-10"></a>
 
 #### Constructor
 
@@ -2274,7 +2317,7 @@ Raised when tool execution fails.
 
 - [`ToolExecutionError`](#api-toolexecutionerror)
 
-<a id="api-constructor-10"></a>
+<a id="api-constructor-11"></a>
 
 #### Constructor
 
@@ -2306,7 +2349,7 @@ new ExternalAPICallError(
 
 **Overrides**
 
-[`ToolExecutionError`](#api-toolexecutionerror).[`constructor`](#api-constructor-35)
+[`ToolExecutionError`](#api-toolexecutionerror).[`constructor`](#api-constructor-36)
 
 #### Properties
 
@@ -2331,7 +2374,7 @@ new ExternalAPICallError(
 
 - `SpanExporter`
 
-<a id="api-constructor-11"></a>
+<a id="api-constructor-12"></a>
 
 #### Constructor
 
@@ -2428,7 +2471,7 @@ SpanExporter.shutdown
 
 - `Error`
 
-<a id="api-constructor-12"></a>
+<a id="api-constructor-13"></a>
 
 #### Constructor
 
@@ -2469,7 +2512,7 @@ Error.constructor
 
 Explicit provider/model options passed with an LLM invocation.
 
-<a id="api-constructor-13"></a>
+<a id="api-constructor-14"></a>
 
 #### Constructor
 
@@ -2568,7 +2611,7 @@ Mirrors Python's LLMRegistryLoadError.
 
 - `Error`
 
-<a id="api-constructor-14"></a>
+<a id="api-constructor-15"></a>
 
 #### Constructor
 
@@ -2601,7 +2644,7 @@ Error.constructor
 
 Framework-neutral LLM response.
 
-<a id="api-constructor-15"></a>
+<a id="api-constructor-16"></a>
 
 #### Constructor
 
@@ -2676,7 +2719,7 @@ underlying provider (OpenAI, Gemini, Anthropic, etc.). Implemented as
 a class to mirror `LLMResponse` in agent-engine-sdk and to host the
 `fromResponse` / `toResponse` / `extractUsage` conversion methods.
 
-<a id="api-constructor-16"></a>
+<a id="api-constructor-17"></a>
 
 #### Constructor
 
@@ -2787,7 +2830,7 @@ content extraction.
 
 Typed token-usage metadata for LLM calls.
 
-<a id="api-constructor-17"></a>
+<a id="api-constructor-18"></a>
 
 #### Constructor
 
@@ -2868,7 +2911,7 @@ Returns LangChain's expected usage-metadata keys.
 
 Typed final tool call requested by an LLM.
 
-<a id="api-constructor-18"></a>
+<a id="api-constructor-19"></a>
 
 #### Constructor
 
@@ -2926,7 +2969,7 @@ Returns a LangChain-compatible tool-call dict (excludes index).
 
 Serializable bound-tool schema forwarded with an LLM call.
 
-<a id="api-constructor-19"></a>
+<a id="api-constructor-20"></a>
 
 #### Constructor
 
@@ -2989,7 +3032,7 @@ Raised when remote MCP configuration cannot be resolved.
 
 - `Error`
 
-<a id="api-constructor-20"></a>
+<a id="api-constructor-21"></a>
 
 #### Constructor
 
@@ -3025,7 +3068,7 @@ Raised when a remote MCP tool returns an MCP error result or a transport failure
 
 - `Error`
 
-<a id="api-constructor-21"></a>
+<a id="api-constructor-22"></a>
 
 #### Constructor
 
@@ -3055,7 +3098,7 @@ Error.constructor
 
 ### Metrics
 
-<a id="api-constructor-22"></a>
+<a id="api-constructor-23"></a>
 
 #### Constructor
 
@@ -3152,7 +3195,7 @@ static reset(): void;
 
 - `SpanExporter`
 
-<a id="api-constructor-23"></a>
+<a id="api-constructor-24"></a>
 
 #### Constructor
 
@@ -3249,7 +3292,7 @@ SpanExporter.shutdown
 
 - `NullExecutionCallback`
 
-<a id="api-constructor-24"></a>
+<a id="api-constructor-25"></a>
 
 #### Constructor
 
@@ -3433,7 +3476,7 @@ before the first await.
 
 - [`OperationalStepSource`](#api-operationalstepsource)
 
-<a id="api-constructor-25"></a>
+<a id="api-constructor-26"></a>
 
 #### Constructor
 
@@ -3513,7 +3556,7 @@ Contract implemented by native and future remote guardrail engines.
 
 - [`GuardrailPolicyEngine`](#api-guardrailpolicyengine)
 
-<a id="api-constructor-26"></a>
+<a id="api-constructor-27"></a>
 
 #### Constructor
 
@@ -3577,7 +3620,7 @@ Return engine-owned evidence and optional transformed text when triggered.
 
 - `Error`
 
-<a id="api-constructor-27"></a>
+<a id="api-constructor-28"></a>
 
 #### Constructor
 
@@ -3624,7 +3667,7 @@ Error.constructor
 
 - [`WorkflowClientError`](#api-workflowclienterror)
 
-<a id="api-constructor-28"></a>
+<a id="api-constructor-29"></a>
 
 #### Constructor
 
@@ -3645,7 +3688,7 @@ new ReplayedActivityFailedError(code, message): ReplayedActivityFailedError;
 
 **Overrides**
 
-[`WorkflowClientError`](#api-workflowclienterror).[`constructor`](#api-constructor-40)
+[`WorkflowClientError`](#api-workflowclienterror).[`constructor`](#api-constructor-42)
 
 #### Properties
 
@@ -3667,7 +3710,7 @@ TS getters under camelCase names; Python field names on
 `AgentFeatureConfig` are preserved verbatim so wire/log parity is
 maintained.
 
-<a id="api-constructor-29"></a>
+<a id="api-constructor-30"></a>
 
 #### Constructor
 
@@ -3773,7 +3816,7 @@ Return a feature flag value, falling back to `defaultValue` when omitted.
 
 ### SecureLLMProxy
 
-<a id="api-constructor-30"></a>
+<a id="api-constructor-31"></a>
 
 #### Constructor
 
@@ -3928,7 +3971,7 @@ Static — can be called without a proxy instance (e.g. after parallel streaming
 
 ### SecureToolWrapper
 
-<a id="api-constructor-31"></a>
+<a id="api-constructor-32"></a>
 
 #### Constructor
 
@@ -4064,6 +4107,25 @@ Raise the allocator watermark (e.g. from OE latest_step_number).
 
 `void`
 
+<a id="api-throwifplatformfailed"></a>
+
+##### throwIfPlatformFailed()
+
+```ts
+throwIfPlatformFailed(): void;
+```
+
+Throw the first platform failure a tool call in this execution hit.
+
+Frameworks such as LangGraph.js turn any error a tool throws into a
+message for the model, so the error type alone cannot end the turn. The
+framework adapter calls this before the next model call and before
+committing a durable step.
+
+**Returns**
+
+`void`
+
 ***
 
 <a id="api-tenantruntime"></a>
@@ -4079,7 +4141,7 @@ graph builder and starts the per-mode Fastify server.
 
 - [`ITenantRuntime`](#api-itenantruntime)
 
-<a id="api-constructor-32"></a>
+<a id="api-constructor-33"></a>
 
 #### Constructor
 
@@ -4320,13 +4382,18 @@ Explicit pre-build via the graph builder's `warmUp()`, if it has one.
 
 ### TerminalExecutionError
 
-Raised when tool execution fails.
+Raised when the platform, not the tool, failed a tool call.
+
+The tool may already have run, for example when OE rejects or never
+acknowledges its result, so it must not reach the model as a failed tool it
+could call again: the wrapper records it and refuses the execution's next
+model call and durable step (see [SecureToolWrapper.throwIfPlatformFailed](#api-throwifplatformfailed)).
 
 #### Extends
 
-- [`ToolExecutionError`](#api-toolexecutionerror)
+- [`ToolPlatformError`](#api-toolplatformerror)
 
-<a id="api-constructor-33"></a>
+<a id="api-constructor-34"></a>
 
 #### Constructor
 
@@ -4347,13 +4414,13 @@ new TerminalExecutionError(error, options?): TerminalExecutionError;
 
 **Overrides**
 
-[`ToolExecutionError`](#api-toolexecutionerror).[`constructor`](#api-constructor-35)
+[`ToolPlatformError`](#api-toolplatformerror).[`constructor`](#api-constructor-38)
 
 #### Properties
 
 | Property | Modifier | Type | Inherited from |
 | :------ | :------ | :------ | :------ |
-| <a id="api-property-error-2"></a> `error` | `readonly` | `string` | [`ToolExecutionError`](#api-toolexecutionerror).[`error`](#api-property-error-4) |
+| <a id="api-property-error-2"></a> `error` | `readonly` | `string` | [`ToolPlatformError`](#api-toolplatformerror).[`error`](#api-property-error-5) |
 
 ***
 
@@ -4371,7 +4438,7 @@ the developer to debug governance instead of their tool.
 
 - [`ToolExecutionError`](#api-toolexecutionerror)
 
-<a id="api-constructor-34"></a>
+<a id="api-constructor-35"></a>
 
 #### Constructor
 
@@ -4399,7 +4466,7 @@ new ToolCallTimeoutError(
 
 **Overrides**
 
-[`ToolExecutionError`](#api-toolexecutionerror).[`constructor`](#api-constructor-35)
+[`ToolExecutionError`](#api-toolexecutionerror).[`constructor`](#api-constructor-36)
 
 #### Properties
 
@@ -4424,11 +4491,11 @@ Raised when tool execution fails.
 
 #### Extended by
 
-- [`TerminalExecutionError`](#api-terminalexecutionerror)
 - [`ToolCallTimeoutError`](#api-toolcalltimeouterror)
+- [`ToolPlatformError`](#api-toolplatformerror)
 - [`ExternalAPICallError`](#api-externalapicallerror)
 
-<a id="api-constructor-35"></a>
+<a id="api-constructor-36"></a>
 
 #### Constructor
 
@@ -4473,7 +4540,7 @@ to {oe_url}/tool/result, and returns. Mirrors Python's ToolFunctionRunner.
 
 `metadataDir` is injectable for tests.
 
-<a id="api-constructor-36"></a>
+<a id="api-constructor-37"></a>
 
 #### Constructor
 
@@ -4514,6 +4581,56 @@ records the execution as failed.
 
 ***
 
+<a id="api-toolplatformerror"></a>
+
+### ToolPlatformError
+
+Raised when the platform, not the tool, failed a tool call.
+
+The tool may already have run, for example when OE rejects or never
+acknowledges its result, so it must not reach the model as a failed tool it
+could call again: the wrapper records it and refuses the execution's next
+model call and durable step (see [SecureToolWrapper.throwIfPlatformFailed](#api-throwifplatformfailed)).
+
+#### Extends
+
+- [`ToolExecutionError`](#api-toolexecutionerror)
+
+#### Extended by
+
+- [`TerminalExecutionError`](#api-terminalexecutionerror)
+
+<a id="api-constructor-38"></a>
+
+#### Constructor
+
+```ts
+new ToolPlatformError(error, options?): ToolPlatformError;
+```
+
+**Parameters**
+
+| Parameter | Type |
+| :------ | :------ |
+| `error` | `string` |
+| `options?` | `ErrorOptions` |
+
+**Returns**
+
+[`ToolPlatformError`](#api-toolplatformerror)
+
+**Overrides**
+
+[`ToolExecutionError`](#api-toolexecutionerror).[`constructor`](#api-constructor-36)
+
+#### Properties
+
+| Property | Modifier | Type | Inherited from |
+| :------ | :------ | :------ | :------ |
+| <a id="api-property-error-5"></a> `error` | `readonly` | `string` | [`ToolExecutionError`](#api-toolexecutionerror).[`error`](#api-property-error-4) |
+
+***
+
 <a id="api-toolserver"></a>
 
 ### ToolServer
@@ -4522,7 +4639,7 @@ records the execution as failed.
 
 - `BaseServer`
 
-<a id="api-constructor-37"></a>
+<a id="api-constructor-39"></a>
 
 #### Constructor
 
@@ -4798,7 +4915,7 @@ BaseServer.run
 
 - `Error`
 
-<a id="api-constructor-38"></a>
+<a id="api-constructor-40"></a>
 
 #### Constructor
 
@@ -4828,7 +4945,7 @@ Error.constructor
 
 ### WorkflowClient
 
-<a id="api-constructor-39"></a>
+<a id="api-constructor-41"></a>
 
 #### Constructor
 
@@ -4992,7 +5109,7 @@ startAttempt(request): Promise<AttemptContext | null>;
 
 - [`ReplayedActivityFailedError`](#api-replayedactivityfailederror)
 
-<a id="api-constructor-40"></a>
+<a id="api-constructor-42"></a>
 
 #### Constructor
 
@@ -5049,6 +5166,7 @@ store, etc.).
 ```ts
 getMessagesForSession(sessionId): Promise<{
   messages: object[];
+  outcome_supported: boolean;
 }>;
 ```
 
@@ -5064,6 +5182,7 @@ Given a session_id, return a SessionMessagesResponse.
 
 `Promise`\<\{
   `messages`: `object`[];
+  `outcome_supported`: `boolean`;
 \}\>
 
 <a id="api-getsummariesforsessions"></a>
@@ -5109,12 +5228,20 @@ Given a list of session_ids, return a SessionsSummaryResponse.
 
 ### ChildOperationBoundary
 
+Framework-neutral identity for one nested operation.
+
+`spawnedTask` marks a task the framework started at runtime on behalf of its
+enclosing graph, such as a LangGraph `Send` task. A keyed activity inside
+one may take the position its key was preallocated at elsewhere in that
+enclosing graph; see `allocateActivityPosition`.
+
 #### Properties
 
 | Property | Type |
 | :------ | :------ |
 | <a id="api-property-name-4"></a> `name` | `string` |
 | <a id="api-property-occurrencekey"></a> `occurrenceKey` | `string` |
+| <a id="api-property-spawnedtask"></a> `spawnedTask?` | `boolean` |
 
 ***
 
@@ -5638,7 +5765,7 @@ Public options for `registerAndRun`.
 | :------ | :------ | :------ |
 | <a id="api-property-completiontokens-1"></a> `completionTokens?` | `number` \| `null` | - |
 | <a id="api-property-durationms"></a> `durationMs` | `number` | - |
-| <a id="api-property-error-5"></a> `error?` | `string` \| `null` | - |
+| <a id="api-property-error-6"></a> `error?` | `string` \| `null` | - |
 | <a id="api-property-executionid-4"></a> `executionId` | `string` | - |
 | <a id="api-property-kind"></a> `kind?` | `string` \| `null` | - |
 | <a id="api-property-metadata-2"></a> `metadata?` | `Record`\<`string`, `unknown`\> | - |
@@ -6650,6 +6777,16 @@ OE forwards payload_json without interpreting framework messages.
 #### Generated
 
 from message mongodb.agentic.workflow.v1.MemoryWrite
+
+***
+
+<a id="api-onunknownoutcome"></a>
+
+### OnUnknownOutcome
+
+```ts
+type OnUnknownOutcome = "fail" | "rerun";
+```
 
 ***
 
@@ -7675,7 +7812,7 @@ ExecutionStatus: object;
 | :------ | :------ | :------ |
 | <a id="api-property-cancelled"></a> `CANCELLED` | `"cancelled"` | `"cancelled"` |
 | <a id="api-property-completed"></a> `COMPLETED` | `"completed"` | `"completed"` |
-| <a id="api-property-error-6"></a> `ERROR` | `"error"` | `"error"` |
+| <a id="api-property-error-7"></a> `ERROR` | `"error"` | `"error"` |
 | <a id="api-property-pending"></a> `PENDING` | `"pending"` | `"pending"` |
 | <a id="api-property-resuming"></a> `RESUMING` | `"resuming"` | `"resuming"` |
 | <a id="api-property-running"></a> `RUNNING` | `"running"` | `"running"` |
@@ -9693,6 +9830,36 @@ function allocateActivityOrdinal(key?): number;
 
 ***
 
+<a id="api-allocateactivityposition"></a>
+
+### allocateActivityPosition()
+
+```ts
+function allocateActivityPosition(key?): object;
+```
+
+Return the operation path and ordinal for a possibly preallocated `key`.
+
+Use this where the activity may run in a spawned task other than the one
+that preallocated its key; pass the returned path to the activity command.
+
+#### Parameters
+
+| Parameter | Type |
+| :------ | :------ |
+| `key?` | `string` |
+
+#### Returns
+
+`object`
+
+| Name | Type |
+| :------ | :------ |
+| `activityOrdinal` | `number` |
+| `operationPath` | [`OperationPath`](#api-operationpath) |
+
+***
+
 <a id="api-appliestostage"></a>
 
 ### appliesToStage()
@@ -9842,11 +10009,12 @@ function buildActivityCommand(args): ActivityCommand;
 
 | Parameter | Type |
 | :------ | :------ |
-| `args` | \{ `activityOrdinal`: `number`; `attempt`: [`AttemptContext`](#api-attemptcontext); `kind`: [`ActivityKind`](#api-activitykind); `name`: `string`; `operationPath?`: [`OperationPath`](#api-operationpath); `semanticInput`: `unknown`; `stepOrdinal?`: `number`; \} |
+| `args` | \{ `activityOrdinal`: `number`; `attempt`: [`AttemptContext`](#api-attemptcontext); `kind`: [`ActivityKind`](#api-activitykind); `name`: `string`; `onUnknownOutcome?`: [`OnUnknownOutcome`](#api-onunknownoutcome); `operationPath?`: [`OperationPath`](#api-operationpath); `semanticInput`: `unknown`; `stepOrdinal?`: `number`; \} |
 | `args.activityOrdinal` | `number` |
 | `args.attempt` | [`AttemptContext`](#api-attemptcontext) |
 | `args.kind` | [`ActivityKind`](#api-activitykind) |
 | `args.name` | `string` |
+| `args.onUnknownOutcome?` | [`OnUnknownOutcome`](#api-onunknownoutcome) |
 | `args.operationPath?` | [`OperationPath`](#api-operationpath) |
 | `args.semanticInput` | `unknown` |
 | `args.stepOrdinal?` | `number` |
@@ -11786,6 +11954,22 @@ a boot blocker.
 #### Returns
 
 `Promise`\<`boolean`\>
+
+***
+
+<a id="api-inspawnedtask"></a>
+
+### inSpawnedTask()
+
+```ts
+function inSpawnedTask(): boolean;
+```
+
+Whether the current operation path runs inside a spawned task.
+
+#### Returns
+
+`boolean`
 
 ***
 
@@ -13730,10 +13914,9 @@ function resolveEntrypoint(): ResolvedEntrypoint;
 
 Parse `AGENT_ENTRYPOINT` into `{ modulePath, exportName }`.
 
-Exits the process with `EXIT_NO_ENTRYPOINT` if the env var is unset or
-malformed — matches Python `_resolve_entrypoint`'s equivalent exit code.
-Exported so tests can spawn this in a subprocess and assert on exit
-code / stderr.
+Throws if the env var is unset or malformed; `runLauncher` maps that throw
+to `EXIT_NO_ENTRYPOINT` and the termination message. Exported so tests can
+assert on the parse directly.
 
 #### Returns
 
@@ -14036,7 +14219,7 @@ function runSerialActivity<T>(args): Promise<T>;
 
 | Parameter | Type | Description |
 | :------ | :------ | :------ |
-| `args` | \{ `activityOrdinal`: `number`; `attempt?`: [`AttemptContext`](#api-attemptcontext); `client`: `ActivityRuntimeClient`; `exclusive?`: `boolean`; `execute`: (`context`) => `T` \| `Promise`\<`T`\>; `kind`: [`ActivityKind`](#api-activitykind); `name`: `string`; `onActivityResolved?`: [`ActivityResolvedHook`](#api-activityresolvedhook)\<`T`\>; `semanticInput`: `unknown`; `stepOrdinal?`: `number`; \} | - |
+| `args` | \{ `activityOrdinal`: `number`; `attempt?`: [`AttemptContext`](#api-attemptcontext); `client`: `ActivityRuntimeClient`; `exclusive?`: `boolean`; `execute`: (`context`) => `T` \| `Promise`\<`T`\>; `kind`: [`ActivityKind`](#api-activitykind); `name`: `string`; `onActivityResolved?`: [`ActivityResolvedHook`](#api-activityresolvedhook)\<`T`\>; `onUnknownOutcome?`: [`OnUnknownOutcome`](#api-onunknownoutcome); `operationPath?`: [`OperationPath`](#api-operationpath); `semanticInput`: `unknown`; `stepOrdinal?`: `number`; \} | - |
 | `args.activityOrdinal` | `number` | - |
 | `args.attempt?` | [`AttemptContext`](#api-attemptcontext) | - |
 | `args.client` | `ActivityRuntimeClient` | - |
@@ -14045,6 +14228,8 @@ function runSerialActivity<T>(args): Promise<T>;
 | `args.kind` | [`ActivityKind`](#api-activitykind) | - |
 | `args.name` | `string` | - |
 | `args.onActivityResolved?` | [`ActivityResolvedHook`](#api-activityresolvedhook)\<`T`\> | - |
+| `args.onUnknownOutcome?` | [`OnUnknownOutcome`](#api-onunknownoutcome) | The tool's declared policy for a retry after its runner was lost; unset uses OE's default. |
+| `args.operationPath?` | [`OperationPath`](#api-operationpath) | Defaults to the current operation path. |
 | `args.semanticInput` | `unknown` | - |
 | `args.stepOrdinal?` | `number` | - |
 
@@ -14780,6 +14965,31 @@ function validateDurableMemoryIdentity(identity, userId): void;
 #### Returns
 
 `void`
+
+***
+
+<a id="api-validateonunknownoutcome"></a>
+
+### validateOnUnknownOutcome()
+
+```ts
+function validateOnUnknownOutcome(value): OnUnknownOutcome | undefined;
+```
+
+Return a tool's declared unknown-outcome policy, rejecting other values.
+
+SDKs call this when a tool is registered so a typo fails at startup rather
+than on the tool's first call; JavaScript callers bypass the type.
+
+#### Parameters
+
+| Parameter | Type |
+| :------ | :------ |
+| `value` | `unknown` |
+
+#### Returns
+
+[`OnUnknownOutcome`](#api-onunknownoutcome) \| `undefined`
 
 ***
 

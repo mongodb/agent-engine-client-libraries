@@ -10,11 +10,8 @@ chunk emit never aborts the tool.
 
 from __future__ import annotations
 
-import atexit
 import logging
-import os
-import threading
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 import httpx
 
@@ -36,86 +33,10 @@ from agent_engine_runner_shared.server.chunk_types import (
     SUBAGENT_START,
     TEXT,
 )
-from agent_engine_runner_shared.tls_client import create_httpx_client_with_tls
+from agent_engine_runner_shared.tls_client import get_shared_client
+from agent_engine_runner_shared.utils import PROGRESS_TIMEOUT_SECS
 
 logger = logging.getLogger(__name__)
-
-# Short timeout: chunk emits are best-effort fire-and-forget. A slow or
-# unreachable OE must not delay the tool function itself.
-_PROGRESS_TIMEOUT_SECS = 5.0
-
-# Module-level client so the underlying TCP/TLS connection to the OE is pooled
-# and reused across emit() calls. httpx.Client is thread-safe for request
-# operations; atexit closes it deterministically on interpreter shutdown.
-# Lazy-initialized with TLS configuration based on the OE_URL.
-# CRITICAL: _client_lock protects concurrent lazy-init and rotation from threads
-# spawned by asyncio.to_thread (docstring says emit() runs on concurrent threads).
-_client: Optional[httpx.Client] = None
-_client_oe_url: Optional[str] = None
-_client_cert_mtimes: Optional[tuple[float, float, float]] = None
-_client_lock = threading.Lock()
-
-
-def _get_cert_mtimes() -> Optional[tuple[float, float, float]]:
-    """Get modification times of TLS cert files for rotation detection."""
-    try:
-        cert_path = os.environ.get("TLS_CERT_PATH", "")
-        key_path = os.environ.get("TLS_KEY_PATH", "")
-        ca_path = os.environ.get("TLS_CA_CERT_PATH", "")
-
-        # Only track mtimes if we're using file-based certs (container mode)
-        # VM mode uses env vars with PEM content, which can't detect rotation
-        if not (cert_path and key_path and ca_path):
-            return None
-
-        return (
-            os.path.getmtime(cert_path),
-            os.path.getmtime(key_path),
-            os.path.getmtime(ca_path),
-        )
-    except (OSError, ValueError):
-        # Cert files don't exist or aren't readable - not using TLS
-        return None
-
-
-def _get_client(oe_url: str) -> httpx.Client:
-    """Get or create the module-level HTTP client, configured for the OE URL.
-
-    Automatically invalidates the cached client if TLS certificate files have
-    been rotated (based on mtime). This ensures the client picks up renewed
-    certificates without requiring a pod restart.
-
-    Thread-safe: protects lazy initialization and cert rotation from concurrent
-    threads spawned by asyncio.to_thread when emit() is called from async tools.
-    """
-    global _client, _client_oe_url, _client_cert_mtimes
-
-    # Check mtimes outside lock (read-only, no mutation)
-    current_mtimes = _get_cert_mtimes()
-
-    with _client_lock:
-        # If the OE URL changed (unlikely but possible in testing), recreate the client
-        if _client is not None and _client_oe_url != oe_url:
-            _client.close()
-            _client = None
-
-        # Check if certs have been rotated (container mode only)
-        if _client is not None and current_mtimes is not None:
-            if _client_cert_mtimes != current_mtimes:
-                logger.info(
-                    "TLS certificates rotated, invalidating cached HTTP client",
-                    extra={"old_mtimes": _client_cert_mtimes, "new_mtimes": current_mtimes},
-                )
-                _client.close()
-                _client = None
-
-        if _client is None:
-            _client = create_httpx_client_with_tls(oe_url, _PROGRESS_TIMEOUT_SECS)
-            _client_oe_url = oe_url
-            _client_cert_mtimes = current_mtimes
-            atexit.register(_client.close)
-
-        return _client
 
 
 def _post_chunk_owner_first(
@@ -125,6 +46,7 @@ def _post_chunk_owner_first(
     owner_url: Optional[str],
     payload: dict,
     on_owner_failure: Optional[Callable[[], None]] = None,
+    timeout: Any = httpx.USE_CLIENT_DEFAULT,
 ) -> None:
     """POST ``payload`` to ``owner_url`` first, falling back to ``service_url``.
 
@@ -136,7 +58,7 @@ def _post_chunk_owner_first(
     back to the trusted service URL and, when ``on_owner_failure`` is
     provided, runs it exactly once before the fallback (mirrors
     ``post_json_with_retries``) so callers can stop offering the owner on
-    later emits.
+    later emits. ``timeout`` overrides the shared client's default per request.
     """
     if owner_url is not None:
         if owner_delivered(
@@ -144,11 +66,12 @@ def _post_chunk_owner_first(
             owner_url,
             payload,
             lambda msg: logger.debug("emit: %s", msg),
+            timeout=timeout,
         ):
             return
         if on_owner_failure is not None:
             on_owner_failure()
-    response = post_without_reading_response_body(client, service_url, payload)
+    response = post_without_reading_response_body(client, service_url, payload, timeout=timeout)
     response.raise_for_status()
 
 
@@ -197,7 +120,7 @@ def emit(event: str, data: str) -> None:
         return
 
     try:
-        client = _get_client(oe_url)
+        client = get_shared_client(oe_url)
         _post_chunk_owner_first(
             client,
             service_url=f"{oe_url.rstrip('/')}/stream/chunk",
@@ -209,6 +132,7 @@ def emit(event: str, data: str) -> None:
                 "metadata": {},
             },
             on_owner_failure=report_oe_owner_url_failure,
+            timeout=PROGRESS_TIMEOUT_SECS,
         )
     except Exception as exc:
         # Best-effort: a failed chunk must never abort the tool function.

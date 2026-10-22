@@ -262,6 +262,28 @@ def test_basic_and_compound_credentials(document):
     assert requests[-1].headers["api-version"] == "2026-01-01"
 
 
+def test_default_user_agent_yields_to_authored_header(document):
+    """Some providers refuse requests without a User-Agent, so every request
+    carries one; a connector's own auth header, in any case, replaces it."""
+    requests = []
+
+    def user_agents() -> list[str]:
+        with ConnectorExecutor(
+            ToolDefinitions.model_validate(document),
+            transport=httpx.MockTransport(
+                lambda request: requests.append(request) or httpx.Response(200, text="ok")
+            ),
+        ) as executor:
+            executor.execute(
+                "jiradc_getComments", {"issueIdOrKey": "DEMO-1"}, env={"JIRA_TOKEN": "t"}
+            )
+        return requests[-1].headers.get_list("user-agent")
+
+    assert user_agents() == ["agent-engine-connector"]
+    document["auth"]["headers"] = {"user-agent": "custom-client/1.0"}
+    assert user_agents() == ["custom-client/1.0"]
+
+
 @pytest.mark.parametrize(
     "encoding,value,expected,content_type",
     [
@@ -692,6 +714,37 @@ def test_redirect_cannot_leak_credentials(document, location):
     assert "token" not in str(caught.value)
     assert "location" not in caught.value.response.headers
     assert "authorization" not in caught.value.request.headers
+
+
+@pytest.mark.parametrize(
+    ("content", "reason"),
+    [
+        (
+            b"Please make sure your request has a User-Agent header"
+            b" (https://docs.example/user-agent).\r\n",
+            "Please make sure your request has a User-Agent header",
+        ),
+        (b"bad \xff\xfe bytes", None),
+    ],
+)
+def test_http_error_carries_a_plain_text_refusal(document, content, reason):
+    """The executor decodes error bodies leniently, so an undecodable refusal
+    must still reach the classifier as one it rejects."""
+
+    def handler(request):
+        return httpx.Response(403, content=content, headers={"content-type": "text/html"})
+
+    with ConnectorExecutor(
+        ToolDefinitions.model_validate(document), transport=httpx.MockTransport(handler)
+    ) as executor:
+        with pytest.raises(httpx.HTTPStatusError) as caught:
+            executor.execute(
+                "jiradc_getComments", {"issueIdOrKey": "DEMO-1"}, env={"JIRA_TOKEN": "token"}
+            )
+
+    error, message = classify_tool_api_error(caught.value, "jira")
+    assert error.reason == reason
+    assert message.endswith(f"— {reason}" if reason else "HTTP 403 AUTH_FAILED")
 
 
 def test_http_error_carries_a_bounded_provider_error_envelope(document):
@@ -1289,3 +1342,105 @@ def test_operation_without_arguments(document):
     ) as executor:
         assert executor.execute("status", {}, env={"JIRA_TOKEN": "t"}) == "healthy"
     assert str(requests[0].url) == "https://jira.example/rest/status"
+
+
+@pytest.fixture
+def inspected_https_server(tmp_path):
+    """Serve HTTPS on loopback with a certificate from a private CA, as a TLS-inspecting
+    gateway does; yields the server's base URL and the CA's PEM path."""
+    import datetime
+    import ipaddress
+    import ssl
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    x509 = pytest.importorskip("cryptography.x509")
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.x509.oid import NameOID
+
+    now = datetime.datetime.now(datetime.timezone.utc)
+    ca_key = ec.generate_private_key(ec.SECP256R1())
+    ca_name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "inspecting-gateway-ca")])
+    ca_cert = (
+        x509.CertificateBuilder()
+        .subject_name(ca_name)
+        .issuer_name(ca_name)
+        .public_key(ca_key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - datetime.timedelta(minutes=1))
+        .not_valid_after(now + datetime.timedelta(days=1))
+        .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+        .sign(ca_key, hashes.SHA256())
+    )
+    key = ec.generate_private_key(ec.SECP256R1())
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "127.0.0.1")]))
+        .issuer_name(ca_name)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - datetime.timedelta(minutes=1))
+        .not_valid_after(now + datetime.timedelta(days=1))
+        .add_extension(
+            x509.SubjectAlternativeName([x509.IPAddress(ipaddress.ip_address("127.0.0.1"))]),
+            critical=False,
+        )
+        .sign(ca_key, hashes.SHA256())
+    )
+    ca_path, cert_path, key_path = tmp_path / "ca.pem", tmp_path / "tls.crt", tmp_path / "tls.key"
+    ca_path.write_bytes(ca_cert.public_bytes(serialization.Encoding.PEM))
+    cert_path.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
+    key_path.write_bytes(
+        key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        )
+    )
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", "2")
+            self.end_headers()
+            self.wfile.write(b"ok")
+
+        def log_message(self, *args):
+            pass
+
+    server = HTTPServer(("127.0.0.1", 0), Handler)
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(cert_path, key_path)
+    server.socket = context.wrap_socket(server.socket, server_side=True)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"https://127.0.0.1:{server.server_address[1]}/rest", ca_path
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_connector_trusts_the_ca_bundle_named_by_ssl_cert_file(
+    document, inspected_https_server, monkeypatch, fake_time
+):
+    """Behind a TLS-inspecting gateway, `dev up --ca-bundle` sets SSL_CERT_FILE; the
+    connector must trust it while still ignoring proxy settings."""
+    base_url, ca_path = inspected_https_server
+    document["source"]["base_url"] = base_url
+    definitions = ToolDefinitions.model_validate(document)
+    call = {"issueIdOrKey": "DEMO-1"}
+    monkeypatch.delenv("SSL_CERT_FILE", raising=False)
+    monkeypatch.delenv("SSL_CERT_DIR", raising=False)
+    # A proxy setting must never divert a credentialed connector request.
+    monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:9")
+
+    with ConnectorExecutor(definitions) as executor:
+        with pytest.raises(httpx.ConnectError):
+            executor.execute("jiradc_getComments", call, env={"JIRA_TOKEN": "t"})
+
+    monkeypatch.setenv("SSL_CERT_FILE", str(ca_path))
+    with ConnectorExecutor(definitions) as executor:
+        assert executor.execute("jiradc_getComments", call, env={"JIRA_TOKEN": "t"}) == "ok"

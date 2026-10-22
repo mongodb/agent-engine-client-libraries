@@ -21,6 +21,7 @@ serialization stack itself.
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
 from typing import Any
 
@@ -34,6 +35,11 @@ from langchain_core.messages import (
     ToolMessage,
 )
 
+from agent_engine_sdk_langgraph.cancelled_turn import (
+    CANCELLED_TURN_MESSAGE_ID_METADATA_KEY,
+    CANCELLED_TURN_MESSAGE_IDS_METADATA_KEY,
+    CANCELLED_TURN_METADATA_KEY,
+)
 from agent_engine_sdk_langgraph.query import LangGraphQueryPlugin
 
 # ---------------------------------------------------------------------------
@@ -131,14 +137,31 @@ class _StubSaver:
         self.alist_calls: list[dict[str, Any]] = []
         self._alist_result: list[_CheckpointTuple] = []
         self._alist_results_by_thread_id: dict[str, list[_CheckpointTuple]] = {}
+        # When set, a filtered (cancelled-turn) alist never yields — the caller
+        # must bound it by its own budget rather than hanging the request.
+        self.hang_marker_lookup = False
+        # When set, a filtered (cancelled-turn) alist raises instead of yielding.
+        self.marker_lookup_error: Exception | None = None
 
-    def set_alist_result(self, checkpoints: list[dict[str, Any]]) -> None:
+    def set_alist_result(
+        self,
+        checkpoints: list[dict[str, Any] | tuple[dict[str, Any], dict[str, Any]]],
+    ) -> None:
         """Pre-canned response for the next alist() call.
 
         MongoDBSaver.alist returns checkpoints in newest-first order; tests
-        should follow that convention when populating the result.
+        should follow that convention when populating the result. An entry
+        may be a ``(checkpoint, metadata)`` pair when the test needs the
+        checkpoint's metadata (the cancelled-turn classification reads it).
         """
-        self._alist_result = [_CheckpointTuple(ck) for ck in checkpoints]
+        tuples: list[_CheckpointTuple] = []
+        for entry in checkpoints:
+            if isinstance(entry, tuple):
+                checkpoint, metadata = entry
+                tuples.append(_CheckpointTuple(checkpoint, metadata=metadata))
+            else:
+                tuples.append(_CheckpointTuple(entry))
+        self._alist_result = tuples
         self._alist_results_by_thread_id = {}
 
     def set_alist_results_by_thread_id(
@@ -158,8 +181,27 @@ class _StubSaver:
             checkpoints = self._alist_results_by_thread_id[thread_id]
         else:
             checkpoints = self._alist_result
+        filter_spec = kwargs.get("filter") or {}
+        if filter_spec and self.hang_marker_lookup:
+            await asyncio.Event().wait()
+        if filter_spec and self.marker_lookup_error is not None:
+            raise self.marker_lookup_error
         for ct in checkpoints:
+            if filter_spec and not _matches_metadata_filter(ct.metadata, filter_spec):
+                continue
             yield ct
+
+
+def _matches_metadata_filter(metadata: Any, filter_spec: dict[str, Any]) -> bool:
+    """Whether a checkpoint's metadata satisfies an ``alist(filter=...)`` spec.
+
+    Mirrors MongoDBSaver's metadata filter, which matches each key's value
+    exactly, so the stub returns only marker checkpoints to the cancelled-turn
+    lookup rather than the whole window.
+    """
+    if not isinstance(metadata, dict):
+        return False
+    return all(metadata.get(key) == value for key, value in filter_spec.items())
 
 
 def _iso(seconds_after_epoch: int) -> str:
@@ -531,53 +573,50 @@ async def test_get_messages_for_session_preserves_message_additional_kwargs() ->
 
 
 # ---------------------------------------------------------------------------
-# Cancelled-turn stamps
+# Cancelled-turn outcome
 #
-# The write path stamps the turn-opening message's own additional_kwargs with
-# ``cancelled_turn`` (see cancelled_turn.py). The reader never scans for
-# marker checkpoints: the stamp flows through the standard kwargs passthrough,
-# so it survives exactly as long as the message itself — independent of the
-# bounded checkpoint window.
+# The write path records the turn-opening message id in the cancelled-turn
+# checkpoint's metadata (see cancelled_turn.py). The reader classifies a
+# message as stopped only when its id matches that metadata — never from an
+# agent-authorable message kwarg.
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.anyio
-async def test_stamped_user_message_carries_cancelled_turn_kwarg() -> None:
+async def test_marked_opener_gets_the_cancelled_outcome() -> None:
     saver = _StubSaver()
     saver.set_alist_result(
         [
-            {
-                "ts": _iso(0),
-                "channel_values": {
-                    "messages": [
-                        HumanMessage(content="first", id="h1"),
-                        AIMessage(content="first reply", id="a1"),
-                        HumanMessage(
-                            content="stop this",
-                            id="h2",
-                            additional_kwargs={"cancelled_turn": True},
-                        ),
-                    ]
+            (
+                {
+                    "ts": _iso(0),
+                    "channel_values": {
+                        "messages": [
+                            HumanMessage(content="first", id="h1"),
+                            AIMessage(content="first reply", id="a1"),
+                            HumanMessage(content="stop this", id="h2"),
+                        ]
+                    },
                 },
-            }
+                {
+                    CANCELLED_TURN_METADATA_KEY: True,
+                    CANCELLED_TURN_MESSAGE_ID_METADATA_KEY: "h2",
+                },
+            )
         ]
     )
 
     plugin = LangGraphQueryPlugin(saver)  # type: ignore[arg-type]
     result = await plugin.get_messages_for_session("s1")
 
-    assert [m.additional_kwargs for m in result.messages] == [
-        None,
-        None,
-        {"cancelled_turn": True},
-    ]
+    assert [m.outcome for m in result.messages] == ["", "", "cancelled"]
 
 
 @pytest.mark.anyio
-async def test_stamp_survives_beyond_the_checkpoint_window() -> None:
-    """Only the tip is in the read window and no marker checkpoint is anywhere
-    in reach — the stamp lives on the message, so an old cancelled turn keeps
-    its status while its message is still served."""
+async def test_marker_on_an_older_checkpoint_still_classifies_the_opener() -> None:
+    """The marker lives on an older checkpoint in the read window, not on the
+    tip — the reader scans the whole window, so an old cancelled turn keeps
+    its status while later turns are served unmarked."""
     saver = _StubSaver()
     saver.set_alist_result(
         [
@@ -587,36 +626,50 @@ async def test_stamp_survives_beyond_the_checkpoint_window() -> None:
                     "messages": [
                         HumanMessage(content="first", id="h1"),
                         AIMessage(content="first reply", id="a1"),
-                        HumanMessage(
-                            content="stop this",
-                            id="h2",
-                            additional_kwargs={"cancelled_turn": True},
-                        ),
+                        HumanMessage(content="stop this", id="h2"),
                         HumanMessage(content="try again", id="h3"),
                         AIMessage(content="ok this time", id="a3"),
                     ]
                 },
-            }
+            },
+            (
+                {
+                    "ts": _iso(2),
+                    "channel_values": {
+                        "messages": [
+                            HumanMessage(content="first", id="h1"),
+                            AIMessage(content="first reply", id="a1"),
+                            HumanMessage(content="stop this", id="h2"),
+                        ]
+                    },
+                },
+                {
+                    CANCELLED_TURN_METADATA_KEY: True,
+                    CANCELLED_TURN_MESSAGE_ID_METADATA_KEY: "h2",
+                },
+            ),
         ]
     )
 
     plugin = LangGraphQueryPlugin(saver)  # type: ignore[arg-type]
     result = await plugin.get_messages_for_session("s1")
 
-    assert [m.additional_kwargs for m in result.messages] == [
-        None,
-        None,
-        {"cancelled_turn": True},
-        None,
-        None,
+    assert [m.outcome for m in result.messages] == [
+        "",
+        "",
+        "cancelled",
+        "",
+        "",
     ]
+    # The reader leaves additional_kwargs untouched.
+    assert [m.additional_kwargs for m in result.messages] == [None] * 5
 
 
 @pytest.mark.anyio
-async def test_stamp_on_non_user_message_passes_through_untranslated() -> None:
-    """The reader passes kwargs through verbatim; the user-role gating lives
-    in the UI normalizer. A non-user message carrying the kwarg is served
-    as-is."""
+async def test_hand_written_kwarg_without_a_marker_does_not_classify() -> None:
+    """The stopped classification is platform-owned: a ``cancelled_turn`` entry
+    in a message's additional_kwargs — something an agent could write — must
+    never mark a turn cancelled on its own."""
     saver = _StubSaver()
     saver.set_alist_result(
         [
@@ -625,9 +678,9 @@ async def test_stamp_on_non_user_message_passes_through_untranslated() -> None:
                 "channel_values": {
                     "messages": [
                         HumanMessage(content="first", id="h1"),
-                        AIMessage(
-                            content="reply",
-                            id="a1",
+                        HumanMessage(
+                            content="stop this",
+                            id="h2",
                             additional_kwargs={"cancelled_turn": True},
                         ),
                     ]
@@ -639,15 +692,16 @@ async def test_stamp_on_non_user_message_passes_through_untranslated() -> None:
     plugin = LangGraphQueryPlugin(saver)  # type: ignore[arg-type]
     result = await plugin.get_messages_for_session("s1")
 
+    assert [m.outcome for m in result.messages] == ["", ""]
+    # The kwarg still passes through verbatim — it just classifies nothing.
     assert [m.additional_kwargs for m in result.messages] == [
         None,
         {"cancelled_turn": True},
     ]
-    assert result.messages[1].role == "assistant"
 
 
 @pytest.mark.anyio
-async def test_unmarked_checkpoints_carry_no_cancelled_stamp() -> None:
+async def test_unmarked_checkpoints_carry_no_cancelled_outcome() -> None:
     saver = _StubSaver()
     saver.set_alist_result(
         [
@@ -661,7 +715,147 @@ async def test_unmarked_checkpoints_carry_no_cancelled_stamp() -> None:
     plugin = LangGraphQueryPlugin(saver)  # type: ignore[arg-type]
     result = await plugin.get_messages_for_session("s1")
 
-    assert result.messages[0].additional_kwargs is None
+    assert result.messages[0].outcome == ""
+
+
+@pytest.mark.anyio
+async def test_marker_older_than_the_message_window_still_classifies() -> None:
+    """A stopped turn's marker must stay resolvable however many newer
+    checkpoints sit above it: the lookup is decoupled from the 500-checkpoint
+    message window, so the retained opener keeps its status even when the
+    marker checkpoint is far outside it."""
+    saver = _StubSaver()
+    tip = {
+        "ts": _iso(59),
+        "channel_values": {
+            "messages": [
+                HumanMessage(content="stop this", id="h2"),
+                AIMessage(content="later reply", id="a9"),
+            ]
+        },
+    }
+    # 600 fillers push the marker past the 500-checkpoint message window.
+    fillers = [
+        {
+            "ts": _iso(1),
+            "channel_values": {"messages": [HumanMessage(content="f", id=f"f{index}")]},
+        }
+        for index in range(600)
+    ]
+    marker = (
+        {
+            "ts": _iso(0),
+            "channel_values": {
+                "messages": [HumanMessage(content="stop this", id="h2")]
+            },
+        },
+        {
+            CANCELLED_TURN_METADATA_KEY: True,
+            CANCELLED_TURN_MESSAGE_ID_METADATA_KEY: "h2",
+        },
+    )
+    # Newest-first, like MongoDBSaver.alist: the marker is the oldest checkpoint.
+    saver.set_alist_result([tip, *fillers, marker])
+
+    plugin = LangGraphQueryPlugin(saver)  # type: ignore[arg-type]
+    result = await plugin.get_messages_for_session("s1")
+
+    assert [m.outcome for m in result.messages] == ["cancelled", ""]
+
+
+@pytest.mark.anyio
+async def test_carried_cancelled_openers_from_a_fork_classify_every_opener() -> None:
+    """A fork re-records the source thread's whole set of cancelled-opener ids
+    on its copied tip, because replay rebuilds checkpoints and drops the
+    per-turn marker metadata. The reader resolves every carried id."""
+    saver = _StubSaver()
+    saver.set_alist_result(
+        [
+            (
+                {
+                    "ts": _iso(0),
+                    "channel_values": {
+                        "messages": [
+                            HumanMessage(content="stop one", id="h2"),
+                            HumanMessage(content="stop two", id="h4"),
+                            AIMessage(content="later", id="a9"),
+                        ]
+                    },
+                },
+                {
+                    CANCELLED_TURN_METADATA_KEY: True,
+                    CANCELLED_TURN_MESSAGE_IDS_METADATA_KEY: ["h2", "h4"],
+                },
+            )
+        ]
+    )
+
+    plugin = LangGraphQueryPlugin(saver)  # type: ignore[arg-type]
+    result = await plugin.get_messages_for_session("s1")
+
+    assert [m.outcome for m in result.messages] == ["cancelled", "cancelled", ""]
+
+
+@pytest.mark.anyio
+async def test_a_stalled_cancelled_turn_lookup_still_returns_the_transcript(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The lookup takes only what remains of the session budget, so a slow or
+    hung classification read degrades to "no stopped turns" instead of pushing
+    the request past the OE's deadline and failing the transcript read."""
+    monkeypatch.setattr(
+        "agent_engine_sdk_langgraph.query._CANCELLED_TURN_READ_BUDGET_SECONDS",
+        0.05,
+    )
+    saver = _StubSaver()
+    saver.set_alist_result(
+        [
+            {
+                "ts": _iso(0),
+                "channel_values": {
+                    "messages": [
+                        HumanMessage(content="stop this", id="h2"),
+                        AIMessage(content="later reply", id="a9"),
+                    ]
+                },
+            }
+        ]
+    )
+    saver.hang_marker_lookup = True
+
+    plugin = LangGraphQueryPlugin(saver)  # type: ignore[arg-type]
+    result = await plugin.get_messages_for_session("s1")
+
+    assert [m.id for m in result.messages] == ["h2", "a9"]
+    assert [m.outcome for m in result.messages] == ["", ""]
+
+
+@pytest.mark.anyio
+async def test_a_failed_cancelled_turn_lookup_still_returns_the_transcript() -> None:
+    """The classification is non-essential: any lookup failure — not only a
+    timeout — degrades to "no stopped turns" rather than failing the transcript
+    read, matching the TypeScript reader."""
+    saver = _StubSaver()
+    saver.set_alist_result(
+        [
+            {
+                "ts": _iso(0),
+                "channel_values": {
+                    "messages": [
+                        HumanMessage(content="stop this", id="h2"),
+                        AIMessage(content="later reply", id="a9"),
+                    ]
+                },
+            }
+        ]
+    )
+    saver.marker_lookup_error = RuntimeError("checkpoint store down")
+
+    plugin = LangGraphQueryPlugin(saver)  # type: ignore[arg-type]
+    result = await plugin.get_messages_for_session("s1")
+
+    assert [m.id for m in result.messages] == ["h2", "a9"]
+    assert [m.outcome for m in result.messages] == ["", ""]
 
 
 @pytest.mark.anyio
@@ -1094,13 +1288,7 @@ async def test_summary_preview_falls_back_to_authoritative_messages() -> None:
             {
                 "ts": _iso(0),
                 "channel_values": {
-                    "messages": [
-                        HumanMessage(
-                            content="rescued first prompt",
-                            id="h1",
-                            additional_kwargs={"cancelled_turn": True},
-                        )
-                    ]
+                    "messages": [HumanMessage(content="rescued first prompt", id="h1")]
                 },
             }
         ]

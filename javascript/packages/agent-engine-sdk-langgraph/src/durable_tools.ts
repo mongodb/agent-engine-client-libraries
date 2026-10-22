@@ -1,9 +1,13 @@
 /** Durable replay identity for platform-executed LangGraph tools. */
 
+import { createHash } from "node:crypto";
+
 import { ToolMessage } from "@langchain/core/messages";
 import {
   currentAttemptContext,
+  currentOperationPath,
   currentStepOrdinal,
+  inSpawnedTask,
   type createSecureToolFunction,
 } from "@mongodb-js/agent-engine-runner-shared";
 
@@ -16,10 +20,19 @@ function durableToolResultMessageId(toolCallId: string): string | null {
   if (attempt === null) return null;
 
   const { executionId } = attempt.workflowIdentity as { executionId: string };
-  return (
+  const messageId =
     `durable-tool-result:${executionId}:` +
-    `${currentStepOrdinal()}:${toolCallId}`
+    `${currentStepOrdinal()}:${toolCallId}`;
+  if (!inSpawnedTask()) return messageId;
+  // Send workers in one step may see the same ToolCall ID, so their results
+  // also carry the worker's path. Other IDs keep their recorded form.
+  const path = JSON.stringify(
+    currentOperationPath().segments.map((segment) => [
+      segment.name,
+      Number(segment.ordinal),
+    ]),
   );
+  return `${messageId}:${createHash("sha256").update(path).digest("hex")}`;
 }
 
 /**

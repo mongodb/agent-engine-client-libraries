@@ -22,6 +22,7 @@ _MAX_ENVELOPE_BODY = 4096
 # with a non-whitespace authority. Encoded or nested spellings are accepted
 # risk, not chased.
 _PROTOCOL_RELATIVE_URL = re.compile(r"(?<![A-Za-z0-9])//(?=\S)")
+_URL_MARKER = re.compile(r"://|" + _PROTOCOL_RELATIVE_URL.pattern)
 
 
 def request_credential_values() -> list[str]:
@@ -61,6 +62,11 @@ _CREDENTIAL_NAME_MARKERS = (
 )
 
 
+def is_credential_name(name: str) -> bool:
+    upper = name.upper()
+    return any(marker in upper for marker in _CREDENTIAL_NAME_MARKERS)
+
+
 def request_named_credential_values() -> list[str]:
     """Credential values a name marks as secrets, at any length.
 
@@ -76,9 +82,7 @@ def request_named_credential_values() -> list[str]:
     from agent_engine_runner_shared.utils import tenant_env_vars
 
     values = [
-        value
-        for name, value in tenant_env_vars().items()
-        if value and any(marker in name.upper() for marker in _CREDENTIAL_NAME_MARKERS)
+        value for name, value in tenant_env_vars().items() if value and is_credential_name(name)
     ]
     authorization = get_current_authorization()
     token = getattr(authorization, "token", None) if authorization is not None else None
@@ -212,10 +216,40 @@ def _extract_envelope(
     try:
         body = json.loads(bytes(raw))
     except Exception:
-        return None, None
+        return None, _plain_text_reason(bytes(raw), credentials)
     if not isinstance(body, dict):
         return None, None
     return _envelope_error_code(body, credentials), _envelope_reason(body, credentials)
+
+
+def _plain_text_reason(raw: bytes, credentials: Sequence[str] = ()) -> str | None:
+    """The explanation in a body that is not JSON.
+
+    Some providers and gateways refuse with a bare sentence, whatever content
+    type they declare, often followed by documentation links. Only the text
+    before the first link is kept, so the explanation survives the URL rule.
+    Markup is skipped so an HTML error page never becomes the reason, and an
+    undecodable body supplies none, including one a caller already decoded
+    with replacement characters.
+    """
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    if "\ufffd" in text:
+        return None
+    text = _printable(" ".join(text.split()))
+    if text.startswith("<"):
+        return None
+    marker = _URL_MARKER.search(text)
+    if marker:
+        text = text[: text.rfind(" ", 0, marker.start()) + 1].rstrip(" ([:,;-")
+    if not text:
+        return None
+    # The markup and link checks read the provider's own text; redaction then
+    # covers each credential as sent and as the normalization above respells it.
+    spellings = [*credentials, *(_printable(" ".join(value.split())) for value in credentials)]
+    return _safe_envelope_text(text, _MAX_REASON_LEN, spellings)
 
 
 def _envelope_error_code(body: dict[str, Any], credentials: Sequence[str] = ()) -> str | None:
@@ -266,10 +300,15 @@ def _safe_envelope_text(text: str, max_len: int, credentials: Sequence[str] = ()
     text is rejected, exact credential values are redacted, and the result is
     bounded. Other encodings and provider-specific content are accepted risk.
     """
-    printable = "".join(ch for ch in text if unicodedata.category(ch)[0] != "C")
+    printable = _printable(text)
     if "://" in printable or _PROTOCOL_RELATIVE_URL.search(printable):
         return None
     for value in sorted((value for value in credentials if value), key=len, reverse=True):
         printable = printable.replace(value, "<redacted>")
     redacted = _redact_text(printable)[:max_len]
     return redacted or None
+
+
+def _printable(text: str) -> str:
+    """``text`` without control characters, so none can hide a URL marker."""
+    return "".join(ch for ch in text if unicodedata.category(ch)[0] != "C")

@@ -11,7 +11,10 @@ import {
 import { isDeepStrictEqual } from "node:util";
 
 import {
+  CANCELLED_TURN_MESSAGE_ID_METADATA_KEY,
+  CANCELLED_TURN_MESSAGE_IDS_METADATA_KEY,
   CANCELLED_TURN_METADATA_KEY,
+  cancelledOpenerIdsFromMetadata,
   clearQueuedTasks,
   terminalizeVersionsSeen,
 } from "./cancelled_turn.js";
@@ -229,10 +232,16 @@ export async function completedRootCheckpoint(
  * Port of Python's `checkpoint_replay_plan`; fork builds this before
  * CreateBranch so the copied snapshot is the one that was validated.
  */
+export interface CheckpointReplayPlanResult {
+  supersteps: CheckpointReplayPlan;
+  /** Every cancelled-opener id the source history records, for the copy. */
+  cancelledOpeners: string[];
+}
+
 export async function checkpointReplayPlan(
   graph: CompiledStateGraph<unknown, unknown>,
   source: LangGraphCheckpoint,
-): Promise<CheckpointReplayPlan> {
+): Promise<CheckpointReplayPlanResult> {
   const checkpointer = graph.checkpointer;
   if (checkpointer === undefined || typeof checkpointer === "boolean") {
     throw new Error("LangGraph checkpoint branching requires a checkpointer");
@@ -259,9 +268,16 @@ export async function checkpointReplayPlan(
   }
 
   const supersteps: CheckpointReplayPlan = [];
+  const cancelledOpeners = new Set<string>();
   for (const snapshot of history.reverse()) {
     const metadata = snapshot.metadata as Record<string, unknown> | undefined;
     if (metadata?.[CANCELLED_TURN_METADATA_KEY] === true) {
+      // Replay rebuilds checkpoints and drops the per-turn marker metadata, so
+      // the copy re-records every opener the source history names — otherwise a
+      // forked stopped turn would lose its badge.
+      for (const openerId of cancelledOpenerIdsFromMetadata(metadata)) {
+        cancelledOpeners.add(openerId);
+      }
       // Lazy: the writer node is only needed for marker tips, and normal
       // forks must not require the graph's drawable form.
       const updates = cancelledTipUpdates(snapshot, replayWriterNode(graph));
@@ -275,7 +291,7 @@ export async function checkpointReplayPlan(
   if (supersteps.length === 0) {
     throw new Error("LangGraph branch point has no checkpoint history");
   }
-  return supersteps;
+  return { supersteps, cancelledOpeners: [...cancelledOpeners].sort() };
 }
 
 /**
@@ -291,6 +307,8 @@ export async function checkpointReplayPlan(
 async function terminalizeCopiedMarkerTip(
   graph: CompiledStateGraph<unknown, unknown>,
   threadId: string,
+  cancelledMessageId?: unknown,
+  cancelledOpeners: Iterable<string> = [],
 ): Promise<void> {
   const raw = graph.checkpointer;
   const saver = raw instanceof PlatformCheckpointer ? raw.native : raw;
@@ -325,6 +343,21 @@ async function terminalizeCopiedMarkerTip(
     parents: {},
     [CANCELLED_TURN_METADATA_KEY]: true,
   };
+  // Carry the source opener id onto the copy so the history reader still
+  // classifies the forked opener as stopped — the reader derives the outcome
+  // from this metadata, not from the message.
+  if (typeof cancelledMessageId === "string" && cancelledMessageId !== "") {
+    metadata[CANCELLED_TURN_MESSAGE_ID_METADATA_KEY] = cancelledMessageId;
+  }
+  // Re-record every opener the source history named: replay drops the per-turn
+  // marker metadata, so a fork of later history would otherwise lose the
+  // earlier stopped turns.
+  const carried = [...new Set(cancelledOpeners)]
+    .filter((openerId) => openerId !== "")
+    .sort();
+  if (carried.length > 0) {
+    metadata[CANCELLED_TURN_MESSAGE_IDS_METADATA_KEY] = carried;
+  }
   await saver.put(
     {
       configurable: {
@@ -350,7 +383,7 @@ export async function copyCheckpoint(
   graph: CompiledStateGraph<unknown, unknown>,
   targetConfig: RunnableConfig,
   source: LangGraphCheckpoint,
-  plan?: CheckpointReplayPlan,
+  plan?: CheckpointReplayPlanResult,
 ): Promise<void> {
   const checkpointer = graph.checkpointer;
   if (checkpointer === undefined || typeof checkpointer === "boolean") {
@@ -368,7 +401,8 @@ export async function copyCheckpoint(
     throw new Error("LangGraph branch destination thread is not empty");
   }
 
-  const supersteps = plan ?? (await checkpointReplayPlan(graph, source));
+  const { supersteps, cancelledOpeners } =
+    plan ?? (await checkpointReplayPlan(graph, source));
   const sourceConfig = checkpointConfig(source);
   const selected = await graph.getState(sourceConfig);
 
@@ -384,10 +418,19 @@ export async function copyCheckpoint(
   const selectedMetadata = selected.metadata as
     | Record<string, unknown>
     | undefined;
+  const markerTip = selectedMetadata?.[CANCELLED_TURN_METADATA_KEY] === true;
+  // Re-record the source's cancelled openers on the copy whenever the history
+  // held any — not only when the tip itself is a marker — so a fork of later
+  // history keeps every earlier stopped turn classified.
   const copied =
-    selectedMetadata?.[CANCELLED_TURN_METADATA_KEY] === true
+    markerTip || cancelledOpeners.length > 0
       ? await (async () => {
-          await terminalizeCopiedMarkerTip(graph, targetThreadId);
+          await terminalizeCopiedMarkerTip(
+            graph,
+            targetThreadId,
+            selectedMetadata?.[CANCELLED_TURN_MESSAGE_ID_METADATA_KEY],
+            cancelledOpeners,
+          );
           return graph.getState({
             configurable: { thread_id: targetThreadId, checkpoint_ns: "" },
           });

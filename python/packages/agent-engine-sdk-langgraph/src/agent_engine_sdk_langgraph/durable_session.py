@@ -25,11 +25,15 @@ from agent_engine_runner_shared.generated.workflow.v1.activity_pb2 import (
 )
 from agent_engine_runner_shared.generated.workflow.v1.runtime_pb2 import AttemptContext
 from agent_engine_runner_shared.secure_llm_proxy import guardrail_review_wait_id
+from agent_engine_runner_shared.secure_wrapper import (
+    oauth_authorization_wait_id,
+)
 from agent_engine_runner_shared.workflow import (
     AsyncWorkflowClient,
     finalize_current_step_suspensions_command,
 )
 from agent_engine_runner_shared.workflow.activity import (
+    OAUTH_FRONTIER_INTERRUPT_REASON,
     unwrap_activity_outcome,
 )
 from agent_engine_runner_shared.workflow.context import (
@@ -99,7 +103,7 @@ async def settle_interrupts(
     # checkpoint interrupt to that stable activity position on every attempt.
     # Only pauses still waiting are candidates: a task that pauses again
     # reuses the native id of its already-answered pauses.
-    activities_by_native_id: dict[str, InterruptedActivity] = {}
+    activities_by_native_id: dict[str, list[InterruptedActivity]] = {}
     for activity in interrupted_activities(current_step_ordinal()):
         control_flow = activity.control_flow
         if not isinstance(control_flow, GraphInterrupt):
@@ -109,11 +113,19 @@ async def settle_interrupts(
             raise UnsupportedDurableGraphError(
                 "a durable local tool must raise exactly one native interrupt"
             )
-        if native_interrupts[0].id in activities_by_native_id:
+        group = activities_by_native_id.setdefault(native_interrupts[0].id, [])
+        if group and (
+            activity.command.activity_name != "oauth.authorization"
+            or any(
+                item.command.activity_name != "oauth.authorization" for item in group
+            )
+        ):
             raise UnsupportedDurableGraphError(
                 "durable native interrupt has more than one waiting activity"
             )
-        activities_by_native_id[native_interrupts[0].id] = activity
+        # OAuth answers are owned by individual OE wait positions and only
+        # wake the credential gate. They never enter this shared native array.
+        group.append(activity)
 
     # LangGraph's state keeps the interrupt of a task that has since received
     # its answer and finished, until the whole superstep completes. That stale
@@ -134,30 +146,69 @@ async def settle_interrupts(
             "durable graph reported only already-answered interrupts"
         )
 
+    # ToolNode can project only its first child's native interrupt even though
+    # all sibling tasks have paused. OE owns every registered consent wait;
+    # include those siblings in the frontier without injecting native answers.
+    exposed_ids = {interrupt.id for interrupt in interrupts}
+    has_oauth_frontier = any(
+        item.command.activity_name == "oauth.authorization"
+        and oauth_authorization_wait_id(item.control_flow.args[0][0].value) is not None
+        for group in activities_by_native_id.values()
+        for item in group
+    )
+    interrupts.extend(
+        group[0].control_flow.args[0][0]
+        for native_id, group in activities_by_native_id.items()
+        if native_id not in exposed_ids
+        and (
+            has_oauth_frontier
+            or all(
+                item.command.activity_name == "oauth.authorization" for item in group
+            )
+        )
+    )
+
     interrupts_by_position: dict[bytes, Interrupt] = {}
+    activities_by_position: dict[bytes, InterruptedActivity] = {}
     suspensions: list[StepSuspensionEntry] = []
     for interrupt in interrupts:
-        activity = activities_by_native_id.get(interrupt.id)
-        if activity is None:
+        group = activities_by_native_id.get(interrupt.id)
+        if group is None:
             raise UnsupportedDurableGraphError(
                 "durable native interrupt checkpoint write did not register an activity"
             )
-        command = activity.command
-        interrupts_by_position[
-            command.position.SerializeToString(deterministic=True)
-        ] = interrupt
-        suspensions.append(
-            StepSuspensionEntry(
-                position=command.position,
-                activity_kind=command.activity_kind,
-                activity_name=command.activity_name,
-                semantic_input=command.semantic_input,
-                suspension=ActivitySuspension(
-                    reason=_FRAMEWORK_INTERRUPT_REASON,
-                    context=json_to_proto_struct({"value": interrupt.value}),
-                ),
+        for activity in group:
+            command = activity.command
+            # A shared native ID may expose one sibling's exception. Each
+            # registered OAuth call retains its own typed value and OE owner.
+            owned = activity.control_flow.args[0][0]
+            key = command.position.SerializeToString(deterministic=True)
+            interrupts_by_position[key] = owned
+            activities_by_position[key] = activity
+            suspensions.append(
+                StepSuspensionEntry(
+                    position=command.position,
+                    activity_kind=command.activity_kind,
+                    activity_name=command.activity_name,
+                    semantic_input=command.semantic_input,
+                    suspension=ActivitySuspension(
+                        reason=_FRAMEWORK_INTERRUPT_REASON,
+                        context=json_to_proto_struct({"value": owned.value}),
+                    ),
+                )
             )
-        )
+
+    if any(
+        activity.command.activity_name == "oauth.authorization"
+        and oauth_authorization_wait_id(activity.control_flow.args[0][0].value)
+        is not None
+        for activity in activities_by_position.values()
+    ):
+        # Keep the one-value public envelope intact: OE uses it to publish
+        # answer schemas and recognise guardrail reviews. The existing reason
+        # discriminator records participation for historical local replay.
+        for suspension in suspensions:
+            suspension.suspension.reason = OAUTH_FRONTIER_INTERRUPT_REASON
 
     async with AsyncWorkflowClient(oe_url) as client:
         entries = await client.finalize_step(
@@ -172,20 +223,25 @@ async def settle_interrupts(
                 entry.position.SerializeToString(deterministic=True)
             ],
             entry.outcome,
+            activities_by_position[
+                entry.position.SerializeToString(deterministic=True)
+            ],
         )
         for entry in entries
     ]
     if settled[0][1].outcome_kind == ACTIVITY_OUTCOME_KIND_SUSPENDED:
         return [
             {"id": outcome.activity_id, "value": interrupt.value}
-            for interrupt, outcome in settled
+            for interrupt, outcome, activity in settled
         ]
 
     wrapper = get_current_wrapper()
     if wrapper is not None and wrapper.durable_memory is not None:
-        for interrupt, outcome in settled:
-            activity = activities_by_native_id[interrupt.id]
-            if not is_direct_interrupt_activity(activity):
+        for interrupt, outcome, activity in settled:
+            if (
+                not is_direct_interrupt_activity(activity)
+                and activity.command.activity_name != "oauth.authorization"
+            ):
                 continue
             # Direct graph interrupts bypass SecureToolWrapper, so close their
             # resolved activity in Memory here under OE's winning fence.
@@ -195,9 +251,12 @@ async def settle_interrupts(
                 attempt_id=outcome.attempt_id,
                 fencing_token=outcome.fencing_token,
             )
-            if guardrail_review_wait_id(interrupt.value) is not None:
-                # The answer is the platform's review decision, not something
-                # the user or a tool said.
+            if (
+                guardrail_review_wait_id(interrupt.value) is not None
+                or oauth_authorization_wait_id(interrupt.value) is not None
+            ):
+                # Platform control answers wake a review or credential gate;
+                # they are not conversation content or the resource's result.
                 await asyncio.to_thread(
                     wrapper.durable_memory.acknowledge, wrapper.workflow, context
                 )
@@ -213,15 +272,13 @@ async def settle_interrupts(
             )
 
     mark_interrupted_activities_answered(
-        [
-            activities_by_native_id[interrupt.id].command.position
-            for interrupt, _ in settled
-        ]
+        [activity.command.position for _, _, activity in settled]
     )
     return Command(
         resume={
             interrupt.id: unwrap_activity_outcome(outcome)
-            for interrupt, outcome in settled
+            for interrupt, outcome, activity in settled
+            if activity.command.activity_name != "oauth.authorization"
         }
     )
 

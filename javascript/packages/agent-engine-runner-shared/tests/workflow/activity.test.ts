@@ -7,6 +7,7 @@ import {
   ActivityOutcomeKind,
   ActivityOutcomeSchema,
   StepSuspensionEntrySchema,
+  UnknownOutcomePolicy as UnknownOutcomePolicyProto,
   type ActivityCommand,
   type ActivityContext,
   type ActivityOutcome,
@@ -46,6 +47,7 @@ import {
   runWithOperationPathResolver,
   setActivityReconstructionIds,
   unwrapActivityOutcome,
+  validateOnUnknownOutcome,
   valueToJson,
 } from "../../src/workflow/index.js";
 
@@ -129,6 +131,53 @@ describe("buildActivityCommand", () => {
       messages: [{ role: "user", content: "hi" }],
     });
   });
+
+  test.each([
+    ["fail", UnknownOutcomePolicyProto.FAIL],
+    ["rerun", UnknownOutcomePolicyProto.RERUN],
+    [undefined, UnknownOutcomePolicyProto.UNSPECIFIED],
+  ] as const)(
+    "sends the declared unknown-outcome policy %s",
+    (onUnknownOutcome, expected) => {
+      const command = buildActivityCommand({
+        attempt: attempt(),
+        kind: ActivityKind.TOOL,
+        name: "refund_order",
+        activityOrdinal: 1,
+        stepOrdinal: 1,
+        semanticInput: {},
+        onUnknownOutcome,
+      });
+      expect(command.onUnknownOutcome).toBe(expected);
+    },
+  );
+
+  test("keeps the generated policy enum in the public exports", async () => {
+    const publicApi = await import("../../src/index.js");
+    expect(publicApi.UnknownOutcomePolicy.FAIL).toBe(
+      UnknownOutcomePolicyProto.FAIL,
+    );
+  });
+
+  test.each(["retry", "FAIL", null, 1])(
+    "rejects the undeclared unknown-outcome policy %j",
+    (value) => {
+      expect(() => validateOnUnknownOutcome(value)).toThrow(
+        /onUnknownOutcome must be "fail", "rerun", or undefined/,
+      );
+      expect(() =>
+        buildActivityCommand({
+          attempt: attempt(),
+          kind: ActivityKind.TOOL,
+          name: "refund_order",
+          activityOrdinal: 1,
+          stepOrdinal: 1,
+          semanticInput: {},
+          onUnknownOutcome: value as never,
+        }),
+      ).toThrow(/onUnknownOutcome must be/);
+    },
+  );
 
   test("requires workflow identity", () => {
     expect(() =>
@@ -581,6 +630,24 @@ describe("runSerialActivity", () => {
     ).toEqual({
       answer: 42,
     });
+  });
+
+  test("sends the tool's unknown-outcome policy when starting it", async () => {
+    const client = new FakeClient(new ActivityDispatch(activityContext()));
+    await runSerialActivity({
+      client,
+      kind: ActivityKind.TOOL,
+      name: "refund_order",
+      activityOrdinal: 1,
+      stepOrdinal: 1,
+      semanticInput: {},
+      execute: () => "refunded",
+      attempt: attempt(),
+      onUnknownOutcome: "fail",
+    });
+    expect(client.commands[0]?.onUnknownOutcome).toBe(
+      UnknownOutcomePolicyProto.FAIL,
+    );
   });
 
   test("runs the post-outcome hook after reporting a fresh result", async () => {

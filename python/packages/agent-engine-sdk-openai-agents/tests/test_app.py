@@ -35,6 +35,7 @@ from agents import (
     ToolInputGuardrail,
     ToolOutputGuardrail,
     agent_tool_state,
+    default_tool_error_function,
     function_tool,
     handoff,
 )
@@ -48,6 +49,7 @@ from openai.types.responses import ResponseFunctionToolCall
 from openai.types.shared import Reasoning
 from pydantic import BaseModel
 
+from agent_engine_runner_shared import RuntimeMode
 from agent_engine_runner_shared.generated.workflow.v1.activity_pb2 import (
     ACTIVITY_OUTCOME_KIND_COMPLETED,
     ACTIVITY_OUTCOME_KIND_SUSPENDED,
@@ -73,6 +75,7 @@ from agent_engine_runner_shared.secure_wrapper import (
     INTERRUPTED_CALL_CONTENT,
     PolicyDeniedException,
     ToolExecutionError,
+    ToolPlatformError,
 )
 from agent_engine_runner_shared.workflow.activity import semantic_input_from_json
 from agent_engine_runner_shared.workflow.context import (
@@ -140,6 +143,8 @@ class OE:
         self.tool_paths: dict[str, list[tuple[str, int]]] = {}
         # Call ids OE stops mid-flight, as when a user stops a running call.
         self.stopped_call_ids: set[str] = set()
+        # Call ids whose tool runs but whose result OE never acknowledges.
+        self.unacknowledged_call_ids: set[str] = set()
         # The execution policy each tool was wrapped with, by tool name.
         self.tool_policies: dict[str, dict[str, Any]] = {}
         monkeypatch.setattr(agent_module, "current_attempt_context", self.attempt)
@@ -261,14 +266,54 @@ class OE:
                     # The real wrapper runs an async tool to completion on
                     # its worker thread.
                     result = asyncio.run(result)
+            except PolicyDeniedException:
+                # The real wrapper reports OE's denial of a call by type.
+                raise
             except Exception as error:
                 # The real wrapper reports a failed local tool this way.
                 raise ToolExecutionError(str(error)) from error
             # Like the real durable wrapper, record only JSON tool results.
             json.dumps(result, allow_nan=False)
+            if tool_call_id in self.unacknowledged_call_ids:
+                raise ToolPlatformError("OE did not acknowledge tool result settlement")
             return result, None
 
         return call
+
+
+def test_tools_carry_their_declared_unknown_outcome_policy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    declared: dict[str, Any] = {}
+
+    def secure(**kwargs: Any) -> Any:
+        declared[kwargs["tool_name"]] = kwargs.get("on_unknown_outcome")
+        return lambda **arguments: None
+
+    monkeypatch.setattr(tools_module, "create_secure_tool_function", secure)
+    app = App(app_name="support")
+    app._runtime.mode = RuntimeMode.AER
+
+    @app.tool(on_unknown_outcome="rerun")
+    def lookup_order(order_id: str) -> str:
+        """Look up an order."""
+        return order_id
+
+    @app.tool()
+    def refund_order(order_id: str) -> str:
+        """Refund an order."""
+        return order_id
+
+    app.tools()
+
+    assert declared == {"lookup_order": "rerun", "refund_order": None}
+
+
+def test_tool_rejects_an_unknown_outcome_policy_it_does_not_know() -> None:
+    app = App(app_name="support")
+
+    with pytest.raises(ValueError, match="on_unknown_outcome"):
+        app.tool(on_unknown_outcome=cast(Any, "retry"))
 
 
 def _order_app(native: ScriptedNativeModel, **agent_options: Any) -> App:
@@ -444,7 +489,7 @@ async def test_failed_parallel_turn_waits_for_its_running_sibling(oe: OE) -> Non
     def lookup_order(order_id: str) -> str:
         """Look up an order."""
         if order_id == "A1":
-            raise RuntimeError("inventory service unavailable")
+            raise PolicyDeniedException("A1 is restricted")
         time.sleep(0.3)
         finished.append(order_id)
         return f"{order_id} shipped"
@@ -460,7 +505,7 @@ async def test_failed_parallel_turn_waits_for_its_running_sibling(oe: OE) -> Non
         ]
     )
 
-    with pytest.raises(ToolExecutionError, match="inventory service unavailable"):
+    with pytest.raises(PolicyDeniedException, match="A1 is restricted"):
         await _attempt(app, oe, RequestContext(session_id="s-1"))
 
     # The sibling's worker thread cannot be interrupted; the turn ends only
@@ -488,7 +533,7 @@ async def test_cancelled_turn_still_waits_for_its_running_tool(
         """Look up an order."""
         if order_id == "A1":
             assert started.wait(timeout=5)
-            raise RuntimeError("inventory service unavailable")
+            raise PolicyDeniedException("A1 is restricted")
         started.set()
         assert release.wait(timeout=5)
         finished.append(order_id)
@@ -540,8 +585,15 @@ async def test_later_turn_continues_from_the_committed_conversation(oe: OE) -> N
     ]
 
 
-async def test_failed_tool_fails_the_turn_without_committing(oe: OE) -> None:
-    native = ScriptedNativeModel([function_call_item("call-1")], [text_item("unused")])
+# How every OpenAI Agents release in the supported range begins its default
+# text for a failed tool; newer releases leave out the error itself.
+_TOOL_FAILED = "An error occurred while running the tool."
+
+
+async def test_failed_tool_is_reported_to_the_model_as_the_sdk_does(oe: OE) -> None:
+    native = ScriptedNativeModel(
+        [function_call_item("call-1")], [text_item("The lookup failed.")]
+    )
     app = App(app_name="support")
 
     @app.tool()
@@ -553,11 +605,61 @@ async def test_failed_tool_fails_the_turn_without_committing(oe: OE) -> None:
     def build() -> Agent[Any]:
         return Agent(name="support", model=app.llm(native), tools=app.tools())
 
-    # The secure path's error reaches the AER as is, not re-wrapped by the SDK.
-    with pytest.raises(ToolExecutionError, match="inventory service unavailable"):
+    await _turn(app, "Where is A1?", oe)
+
+    # The installed OpenAI Agents SDK's default text for a tool that raises.
+    tool_output = native.calls[1]["input"][-1]
+    assert tool_output["output"] == default_tool_error_function(
+        cast(Any, None), RuntimeError("inventory service unavailable")
+    )
+    assert len(oe.settled) == 1
+
+
+async def test_tool_call_denied_by_policy_fails_the_turn_without_committing(
+    oe: OE,
+) -> None:
+    native = ScriptedNativeModel([function_call_item("call-1")], [text_item("unused")])
+    app = App(app_name="support")
+
+    @app.tool()
+    def lookup_order(order_id: str) -> str:
+        """Look up an order."""
+        raise PolicyDeniedException("A1 is restricted")
+
+    @app.entrypoint
+    def build() -> Agent[Any]:
+        return Agent(name="support", model=app.llm(native), tools=app.tools())
+
+    # The secure path's denial reaches the AER as is, not re-wrapped by the SDK.
+    with pytest.raises(PolicyDeniedException, match="A1 is restricted"):
         await _turn(app, "Where is A1?", oe)
     assert oe.settled == []
-    assert len(native.calls) == 1  # the model never saw the failure as tool output
+    assert len(native.calls) == 1  # the model never saw the denial as tool output
+
+
+async def test_platform_failure_after_the_tool_ran_fails_the_turn(oe: OE) -> None:
+    native = ScriptedNativeModel(
+        [function_call_item("call-1", name="refund_order")], [text_item("unused")]
+    )
+    app = App(app_name="support")
+    refunded: list[str] = []
+
+    @app.tool()
+    def refund_order(order_id: str) -> str:
+        """Refund an order."""
+        refunded.append(order_id)
+        return f"refunded {order_id}"
+
+    @app.entrypoint
+    def build() -> Agent[Any]:
+        return Agent(name="support", model=app.llm(native), tools=app.tools())
+
+    oe.unacknowledged_call_ids.add("call-1")
+    with pytest.raises(ToolPlatformError, match="did not acknowledge"):
+        await _turn(app, "Refund A1", oe)
+    assert refunded == ["A1"]
+    # Told the refund failed, the model could have refunded again.
+    assert len(native.calls) == 1 and oe.settled == []
 
 
 class _UnavailableModel(Model):
@@ -686,8 +788,10 @@ async def test_async_tool_is_awaited_and_its_result_reaches_the_model_as_json_te
     assert inspect.iscoroutinefunction(definition.callable)
 
 
-async def test_opaque_tool_result_fails_the_turn_without_committing(oe: OE) -> None:
-    native = ScriptedNativeModel([function_call_item("call-1")], [text_item("unused")])
+async def test_opaque_tool_result_is_reported_to_the_model_as_a_failed_call(
+    oe: OE,
+) -> None:
+    native = ScriptedNativeModel([function_call_item("call-1")], [text_item("done")])
     app = App(app_name="support")
 
     @app.tool()
@@ -700,10 +804,9 @@ async def test_opaque_tool_result_fails_the_turn_without_committing(oe: OE) -> N
         return Agent(name="support", model=app.llm(native), tools=app.tools())
 
     # Serialization runs where the tool runs, so it fails like any tool error.
-    with pytest.raises(ToolExecutionError, match="Unable to serialize"):
-        await _turn(app, "Where is A1?", oe)
-    assert oe.settled == []
-    assert len(native.calls) == 1
+    await _turn(app, "Where is A1?", oe)
+    assert native.calls[1]["input"][-1]["output"].startswith(_TOOL_FAILED)
+    assert len(oe.settled) == 1
 
 
 async def test_a_tool_result_oe_would_round_fails_the_call_where_the_tool_runs(
@@ -723,10 +826,10 @@ async def test_a_tool_result_oe_would_round_fails_the_call_where_the_tool_runs(
         return Agent(name="support", model=app.llm(native), tools=app.tools())
 
     # The platform's tool path reports it, as it does any tool failure.
-    with pytest.raises(ToolExecutionError, match="as a string"):
-        await _turn(app, "Where is A1?", oe)
-    # The model never read a value a replay could not reproduce.
-    assert len(native.calls) == 1 and oe.settled == []
+    await _turn(app, "Where is A1?", oe)
+    # The model reads the failure instead of a value a replay could not
+    # reproduce.
+    assert native.calls[1]["input"][-1]["output"].startswith(_TOOL_FAILED)
 
 
 async def test_a_tool_argument_oe_would_round_fails_before_the_tool_runs(
@@ -2389,14 +2492,14 @@ async def test_a_later_call_to_the_same_agent_tool_is_the_next_occurrence(
 
 async def test_a_failed_nested_run_fails_the_turn(oe: OE) -> None:
     def offline(_order_id: str) -> str:
-        raise RuntimeError("carrier service unavailable")
+        raise PolicyDeniedException("carrier service unavailable")
 
     support = ScriptedNativeModel([_ask("call-1", "A1")])
     app = _specialist_app(support, _shipping_model(), track=offline)
 
-    with pytest.raises(ToolExecutionError, match="carrier service unavailable"):
+    with pytest.raises(PolicyDeniedException, match="carrier service unavailable"):
         await _attempt(app, oe, RequestContext(session_id="s-1"))
-    # The failure was not turned into text for the support model to answer from.
+    # The denial was not turned into text for the support model to answer from.
     assert len(support.calls) == 1 and oe.settled == []
 
 
@@ -2833,7 +2936,7 @@ async def test_approval_two_agent_tools_deep_waits_at_the_innermost_path(
         """Refund an order; a person approves every refund."""
         refunds.append(order_id)
         if refund_fails:
-            raise RuntimeError("payments are down")
+            raise PolicyDeniedException("payments are down")
         return f"refunded {order_id}"
 
     def desk(items: Any) -> list[Any]:
@@ -2876,7 +2979,7 @@ async def test_approval_two_agent_tools_deep_waits_at_the_innermost_path(
 
     approved = _resume({interrupt["id"]: {"confirmed": True}}, oe)
     if refund_fails:
-        with pytest.raises(ToolExecutionError, match="payments are down"):
+        with pytest.raises(PolicyDeniedException, match="payments are down"):
             await _attempt(app, oe, approved)
     else:
         resumed = await _attempt(app, oe, approved)
@@ -3017,7 +3120,7 @@ async def test_failed_turn_waits_for_a_nested_agents_model_request(oe: OE) -> No
         # Fail only once the specialist's model request is under way.
         assert requested.wait(timeout=5)
         failing.set()
-        raise RuntimeError("inventory service unavailable")
+        raise PolicyDeniedException("A1 is restricted")
 
     def slow_model(_order_id: str) -> None:
         requested.set()
@@ -3040,7 +3143,7 @@ async def test_failed_turn_waits_for_a_nested_agents_model_request(oe: OE) -> No
         ask = specialist.as_tool(tool_name="ask_shipping", tool_description="Ask.")
         return Agent(name="support", model=app.llm(support), tools=[ask, *app.tools()])
 
-    with pytest.raises(ToolExecutionError, match="inventory service unavailable"):
+    with pytest.raises(PolicyDeniedException, match="A1 is restricted"):
         await _attempt(app, oe, RequestContext(session_id="s-1"))
 
     # No model request outlives the failed attempt.
@@ -3335,19 +3438,20 @@ async def test_mcp_tool_of_an_agent_used_as_a_tool_runs_under_the_nested_path(
     assert oe.tool_paths == {"find-1": [("agent", 1), ("ask_research", 1)]}
 
 
-async def test_failed_mcp_tool_fails_the_turn_without_committing(
+async def test_failed_mcp_tool_is_reported_to_the_model_as_the_sdk_does(
     oe: OE, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
 ) -> None:
     def unavailable(_arguments: dict[str, Any]) -> Any:
         raise MCPToolError("MCP tool returned error: cluster paused")
 
     _atlas_mcp_server(monkeypatch, tmp_path, call=unavailable)
-    native = ScriptedNativeModel([_find("call-1", "x")], [text_item("unused")])
+    native = ScriptedNativeModel([_find("call-1", "x")], [text_item("Paused.")])
 
-    with pytest.raises(ToolExecutionError, match="cluster paused"):
-        await _turn(await _started(lambda: _order_app(native)), "Find x.", oe)
-    assert oe.settled == []
-    assert len(native.calls) == 1  # the model never saw the failure as tool output
+    await _turn(await _started(lambda: _order_app(native)), "Find x.", oe)
+    assert native.calls[1]["input"][-1]["output"] == default_tool_error_function(
+        cast(Any, None), RuntimeError("MCP tool returned error: cluster paused")
+    )
+    assert len(oe.settled) == 1
 
 
 # 2**53 itself is refused: OE reads a larger integer back as that one, and the

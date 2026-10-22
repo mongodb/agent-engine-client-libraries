@@ -149,6 +149,14 @@ describe("App.run() registers framework hooks", () => {
     expect(stateAtServerStart.instrumentor).not.toBeNull();
   });
 
+  it("awaits and propagates runtime startup failures", async () => {
+    const { app, runSpy } = makeApp();
+    const startupFailure = new Error("listen failed");
+    runSpy.mockRejectedValue(startupFailure);
+
+    await expect(app.run()).rejects.toBe(startupFailure);
+  });
+
   it("rejects if no @app.entrypoint was registered", async () => {
     const app = new App({ appName: "test-agent" });
     // No entrypoint registration

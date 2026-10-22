@@ -67,6 +67,7 @@ import {
   waitForRetry,
 } from "./server/http_retry.js";
 import { SpanStatusCode } from "@opentelemetry/api";
+import { ZodError } from "zod";
 import { getCurrentTraceContext, getTracer } from "./tracing/setup.js";
 import { runWithToolMemoryReadOwnership } from "./tool_memory_ownership.js";
 import {
@@ -76,11 +77,14 @@ import {
   type DurableMemoryState,
   ReplayedActivityFailedError,
   WorkflowClient,
+  WorkflowClientError,
   activityRequiresReconstruction,
-  allocateActivityOrdinal,
+  allocateActivityPosition,
   currentAttemptContext,
   runSerialActivity,
   toolActivityKey,
+  type OnUnknownOutcome,
+  validateOnUnknownOutcome,
 } from "./workflow/index.js";
 import { semanticInputFromJson, valueToJson } from "./workflow/activity.js";
 
@@ -198,6 +202,17 @@ export class PolicyDeniedException extends Error {
   }
 }
 
+/**
+ * OE never gave a readable answer to a /tool/execute request. It stays a
+ * PolicyDeniedException for model calls; a tool call turns it into a
+ * ToolPlatformError, because OE may already have run the tool.
+ */
+class OEUnreachableError extends PolicyDeniedException {
+  constructor(reason: string, options?: ErrorOptions) {
+    super(reason, null, options);
+  }
+}
+
 class OERetryAfterError extends Error {
   readonly waitMs: number;
   constructor(waitMs: number, options?: ErrorOptions) {
@@ -217,6 +232,21 @@ export class ToolExecutionError extends Error {
   }
 }
 
+/**
+ * Raised when the platform, not the tool, failed a tool call.
+ *
+ * The tool may already have run, for example when OE rejects or never
+ * acknowledges its result, so it must not reach the model as a failed tool it
+ * could call again: the wrapper records it and refuses the execution's next
+ * model call and durable step (see {@link SecureToolWrapper.throwIfPlatformFailed}).
+ */
+export class ToolPlatformError extends ToolExecutionError {
+  constructor(error: string, options?: ErrorOptions) {
+    super(error, options);
+    this.name = "ToolPlatformError";
+  }
+}
+
 const TERMINAL_EXECUTION_REASONS: Record<string, string> = {
   "execution already error":
     "This execution already ended in error; later tool calls are rejected.",
@@ -226,7 +256,7 @@ const TERMINAL_EXECUTION_REASONS: Record<string, string> = {
     "This execution was cancelled; later tool calls are rejected.",
 };
 
-export class TerminalExecutionError extends ToolExecutionError {
+export class TerminalExecutionError extends ToolPlatformError {
   constructor(error: string, options?: ErrorOptions) {
     super(error, options);
     this.name = "TerminalExecutionError";
@@ -318,6 +348,9 @@ function encodeDurableToolFailure(error: unknown): string {
   } else if (error instanceof ExternalAPICallError) {
     payload["kind"] = "external_api";
     payload["tool_api_error"] = error.tool_api_error;
+  } else if (error instanceof ToolPlatformError) {
+    // A replay must still keep a platform failure away from the model.
+    payload["kind"] = "platform";
   }
   return `${DURABLE_TOOL_FAILURE_PREFIX}${JSON.stringify(payload)}`;
 }
@@ -343,6 +376,9 @@ function decodeDurableToolFailure(
       ? payload["message"]
       : DURABLE_TOOL_FAILURE_FALLBACK;
   const kind = payload["kind"];
+  if (kind === "platform") {
+    return new ToolPlatformError(failureMessage, { cause });
+  }
   if (kind === "external_api") {
     const parsed = ToolAPIErrorSchema.safeParse(payload["tool_api_error"]);
     if (!parsed.success) {
@@ -473,11 +509,9 @@ export async function requestOeApproval(
     return await requestOeApprovalRaw(args);
   } catch (exc) {
     if (exc instanceof OERetryAfterError) {
-      throw new PolicyDeniedException(
-        "OE unreachable; blocking for safety",
-        null,
-        { cause: exc },
-      );
+      throw new OEUnreachableError("OE unreachable; blocking for safety", {
+        cause: exc,
+      });
     }
     throw exc;
   }
@@ -615,13 +649,9 @@ async function requestOeApprovalRaw(
       { step, err: String(exc) },
       `Step ${step}: Failed to request OE approval`,
     );
-    throw new PolicyDeniedException(
-      "OE unreachable; blocking for safety",
-      null,
-      {
-        cause: exc,
-      },
-    );
+    throw new OEUnreachableError("OE unreachable; blocking for safety", {
+      cause: exc,
+    });
   }
 
   // Reading the body is part of the fail-safe contract: a 200 with a
@@ -635,9 +665,8 @@ async function requestOeApprovalRaw(
       { step, err: String(exc) },
       `Step ${step}: Failed to read OE approval response`,
     );
-    throw new PolicyDeniedException(
+    throw new OEUnreachableError(
       "OE response unreadable; blocking for safety",
-      null,
       { cause: exc },
     );
   }
@@ -676,9 +705,8 @@ export async function requestOeApprovalRetryable(
             }
             attemptCount = attempt + 1;
             if (attempt >= OE_RETRYABLE_MAX_ATTEMPTS - 1) {
-              throw new PolicyDeniedException(
+              throw new OEUnreachableError(
                 "OE unreachable; blocking for safety",
-                null,
                 { cause: err },
               );
             }
@@ -693,9 +721,8 @@ export async function requestOeApprovalRetryable(
               if (isExecutionAborted()) {
                 throw executionAbortedError(err);
               }
-              throw new PolicyDeniedException(
+              throw new OEUnreachableError(
                 "OE unreachable; blocking for safety",
-                null,
                 { cause: err },
               );
             }
@@ -707,9 +734,7 @@ export async function requestOeApprovalRetryable(
           }
         }
         if (response === undefined) {
-          throw new PolicyDeniedException(
-            "OE unreachable; blocking for safety",
-          );
+          throw new OEUnreachableError("OE unreachable; blocking for safety");
         }
         return response;
       } catch (err) {
@@ -886,7 +911,7 @@ async function reportOeResultAttempts(
       const retryAfter = response.headers?.get?.("Retry-After") ?? null;
       await discardResponseBody(response);
       if (ok) return;
-      const error = new ToolExecutionError(
+      const error = new ToolPlatformError(
         `OE rejected result settlement with HTTP ${responseStatus}`,
       );
       if (responseStatus >= 400 && responseStatus < 500) {
@@ -903,7 +928,7 @@ async function reportOeResultAttempts(
       );
     }
   }
-  throw new ToolExecutionError(
+  throw new ToolPlatformError(
     `OE did not acknowledge tool result settlement: ${String(lastError)}`,
   );
 }
@@ -1135,6 +1160,12 @@ export interface ExecuteToolOptions {
    * Stopped while side effects continue.
    */
   supportsCallInterrupt?: boolean | undefined;
+  /**
+   * What a retry does when the runner was lost while this tool was in flight
+   * in a durable workflow: `"rerun"` runs it again, `"fail"` refuses the
+   * retry. Unset uses OE's default.
+   */
+  onUnknownOutcome?: OnUnknownOutcome | undefined;
 }
 
 export class SecureToolWrapper {
@@ -1157,6 +1188,7 @@ export class SecureToolWrapper {
    * calls unaddressable, as before.
    */
   private readonly drainRegistry: DrainRegistry | null;
+  private platformFailure: ToolPlatformError | null = null;
 
   constructor(
     oeUrl: string,
@@ -1208,6 +1240,18 @@ export class SecureToolWrapper {
   }
 
   /**
+   * Throw the first platform failure a tool call in this execution hit.
+   *
+   * Frameworks such as LangGraph.js turn any error a tool throws into a
+   * message for the model, so the error type alone cannot end the turn. The
+   * framework adapter calls this before the next model call and before
+   * committing a durable step.
+   */
+  throwIfPlatformFailed(): void {
+    if (this.platformFailure !== null) throw this.platformFailure;
+  }
+
+  /**
    * Execute a tool call through OE.
    *
    * Flow:
@@ -1220,15 +1264,22 @@ export class SecureToolWrapper {
     args: Record<string, unknown>,
     options: ExecuteToolOptions = {},
   ): Promise<unknown> {
+    // The turn has already failed; no further tool side effects.
+    this.throwIfPlatformFailed();
     const step = this.nextOperationalStep();
     // The tool's redact_fields policy must reach the debug argument dump —
     // it ships to the centralized log sink even at debug level.
     logToolRequest(toolName, args, step, "TOOL", options.redactFields ?? []);
 
-    if (currentAttemptContext() === null) {
-      return this.executeToolNative(toolName, args, step, options);
+    try {
+      if (currentAttemptContext() === null) {
+        return await this.executeToolNative(toolName, args, step, options);
+      }
+      return await this.executeToolDurably(toolName, args, step, options);
+    } catch (error) {
+      if (error instanceof ToolPlatformError) this.platformFailure ??= error;
+      throw error;
     }
-    return this.executeToolDurably(toolName, args, step, options);
   }
 
   private async executeToolDurably(
@@ -1240,13 +1291,17 @@ export class SecureToolWrapper {
     const { toolCallId, rawOnInterrupt = false } = options;
     const durableMemory = this.durableMemory;
     const activityKey = toolCallId ? toolActivityKey(toolCallId) : undefined;
-    const activityOrdinal = allocateActivityOrdinal(activityKey);
+    // A tool its model requested may run in another LangGraph Send task; it
+    // still takes the position the model preallocated for its call id.
+    const { operationPath, activityOrdinal } =
+      allocateActivityPosition(activityKey);
     try {
       const result = await runSerialActivity({
         client: new WorkflowClient(this.oeUrl),
         kind: ActivityKind.TOOL,
         name: toolName,
         activityOrdinal,
+        operationPath,
         semanticInput: buildToolActivityInput(args, options),
         execute: (context) =>
           this.executeToolActivity(
@@ -1269,6 +1324,7 @@ export class SecureToolWrapper {
                   toolName,
                 ),
         exclusive: activityKey === undefined,
+        onUnknownOutcome: options.onUnknownOutcome,
       });
       return decodeToolActivityResult(result, rawOnInterrupt);
     } catch (error) {
@@ -1283,6 +1339,11 @@ export class SecureToolWrapper {
       }
       if (error instanceof DurableToolActivityFailedError) {
         throw decodeDurableToolFailure(error.message, error);
+      }
+      if (error instanceof WorkflowClientError) {
+        // OE's workflow API failed around the call, possibly after the tool
+        // ran, e.g. while recording its outcome.
+        throw new ToolPlatformError(error.message, { cause: error });
       }
       throw error;
     }
@@ -1314,7 +1375,7 @@ export class SecureToolWrapper {
           return value;
         });
         if (suspendMarker !== null) {
-          throw new ToolExecutionError(
+          throw new ToolPlatformError(
             "durable Tool activities support terminal outcomes only; " +
               "the framework adapter must own suspension and resume",
           );
@@ -1345,6 +1406,48 @@ export class SecureToolWrapper {
     }
   }
 
+  /**
+   * Asks OE to approve one native tool call, mapping transport and contract
+   * failures to ToolPlatformError.
+   */
+  private async requestNativeApproval(
+    toolName: string,
+    args: Record<string, unknown>,
+    step: number,
+    options: ExecuteToolOptions,
+    isLocal: boolean,
+  ): Promise<ToolExecuteResponse> {
+    try {
+      return await requestOeApprovalRetryable({
+        oeUrl: this.oeUrl,
+        executionId: this.executionId,
+        toolName,
+        arguments: args,
+        step,
+        isLocal,
+        redactFields: options.redactFields,
+        providerType: options.providerType,
+        scopes: options.scopes,
+        toolCallId: options.toolCallId,
+        metadata: options.metadata,
+        customHeaders: this.customHeaders,
+      });
+    } catch (error) {
+      if (error instanceof OEUnreachableError) {
+        throw new ToolPlatformError(error.reason, { cause: error });
+      }
+      // OE answers only after running a remote tool, so a reply that breaks
+      // the contract may follow a tool that already ran.
+      if (error instanceof ZodError) {
+        throw new ToolPlatformError(
+          "OE tool response does not match its contract",
+          { cause: error },
+        );
+      }
+      throw error;
+    }
+  }
+
   private async executeToolNative(
     toolName: string,
     args: Record<string, unknown>,
@@ -1369,24 +1472,16 @@ export class SecureToolWrapper {
     });
     const effectiveLocalExecutor = effectiveIsLocal ? localExecutor : undefined;
 
-    const response = await requestOeApprovalRetryable({
-      oeUrl: this.oeUrl,
-      executionId: this.executionId,
+    let response = await this.requestNativeApproval(
       toolName,
-      arguments: args,
+      args,
       step,
-      isLocal: effectiveIsLocal,
-      redactFields: options.redactFields,
-      providerType,
-      scopes,
-      toolCallId,
-      metadata,
-      customHeaders: this.customHeaders,
-    });
-
+      options,
+      effectiveIsLocal,
+    );
     if (response.elicitation) {
       if (interruptMode === "reject") {
-        throw new ToolExecutionError(
+        throw new ToolPlatformError(
           "durable Tool activities support terminal outcomes only; " +
             "the framework adapter must own authorization interrupts",
         );
@@ -1406,13 +1501,29 @@ export class SecureToolWrapper {
           created: response.elicitation.created,
         },
       });
-      throw new Error(
-        "authorization_required interrupt must halt execution; suspend handler should throw (e.g. LangGraph GraphInterrupt).",
+      // On a native resume interrupt() returns the Continue answer instead of
+      // pausing, so the token gate is asked once more; a second challenge fails
+      // rather than running the tool without a credential.
+      response = await this.requestNativeApproval(
+        toolName,
+        args,
+        step,
+        options,
+        effectiveIsLocal,
       );
+      if (response.elicitation) {
+        throw new ToolExecutionError(
+          "OAuth authorization is still required after continuation",
+        );
+      }
     }
 
     if (!response.proceed) {
       const reason = response.reason ?? "Policy denied";
+      // A transient platform failure, such as the credential broker being
+      // unavailable, not a policy decision. OE has recorded the step as
+      // failed, so it is not retried here.
+      if (response.retryable) throw new ToolPlatformError(reason);
       if (!Object.hasOwn(TERMINAL_EXECUTION_REASONS, reason)) {
         logPolicyBlocked(toolName, step, reason);
       }
@@ -1429,7 +1540,7 @@ export class SecureToolWrapper {
 
     if (response.route_to === "callback") {
       if (!effectiveIsLocal) {
-        throw new ToolExecutionError(
+        throw new ToolPlatformError(
           "OE returned a local callback route for a tool declared as remote",
         );
       }
@@ -1437,7 +1548,7 @@ export class SecureToolWrapper {
         // Registered-tool adapters always install this executor. Merely
         // running in AER is not enough for a low-level caller: the wrapper
         // still needs the original framework tool object to invoke.
-        throw new ToolExecutionError(
+        throw new ToolPlatformError(
           "Local callback route is missing its registered tool executor",
         );
       }
@@ -1544,10 +1655,17 @@ export class SecureToolWrapper {
             toolApiError: classified?.toolApiError,
           });
         } catch (settlementError) {
-          throw new AggregateError(
-            [propagatedError, settlementError],
+          // OE never recorded the tool's failure, so the turn must end rather
+          // than let the model call the tool again.
+          throw new ToolPlatformError(
             "In-process tool result settlement failed",
-            { cause: settlementError },
+            {
+              cause: new AggregateError(
+                [propagatedError, settlementError],
+                "In-process tool result settlement failed",
+                { cause: settlementError },
+              ),
+            },
           );
         }
         if (stoppedByCallInterrupt) {
@@ -1563,7 +1681,7 @@ export class SecureToolWrapper {
       }
       const durationMs = performance.now() - startedAt;
       if (suspendMarker !== null && interruptMode === "reject") {
-        const error = new ToolExecutionError(
+        const error = new ToolPlatformError(
           "durable Tool activities support terminal outcomes only; " +
             "the framework adapter must own suspension and resume",
         );
@@ -1610,7 +1728,7 @@ export class SecureToolWrapper {
       return localResult;
     }
     if (response.route_to != null) {
-      throw new ToolExecutionError(
+      throw new ToolPlatformError(
         `Unexpected OE tool route: ${response.route_to}`,
       );
     }
@@ -1628,6 +1746,11 @@ export class SecureToolWrapper {
       return rawOnInterrupt ? CALL_INTERRUPTED : { interrupted: true };
     }
     if (status === "error") {
+      // OE marks only its own failures retryable, before dispatching the
+      // tool; this is the reply left after the retries ran out.
+      if (response.retryable) {
+        throw new ToolPlatformError(error ?? "OE could not dispatch the tool");
+      }
       if (response.tool_api_error) {
         throw new ExternalAPICallError(
           error ?? "Unknown error",
@@ -1642,7 +1765,7 @@ export class SecureToolWrapper {
     // A successful result is returned verbatim.
     if (status === "suspend") {
       if (interruptMode === "reject") {
-        throw new ToolExecutionError(
+        throw new ToolPlatformError(
           "durable Tool activities support terminal outcomes only; " +
             "the framework adapter must own suspension and resume",
         );
@@ -1650,7 +1773,7 @@ export class SecureToolWrapper {
       return this.handleSuspend(result);
     }
     if (status !== "success") {
-      throw new ToolExecutionError(`Unexpected OE tool status: ${status}`);
+      throw new ToolPlatformError(`Unexpected OE tool status: ${status}`);
     }
 
     return result;
@@ -1671,7 +1794,7 @@ export class SecureToolWrapper {
       parsed === null ||
       Array.isArray(parsed)
     ) {
-      throw new ToolExecutionError(
+      throw new ToolPlatformError(
         "OE reported suspend but the result is not a suspend payload",
       );
     }
@@ -1681,7 +1804,14 @@ export class SecureToolWrapper {
         "No suspend handler registered. Ensure the framework SDK calls registerSuspendHandler() before run().",
       );
     }
-    const payload = SuspendPayloadSchema.parse(parsed);
+    const validated = SuspendPayloadSchema.safeParse(parsed);
+    if (!validated.success) {
+      throw new ToolPlatformError(
+        "OE reported suspend but the result is not a suspend payload",
+        { cause: validated.error },
+      );
+    }
+    const payload = validated.data;
     const humanDecision = interrupt(payload as Record<string, unknown>);
     if (
       typeof humanDecision !== "object" ||
@@ -1788,6 +1918,11 @@ export interface CreateSecureToolFunctionOptions {
    * {@link ExecuteToolOptions.supportsCallInterrupt}.
    */
   supportsCallInterrupt?: boolean | undefined;
+  /**
+   * The tool's declared retry policy for an unknown outcome. See
+   * {@link ExecuteToolOptions.onUnknownOutcome}.
+   */
+  onUnknownOutcome?: OnUnknownOutcome | undefined;
 }
 
 /**
@@ -1820,6 +1955,7 @@ export function createSecureToolFunction(
     isFrameworkControlFlow,
     supportsCallInterrupt = false,
   } = options;
+  const onUnknownOutcome = validateOnUnknownOutcome(options.onUnknownOutcome);
   const effectiveToolFormat = toolDeclaredFormat ?? responseFormat;
   return async (
     kwargs: Record<string, unknown> = {},
@@ -1882,6 +2018,7 @@ export function createSecureToolFunction(
         // Absent unless declared: a present-but-false key would read as a
         // declared capability to exact-shape consumers.
         ...(supportsCallInterrupt && { supportsCallInterrupt }),
+        ...(onUnknownOutcome !== undefined && { onUnknownOutcome }),
       });
       return coerceContentAndArtifact(
         result,

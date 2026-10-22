@@ -141,7 +141,11 @@ class TestDurableToolWrapper:
         from agent_engine_runner_shared.workflow.activity import value_to_json
 
         wrapper = SecureToolWrapper("http://oe:8000", "execution-1")
-        recorded = completed_outcome(_activity_context(), {"cached": True})
+        # OAuth producers wrap real data so a result cannot manufacture a
+        # platform consent challenge. Configuration still stays out of input identity.
+        recorded = completed_outcome(
+            _activity_context(), {"kind": "result", "result": {"cached": True}}
+        )
         wrapper._workflow = _FakeWorkflow(ActivityReplay(outcome=recorded))
 
         with attempt_context_scope(_attempt()):

@@ -407,14 +407,15 @@ Only effects routed through Atlas Agent Engine's secure LLM and Tool wrappers pa
 in durable record/replay. For durable Tool replay, the ToolCall must come from
 the secure LLM wrapper and execute through a Tool returned by `app.get_tools()`.
 
-Durable workflows do not expose LangGraph's dynamic
-[`Send`](https://docs.langchain.com/oss/python/langgraph/graph-api#send) fan-out.
-The normal platform checkpointer rejects application-authored `Send` writes.
-Graphs created by `app.deep_agent()` are an opaque exception because LangChain
-uses `Send` internally to route ToolCalls; this private compatibility does not
-make `Send` a supported application API. Use fixed graph edges, compiled
-subgraphs, or Deep Agent task delegation instead. Native-checkpoint workflows
-are unaffected.
+Durable workflows support LangGraph
+[`Send`](https://docs.langchain.com/oss/python/langgraph/graph-api#send) fan-out,
+such as map-reduce. Each `Send` worker records its LLM and Tool calls under its
+own operation path, named by its superstep and its index in that superstep's
+send list, so a replacement attempt replays each worker's results even when the
+workers run in a different order. A worker may be a plain node or a compiled subgraph. Plain
+nodes that run in parallel on fixed edges still share one path; keep model calls
+in such branches inside compiled subgraphs. See
+[Durable compiled subgraphs](docs/durable-subgraphs.md#send-workers).
 
 **Reads are scoped-only.** Session history expands each Atlas Agent Engine
 `session_id` to only its workspace-scoped composite key; the bare unscoped

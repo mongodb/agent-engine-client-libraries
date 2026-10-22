@@ -59,6 +59,8 @@ import {
   TenantRuntime,
   type TenantRuntimeOptions,
   type ToolResponseFormat,
+  type OnUnknownOutcome,
+  validateOnUnknownOutcome,
   getTracer,
   GRAPH_BUILD,
   OPENINFERENCE_SPAN_KIND,
@@ -220,6 +222,14 @@ export interface ToolDecoratorOptions {
   schema?: ZodType;
   /** Override the registered tool name. Defaults to the wrapped function's `name`. */
   name?: string;
+  /**
+   * What a retry does when the platform lost the runner while this tool was
+   * running in a durable workflow, so nobody knows whether it ran. `"rerun"`
+   * runs the tool again (at-least-once execution; declare it only for a tool
+   * that is safe to run twice). `"fail"` refuses the retry, so the tool never
+   * runs twice. Leave unset for the platform default.
+   */
+  onUnknownOutcome?: OnUnknownOutcome;
 }
 
 /**
@@ -320,6 +330,7 @@ export class App extends BaseApp {
     };
     this.runtime = new TenantRuntime(runtimeOpts);
     this.mcpToolsReady = this.registerMcpTools();
+    void this.mcpToolsReady.catch(() => undefined);
   }
 
   /**
@@ -408,6 +419,7 @@ export class App extends BaseApp {
     /** Set for MCP-discovered tools so `getTools()` forwards Tool-Pod call metadata. */
     mcpServer?: string;
     mcpTool?: string;
+    onUnknownOutcome?: OnUnknownOutcome | undefined;
   }): void {
     if (args.name in this.runtime.tools || this.lcTools.has(args.name)) {
       throw new Error(`tool '${args.name}' is already registered`);
@@ -424,6 +436,9 @@ export class App extends BaseApp {
       redact_fields: args.redactFields,
       ...(args.mcpServer !== undefined && { mcp_server: args.mcpServer }),
       ...(args.mcpTool !== undefined && { mcp_tool: args.mcpTool }),
+      ...(args.onUnknownOutcome !== undefined && {
+        on_unknown_outcome: args.onUnknownOutcome,
+      }),
     };
     // His TenantRuntime.registerTool signature: (name, func, metadata) positional.
     this.runtime.registerTool(args.name, args.func as never, metadata);
@@ -475,6 +490,7 @@ export class App extends BaseApp {
     const description = options.description ?? "";
     const schema = options.schema;
     const explicitName = options.name;
+    const onUnknownOutcome = validateOnUnknownOutcome(options.onUnknownOutcome);
 
     return <F extends (...input: never[]) => unknown>(fn: F): F => {
       const name =
@@ -504,6 +520,7 @@ export class App extends BaseApp {
         timeoutSeconds: timeout,
         redactFields,
         langchainTool,
+        onUnknownOutcome,
       });
       return fn;
     };
@@ -657,7 +674,7 @@ export class App extends BaseApp {
     runInstrumentor();
     await this.resolveCheckpointDbName();
     this.registerQueryPlugin();
-    this.runtime.registerAndRun(this, options);
+    await this.runtime.registerAndRun(this, options);
   }
 
   /**
@@ -1090,6 +1107,9 @@ export class App extends BaseApp {
           redactFields,
           isFrameworkControlFlow: isGraphBubbleUp,
           supportsCallInterrupt,
+          onUnknownOutcome: validateOnUnknownOutcome(
+            toolMetadata["on_unknown_outcome"],
+          ),
         },
       );
       const durableWrapperFunc = withDurableToolResultIdentity(

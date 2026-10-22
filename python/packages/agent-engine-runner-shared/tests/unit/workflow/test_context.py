@@ -448,6 +448,153 @@ def test_preallocate_preserves_identity_under_inverted_start_order() -> None:
         assert allocate_activity_ordinal() == 3
 
 
+def _position_helpers():
+    from agent_engine_runner_shared.workflow.context import (
+        allocate_activity_position,
+        preallocate_activity_ordinals,
+        tool_activity_key,
+    )
+
+    def spawned(name: str) -> ChildOperationBoundary:
+        return ChildOperationBoundary(name, name, spawned_task=True)
+
+    def child(name: str) -> ChildOperationBoundary:
+        return ChildOperationBoundary(name, name)
+
+    def preallocate(*keys: str) -> None:
+        preallocate_activity_ordinals([tool_activity_key(key) for key in keys])
+
+    def position(key: str) -> tuple[tuple[str, ...], int]:
+        operation_path, ordinal = allocate_activity_position(tool_activity_key(key))
+        return tuple(segment.name for segment in operation_path.segments), ordinal
+
+    return spawned, child, preallocate, position
+
+
+def test_tool_in_a_spawned_task_keeps_its_model_position() -> None:
+    spawned, child, preallocate, position = _position_helpers()
+    boundaries: list[ChildOperationBoundary] = []
+    with attempt_context_scope(_attempt("attempt-1")):
+        with operation_path_resolver_scope(lambda: boundaries):
+            # A model in Send worker 0 requests two tools.
+            boundaries[:] = [spawned("worker-0")]
+            preallocate("call-a", "call-b")
+
+            # Each tool runs in its own Send task spawned by the root graph.
+            boundaries[:] = [spawned("tool-1")]
+            assert position("call-b") == (("agent", "worker-0"), 2)
+            boundaries[:] = [spawned("tool-0")]
+            assert position("call-a") == (("agent", "worker-0"), 1)
+
+            # A key that was never preallocated keeps today's allocation.
+            assert position("call-c") == (("agent", "tool-0"), 1)
+
+
+def test_tool_outside_a_spawned_task_allocates_in_its_own_path() -> None:
+    spawned, child, preallocate, position = _position_helpers()
+    boundaries: list[ChildOperationBoundary] = []
+    with attempt_context_scope(_attempt("attempt-1")):
+        with operation_path_resolver_scope(lambda: boundaries):
+            # A planner subgraph requests a tool that a sibling tools subgraph
+            # runs, and a root model's tool runs inside a subgraph. Neither
+            # path has a spawned task, so both record where they did before.
+            boundaries[:] = [child("planner")]
+            preallocate("call-a")
+            boundaries[:] = []
+            preallocate("call-b")
+
+            boundaries[:] = [child("tools")]
+            assert position("call-a") == (("agent", "tools"), 1)
+            assert position("call-b") == (("agent", "tools"), 2)
+
+
+def test_spawned_tools_of_parallel_graphs_stay_in_their_own_graph() -> None:
+    spawned, child, preallocate, position = _position_helpers()
+    boundaries: list[ChildOperationBoundary] = []
+    with attempt_context_scope(_attempt("attempt-1")):
+        with operation_path_resolver_scope(lambda: boundaries):
+            # Two coordinator workers reuse one tool call id.
+            for worker in ("worker-0", "worker-1"):
+                boundaries[:] = [spawned(worker), child("coordinator")]
+                preallocate("call-x", "call-a")
+
+            # Each coordinator's tool runs in a Send task it spawned.
+            for worker in ("worker-1", "worker-0"):
+                boundaries[:] = [spawned(worker), child("coordinator"), spawned("tool")]
+                assert position("call-a") == (("agent", worker, "coordinator"), 2)
+
+
+def test_tool_call_id_reused_within_one_graph_fails_in_either_order() -> None:
+    from agent_engine_runner_shared.workflow.context import AmbiguousActivityKeyError
+
+    spawned, child, preallocate, position = _position_helpers()
+    boundaries: list[ChildOperationBoundary] = []
+
+    # Both models preallocate before the tool runs.
+    with attempt_context_scope(_attempt("attempt-1")):
+        with operation_path_resolver_scope(lambda: boundaries):
+            for worker in ("worker-0", "worker-1"):
+                boundaries[:] = [spawned(worker)]
+                preallocate("call-a")
+            boundaries[:] = [spawned("tool")]
+            with pytest.raises(AmbiguousActivityKeyError, match="call-a"):
+                position("call-a")
+
+    # The tool runs before the second model preallocates.
+    with attempt_context_scope(_attempt("attempt-2")):
+        with operation_path_resolver_scope(lambda: boundaries):
+            boundaries[:] = [spawned("worker-0")]
+            preallocate("call-a")
+            boundaries[:] = [spawned("tool")]
+            assert position("call-a") == (("agent", "worker-0"), 1)
+            boundaries[:] = [spawned("worker-1")]
+            with pytest.raises(AmbiguousActivityKeyError, match="call-a"):
+                preallocate("call-a")
+
+    # Each tool runs inside the worker whose model requested it.
+    with attempt_context_scope(_attempt("attempt-3")):
+        with operation_path_resolver_scope(lambda: boundaries):
+            for worker in ("worker-0", "worker-1"):
+                boundaries[:] = [spawned(worker)]
+                preallocate("call-a")
+            with pytest.raises(AmbiguousActivityKeyError, match="call-a"):
+                position("call-a")
+
+    with attempt_context_scope(_attempt("attempt-4")):
+        with operation_path_resolver_scope(lambda: boundaries):
+            boundaries[:] = [spawned("worker-0")]
+            preallocate("call-a")
+            assert position("call-a") == (("agent", "worker-0"), 1)
+            boundaries[:] = [spawned("worker-1")]
+            with pytest.raises(AmbiguousActivityKeyError, match="call-a"):
+                preallocate("call-a")
+
+
+def test_tool_call_id_take_in_one_graph_does_not_hide_a_take_in_another() -> None:
+    from agent_engine_runner_shared.workflow.context import AmbiguousActivityKeyError
+
+    spawned, child, preallocate, position = _position_helpers()
+    boundaries: list[ChildOperationBoundary] = []
+
+    def in_coordinator(worker: str, *inner: ChildOperationBoundary) -> None:
+        boundaries[:] = [spawned(worker), child("coordinator"), *inner]
+
+    with attempt_context_scope(_attempt("attempt-1")):
+        with operation_path_resolver_scope(lambda: boundaries):
+            # Two parallel coordinators reuse one tool call id; each tool takes
+            # its own coordinator's reservation.
+            for worker in ("worker-0", "worker-1"):
+                in_coordinator(worker, spawned("model-0"))
+                preallocate("call-a")
+                in_coordinator(worker, spawned("tool"))
+                position("call-a")
+
+            # A second reservation in the first coordinator still fails.
+            in_coordinator("worker-0", spawned("model-1"))
+            with pytest.raises(AmbiguousActivityKeyError, match="call-a"):
+                preallocate("call-a")
+
+
 def test_allocate_without_key_is_monotonic() -> None:
     from agent_engine_runner_shared.workflow.context import allocate_activity_ordinal
 

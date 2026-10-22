@@ -525,7 +525,7 @@ describe.skipIf(TEST_MONGO_URI === "")(
       "returns an empty list for a session with no checkpoints",
       async () => {
         const result = await plugin.getMessagesForSession("sess-nonexistent");
-        expect(result).toEqual({ messages: [] });
+        expect(result).toEqual({ messages: [], outcome_supported: true });
       },
       TIMEOUT,
     );

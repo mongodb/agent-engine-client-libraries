@@ -11,9 +11,9 @@
  *     `TestMain` tests run as subprocesses against the built `dist/launcher.js`
  *     with real temp module files on disk — same pattern as p13-smoke.mjs.
  *   - Python `_resolve_entrypoint` calls `sys.exit(1)` on error. TS
- *     `resolveEntrypoint` calls `process.exit(1)`. In-process testing
- *     requires mocking `process.exit` to throw a sentinel instead of
- *     killing the Vitest worker.
+ *     `resolveEntrypoint` throws instead; `runLauncher` maps the throw to
+ *     `EXIT_NO_ENTRYPOINT`. In-process testing requires mocking `process.exit`
+ *     to throw a sentinel instead of killing the Vitest worker.
  *   - Requires `dist/launcher.js` to be built. The standard build/test gate
  *     ensures this; running `npm test` in isolation will fail until
  *     `npm run build` has been executed.
@@ -39,7 +39,7 @@ import {
 import { readFileSync } from "node:fs";
 
 // ---------------------------------------------------------------------------
-// TestResolveEntrypoint — in-process, with process.exit mocked
+// TestResolveEntrypoint — in-process, with malformed values rejected
 // ---------------------------------------------------------------------------
 
 class ProcessExitError extends Error {
@@ -128,95 +128,34 @@ describe("resolveEntrypoint", () => {
     });
   });
 
-  test("whitespace-only AGENT_ENTRYPOINT exits EXIT_NO_ENTRYPOINT", () => {
+  test("whitespace-only AGENT_ENTRYPOINT is rejected", () => {
     // test_whitespace_only_env_var_exits
     vi.stubEnv("AGENT_ENTRYPOINT", " \r\n");
-    try {
-      resolveEntrypoint();
-      expect.unreachable();
-    } catch (e) {
-      expect((e as ProcessExitError).code).toBe(EXIT_NO_ENTRYPOINT);
-    }
+    expect(() => resolveEntrypoint()).toThrow("AGENT_ENTRYPOINT is not set");
   });
 
-  test("missing AGENT_ENTRYPOINT exits EXIT_NO_ENTRYPOINT", () => {
+  test("missing AGENT_ENTRYPOINT is rejected", () => {
     // test_missing_env_var_exits
     // beforeEach already deleted the env var
-    expect(() => resolveEntrypoint()).toThrow(ProcessExitError);
-    try {
-      resolveEntrypoint();
-    } catch (e) {
-      expect((e as ProcessExitError).code).toBe(EXIT_NO_ENTRYPOINT);
-    }
+    expect(() => resolveEntrypoint()).toThrow("AGENT_ENTRYPOINT is not set");
   });
 
-  test("empty AGENT_ENTRYPOINT exits EXIT_NO_ENTRYPOINT", () => {
+  test("empty AGENT_ENTRYPOINT is rejected", () => {
     // test_empty_env_var_exits
     vi.stubEnv("AGENT_ENTRYPOINT", "");
-    try {
-      resolveEntrypoint();
-      expect.unreachable();
-    } catch (e) {
-      expect((e as ProcessExitError).code).toBe(EXIT_NO_ENTRYPOINT);
-    }
+    expect(() => resolveEntrypoint()).toThrow("AGENT_ENTRYPOINT is not set");
   });
 
-  test('trailing colon ("module:") exits EXIT_NO_ENTRYPOINT', () => {
+  test('trailing colon ("module:") is rejected', () => {
     // test_trailing_colon_exits
     vi.stubEnv("AGENT_ENTRYPOINT", "my_agent:");
-    try {
-      resolveEntrypoint();
-      expect.unreachable();
-    } catch (e) {
-      expect((e as ProcessExitError).code).toBe(EXIT_NO_ENTRYPOINT);
-    }
+    expect(() => resolveEntrypoint()).toThrow("must be non-empty");
   });
 
-  test('leading colon (":export") exits EXIT_NO_ENTRYPOINT', () => {
+  test('leading colon (":export") is rejected', () => {
     // test_leading_colon_exits
     vi.stubEnv("AGENT_ENTRYPOINT", ":run");
-    try {
-      resolveEntrypoint();
-      expect.unreachable();
-    } catch (e) {
-      expect((e as ProcessExitError).code).toBe(EXIT_NO_ENTRYPOINT);
-    }
-  });
-
-  describe("writes a termination message", () => {
-    let tmpDir: string;
-    let logPath: string;
-
-    beforeEach(() => {
-      tmpDir = mkdtempSync(join(tmpdir(), "termination-log-test-"));
-      logPath = join(tmpDir, "termination-log");
-      setTerminationLogPathForTest(logPath);
-    });
-
-    afterEach(() => {
-      rmSync(tmpDir, { recursive: true, force: true });
-    });
-
-    test("missing AGENT_ENTRYPOINT", () => {
-      try {
-        resolveEntrypoint();
-      } catch {
-        // process.exit is mocked to throw; ignore.
-      }
-      expect(readFileSync(logPath, "utf-8")).toBe(
-        "AGENT_ENTRYPOINT is not set",
-      );
-    });
-
-    test("malformed AGENT_ENTRYPOINT", () => {
-      vi.stubEnv("AGENT_ENTRYPOINT", ":run");
-      try {
-        resolveEntrypoint();
-      } catch {
-        // process.exit is mocked to throw; ignore.
-      }
-      expect(readFileSync(logPath, "utf-8")).toContain("must be non-empty");
-    });
+    expect(() => resolveEntrypoint()).toThrow("must be non-empty");
   });
 });
 
@@ -516,11 +455,74 @@ describe("runLauncher (subprocess)", () => {
       AGENTIC_MCP_OAUTH_B64_GITHUB: "not-valid-base64!!!",
     });
 
-    expect(r.status).toBe(1);
+    expect(r.status).toBe(EXIT_STARTUP_CRASH);
     expect(combinedOutput(r)).toMatch(
       /Cannot materialize MCP OAuth credentials/,
     );
     expect(combinedOutput(r)).toMatch(/not valid base64/);
+  });
+
+  test("startup failures from MCP discovery reach the launcher fatal path", () => {
+    const modulePath = join(tmpModulesDir, "fake_module.mjs");
+    writeFileSync(
+      modulePath,
+      `export const app = { run() { return Promise.reject(new Error('MCP discovery failed')) } }\n`,
+    );
+
+    const r = runLauncher({ AGENT_ENTRYPOINT: `${modulePath}:app` });
+
+    expect(r.status).toBe(EXIT_STARTUP_CRASH);
+    expect(combinedOutput(r)).toMatch(
+      /Unhandled exception from agent entrypoint/,
+    );
+    expect(combinedOutput(r)).toMatch(/MCP discovery failed/);
+  });
+
+  test.each([
+    ["startup hook", "server startup hook failed"],
+    ["listener bind", "listen EADDRINUSE"],
+  ])("%s failures reach the launcher fatal path", (_case, message) => {
+    const modulePath = join(tmpModulesDir, "fake_module.mjs");
+    writeFileSync(
+      modulePath,
+      `export const app = { run() { return Promise.reject(new Error(${JSON.stringify(message)})) } }\n`,
+    );
+
+    const r = runLauncher({ AGENT_ENTRYPOINT: `${modulePath}:app` });
+
+    expect(r.status).toBe(EXIT_STARTUP_CRASH);
+    expect(combinedOutput(r)).toMatch(
+      /Unhandled exception from agent entrypoint/,
+    );
+    expect(combinedOutput(r)).toContain(message);
+  });
+
+  test("an uncaught startup exception reaches the launcher fatal path", () => {
+    const modulePath = join(tmpModulesDir, "fake_module.mjs");
+    writeFileSync(
+      modulePath,
+      `setImmediate(() => { throw new Error('startup hook failed') }); export function start() { return new Promise(() => {}) }\n`,
+    );
+
+    const r = runLauncher({ AGENT_ENTRYPOINT: `${modulePath}:start` });
+
+    expect(r.status).toBe(EXIT_STARTUP_CRASH);
+    expect(combinedOutput(r)).toMatch(/Unhandled exception during startup/);
+    expect(combinedOutput(r)).toMatch(/startup hook failed/);
+  });
+
+  test("an unhandled startup rejection reaches the launcher fatal path", () => {
+    const modulePath = join(tmpModulesDir, "fake_module.mjs");
+    writeFileSync(
+      modulePath,
+      `setImmediate(() => Promise.reject(new Error('startup discovery rejected'))); export function start() { return new Promise(() => {}) }\n`,
+    );
+
+    const r = runLauncher({ AGENT_ENTRYPOINT: `${modulePath}:start` });
+
+    expect(r.status).toBe(EXIT_STARTUP_CRASH);
+    expect(combinedOutput(r)).toMatch(/Unhandled rejection during startup/);
+    expect(combinedOutput(r)).toMatch(/startup discovery rejected/);
   });
 
   test("non-callable export without .run() exits EXIT_NO_ENTRYPOINT", () => {

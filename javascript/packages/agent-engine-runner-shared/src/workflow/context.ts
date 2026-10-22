@@ -39,9 +39,18 @@ interface AttemptContextHolder {
 
 const storage = new AsyncLocalStorage<AttemptContextHolder>();
 
+/**
+ * Framework-neutral identity for one nested operation.
+ *
+ * `spawnedTask` marks a task the framework started at runtime on behalf of its
+ * enclosing graph, such as a LangGraph `Send` task. A keyed activity inside
+ * one may take the position its key was preallocated at elsewhere in that
+ * enclosing graph; see `allocateActivityPosition`.
+ */
 export interface ChildOperationBoundary {
   name: string;
   occurrenceKey: string;
+  spawnedTask?: boolean;
 }
 
 export type OperationPathResolver = () => readonly ChildOperationBoundary[];
@@ -60,6 +69,14 @@ export class UnsupportedChildOperationFanOutError extends Error {
   }
 }
 
+/** One key was preallocated at two positions a spawned task could take. */
+export class AmbiguousActivityKeyError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "AmbiguousActivityKeyError";
+  }
+}
+
 type PathKey = string;
 
 function pathKeyFromSegments(
@@ -67,6 +84,18 @@ function pathKeyFromSegments(
 ): PathKey {
   return JSON.stringify(
     segments.map((segment) => [segment.name, Number(segment.ordinal)]),
+  );
+}
+
+function pathSegments(path: PathKey): [string, number][] {
+  return JSON.parse(path) as [string, number][];
+}
+
+/** Whether `path` is `scope` or lies inside it. */
+function within(path: PathKey, scope: PathKey): boolean {
+  const scopeSegments = pathSegments(scope);
+  return (
+    JSON.stringify(pathSegments(path).slice(0, scopeSegments.length)) === scope
   );
 }
 
@@ -211,6 +240,15 @@ class ActivityReconstruction {
 class ActivityOrdinalAllocator {
   private readonly nextByPath = new Map<PathKey, number>();
   private readonly byPathAndKey = new Map<string, number>();
+  private readonly preallocatedPathsByKey = new Map<string, PathKey[]>();
+  // Key -> spawning scope -> owner, for keys a spawned task took, so a later
+  // preallocation of the same key in that scope fails instead of having lost a
+  // race it would win on another attempt. Kept per scope so a take in one
+  // graph cannot hide a take in another.
+  private readonly takenBySpawnedTask = new Map<
+    string,
+    Map<PathKey, PathKey>
+  >();
   private readonly callsByScope = new WeakMap<object, number>();
 
   /** Count calls within one scope object, starting at 1. */
@@ -221,7 +259,63 @@ class ActivityOrdinalAllocator {
   }
 
   preallocate(path: PathKey, keys: readonly string[]): number[] {
-    return keys.map((key) => this.allocate(path, key));
+    return keys.map((key) => {
+      if (key === "") throw new Error("activity ordinal key must be non-empty");
+      for (const [scope, owner] of this.takenBySpawnedTask.get(key) ?? []) {
+        if (path !== owner && within(path, scope)) {
+          throw new AmbiguousActivityKeyError(
+            `activity key ${JSON.stringify(key)} was preallocated at two ` +
+              "positions in one graph; tool call ids must be unique within a turn",
+          );
+        }
+      }
+      if (!this.byPathAndKey.has(JSON.stringify([path, key]))) {
+        const paths = this.preallocatedPathsByKey.get(key) ?? [];
+        paths.push(path);
+        this.preallocatedPathsByKey.set(key, paths);
+      }
+      return this.allocate(path, key);
+    });
+  }
+
+  /**
+   * Return the path and ordinal for `key`, preferring where it was preallocated.
+   *
+   * Only an activity inside a spawned task (`spawningScope` is the path of the
+   * graph that spawned it) may move: a tool a model requested and that then
+   * runs in its own LangGraph `Send` task keeps the model's position. The key
+   * must have been preallocated exactly once within that scope, even when the
+   * tool runs in the task that preallocated it. Any other activity is
+   * allocated in `path`, so paths that contain no spawned task record exactly
+   * as they did before spawned tasks existed.
+   */
+  allocatePosition(
+    path: PathKey,
+    key: string | undefined,
+    spawningScope: PathKey | null,
+  ): [PathKey, number] {
+    if (key !== undefined && key !== "" && spawningScope !== null) {
+      // A key may legitimately be preallocated once per spawning graph, so
+      // only owners inside this task's spawning graph compete for it.
+      const owners = (this.preallocatedPathsByKey.get(key) ?? []).filter(
+        (candidate) => within(candidate, spawningScope),
+      );
+      if (owners.length > 1) {
+        throw new AmbiguousActivityKeyError(
+          `activity key ${JSON.stringify(key)} was preallocated at ` +
+            `${owners.length} positions in one graph; tool call ids must be ` +
+            "unique within a turn",
+        );
+      }
+      const owner = owners[0];
+      if (owner !== undefined) {
+        const takes = this.takenBySpawnedTask.get(key) ?? new Map();
+        takes.set(spawningScope, owner);
+        this.takenBySpawnedTask.set(key, takes);
+        return [owner, this.allocate(owner, key)];
+      }
+    }
+    return [path, this.allocate(path, key)];
   }
 
   allocate(path: PathKey, key?: string): number {
@@ -247,6 +341,7 @@ class ChildOperationPathAllocator {
   private readonly nextOrdinalByChild = new Map<string, number>();
   private readonly ordinalByOccurrence = new Map<string, number>();
   private readonly keysByStepChild = new Map<string, Set<string>>();
+  private readonly spawnedTaskPaths = new Set<PathKey>();
 
   /**
    * Assign ordinals to a complete sibling batch in list order, before
@@ -301,8 +396,22 @@ class ChildOperationPathAllocator {
           ordinal: BigInt(ordinal),
         }),
       );
+      if (boundary.spawnedTask === true) {
+        this.spawnedTaskPaths.add(pathKeyFromSegments(segments));
+      }
     }
     return create(OperationPathSchema, { segments });
+  }
+
+  /** Return the path of the graph that spawned the innermost task in `path`. */
+  spawningScope(path: PathKey): PathKey | null {
+    const segments = pathSegments(path);
+    for (let end = segments.length; end > 0; end -= 1) {
+      if (this.spawnedTaskPaths.has(JSON.stringify(segments.slice(0, end)))) {
+        return JSON.stringify(segments.slice(0, end - 1));
+      }
+    }
+    return null;
   }
 
   private assign(
@@ -588,6 +697,44 @@ export function allocateActivityOrdinal(key?: string): number {
   return holder.activityOrdinals.allocate(
     pathKeyFromSegments(currentOperationPath().segments),
     key,
+  );
+}
+
+/**
+ * Return the operation path and ordinal for a possibly preallocated `key`.
+ *
+ * Use this where the activity may run in a spawned task other than the one
+ * that preallocated its key; pass the returned path to the activity command.
+ */
+export function allocateActivityPosition(key?: string): {
+  operationPath: OperationPath;
+  activityOrdinal: number;
+} {
+  const holder = requireHolder("activity_ordinal");
+  const current = pathKeyFromSegments(currentOperationPath().segments);
+  const [path, activityOrdinal] = holder.activityOrdinals.allocatePosition(
+    current,
+    key,
+    holder.childPaths.spawningScope(current),
+  );
+  return {
+    operationPath: create(OperationPathSchema, {
+      segments: pathSegments(path).map(([name, ordinal]) =>
+        create(OperationPathSegmentSchema, { name, ordinal: BigInt(ordinal) }),
+      ),
+    }),
+    activityOrdinal,
+  };
+}
+
+/** Whether the current operation path runs inside a spawned task. */
+export function inSpawnedTask(): boolean {
+  const holder = activeHolder();
+  if (holder === undefined) return false;
+  return (
+    holder.childPaths.spawningScope(
+      pathKeyFromSegments(currentOperationPath().segments),
+    ) !== null
   );
 }
 

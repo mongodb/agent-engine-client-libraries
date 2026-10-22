@@ -10,10 +10,16 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections.abc import Callable
 from typing import Any, Dict, Optional
 
 import httpx
+
+from agent_engine_runner_shared.owner_callback import (
+    MAX_DISCARD_BYTES,
+    discard_budget_seconds,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -37,16 +43,37 @@ _DEFAULT_RETRYABLE_TRANSPORT_ERRORS = (
 )
 
 
+async def _discard_response_body(
+    response: httpx.Response, *, timeout: Any = httpx.USE_CLIENT_DEFAULT
+) -> None:
+    """Async twin of ``owner_callback.discard_response_body``; see it for the why.
+
+    Bounded by both the byte cap and the wall-clock budget — itself clamped to
+    the caller's per-request timeout — so a slow-drip peer cannot pin the
+    callback longer than the caller asked to wait.
+    """
+    deadline = time.monotonic() + discard_budget_seconds(timeout)
+    remaining = MAX_DISCARD_BYTES
+    async for chunk in response.aiter_raw():
+        remaining -= len(chunk)
+        if remaining < 0 or time.monotonic() >= deadline:
+            break
+
+
 async def _post_without_reading_response_body(
     client: httpx.AsyncClient,
     url: str,
     payload: Dict[str, Any],
 ) -> httpx.Response:
-    """POST without consuming the body, preserving the received status on close errors."""
+    """POST without exposing the body, preserving the received status on close errors.
+
+    The body is drained (never decoded or logged) so the pooled connection is
+    returned to the AER's cached client instead of being closed.
+    """
     response: httpx.Response | None = None
     try:
         async with client.stream("POST", url, json=payload, follow_redirects=False) as response:
-            pass
+            await _discard_response_body(response, timeout=client.timeout)
     except Exception:
         if response is None:
             raise

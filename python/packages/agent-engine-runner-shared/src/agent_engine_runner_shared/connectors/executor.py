@@ -39,6 +39,9 @@ MAX_RETRIES = 3
 # Mirrors the classifier's envelope cap: only a body small enough to be parsed
 # as a provider error envelope is retained on a raised HTTP error.
 MAX_ERROR_ENVELOPE_BYTES = 4096
+# Sent when the connector supplies none: the bare transport skips httpx.Client,
+# which normally adds one, and some providers refuse requests without it.
+USER_AGENT = "agent-engine-connector"
 
 
 def _origin(url: httpx.URL) -> tuple[str, str, int | None]:
@@ -83,9 +86,15 @@ class ConnectorExecutor:
         ):
             raise ValueError("connector path credential must be materialized before execution")
         self._operations = {tool.name: tool for tool in self._definitions.tools}
-        # The transport provides pooling without Client's cookie or redirect state.
+        # The transport provides pooling without Client's cookie or redirect state,
+        # and ignores proxy and netrc settings. Trust still follows SSL_CERT_FILE /
+        # SSL_CERT_DIR so a TLS-inspecting gateway's CA (`agentengine dev up
+        # --ca-bundle`) is honoured; the process environment is tenant-owned, so
+        # this trusts nothing the tenant could not already change in-process.
         self._transport = (
-            transport if transport is not None else httpx.HTTPTransport(trust_env=False)
+            transport
+            if transport is not None
+            else httpx.HTTPTransport(trust_env=False, verify=httpx.create_ssl_context())
         )
         self._timeout_seconds = timeout_seconds
 
@@ -187,6 +196,8 @@ class ConnectorExecutor:
         content, content_type = self._request_body(tool, arguments)
         if content_type:
             headers["Content-Type"] = content_type
+        if not any(name.lower() == "user-agent" for name in headers):
+            headers["User-Agent"] = USER_AGENT
         url = httpx.URL(base_url + path)
         if query:
             url = url.copy_merge_params(query)

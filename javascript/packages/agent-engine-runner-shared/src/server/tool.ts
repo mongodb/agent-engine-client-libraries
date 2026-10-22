@@ -53,6 +53,7 @@ import {
 } from "../models.js";
 import { redactText } from "../error_reporting.js";
 import { evaluateGuardrailCheck } from "../guardrails_evaluator/index.js";
+import { evaluateGuardrailCheckTraced } from "./guardrail_span.js";
 import { SecureLLMProxy } from "../secure_llm_proxy.js";
 import { closeAllTLSAgents } from "../tls_client.js";
 import {
@@ -848,7 +849,9 @@ export class ToolServer extends BaseServer {
       // there is no abort channel to signal; a drain waits it out.
       this.drainRegistry.beginWork(body.execution_id);
       try {
-        return reply.send(await this.handleGuardrailsCheck(body));
+        return reply.send(
+          await this.handleGuardrailsCheck(body, request.headers),
+        );
       } finally {
         this.drainRegistry.endWork(body.execution_id);
       }
@@ -857,8 +860,11 @@ export class ToolServer extends BaseServer {
 
   private handleGuardrailsCheck = withMetrics(
     "tool_pod_guardrails_check",
-    (request: GuardrailCheckRequest): GuardrailCheckResponse =>
-      evaluateGuardrailCheck(request),
+    (
+      request: GuardrailCheckRequest,
+      headers: Record<string, string | string[] | undefined>,
+    ): GuardrailCheckResponse =>
+      evaluateGuardrailCheckTraced(headers, request, evaluateGuardrailCheck),
     { recordErrors: false },
   );
 

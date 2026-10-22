@@ -3555,6 +3555,7 @@ const SessionMessageSchema: ZodObject<{
   content: ZodString;
   id: ZodString;
   name: ZodDefault<ZodString>;
+  outcome: ZodDefault<ZodString>;
   role: ZodString;
   session_id: ZodString;
   timestamp: ZodString;
@@ -3597,6 +3598,7 @@ const SessionMessagesResponseSchema: ZodObject<{
      content: ZodString;
      id: ZodString;
      name: ZodDefault<ZodString>;
+     outcome: ZodDefault<ZodString>;
      role: ZodString;
      session_id: ZodString;
      timestamp: ZodString;
@@ -3617,6 +3619,7 @@ const SessionMessagesResponseSchema: ZodObject<{
         type?: ...;
      }>>>>>;
   }, $strip>>;
+  outcome_supported: ZodDefault<ZodBoolean>;
 }, $strip>;
 ```
 

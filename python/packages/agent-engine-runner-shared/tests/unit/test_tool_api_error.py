@@ -329,13 +329,64 @@ def test_non_string_error_code_ignored():
     assert error.reason == "ok"
 
 
-def test_no_json_body_does_not_set_error_code():
-    exc = _status_error(403, text="plain text body")
-    result = classify_tool_api_error(exc, "atlas")
+def test_plain_text_body_becomes_the_reason():
+    """A provider that refuses with a bare sentence, whatever content type it
+    declares, still tells the agent why; the trailing documentation links go."""
+    body = (
+        b"\r\nRequest forbidden by administrative rules. Please make sure your request"
+        b" has a User-Agent header (https://docs.github.com/en/rest/using-the-rest-api"
+        b"/troubleshooting-the-rest-api#user-agent-required). Check"
+        b" https://developer.github.com for other possible causes.\r\n"
+    )
+    reason = (
+        "Request forbidden by administrative rules. Please make sure your request"
+        " has a User-Agent header"
+    )
+    request = httpx.Request("GET", "https://api.example.com/resource")
+    response = httpx.Response(
+        403, content=body, headers={"content-type": "text/html"}, request=request
+    )
+    exc = httpx.HTTPStatusError("HTTP 403", request=request, response=response)
+    result = classify_tool_api_error(exc, "svc")
     assert result is not None
-    error, _ = result
+    error, message = result
     assert error.error_code is None
-    assert error.reason is None
+    assert error.reason == reason
+    assert message == f"svc API call failed: HTTP 403 AUTH_FAILED — {reason}"
+
+
+@pytest.mark.parametrize(
+    ("content", "credentials", "reason"),
+    [
+        (b"first line\r\n\tsecond line", [], "first line second line"),
+        (b"Rejected credential sk-live-123", ["sk-live-123"], "Rejected credential <redacted>"),
+        (b"Rejected credential alpha  bravo", ["alpha  bravo"], "Rejected credential <redacted>"),
+        (
+            b"sk-live-123: authentication failed",
+            ["sk-live-123"],
+            "<redacted>: authentication failed",
+        ),
+        (b"Denied; see https://docs.example/auth", ["/"], "Denied; see"),
+        ("bad \ufffd replaced".encode(), [], None),
+        (b"https://internal.example/private", [], None),
+        (b"Blocked by policy; see //internal.example/x", [], "Blocked by policy; see"),
+        (b"Blocked https:/\x00/evil.example", [], "Blocked"),
+        (b"<html><body><h1>403 Forbidden</h1></body></html>", [], None),
+        (b"  <!DOCTYPE html><title>Blocked</title>", [], None),
+        (b"bad \xff\xfe bytes", [], None),
+        (b"   ", [], None),
+    ],
+)
+def test_plain_text_reason_gets_envelope_hygiene(content, credentials, reason):
+    """Plain text is as untrusted as a JSON message: it gets the same cleanup and
+    keeps only the text before its first link, and an HTML page or undecodable
+    body supplies no reason at all."""
+    request = httpx.Request("GET", "https://api.example.com/resource")
+    response = httpx.Response(403, content=content, request=request)
+    exc = httpx.HTTPStatusError("HTTP 403", request=request, response=response)
+    result = classify_tool_api_error(exc, "svc", credentials=credentials)
+    assert result is not None
+    assert result[0].reason == reason
 
 
 def test_non_http_exception_returns_none():

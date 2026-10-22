@@ -41,7 +41,7 @@ _SECRET_INLINE_PATTERN = re.compile(
     r"([\"']?\s*[=:]\s*)"
     r"(\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|\"(?:\\.|[^\"\\])*$|'(?:\\.|[^'\\])*$|[^\s,]+(?:,(?!\s*[\"']?[A-Za-z0-9_.\-]+[\"']?\s*[=:])[^\s,]+)*)"
 )
-_BEARER_PATTERN = re.compile(r"(?i)\b(bearer)\s+[A-Za-z0-9._\-]+")
+_BEARER_PATTERN = re.compile(r"(?i)\b(bearer)\s+[A-Za-z0-9._\-+/=~]+")
 # Key-name blocklist for structured payloads: a bare secret under a
 # secret-named field matches no inline content pattern, so the field name
 # itself must trigger masking.

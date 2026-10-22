@@ -7,7 +7,7 @@ history as their replay source.
 from __future__ import annotations
 
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterable
 from typing import Any, cast
 
 from langchain_core.messages import BaseMessage
@@ -18,7 +18,10 @@ from langgraph.types import Interrupt, Overwrite, StateSnapshot, StateUpdate
 from pydantic import BaseModel, ConfigDict, Field
 
 from agent_engine_sdk_langgraph.cancelled_turn import (
+    CANCELLED_TURN_MESSAGE_ID_METADATA_KEY,
+    CANCELLED_TURN_MESSAGE_IDS_METADATA_KEY,
     CANCELLED_TURN_METADATA_KEY,
+    cancelled_opener_ids_from_metadata,
     clear_queued_tasks,
     terminalize_versions_seen,
 )
@@ -267,8 +270,14 @@ def _replay_writer_node(graph: Any) -> str:
 async def checkpoint_replay_plan(
     graph: CompiledStateGraph[Any, Any, Any, Any],
     source: LangGraphCheckpoint,
-) -> list[list[StateUpdate]]:
-    """Build the copyable superstep plan, or raise before any dest write."""
+) -> tuple[list[list[StateUpdate]], list[str]]:
+    """Build the copyable superstep plan, or raise before any dest write.
+
+    Returns the supersteps and every cancelled-opener id the source history
+    records. Replay rebuilds checkpoints and drops per-turn marker metadata, so
+    the caller re-records this set on the copy — otherwise a forked stopped
+    turn would lose its badge.
+    """
     source_config: RunnableConfig = {
         "configurable": {
             "thread_id": source.thread_id,
@@ -282,6 +291,7 @@ async def checkpoint_replay_plan(
     if selected.next or selected.tasks:
         raise RuntimeError("LangGraph branch point must be a completed root checkpoint")
     supersteps: list[list[StateUpdate]] = []
+    cancelled_openers: list[str] = []
     for snapshot in reversed(
         [item async for item in _checkpoint_history(graph, source_config)]
     ):
@@ -289,6 +299,9 @@ async def checkpoint_replay_plan(
         if isinstance(snapshot_metadata, dict) and snapshot_metadata.get(
             CANCELLED_TURN_METADATA_KEY
         ):
+            cancelled_openers.extend(
+                sorted(cancelled_opener_ids_from_metadata(snapshot_metadata))
+            )
             updates = _cancelled_tip_updates(snapshot, _replay_writer_node(graph))
         else:
             updates = _state_updates(snapshot)
@@ -296,13 +309,17 @@ async def checkpoint_replay_plan(
             supersteps.append(updates)
     if not supersteps:
         raise RuntimeError("LangGraph branch point has no checkpoint history")
-    return supersteps
+    return supersteps, cancelled_openers
 
 
 async def _terminalize_copied_marker_tip(
-    graph: CompiledStateGraph[Any, Any, Any, Any], thread_id: str
+    graph: CompiledStateGraph[Any, Any, Any, Any],
+    thread_id: str,
+    *,
+    cancelled_message_id: Any = None,
+    cancelled_openers: Iterable[str] = (),
 ) -> None:
-    """Close the copied marker tip's artificially-triggered work.
+    """Close the copied tip and record the thread's cancelled openers on it.
 
     Replaying a marker tip applies its message state wholesale (no task
     writes), so nodes that never ran in the source have no ``versions_seen``
@@ -311,6 +328,11 @@ async def _terminalize_copied_marker_tip(
     check rejects a non-terminal tip. The written tip keeps the marker: it is
     itself an authoritative-values, writes-less checkpoint and must replay as
     one when the fork becomes a fork source.
+
+    ``cancelled_message_id`` is the source tip's opener id and
+    ``cancelled_openers`` every opener the source history recorded. Replay drops
+    the per-turn marker metadata, so the copy re-records them here — the reader
+    derives the outcome from this metadata, not from the message.
     """
     checkpointer = graph.checkpointer
     if checkpointer is None or isinstance(checkpointer, bool):
@@ -342,6 +364,11 @@ async def _terminalize_copied_marker_tip(
         "parents": {},
         CANCELLED_TURN_METADATA_KEY: True,
     }
+    if isinstance(cancelled_message_id, str) and cancelled_message_id:
+        metadata[CANCELLED_TURN_MESSAGE_ID_METADATA_KEY] = cancelled_message_id
+    carried = sorted({opener for opener in cancelled_openers if opener})
+    if carried:
+        metadata[CANCELLED_TURN_MESSAGE_IDS_METADATA_KEY] = carried
     await saver.aput(
         {
             "configurable": {
@@ -361,7 +388,7 @@ async def copy_checkpoint(
     target_config: RunnableConfig,
     source: LangGraphCheckpoint,
     *,
-    plan: list[list[StateUpdate]] | None = None,
+    plan: tuple[list[list[StateUpdate]], list[str]] | None = None,
 ) -> None:
     """Rebuild ``source`` in the empty thread named by ``target_config``."""
     checkpointer = graph.checkpointer
@@ -375,7 +402,7 @@ async def copy_checkpoint(
     ):
         raise RuntimeError("LangGraph branch destination thread is not empty")
 
-    supersteps = (
+    supersteps, cancelled_openers = (
         plan if plan is not None else await checkpoint_replay_plan(graph, source)
     )
     source_config: RunnableConfig = {
@@ -394,10 +421,23 @@ async def copy_checkpoint(
     }
     copied_config = await graph.abulk_update_state(destination_config, supersteps)
     selected_metadata = getattr(selected, "metadata", None)
-    if isinstance(selected_metadata, dict) and selected_metadata.get(
-        CANCELLED_TURN_METADATA_KEY
-    ):
-        await _terminalize_copied_marker_tip(graph, target_thread_id)
+    marker_tip = isinstance(selected_metadata, dict) and bool(
+        selected_metadata.get(CANCELLED_TURN_METADATA_KEY)
+    )
+    # Re-record the source's cancelled openers on the copy whenever the history
+    # held any — not only when the tip itself is a marker — so a fork of later
+    # history keeps every earlier stopped turn classified.
+    if marker_tip or cancelled_openers:
+        await _terminalize_copied_marker_tip(
+            graph,
+            target_thread_id,
+            cancelled_message_id=(
+                selected_metadata.get(CANCELLED_TURN_MESSAGE_ID_METADATA_KEY)
+                if isinstance(selected_metadata, dict)
+                else None
+            ),
+            cancelled_openers=cancelled_openers,
+        )
         copied = await graph.aget_state(
             {"configurable": {"thread_id": target_thread_id, "checkpoint_ns": ""}}
         )

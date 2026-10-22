@@ -22,7 +22,7 @@ from typing import (
     get_type_hints,
 )
 
-from agents import AgentsException, FunctionTool
+from agents import AgentsException, FunctionTool, default_tool_error_function
 from agents.function_schema import FuncSchema, function_schema
 from agents.tool import set_function_tool_failure_error_function
 from agents.tool_context import ToolContext
@@ -31,8 +31,11 @@ from pydantic_core import to_jsonable_python
 from agent_engine_runner_shared.secure_llm_proxy import GuardrailReviewPending
 from agent_engine_runner_shared.secure_wrapper import (
     CALL_INTERRUPTED_ARTIFACT_KEY,
+    ToolExecutionError,
+    ToolPlatformError,
     create_secure_tool_function,  # pyright: ignore[reportUnknownVariableType]
 )
+from agent_engine_runner_shared.workflow import UnknownOutcomePolicy
 from agent_engine_runner_shared.workflow.context import ChildOperationBoundary
 from agent_engine_sdk_openai_agents.errors import UnsupportedDurableOpenAIAgentsError
 
@@ -392,6 +395,16 @@ class SecureToolInvoker:
             # The SDK would store a non-string result as its Python repr;
             # durable history needs text the next turn can read back.
             return json_text(content)
+        except ToolPlatformError as error:
+            # The platform failed, perhaps after the tool already ran; told it
+            # failed, the model could call it again.
+            raise ToolCallFailed(error) from error
+        except ToolExecutionError as error:
+            # The tool itself failed. Tell the model, as the OpenAI Agents SDK
+            # does by default. OE records the failure, so a replay sends the
+            # model the same text. Only the tool's message is passed on, not
+            # the wrapper's "Tool execution error:" prefix.
+            return default_tool_error_function(context, Exception(error.error))
         except Exception as error:
             raise ToolCallFailed(error) from error
 
@@ -405,6 +418,7 @@ def secure_function_tool(
     allow_direct: bool,
     issuer: object,
     needs_approval: bool = False,
+    on_unknown_outcome: UnknownOutcomePolicy | None = None,
 ) -> FunctionTool:
     """Build the native FunctionTool the agent sees for a registered tool."""
     secure: Callable[..., Any] = create_secure_tool_function(  # type: ignore[no-untyped-call]
@@ -416,6 +430,7 @@ def secure_function_tool(
         # Carries OE's authenticated stopped-call marker beside the content.
         response_format="content_and_artifact",
         tool_declared_format="content",
+        on_unknown_outcome=on_unknown_outcome,
     )
 
     def parse(arguments: str) -> dict[str, Any]:
@@ -431,8 +446,9 @@ def secure_function_tool(
         strict_json_schema=True,
         needs_approval=needs_approval,
     )
-    # By default the SDK turns a failed or cancelled tool into model-visible
-    # text. Durable tool failures and OE control flow must fail the turn instead.
+    # The SDK's own handler would also turn a cancelled call and OE control
+    # flow into text for the model; SecureToolInvoker reports only a failed
+    # tool, and everything else fails the turn.
     return set_function_tool_failure_error_function(tool, None)
 
 

@@ -26,7 +26,10 @@ from agent_engine_runner_shared.context import (
     set_execution_context,
 )
 from agent_engine_runner_shared.models import ToolExecuteResponse
-from agent_engine_runner_shared.secure_wrapper import SecureToolWrapper
+from agent_engine_runner_shared.secure_wrapper import (
+    SecureToolWrapper,
+    ToolExecutionError,
+)
 
 
 class _NativeInterruptParser(LangGraphOutputParser):
@@ -283,6 +286,94 @@ async def test_tool_result_suspend_resumes_with_decision_as_tool_result() -> Non
     assert [event.event for event in events] == ["result"]
     assert received == [decision]
     assert request_approval.call_count == 2
+
+
+_OAUTH_CHALLENGE = ToolExecuteResponse.model_validate(
+    {
+        "proceed": False,
+        "status": "suspend",
+        "elicitation": {
+            "elicitation_id": "flow-1",
+            "authorization_url": "https://idp.example.com/authorize",
+            "message": "Connect your account to continue",
+            "created": True,
+        },
+    }
+)
+_OAUTH_RESOURCE = ToolExecuteResponse(
+    proceed=True, status="success", result='["qualification-repo"]', duration_ms=1
+)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("approvals", "expected"),
+    [
+        # Continue pressed before consent: the resumed node is challenged
+        # again, and once more after interrupt() returns the answer.
+        (
+            [_OAUTH_CHALLENGE] * 3,
+            "error: Tool execution error: OAuth authorization is still required after continuation",
+        ),
+        # Continue pressed after consent: the resumed node's gate proceeds.
+        ([_OAUTH_CHALLENGE, _OAUTH_RESOURCE], '["qualification-repo"]'),
+    ],
+)
+async def test_oauth_tool_resumed_by_continue_never_returns_none(
+    approvals: list[ToolExecuteResponse], expected: str
+) -> None:
+    app = App(app_name="Native OAuth continuation test")
+    app._runtime.mode = RuntimeMode.AER
+    app._register_hooks()
+    wrapper = SecureToolWrapper(oe_url="http://oe:8000", execution_id="exec-oauth")
+    received: list[Any] = []
+
+    def tool_node(state: MessagesState) -> dict[str, Any]:
+        try:
+            received.append(
+                wrapper.execute_tool(
+                    "list_repos",
+                    {},
+                    provider_type="keycloak",
+                    scopes=["repo"],
+                    is_local=False,
+                )
+            )
+        except ToolExecutionError as error:
+            received.append(f"error: {error}")
+        return {"messages": [AIMessage(content="tool done")]}
+
+    builder = StateGraph(MessagesState)
+    builder.add_node("tool", tool_node)
+    builder.add_edge(START, "tool")
+    builder.add_edge("tool", END)
+    agent = LangGraphBaseAgent(builder.compile(checkpointer=InMemorySaver()))
+    tokens = set_execution_context(
+        execution_id="exec-oauth", wrapper=wrapper, oe_url="http://oe:8000"
+    )
+    try:
+        with patch(
+            "agent_engine_runner_shared.secure_wrapper.request_oe_approval",
+            side_effect=approvals,
+        ) as request_approval:
+            data, metadata = await _suspend(agent, "oauth-continue")
+            assert (
+                data["interrupts"][0]["value"]["suspend_reason"]
+                == "authorization_required"
+            )
+            events = await _resume(
+                agent,
+                "oauth-continue",
+                metadata,
+                {data["interrupts"][0]["id"]: {"decision": "approve"}},
+            )
+    finally:
+        clear_execution_context(tokens)
+        hooks.reset_hooks()
+
+    assert [event.event for event in events] == ["result"]
+    assert received == [expected]
+    assert request_approval.call_count == len(approvals)
 
 
 @pytest.mark.anyio

@@ -32,7 +32,6 @@ from agent_engine_runner_shared.custom_events import (
     FeatureOffCustomEventTransport,
     custom_event_transport,
 )
-from agent_engine_runner_shared.workflow import operation_path_resolver_scope
 
 _logger = logging.getLogger(__name__)
 
@@ -150,5 +149,5 @@ async def scoped_anext(
         # lifetime could be entered in one task and reset in another. Scoping
         # each __anext__ keeps both operations in the task that executes that
         # iteration while still covering all graph work.
-        with operation_path_resolver_scope(resolver):
+        with resolver.scope(session.send_tasks):
             return await anext(stream)

@@ -16,6 +16,7 @@ from agent_engine_runner_shared.generated.workflow.v1.activity_pb2 import (
     ACTIVITY_OUTCOME_KIND_SUSPENDED,
     ActivityContext,
     ActivityOutcome,
+    ActivitySuspension,
 )
 from agent_engine_runner_shared.generated.workflow.v1.common_pb2 import (
     WORKFLOW_ERROR_CODE_CONFLICT,
@@ -29,6 +30,7 @@ from agent_engine_runner_shared.generated.workflow.v1.common_pb2 import (
 from agent_engine_runner_shared.generated.workflow.v1.runtime_pb2 import AttemptContext
 from agent_engine_runner_shared.workflow import WorkflowClientError
 from agent_engine_runner_shared.workflow.activity import (
+    OAUTH_FRONTIER_INTERRUPT_REASON,
     DurableActivityControlFlow,
     DurableActivityDeniedError,
     DurableActivityInterrupted,
@@ -93,6 +95,45 @@ class TestBuildActivityCommand:
         assert value_to_json(command.semantic_input) == {
             "messages": [{"role": "user", "content": "hi"}]
         }
+
+    @pytest.mark.parametrize(
+        ("declared", "wire"),
+        [
+            (None, "UNKNOWN_OUTCOME_POLICY_UNSPECIFIED"),
+            ("fail", "UNKNOWN_OUTCOME_POLICY_FAIL"),
+            ("rerun", "UNKNOWN_OUTCOME_POLICY_RERUN"),
+        ],
+    )
+    def test_carries_the_declared_unknown_outcome_policy(
+        self, declared: str | None, wire: str
+    ) -> None:
+        from agent_engine_runner_shared.generated.workflow.v1.activity_pb2 import (
+            UnknownOutcomePolicy,
+        )
+
+        command = build_activity_command(
+            attempt=_attempt(),
+            kind=ACTIVITY_KIND_TOOL,
+            name="lookup_policy",
+            activity_ordinal=1,
+            step_ordinal=1,
+            semantic_input={"arguments": {}},
+            on_unknown_outcome=declared,  # type: ignore[arg-type]
+        )
+
+        assert UnknownOutcomePolicy.Name(command.on_unknown_outcome) == wire
+
+    def test_rejects_an_unknown_outcome_policy_it_does_not_know(self) -> None:
+        with pytest.raises(ValueError, match="on_unknown_outcome"):
+            build_activity_command(
+                attempt=_attempt(),
+                kind=ACTIVITY_KIND_TOOL,
+                name="lookup_policy",
+                activity_ordinal=1,
+                step_ordinal=1,
+                semantic_input={"arguments": {}},
+                on_unknown_outcome="retry",  # type: ignore[arg-type]
+            )
 
     def test_requires_workflow_identity(self) -> None:
         with pytest.raises(WorkflowClientError) as raised:
@@ -273,6 +314,73 @@ class TestRunSerialActivity:
 
         assert result == {"cached": True}
         assert calls == []
+        assert client.outcomes == []
+
+    @pytest.mark.parametrize(
+        ("kind", "reason", "enabled", "shared", "expected"),
+        [
+            (ACTIVITY_OUTCOME_KIND_COMPLETED, None, True, False, "result"),
+            (ACTIVITY_OUTCOME_KIND_COMPLETED, "agent_interrupt", False, True, "result"),
+            (ACTIVITY_OUTCOME_KIND_COMPLETED, "agent_interrupt", True, False, "result"),
+            (ACTIVITY_OUTCOME_KIND_COMPLETED, "external_wait", True, True, "result"),
+            (ACTIVITY_OUTCOME_KIND_COMPLETED, "agent_interrupt", True, True, "interrupt"),
+            (ACTIVITY_OUTCOME_KIND_DENIED, "agent_interrupt", True, True, "denied"),
+            (ACTIVITY_OUTCOME_KIND_FAILED, "agent_interrupt", True, True, "failed"),
+            (ACTIVITY_OUTCOME_KIND_SUSPENDED, "agent_interrupt", True, True, "suspended"),
+        ],
+    )
+    def test_historical_local_reconstruction_is_limited_to_completed_native_waits(
+        self, kind, reason, enabled, shared, expected
+    ) -> None:
+        """Ordinary effects and rejected waits must never dispatch under the local replay option."""
+        from agent_engine_runner_shared.workflow import attempt_context_scope
+        from agent_engine_runner_shared.workflow.client import ActivityReplay
+
+        recorded = completed_outcome(_context(), "recorded-result")
+        recorded.outcome_kind = kind
+        if reason is not None:
+            recorded.suspension.CopyFrom(ActivitySuspension(reason=reason))
+        if kind in (ACTIVITY_OUTCOME_KIND_DENIED, ACTIVITY_OUTCOME_KIND_FAILED):
+            recorded.error.message = "recorded-failure"
+        if shared and reason == "agent_interrupt":
+            recorded.suspension.reason = OAUTH_FRONTIER_INTERRUPT_REASON
+        client = _FakeClient(ActivityReplay(outcome=recorded))
+        calls = []
+        control = RuntimeError("native-pause")
+
+        def execute(context):
+            """Observe actual callback dispatch, then reproduce the native control boundary."""
+            calls.append(context.activity_id)
+            raise DurableActivityInterrupted(control)
+
+        def run():
+            """Use the real activity helper with an explicit captured-local replay contract."""
+            return run_serial_activity(
+                client=client,
+                kind=ACTIVITY_KIND_TOOL,
+                name="choice",
+                activity_ordinal=1,
+                step_ordinal=1,
+                semantic_input={},
+                execute=execute,
+                replay_local_wait=(lambda context, outcome: execute(context)) if enabled else None,
+            )
+
+        with attempt_context_scope(_attempt()):
+            if expected == "result":
+                assert run() == "recorded-result"
+            else:
+                error = {
+                    "interrupt": RuntimeError,
+                    "denied": DurableActivityDeniedError,
+                    "failed": ReplayedActivityFailedError,
+                    "suspended": DurableActivitySuspended,
+                }[expected]
+                with pytest.raises(error) as raised:
+                    run()
+                if expected == "interrupt":
+                    assert raised.value is control
+        assert calls == (["activity-1"] if expected == "interrupt" else [])
         assert client.outcomes == []
 
     def test_framework_interrupt_replay_reenters_the_activity(self) -> None:

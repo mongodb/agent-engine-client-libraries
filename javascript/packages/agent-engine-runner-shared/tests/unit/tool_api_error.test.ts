@@ -39,6 +39,23 @@ function nativeResponseError(
   return e;
 }
 
+function textResponseError(status: number, body: Uint8Array | string): Error {
+  const e = new Error(`HTTP ${status}`) as Error & { response: Response };
+  e.response = new Response(body, {
+    status,
+    headers: { "Content-Type": "text/html; charset=utf-8" },
+  });
+  return e;
+}
+
+function axiosTextError(status: number, data: string): Error {
+  const e = new Error(`Request failed with status code ${status}`) as Error & {
+    response: { status: number; data: string };
+  };
+  e.response = { status, data };
+  return e;
+}
+
 function fetchFailedError(cause: { code: string }): TypeError {
   const e = new TypeError("fetch failed") as TypeError & { cause: unknown };
   e.cause = cause;
@@ -364,4 +381,90 @@ describe("classifyToolAPIError — security", () => {
       "External API call failed: HTTP 503 PROVIDER_UNAVAILABLE",
     );
   });
+
+  test("surfaces a plain-text body as the reason", async () => {
+    const body =
+      "\r\nRequest forbidden by administrative rules. Please make sure your request" +
+      " has a User-Agent header (https://docs.github.com/en/rest/using-the-rest-api" +
+      "/troubleshooting-the-rest-api#user-agent-required). Check" +
+      " https://developer.github.com for other possible causes.\r\n";
+    const reason =
+      "Request forbidden by administrative rules. Please make sure your request" +
+      " has a User-Agent header";
+    const result = await classifyToolAPIError(
+      textResponseError(403, body),
+      "svc",
+    );
+    expect(result?.toolApiError.error_code).toBeNull();
+    expect(result?.toolApiError.reason).toBe(reason);
+    expect(result?.message).toBe(
+      `svc API call failed: HTTP 403 AUTH_FAILED — ${reason}`,
+    );
+  });
+
+  test("surfaces an Axios string body as the reason", async () => {
+    const result = await classifyToolAPIError(
+      axiosTextError(403, "Forbidden by policy"),
+    );
+    expect(result?.toolApiError.reason).toBe("Forbidden by policy");
+
+    // Axios decodes leniently, so an undecodable body arrives as replacement
+    // characters and must supply no reason.
+    const replaced = await classifyToolAPIError(
+      axiosTextError(403, "bad \ufffd\ufffd bytes"),
+    );
+    expect(replaced?.toolApiError.reason).toBeNull();
+  });
+
+  test.each([
+    ["first line\r\n\tsecond line", [], "first line second line"],
+    [
+      "Rejected credential sk-live-123",
+      ["sk-live-123"],
+      "Rejected credential <redacted>",
+    ],
+    [
+      "Rejected credential alpha  bravo",
+      ["alpha  bravo"],
+      "Rejected credential <redacted>",
+    ],
+    [
+      "sk-live-123: authentication failed",
+      ["sk-live-123"],
+      "<redacted>: authentication failed",
+    ],
+    ["Denied; see https://docs.example/auth", ["/"], "Denied; see"],
+    ["bad \ufffd replaced", [], null],
+    ["https://internal.example/private", [], null],
+    [
+      "Blocked by policy; see //internal.example/x",
+      [],
+      "Blocked by policy; see",
+    ],
+    ["Blocked https:/\u0000/evil.example", [], "Blocked"],
+    ["<html><body><h1>403 Forbidden</h1></body></html>", [], null],
+    ["  <!DOCTYPE html><title>Blocked</title>", [], null],
+    [new Uint8Array([0x62, 0x61, 0x64, 0x20, 0xff, 0xfe]), [], null],
+    ["   ", [], null],
+    ["x".repeat(5000), [], null],
+  ])(
+    "plain-text reason gets envelope hygiene (%#)",
+    async (content, credentials, reason) => {
+      const result = await classifyToolAPIError(
+        textResponseError(403, content),
+        "svc",
+        credentials,
+      );
+      expect(result?.toolApiError.reason).toBe(reason);
+      if (typeof content === "string") {
+        // Axios hands over the same text already decoded.
+        const axios = await classifyToolAPIError(
+          axiosTextError(403, content),
+          "svc",
+          credentials,
+        );
+        expect(axios?.toolApiError.reason).toBe(reason);
+      }
+    },
+  );
 });

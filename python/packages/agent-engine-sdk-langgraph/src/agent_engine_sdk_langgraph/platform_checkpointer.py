@@ -57,7 +57,7 @@ from langgraph.checkpoint.base import (
 )
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.errors import GraphInterrupt
-from langgraph.types import Interrupt, Send
+from langgraph.types import Interrupt
 
 from agent_engine_runner_shared.workflow import current_cancelled_history
 from .durable_errors import UnsupportedDurableGraphError
@@ -82,7 +82,6 @@ _REJECTED_PUT_SOURCES = frozenset({"update", "fork"})
 # checkpoint format, so changing it invalidates forks of older checkpoints.
 OE_STEP_ORDINAL_METADATA_KEY = "agent_engine_oe_step_ordinal"
 _DIRECT_INTERRUPT_ACTIVITY_NAME = "langgraph.interrupt"
-_PREGEL_TASKS_CHANNEL = "__pregel_tasks"
 
 
 def is_direct_interrupt_activity(activity: InterruptedActivity) -> bool:
@@ -200,39 +199,6 @@ class PlatformCheckpointer(BaseCheckpointSaver[str]):
         super().__init__()
         self.native = native
         self._scratch = scratch if scratch is not None else InMemorySaver()
-
-    def _reject_unsupported_send(self, writes: Sequence[tuple[str, Any]]) -> None:
-        """Reject application-authored dynamic fan-out in durable graphs."""
-        for channel, value in writes:
-            if channel != _PREGEL_TASKS_CHANNEL:
-                continue
-            packets = value if isinstance(value, (list, tuple)) else (value,)
-            if any(isinstance(packet, Send) for packet in packets):
-                raise UnsupportedDurableGraphError(
-                    "LangGraph Send is not supported on durable_workflow sessions; "
-                    "use fixed graph edges, compiled subgraphs, or Deep Agent task "
-                    "delegation"
-                )
-
-    def _reject_checkpoint_send(self, checkpoint: Checkpoint) -> None:
-        """Reject Send where LangGraph synchronously commits the producer step.
-
-        LangGraph backgrounds ``put_writes`` for this channel and can start a
-        PUSH worker before that callback fails. Under sync durability, ``put``
-        is the blocking boundary before the next step begins.
-        """
-        channel_values = checkpoint.get("channel_values") or {}
-        candidates = (
-            channel_values.get(_PREGEL_TASKS_CHANNEL),
-            checkpoint.get("pending_sends"),
-        )
-        self._reject_unsupported_send(
-            [
-                (_PREGEL_TASKS_CHANNEL, candidate)
-                for candidate in candidates
-                if candidate
-            ]
-        )
 
     # ----- scratch lifecycle -----
 
@@ -609,7 +575,6 @@ class PlatformCheckpointer(BaseCheckpointSaver[str]):
             return self._require_native().put(
                 config, checkpoint, metadata, new_versions
             )
-        self._reject_checkpoint_send(checkpoint)
         self._reject_durable_put_source(metadata)
         durable_config = self._durable_config(config, context)
         durable_metadata = self._durable_metadata(metadata, durable_config)
@@ -630,7 +595,6 @@ class PlatformCheckpointer(BaseCheckpointSaver[str]):
         if context is None:
             self._require_native().put_writes(config, writes, task_id, task_path)
             return
-        self._reject_unsupported_send(writes)
         self._record_direct_interrupts(context, config, writes, task_path)
         self._scratch.put_writes(
             self._durable_config(config, context), writes, task_id, task_path
@@ -700,7 +664,6 @@ class PlatformCheckpointer(BaseCheckpointSaver[str]):
             return await self._require_native().aput(
                 config, checkpoint, metadata, new_versions
             )
-        self._reject_checkpoint_send(checkpoint)
         self._reject_durable_put_source(metadata)
         durable_config = self._durable_config(config, context)
         durable_metadata = self._durable_metadata(metadata, durable_config)
@@ -723,7 +686,6 @@ class PlatformCheckpointer(BaseCheckpointSaver[str]):
         if context is None:
             await self._require_native().aput_writes(config, writes, task_id, task_path)
             return
-        self._reject_unsupported_send(writes)
         self._record_direct_interrupts(context, config, writes, task_path)
         await self._scratch.aput_writes(
             self._durable_config(config, context), writes, task_id, task_path

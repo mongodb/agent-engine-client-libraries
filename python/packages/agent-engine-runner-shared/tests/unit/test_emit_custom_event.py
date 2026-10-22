@@ -63,7 +63,7 @@ async def test_tool_transport_feature_off_fails_closed() -> None:
     tokens = _set_tool_ctx()
     transport_token = install_tool_custom_event_transport(enabled=False)
     try:
-        with patch("agent_engine_runner_shared.custom_events._get_client") as mock_get_client:
+        with patch("agent_engine_runner_shared.custom_events.get_shared_client") as mock_get_client:
             with pytest.raises(RuntimeError, match="requires features.use_custom_parser"):
                 await emit_custom_event({"event": "step", "data": "no"})
             mock_get_client.assert_not_called()
@@ -76,7 +76,7 @@ def test_tool_transport_feature_off_sync_fails_closed() -> None:
     tokens = _set_tool_ctx()
     transport_token = install_tool_custom_event_transport(enabled=False)
     try:
-        with patch("agent_engine_runner_shared.custom_events._get_client") as mock_get_client:
+        with patch("agent_engine_runner_shared.custom_events.get_shared_client") as mock_get_client:
             with pytest.raises(RuntimeError, match="requires features.use_custom_parser"):
                 emit_custom_event_sync({"event": "step", "data": "no"})
             mock_get_client.assert_not_called()
@@ -90,7 +90,7 @@ async def test_tool_transport_posts_opaque_custom_event_object() -> None:
     tokens = _set_tool_ctx()
     transport_token = install_tool_custom_event_transport()
     try:
-        with patch("agent_engine_runner_shared.custom_events._get_client") as mock_get_client:
+        with patch("agent_engine_runner_shared.custom_events.get_shared_client") as mock_get_client:
             mock_client = MagicMock()
             _wire_stream_to_post(mock_client)
             mock_get_client.return_value = mock_client
@@ -116,7 +116,7 @@ def test_tool_transport_sync_posts_opaque_custom_event_object() -> None:
     tokens = _set_tool_ctx()
     transport_token = install_tool_custom_event_transport()
     try:
-        with patch("agent_engine_runner_shared.custom_events._get_client") as mock_get_client:
+        with patch("agent_engine_runner_shared.custom_events.get_shared_client") as mock_get_client:
             mock_client = MagicMock()
             _wire_stream_to_post(mock_client)
             mock_get_client.return_value = mock_client
@@ -136,7 +136,7 @@ async def test_tool_transport_posts_arbitrary_opaque_object() -> None:
     tokens = _set_tool_ctx()
     transport_token = install_tool_custom_event_transport()
     try:
-        with patch("agent_engine_runner_shared.custom_events._get_client") as mock_get_client:
+        with patch("agent_engine_runner_shared.custom_events.get_shared_client") as mock_get_client:
             mock_client = MagicMock()
             _wire_stream_to_post(mock_client)
             mock_get_client.return_value = mock_client
@@ -154,7 +154,7 @@ async def test_tool_transport_swallows_transport_failure() -> None:
     tokens = _set_tool_ctx()
     transport_token = install_tool_custom_event_transport()
     try:
-        with patch("agent_engine_runner_shared.custom_events._get_client") as mock_get_client:
+        with patch("agent_engine_runner_shared.custom_events.get_shared_client") as mock_get_client:
             mock_client = MagicMock()
             _wire_stream_to_post(mock_client)
             mock_client.post.side_effect = RuntimeError("connection refused")
@@ -221,8 +221,10 @@ class _SyncPostStream:
 
 
 def _wire_stream_to_post(mock_client: MagicMock) -> None:
-    mock_client.stream.side_effect = lambda method, url, *, json, follow_redirects: _SyncPostStream(
-        mock_client, url, json
+    mock_client.stream.side_effect = (
+        lambda method, url, *, json, follow_redirects, timeout=None, **kwargs: _SyncPostStream(
+            mock_client, url, json
+        )
     )
 
 
@@ -231,7 +233,7 @@ async def test_custom_event_prefers_owner_url() -> None:
     tokens = _set_tool_ctx_owner(oe_url=_SERVICE, oe_owner_url=_OWNER)
     transport_token = install_tool_custom_event_transport()
     try:
-        with patch("agent_engine_runner_shared.custom_events._get_client") as mock_get_client:
+        with patch("agent_engine_runner_shared.custom_events.get_shared_client") as mock_get_client:
             mock_client = MagicMock()
             _wire_stream_to_post(mock_client)
             mock_get_client.return_value = mock_client
@@ -251,7 +253,7 @@ async def test_custom_event_falls_back_on_owner_transport_error() -> None:
     tokens = _set_tool_ctx_owner(oe_url=_SERVICE, oe_owner_url=_OWNER)
     transport_token = install_tool_custom_event_transport()
     try:
-        with patch("agent_engine_runner_shared.custom_events._get_client") as mock_get_client:
+        with patch("agent_engine_runner_shared.custom_events.get_shared_client") as mock_get_client:
             mock_client = MagicMock()
             _wire_stream_to_post(mock_client)
             mock_get_client.return_value = mock_client
@@ -276,7 +278,7 @@ async def test_custom_event_falls_back_on_owner_http_error() -> None:
     tokens = _set_tool_ctx_owner(oe_url=_SERVICE, oe_owner_url=_OWNER)
     transport_token = install_tool_custom_event_transport()
     try:
-        with patch("agent_engine_runner_shared.custom_events._get_client") as mock_get_client:
+        with patch("agent_engine_runner_shared.custom_events.get_shared_client") as mock_get_client:
             mock_client = MagicMock()
             _wire_stream_to_post(mock_client)
             mock_get_client.return_value = mock_client
@@ -314,8 +316,8 @@ async def test_custom_event_owner_failure_latch_shared_with_emit() -> None:
     transport_token = install_tool_custom_event_transport()
     try:
         with (
-            patch("agent_engine_runner_shared.custom_events._get_client") as mock_get_ce,
-            patch("agent_engine_runner_shared.progress._get_client") as mock_get_pr,
+            patch("agent_engine_runner_shared.custom_events.get_shared_client") as mock_get_ce,
+            patch("agent_engine_runner_shared.progress.get_shared_client") as mock_get_pr,
         ):
             mock_client = MagicMock()
             _wire_stream_to_post(mock_client)
@@ -337,6 +339,24 @@ async def test_custom_event_owner_failure_latch_shared_with_emit() -> None:
                 f"{_SERVICE}/stream/chunk",
                 f"{_SERVICE}/stream/chunk",
             ]
+    finally:
+        clear_custom_event_transport(transport_token)
+        clear_execution_context(tokens)
+
+
+def test_tool_transport_passes_progress_timeout() -> None:
+    """Custom events keep the 5s best-effort budget on the shared client."""
+    tokens = _set_tool_ctx()
+    transport_token = install_tool_custom_event_transport()
+    try:
+        with patch("agent_engine_runner_shared.custom_events.get_shared_client") as mock_get_client:
+            mock_client = MagicMock()
+            _wire_stream_to_post(mock_client)
+            mock_get_client.return_value = mock_client
+            emit_custom_event_sync({"event": "step"})
+
+            mock_get_client.assert_called_once_with("http://oe:8000")
+            assert mock_client.stream.call_args.kwargs["timeout"] == 5.0
     finally:
         clear_custom_event_transport(transport_token)
         clear_execution_context(tokens)

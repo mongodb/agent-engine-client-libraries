@@ -794,6 +794,12 @@ export const SessionMessageSchema = z.object({
    */
   tool_call_id: z.string().nullable().default(null),
   /**
+   * Platform-owned classification of this row: "cancelled" on a stopped turn's
+   * opener, "interrupted" on a tool call the platform aborted, empty otherwise.
+   * Derived by the reader from the record it trusts, never from message kwargs.
+   */
+  outcome: z.string().default(""),
+  /**
    * Framework message metadata that should remain attached to the message,
    * including generic UI artifact metadata.
    */
@@ -808,6 +814,13 @@ export const SessionMessagesResponseSchema = z.object({
    * session has no persisted messages.
    */
   messages: z.array(SessionMessageSchema),
+  /**
+   * True when the reader classifies each message's platform-owned `outcome`. A
+   * consumer that renders stopped badges from `outcome` must fail closed when a
+   * reader predates this field rather than silently dropping genuine
+   * classifications.
+   */
+  outcome_supported: z.boolean().default(true),
 });
 export type SessionMessagesResponse = z.infer<
   typeof SessionMessagesResponseSchema

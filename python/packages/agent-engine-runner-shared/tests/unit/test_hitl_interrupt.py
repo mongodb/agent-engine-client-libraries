@@ -22,6 +22,7 @@ from agent_engine_runner_shared.secure_wrapper import (
     PolicyDeniedException,
     SecureToolWrapper,
     ToolExecutionError,
+    ToolPlatformError,
 )
 from agent_engine_runner_shared.workflow import attempt_context_scope
 
@@ -131,14 +132,15 @@ class TestHandleSuspend:
         )
         native_handler.assert_not_called()
 
-    def test_suspend_without_reason_raises_validation_error(self):
-        """Missing suspend_reason is caught by SuspendPayload validation."""
+    def test_suspend_without_reason_is_a_platform_failure(self):
+        """A suspend payload missing suspend_reason is OE's contract error."""
         wrapper = self._make_wrapper()
         hooks.register_suspend_handler(Mock())
         bad_payload = json.dumps({"__suspend__": True})
 
-        with pytest.raises(ValidationError):
+        with pytest.raises(ToolPlatformError, match="not a suspend payload") as raised:
             wrapper._handle_suspend(bad_payload)
+        assert isinstance(raised.value.__cause__, ValidationError)
 
     def test_suspend_without_registered_handler_raises_runtime_error(self):
         """A suspend payload with no registered handler raises RuntimeError."""
@@ -156,7 +158,7 @@ class TestHandleSuspend:
         wrapper = self._make_wrapper()
         hooks.register_suspend_handler(Mock())
 
-        with pytest.raises(ToolExecutionError, match="not a suspend payload"):
+        with pytest.raises(ToolPlatformError, match="not a suspend payload"):
             wrapper._handle_suspend("plain text")
 
 
@@ -226,6 +228,56 @@ class TestAuthorizationRequiredInterrupt:
                 },
             }
         )
+
+    @staticmethod
+    def _auth_required() -> ToolExecuteResponse:
+        return ToolExecuteResponse.model_validate(
+            {
+                "proceed": False,
+                "reason": "authorization required for credential broker resource",
+                "status": "suspend",
+                "elicitation": {
+                    "elicitation_id": "el-123",
+                    "authorization_url": "https://auth.example.com/device",
+                    "message": "Connect your account to continue",
+                    "created": False,
+                },
+            }
+        )
+
+    def test_continue_before_consent_fails_instead_of_returning_none(self):
+        # A native resume re-runs the call, and LangGraph's interrupt() then
+        # returns the Continue value instead of pausing.
+        wrapper = self._make_wrapper()
+        mock_interrupt = Mock(return_value={"decision": "approve"})
+        hooks.register_suspend_handler(mock_interrupt)
+
+        with patch(
+            "agent_engine_runner_shared.secure_wrapper.request_oe_approval",
+            side_effect=[self._auth_required(), self._auth_required()],
+        ) as approval:
+            with pytest.raises(ToolExecutionError, match="still required after continuation"):
+                wrapper.execute_tool("demo_tool", {"value": 1})
+
+        assert approval.call_count == 2
+        mock_interrupt.assert_called_once()
+
+    def test_continue_after_consent_returns_the_tool_result(self):
+        wrapper = self._make_wrapper()
+        mock_interrupt = Mock(return_value={"decision": "approve"})
+        hooks.register_suspend_handler(mock_interrupt)
+        granted = ToolExecuteResponse(
+            proceed=True, status="success", result='{"repos": ["qualification-repo"]}'
+        )
+
+        with patch(
+            "agent_engine_runner_shared.secure_wrapper.request_oe_approval",
+            side_effect=[self._auth_required(), granted],
+        ):
+            result = wrapper.execute_tool("demo_tool", {"value": 1})
+
+        assert result == '{"repos": ["qualification-repo"]}'
+        mock_interrupt.assert_called_once()
 
     def test_execute_tool_auth_required_without_handler_raises_runtime_error(self):
         wrapper = self._make_wrapper()

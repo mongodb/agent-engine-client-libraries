@@ -24,6 +24,7 @@ import { resolveCorsPolicy } from "./cors.js";
 import { registerAuthHook } from "./auth.js";
 import { DrainRegistry, registerDrainRoute } from "./drain.js";
 import { registerCallInterruptRoute } from "./callInterrupt.js";
+import { markStartupComplete } from "../startup_state.js";
 
 const logger = getLogger("agent_engine_runner_shared.server.base");
 
@@ -238,5 +239,6 @@ export abstract class BaseServer {
     const app = this.createApp();
     logger.info(`Starting ${this.modeName} server on ${host}:${listenPort}`);
     await app.listen({ host, port: listenPort });
+    markStartupComplete();
   }
 }

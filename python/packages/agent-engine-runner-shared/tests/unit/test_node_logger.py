@@ -34,12 +34,9 @@ class TestOnNodeStart:
             project_id="group-1",
         )
 
-        with patch(
-            "agent_engine_runner_shared.node_logger.create_httpx_client_with_tls"
-        ) as mock_create:
+        with patch("agent_engine_runner_shared.node_logger.get_shared_client") as mock_create:
             mock_client = MagicMock()
-            mock_create.return_value.__enter__ = MagicMock(return_value=mock_client)
-            mock_create.return_value.__exit__ = MagicMock(return_value=False)
+            mock_create.return_value = mock_client
 
             logger.on_node_start(
                 node_name="agent_node",
@@ -50,6 +47,11 @@ class TestOnNodeStart:
             mock_client.post.assert_called_once()
             call_args = mock_client.post.call_args
             assert call_args[0][0] == "http://oe:8080/node/execution"
+            # The shared client carries no per-caller timeout; it must ride the request.
+            assert call_args[1]["timeout"] == 2.0
+            mock_create.assert_called_once_with("http://oe:8080")
+            mock_client.__exit__.assert_not_called()
+            mock_client.close.assert_not_called()
             payload = call_args[1]["json"]
             assert payload["execution_id"] == "exec-1"
             assert payload["node_name"] == "agent_node"
@@ -65,7 +67,7 @@ class TestOnNodeStart:
         """Records start time for duration calculation."""
         logger = NodeExecutionLogger(oe_url="http://oe:8080", execution_id="exec-1")
 
-        with patch("agent_engine_runner_shared.node_logger.create_httpx_client_with_tls"):
+        with patch("agent_engine_runner_shared.node_logger.get_shared_client"):
             logger.on_node_start(
                 node_name="agent_node",
                 inputs={},
@@ -84,12 +86,9 @@ class TestOnNodeEnd:
         # Manually set a start time
         logger._node_start_times["run-123"] = datetime.now(timezone.utc) - timedelta(milliseconds=1)
 
-        with patch(
-            "agent_engine_runner_shared.node_logger.create_httpx_client_with_tls"
-        ) as mock_client_cls:
+        with patch("agent_engine_runner_shared.node_logger.get_shared_client") as mock_client_cls:
             mock_client = MagicMock()
-            mock_client_cls.return_value.__enter__ = MagicMock(return_value=mock_client)
-            mock_client_cls.return_value.__exit__ = MagicMock(return_value=False)
+            mock_client_cls.return_value = mock_client
 
             logger.on_node_end(
                 node_name="agent_node",
@@ -107,12 +106,9 @@ class TestOnNodeEnd:
         """Uses provided duration_ms if given."""
         logger = NodeExecutionLogger(oe_url="http://oe:8080", execution_id="exec-1")
 
-        with patch(
-            "agent_engine_runner_shared.node_logger.create_httpx_client_with_tls"
-        ) as mock_client_cls:
+        with patch("agent_engine_runner_shared.node_logger.get_shared_client") as mock_client_cls:
             mock_client = MagicMock()
-            mock_client_cls.return_value.__enter__ = MagicMock(return_value=mock_client)
-            mock_client_cls.return_value.__exit__ = MagicMock(return_value=False)
+            mock_client_cls.return_value = mock_client
 
             logger.on_node_end(
                 node_name="agent_node",
@@ -128,12 +124,9 @@ class TestOnNodeEnd:
         """Works even if no start time was recorded."""
         logger = NodeExecutionLogger(oe_url="http://oe:8080", execution_id="exec-1")
 
-        with patch(
-            "agent_engine_runner_shared.node_logger.create_httpx_client_with_tls"
-        ) as mock_client_cls:
+        with patch("agent_engine_runner_shared.node_logger.get_shared_client") as mock_client_cls:
             mock_client = MagicMock()
-            mock_client_cls.return_value.__enter__ = MagicMock(return_value=mock_client)
-            mock_client_cls.return_value.__exit__ = MagicMock(return_value=False)
+            mock_client_cls.return_value = mock_client
 
             logger.on_node_end(
                 node_name="agent_node",
@@ -152,12 +145,9 @@ class TestOnNodeError:
         """Sends error status with error message."""
         logger = NodeExecutionLogger(oe_url="http://oe:8080", execution_id="exec-1")
 
-        with patch(
-            "agent_engine_runner_shared.node_logger.create_httpx_client_with_tls"
-        ) as mock_client_cls:
+        with patch("agent_engine_runner_shared.node_logger.get_shared_client") as mock_client_cls:
             mock_client = MagicMock()
-            mock_client_cls.return_value.__enter__ = MagicMock(return_value=mock_client)
-            mock_client_cls.return_value.__exit__ = MagicMock(return_value=False)
+            mock_client_cls.return_value = mock_client
 
             logger.on_node_error(
                 node_name="agent_node",
@@ -175,7 +165,7 @@ class TestOnNodeError:
         logger = NodeExecutionLogger(oe_url="http://oe:8080", execution_id="exec-1")
         logger._node_start_times["run-123"] = datetime.now(timezone.utc)
 
-        with patch("agent_engine_runner_shared.node_logger.create_httpx_client_with_tls"):
+        with patch("agent_engine_runner_shared.node_logger.get_shared_client"):
             logger.on_node_error(
                 node_name="agent_node",
                 error="fail",
@@ -192,12 +182,9 @@ class TestOnNodeSuspend:
         """Sends suspend status with no error field."""
         logger = NodeExecutionLogger(oe_url="http://oe:8080", execution_id="exec-1")
 
-        with patch(
-            "agent_engine_runner_shared.node_logger.create_httpx_client_with_tls"
-        ) as mock_client_cls:
+        with patch("agent_engine_runner_shared.node_logger.get_shared_client") as mock_client_cls:
             mock_client = MagicMock()
-            mock_client_cls.return_value.__enter__ = MagicMock(return_value=mock_client)
-            mock_client_cls.return_value.__exit__ = MagicMock(return_value=False)
+            mock_client_cls.return_value = mock_client
 
             logger.on_node_suspend(
                 node_name="agent_node",
@@ -214,12 +201,9 @@ class TestOnNodeSuspend:
         logger = NodeExecutionLogger(oe_url="http://oe:8080", execution_id="exec-1")
         logger._node_start_times["run-123"] = datetime.now(timezone.utc) - timedelta(milliseconds=1)
 
-        with patch(
-            "agent_engine_runner_shared.node_logger.create_httpx_client_with_tls"
-        ) as mock_client_cls:
+        with patch("agent_engine_runner_shared.node_logger.get_shared_client") as mock_client_cls:
             mock_client = MagicMock()
-            mock_client_cls.return_value.__enter__ = MagicMock(return_value=mock_client)
-            mock_client_cls.return_value.__exit__ = MagicMock(return_value=False)
+            mock_client_cls.return_value = mock_client
 
             logger.on_node_suspend(node_name="agent_node", run_id="run-123")
 
@@ -238,12 +222,9 @@ class TestOnNodeInterrupted:
             milliseconds=150
         )
 
-        with patch(
-            "agent_engine_runner_shared.node_logger.create_httpx_client_with_tls"
-        ) as mock_client_cls:
+        with patch("agent_engine_runner_shared.node_logger.get_shared_client") as mock_client_cls:
             mock_client = MagicMock()
-            mock_client_cls.return_value.__enter__ = MagicMock(return_value=mock_client)
-            mock_client_cls.return_value.__exit__ = MagicMock(return_value=False)
+            mock_client_cls.return_value = mock_client
 
             logger.on_node_interrupted(
                 node_name="agent_node",
@@ -261,12 +242,9 @@ class TestOnNodeInterrupted:
         """duration_ms is absent from the payload when no start time was recorded."""
         logger = NodeExecutionLogger(oe_url="http://oe:8080", execution_id="exec-1")
 
-        with patch(
-            "agent_engine_runner_shared.node_logger.create_httpx_client_with_tls"
-        ) as mock_client_cls:
+        with patch("agent_engine_runner_shared.node_logger.get_shared_client") as mock_client_cls:
             mock_client = MagicMock()
-            mock_client_cls.return_value.__enter__ = MagicMock(return_value=mock_client)
-            mock_client_cls.return_value.__exit__ = MagicMock(return_value=False)
+            mock_client_cls.return_value = mock_client
 
             logger.on_node_suspend(node_name="agent_node", run_id="run-unknown")
 
@@ -278,7 +256,7 @@ class TestOnNodeInterrupted:
         logger = NodeExecutionLogger(oe_url="http://oe:8080", execution_id="exec-1")
         logger._node_start_times["run-123"] = datetime.now(timezone.utc)
 
-        with patch("agent_engine_runner_shared.node_logger.create_httpx_client_with_tls"):
+        with patch("agent_engine_runner_shared.node_logger.get_shared_client"):
             logger.on_node_suspend(
                 node_name="agent_node",
                 run_id="run-123",
@@ -294,13 +272,10 @@ class TestHttpFailureSilence:
         """HTTP errors are caught and logged, not raised."""
         logger = NodeExecutionLogger(oe_url="http://oe:8080", execution_id="exec-1")
 
-        with patch(
-            "agent_engine_runner_shared.node_logger.create_httpx_client_with_tls"
-        ) as mock_client_cls:
+        with patch("agent_engine_runner_shared.node_logger.get_shared_client") as mock_client_cls:
             mock_client = MagicMock()
             mock_client.post.side_effect = Exception("Connection refused")
-            mock_client_cls.return_value.__enter__ = MagicMock(return_value=mock_client)
-            mock_client_cls.return_value.__exit__ = MagicMock(return_value=False)
+            mock_client_cls.return_value = mock_client
 
             # Should not raise
             logger.on_node_start(

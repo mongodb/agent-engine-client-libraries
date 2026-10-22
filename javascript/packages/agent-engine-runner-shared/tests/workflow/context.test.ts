@@ -10,7 +10,9 @@ import {
 import { AttemptContextSchema } from "../../src/generated/workflow/v1/runtime_pb.js";
 import { ActivityCommandSchema } from "../../src/generated/workflow/v1/activity_pb.js";
 import {
+  AmbiguousActivityKeyError,
   allocateActivityOrdinal,
+  allocateActivityPosition,
   activityRequiresReconstruction,
   currentOperationPath,
   currentPendingChildOperationBatch,
@@ -21,6 +23,7 @@ import {
   observedActivityPositions,
   preallocateActivityOrdinals,
   preallocateChildOperationOrdinals,
+  inSpawnedTask,
   recordObservedActivity,
   recordInterruptedActivity,
   recordReconstructedActivityInterrupt,
@@ -30,6 +33,7 @@ import {
   setPendingChildOperationBatch,
   toolActivityKey,
   UnsupportedChildOperationFanOutError,
+  type ChildOperationBoundary,
 } from "../../src/workflow/index.js";
 
 function attempt() {
@@ -383,6 +387,139 @@ describe("activity ordinal allocation", () => {
       expect(allocateActivityOrdinal()).toBe(3);
       expect(allocateActivityOrdinal("stable")).toBe(4);
       expect(allocateActivityOrdinal("stable")).toBe(4);
+    });
+  });
+});
+
+describe("spawned-task tool positions", () => {
+  type Boundary = ChildOperationBoundary;
+  const spawned = (name: string): Boundary => ({
+    name,
+    occurrenceKey: name,
+    spawnedTask: true,
+  });
+  const child = (name: string): Boundary => ({ name, occurrenceKey: name });
+  const preallocate = (...keys: string[]): void => {
+    preallocateActivityOrdinals(keys.map(toolActivityKey));
+  };
+  const position = (key: string): [string[], number] => {
+    const { operationPath, activityOrdinal } = allocateActivityPosition(
+      toolActivityKey(key),
+    );
+    return [pathNames(operationPath), activityOrdinal];
+  };
+  /** Run `fn` in a fresh attempt whose resolver returns `boundaries`. */
+  const inAttempt = (fn: (boundaries: Boundary[]) => void): void => {
+    const boundaries: Boundary[] = [];
+    runWithAttemptContext(attempt(), () =>
+      runWithOperationPathResolver(
+        () => boundaries,
+        () => fn(boundaries),
+      ),
+    );
+  };
+  const set = (boundaries: Boundary[], next: Boundary[]): void => {
+    boundaries.splice(0, boundaries.length, ...next);
+  };
+
+  test("a tool in a spawned task keeps its model's position", () => {
+    inAttempt((boundaries) => {
+      // A model in Send worker 0 requests two tools.
+      set(boundaries, [spawned("worker-0")]);
+      preallocate("call-a", "call-b");
+      expect(inSpawnedTask()).toBe(true);
+
+      // Each tool runs in its own Send task spawned by the root graph.
+      set(boundaries, [spawned("tool-1")]);
+      expect(position("call-b")).toEqual([["agent", "worker-0"], 2]);
+      set(boundaries, [spawned("tool-0")]);
+      expect(position("call-a")).toEqual([["agent", "worker-0"], 1]);
+
+      // A key that was never preallocated keeps today's allocation.
+      expect(position("call-c")).toEqual([["agent", "tool-0"], 1]);
+    });
+  });
+
+  test("a tool outside a spawned task allocates in its own path", () => {
+    inAttempt((boundaries) => {
+      // A planner subgraph requests a tool that a sibling tools subgraph
+      // runs, and a root model's tool runs inside a subgraph. Neither path
+      // has a spawned task, so both record where they did before.
+      set(boundaries, [child("planner")]);
+      preallocate("call-a");
+      set(boundaries, []);
+      preallocate("call-b");
+
+      set(boundaries, [child("tools")]);
+      expect(inSpawnedTask()).toBe(false);
+      expect(position("call-a")).toEqual([["agent", "tools"], 1]);
+      expect(position("call-b")).toEqual([["agent", "tools"], 2]);
+    });
+  });
+
+  test("spawned tools of parallel graphs stay in their own graph", () => {
+    inAttempt((boundaries) => {
+      // Two coordinator workers reuse one tool call id.
+      for (const worker of ["worker-0", "worker-1"]) {
+        set(boundaries, [spawned(worker), child("coordinator")]);
+        preallocate("call-x", "call-a");
+      }
+      // Each coordinator's tool runs in a Send task it spawned.
+      for (const worker of ["worker-1", "worker-0"]) {
+        set(boundaries, [
+          spawned(worker),
+          child("coordinator"),
+          spawned("tool"),
+        ]);
+        expect(position("call-a")).toEqual([
+          ["agent", worker, "coordinator"],
+          2,
+        ]);
+      }
+    });
+  });
+
+  test("a tool call id reused within one graph fails in either order", () => {
+    // Both models preallocate before the tool runs, in its own task or in
+    // the task of a model that requested it.
+    for (const toolTask of [[spawned("tool")], [spawned("worker-1")]]) {
+      inAttempt((boundaries) => {
+        for (const worker of ["worker-0", "worker-1"]) {
+          set(boundaries, [spawned(worker)]);
+          preallocate("call-a");
+        }
+        set(boundaries, toolTask);
+        expect(() => position("call-a")).toThrow(AmbiguousActivityKeyError);
+      });
+    }
+    // The tool runs before the second model preallocates.
+    for (const toolTask of [[spawned("tool")], [spawned("worker-0")]]) {
+      inAttempt((boundaries) => {
+        set(boundaries, [spawned("worker-0")]);
+        preallocate("call-a");
+        set(boundaries, toolTask);
+        expect(position("call-a")).toEqual([["agent", "worker-0"], 1]);
+        set(boundaries, [spawned("worker-1")]);
+        expect(() => preallocate("call-a")).toThrow(/call-a/);
+      });
+    }
+  });
+
+  test("a take in one graph does not hide a take in another", () => {
+    inAttempt((boundaries) => {
+      const inCoordinator = (worker: string, inner: Boundary): void =>
+        set(boundaries, [spawned(worker), child("coordinator"), inner]);
+      // Two parallel coordinators reuse one tool call id; each tool takes
+      // its own coordinator's reservation.
+      for (const worker of ["worker-0", "worker-1"]) {
+        inCoordinator(worker, spawned("model-0"));
+        preallocate("call-a");
+        inCoordinator(worker, spawned("tool"));
+        position("call-a");
+      }
+      // A second reservation in the first coordinator still fails.
+      inCoordinator("worker-0", spawned("model-1"));
+      expect(() => preallocate("call-a")).toThrow(AmbiguousActivityKeyError);
     });
   });
 });

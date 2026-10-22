@@ -16,7 +16,9 @@ from agent_engine_runner_shared.workflow.activity import (
     DurableActivityInterrupted,
     DurableActivitySuspended,
     ReplayedActivityFailedError,
+    UnknownOutcomePolicy,
     run_serial_activity,
+    validate_on_unknown_outcome,
 )
 from agent_engine_runner_shared.workflow.attempt import (
     complete_execution_command,
@@ -34,10 +36,12 @@ from agent_engine_runner_shared.workflow.client import (
     WorkflowClientError,
 )
 from agent_engine_runner_shared.workflow.context import (
+    AmbiguousActivityKeyError,
     ChildOperationBoundary,
     OperationPathResolver,
     UnsupportedChildOperationFanOutError,
     allocate_activity_ordinal,
+    allocate_activity_position,
     attempt_context_scope,
     child_operation_boundary_scope,
     current_attempt_context,
@@ -63,12 +67,14 @@ __all__ = [
     "FinalizedStepEntries",
     "OperationPathResolver",
     "ReplayedActivityFailedError",
+    "AmbiguousActivityKeyError",
     "UnsupportedChildOperationFanOutError",
     "WorkflowClient",
     "WorkflowClientError",
     "WorkflowWireError",
     "SettledExecutionError",
     "allocate_activity_ordinal",
+    "allocate_activity_position",
     "attempt_context_scope",
     "child_operation_boundary_scope",
     "complete_execution_command",
@@ -81,6 +87,8 @@ __all__ = [
     "preallocate_activity_ordinals",
     "preallocate_child_operation_ordinals",
     "run_serial_activity",
+    "UnknownOutcomePolicy",
+    "validate_on_unknown_outcome",
     "settle_execution",
     "tool_activity_key",
 ]

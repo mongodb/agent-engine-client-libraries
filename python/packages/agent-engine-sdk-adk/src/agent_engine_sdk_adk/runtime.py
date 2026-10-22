@@ -39,6 +39,10 @@ from agent_engine_runner_shared.secure_wrapper import (
     create_secure_tool_function,  # pyright: ignore[reportUnknownVariableType]
 )
 from agent_engine_runner_shared.utils import get_env_bool
+from agent_engine_runner_shared.workflow import (
+    UnknownOutcomePolicy,
+    validate_on_unknown_outcome,
+)
 from agent_engine_sdk_adk.mcp import RemoteMCPTool, mcp_tool_description
 from agent_engine_sdk_adk.runner import DurableADKRunner
 
@@ -55,6 +59,7 @@ def _wrap_for_tool_pod(
     allow_direct: bool,
     is_local: bool = True,
     redact_fields: list[str] | None = None,
+    on_unknown_outcome: UnknownOutcomePolicy | None = None,
 ) -> Callable[..., Any]:
     """Wrap a tool so calls route through the OE.
 
@@ -119,6 +124,7 @@ def _wrap_for_tool_pod(
         allow_direct=allow_direct,
         is_local=is_local,
         redact_fields=redact_fields,
+        on_unknown_outcome=on_unknown_outcome,
     )
 
     @functools.wraps(fn)
@@ -331,6 +337,7 @@ class App(BaseApp):
                     allow_direct=allow_direct,
                     is_local=is_local,
                     redact_fields=redact_fields,
+                    on_unknown_outcome=tool_metadata.get("on_unknown_outcome"),
                 )
             )
         return wrapped
@@ -398,9 +405,20 @@ class App(BaseApp):
         network: list[str] | None = None,
         timeout: int = 30,
         redact_fields: list[str] | None = None,
+        on_unknown_outcome: UnknownOutcomePolicy | None = None,
     ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
-        """Register a tool function with the platform."""
+        """Register a tool function with the platform.
+
+        Args:
+            on_unknown_outcome: What a retry does when the platform lost the
+                runner while this tool was running in a durable workflow, so
+                nobody knows whether it ran. ``"rerun"`` runs the tool again
+                (at-least-once execution; declare it only for a tool that is
+                safe to run twice). ``"fail"`` refuses the retry, so the tool
+                never runs twice. Leave unset for the platform default.
+        """
         app = self
+        validate_on_unknown_outcome(on_unknown_outcome)
 
         def wrapper(fn: Callable[..., Any]) -> Callable[..., Any]:
             effective_network = network if network is not None else []
@@ -417,6 +435,8 @@ class App(BaseApp):
                 "timeout_seconds": timeout,
                 "redact_fields": effective_redact,
             }
+            if on_unknown_outcome is not None:
+                metadata["on_unknown_outcome"] = on_unknown_outcome
             app._runtime.register_tool(  # type: ignore[attr-defined]
                 name=name, func=fn, metadata=metadata
             )

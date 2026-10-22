@@ -33,6 +33,7 @@ from agent_engine_sdk.models import (
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Query, Request, Response
 from pydantic import JsonValue, ValidationError
 
+from agent_engine_runner_shared import tls_client
 from agent_engine_runner_shared.checkpoint_workspace import resolve_checkpoint_workspace_id
 from agent_engine_runner_shared.context import (
     OwnerUrlFailureState,
@@ -422,22 +423,7 @@ class AERServer(BaseServer):
 
     def _get_cert_mtimes(self) -> Optional[tuple[float, float, float]]:
         """Get modification times of TLS cert files for rotation detection."""
-        try:
-            cert_path = os.environ.get("TLS_CERT_PATH", "")
-            key_path = os.environ.get("TLS_KEY_PATH", "")
-            ca_path = os.environ.get("TLS_CA_CERT_PATH", "")
-
-            # Only track mtimes if we're using file-based certs (container mode)
-            if not (cert_path and key_path and ca_path):
-                return None
-
-            return (
-                os.path.getmtime(cert_path),
-                os.path.getmtime(key_path),
-                os.path.getmtime(ca_path),
-            )
-        except (OSError, ValueError):
-            return None
+        return tls_client._get_cert_mtimes()
 
     async def _get_client(self, base_url: str) -> httpx.AsyncClient:
         """
@@ -825,6 +811,7 @@ class AERServer(BaseServer):
                 TraceContextTextMapPropagator,
             )
 
+            from agent_engine_runner_shared.caller_trace import runner_trace_scope
             from agent_engine_runner_shared.tracing import get_tracer
         except Exception:
             return await self._handle_execute(request)
@@ -834,12 +821,16 @@ class AERServer(BaseServer):
         tracer = get_tracer("agent-engine-runner-shared.aer")
         # This span is the outermost step of an invocation, so it declares AGENT
         # rather than leaving a backend to fall back on the span name.
-        with tracer.start_as_current_span(
-            "aer.execute",
-            context=parent_context,
-            attributes={OPENINFERENCE_SPAN_KIND: OpenInferenceSpanKind.AGENT.value},
-        ):
-            return await self._handle_execute(request)
+        # The scope is attached first so nested platform calls can tell a root
+        # created here from an inbound caller trace. tls_client propagates that
+        # distinction; is_remote on the next hop cannot.
+        with runner_trace_scope(parent_context):
+            with tracer.start_as_current_span(
+                "aer.execute",
+                context=parent_context,
+                attributes={OPENINFERENCE_SPAN_KIND: OpenInferenceSpanKind.AGENT.value},
+            ):
+                return await self._handle_execute(request)
 
     @with_metrics("aer_execute")
     async def _handle_execute(self, request: ExecuteRequest) -> AERExecuteResponse:

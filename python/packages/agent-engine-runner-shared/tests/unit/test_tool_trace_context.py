@@ -10,6 +10,7 @@ disconnected trace instead of joining the invocation's.
 
 from __future__ import annotations
 
+import json
 import sys
 from typing import Optional
 from unittest.mock import Mock
@@ -22,6 +23,7 @@ from opentelemetry import trace
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+from opentelemetry.trace import NonRecordingSpan, SpanContext, TraceFlags
 
 from agent_engine_runner_shared.server.tool import ToolServer
 from agent_engine_runner_shared.span_kinds import OPENINFERENCE_SPAN_KIND, OpenInferenceSpanKind
@@ -29,6 +31,43 @@ from agent_engine_runner_shared.tracing.setup import get_current_trace_context
 
 CALLER_TRACE_ID = "0af7651916cd43dd8448eb211c80319c"
 TRACEPARENT = f"00-{CALLER_TRACE_ID}-b7ad6b7169203331-01"
+
+
+def _headers_propagated_from_aer(parent_headers: dict[str, str]) -> dict[str, str]:
+    """Headers tls_client would send while aer.execute is the active trace.
+
+    Mirrors production: bind whether the extracted parent was an inbound
+    caller, root or join aer.execute, then inject from a nested span the way
+    a later platform call does.
+    """
+    from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
+
+    from agent_engine_runner_shared.caller_trace import runner_trace_scope
+    from agent_engine_runner_shared.tls_client import _inject_platform_trace_headers
+
+    parent = TraceContextTextMapPropagator().extract(carrier=parent_headers)
+    outbound: dict[str, str] = {}
+    with runner_trace_scope(parent):
+        with trace.get_tracer("test").start_as_current_span("aer.execute", context=parent):
+            with trace.get_tracer("test").start_as_current_span("llm.call"):
+                _inject_platform_trace_headers(outbound)
+    return outbound
+
+
+def _span_joined_to_caller(name: str):
+    """A span whose parent is the caller's remote context.
+
+    Direct calls to the guardrail I/O helper record attributes only when the
+    current span joined an inbound trace. A locally rooted span does not.
+    """
+    parent = SpanContext(
+        trace_id=int(CALLER_TRACE_ID, 16),
+        span_id=int("b7ad6b7169203331", 16),
+        is_remote=True,
+        trace_flags=TraceFlags(0x01),
+    )
+    ctx = trace.set_span_in_context(NonRecordingSpan(parent))
+    return trace.get_tracer("test").start_as_current_span(name, context=ctx)
 
 
 def _make_server() -> ToolServer:
@@ -254,6 +293,217 @@ class TestRouteDeclaredSpanKind:
         spans = {span.name: span for span in in_memory_tracer.get_finished_spans()}
         assert span_name in spans, f"{path} produced spans {sorted(spans)}"
         assert spans[span_name].attributes[OPENINFERENCE_SPAN_KIND] == expected_kind.value
+
+    def test_guardrails_check_span_records_input_and_decision(self, in_memory_tracer):
+        client = _route_client()
+        payload = {
+            **_GUARDRAILS_PAYLOAD,
+            "input": {"text": "Acme appears here.", "metadata": {}},
+            "policies": [
+                {
+                    "id": "pol-acme",
+                    "type": "output_validation",
+                    "action": "block",
+                    "stage_filter": ["llm_output"],
+                    "config": {"regex_patterns": ["Acme"], "on_fail": "exception"},
+                }
+            ],
+        }
+
+        response = client.post(
+            "/guardrails/check", json=payload, headers={"traceparent": TRACEPARENT}
+        )
+
+        assert response.status_code == 200, response.text
+        spans = {span.name: span for span in in_memory_tracer.get_finished_spans()}
+        span = spans["tool.guardrails_check"]
+        recorded_input = json.loads(span.attributes["input.value"])
+        recorded_output = json.loads(span.attributes["output.value"])
+        assert recorded_input["stage"] == "llm_output"
+        assert recorded_input["text"] == "Acme appears here."
+        assert recorded_input["policies"] == [
+            {"id": "pol-acme", "type": "output_validation", "action": "block"}
+        ]
+        assert "regex_patterns" not in json.dumps(recorded_input)
+        assert recorded_output["decision"] == "block"
+        assert recorded_output["allowed"] is False
+        assert recorded_output["triggered_policy_ids"] == ["pol-acme"]
+        assert span.status.status_code.name == "OK"
+
+    def test_guardrails_check_without_traceparent_omits_span_io(self, in_memory_tracer):
+        client = _route_client()
+
+        response = client.post("/guardrails/check", json=_GUARDRAILS_PAYLOAD)
+
+        assert response.status_code == 200, response.text
+        spans = [
+            span
+            for span in in_memory_tracer.get_finished_spans()
+            if span.name == "tool.guardrails_check"
+        ]
+        assert spans
+        assert "input.value" not in spans[0].attributes
+        assert "output.value" not in spans[0].attributes
+
+    def test_guardrails_span_caps_checked_text_and_records_a_rewrite(self, in_memory_tracer):
+        from agent_engine_runner_shared.models import (
+            GuardrailCheckContext,
+            GuardrailCheckDecision,
+            GuardrailCheckEvidence,
+            GuardrailCheckInput,
+            GuardrailCheckRequest,
+            GuardrailCheckResponse,
+            GuardrailRuntimePolicy,
+            GuardrailRuntimeStage,
+        )
+        from agent_engine_runner_shared.server.tool import (
+            _GUARDRAIL_SPAN_TEXT_LIMIT,
+            _record_guardrail_span_io,
+        )
+
+        text = "A" * (_GUARDRAIL_SPAN_TEXT_LIMIT + 25)
+        rewritten = "B" * (_GUARDRAIL_SPAN_TEXT_LIMIT + 10)
+        request = GuardrailCheckRequest(
+            execution_id="exec-1",
+            stage=GuardrailRuntimeStage.LLM_OUTPUT,
+            input=GuardrailCheckInput(text=text),
+            context=GuardrailCheckContext(
+                org_id="000000000000000000000001",
+                project_id="000000000000000000000002",
+            ),
+            policies=[
+                GuardrailRuntimePolicy(
+                    id="pol-rewrite",
+                    type="output_validation",
+                    action="modify",
+                    config={"regex_patterns": ["secret-pattern"]},
+                )
+            ],
+        )
+        response = GuardrailCheckResponse(
+            decision=GuardrailCheckDecision.MODIFY,
+            allowed=True,
+            transformed_text=rewritten,
+            triggered_policy_ids=["pol-rewrite"],
+            evidence=[GuardrailCheckEvidence(policy_id="pol-rewrite", message="rewrote")],
+            reason="modified",
+        )
+        with _span_joined_to_caller("tool.guardrails_check"):
+            _record_guardrail_span_io(request, response)
+
+        span = in_memory_tracer.get_finished_spans()[-1]
+        recorded_input = json.loads(span.attributes["input.value"])
+        recorded_output = json.loads(span.attributes["output.value"])
+        assert recorded_input["text"] == text[:_GUARDRAIL_SPAN_TEXT_LIMIT]
+        assert recorded_input["text_truncated"] is True
+        assert "regex_patterns" not in json.dumps(recorded_input)
+        assert recorded_output["transformed_text"] == rewritten[:_GUARDRAIL_SPAN_TEXT_LIMIT]
+        assert recorded_output["transformed_text_truncated"] is True
+        assert recorded_output["evidence"] == [{"policy_id": "pol-rewrite", "message": "rewrote"}]
+
+    def test_guardrails_span_omits_transformed_text_when_unchanged(self, in_memory_tracer):
+        from agent_engine_runner_shared.models import (
+            GuardrailCheckContext,
+            GuardrailCheckDecision,
+            GuardrailCheckInput,
+            GuardrailCheckRequest,
+            GuardrailCheckResponse,
+            GuardrailRuntimeStage,
+        )
+        from agent_engine_runner_shared.server.tool import _record_guardrail_span_io
+
+        request = GuardrailCheckRequest(
+            execution_id="exec-1",
+            stage=GuardrailRuntimeStage.LLM_INPUT,
+            input=GuardrailCheckInput(text="unchanged"),
+            context=GuardrailCheckContext(
+                org_id="000000000000000000000001",
+                project_id="000000000000000000000002",
+            ),
+        )
+        response = GuardrailCheckResponse(
+            decision=GuardrailCheckDecision.ALLOW,
+            allowed=True,
+            transformed_text="unchanged",
+        )
+        with _span_joined_to_caller("tool.guardrails_check"):
+            _record_guardrail_span_io(request, response)
+
+        recorded_output = json.loads(
+            in_memory_tracer.get_finished_spans()[-1].attributes["output.value"]
+        )
+        assert "transformed_text" not in recorded_output
+
+    def test_guardrails_span_records_empty_rewrite(self, in_memory_tracer):
+        from agent_engine_runner_shared.models import (
+            GuardrailCheckContext,
+            GuardrailCheckDecision,
+            GuardrailCheckInput,
+            GuardrailCheckRequest,
+            GuardrailCheckResponse,
+            GuardrailRuntimeStage,
+        )
+        from agent_engine_runner_shared.server.tool import _record_guardrail_span_io
+
+        request = GuardrailCheckRequest(
+            execution_id="exec-1",
+            stage=GuardrailRuntimeStage.LLM_OUTPUT,
+            input=GuardrailCheckInput(text="secret"),
+            context=GuardrailCheckContext(
+                org_id="000000000000000000000001",
+                project_id="000000000000000000000002",
+            ),
+        )
+        response = GuardrailCheckResponse(
+            decision=GuardrailCheckDecision.MODIFY,
+            allowed=True,
+            transformed_text="",
+        )
+        with _span_joined_to_caller("tool.guardrails_check"):
+            _record_guardrail_span_io(request, response)
+
+        recorded_output = json.loads(
+            in_memory_tracer.get_finished_spans()[-1].attributes["output.value"]
+        )
+        assert recorded_output["transformed_text"] == ""
+        assert recorded_output["transformed_text_truncated"] is False
+
+    def test_propagated_runner_root_omits_guardrail_io(self, in_memory_tracer):
+        headers = _headers_propagated_from_aer({})
+        assert "agentengine=root" in headers.get("tracestate", "")
+
+        client = _route_client()
+        response = client.post("/guardrails/check", json=_GUARDRAILS_PAYLOAD, headers=headers)
+
+        assert response.status_code == 200, response.text
+        spans = [
+            span
+            for span in in_memory_tracer.get_finished_spans()
+            if span.name == "tool.guardrails_check"
+        ]
+        assert spans
+        assert "input.value" not in spans[0].attributes
+        assert "output.value" not in spans[0].attributes
+
+    def test_propagated_inbound_caller_still_records_guardrail_io(self, in_memory_tracer):
+        headers = _headers_propagated_from_aer({"traceparent": TRACEPARENT})
+        assert "agentengine=root" not in headers.get("tracestate", "")
+
+        client = _route_client()
+        response = client.post(
+            "/guardrails/check",
+            json={**_GUARDRAILS_PAYLOAD, "input": {"text": "Acme appears here.", "metadata": {}}},
+            headers=headers,
+        )
+
+        assert response.status_code == 200, response.text
+        spans = {
+            span.name: span
+            for span in in_memory_tracer.get_finished_spans()
+            if span.name == "tool.guardrails_check"
+        }
+        recorded_input = json.loads(spans["tool.guardrails_check"].attributes["input.value"])
+        assert recorded_input["text"] == "Acme appears here."
 
     def test_no_route_declares_llm(self):
         """The /invoke_llm hops are transport, not model calls: the LangChain

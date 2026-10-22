@@ -5,11 +5,11 @@
  * boundaries, and the drain tears the loop down mid-super-step, so the turn
  * vanishes from playground history. This writes one synthetic root-namespace
  * checkpoint from the last committed state (never the in-flight super-step —
- * its channel values are mid-mutation), stamps the turn-opening user message
- * with `cancelled_turn` so the stopped status lives exactly as long as the
- * message itself, and terminal-izes `versions_seen` for every graph node so
- * the tip presents as completed: the cancelled super-step must never look
- * resumable, and fork validation rejects snapshots with pending tasks.
+ * its channel values are mid-mutation), records the turn-opening message id in
+ * the checkpoint metadata so the history reader can classify it as stopped,
+ * and terminal-izes `versions_seen` for every graph node so the tip presents as
+ * completed: the cancelled super-step must never look resumable, and fork
+ * validation rejects snapshots with pending tasks.
  *
  * Port of Python's `agent_engine_sdk_langgraph/cancelled_turn.py` — the twins
  * must stay behaviourally identical.
@@ -28,6 +28,14 @@ import { randomUUID } from "node:crypto";
 export const CANCELLED_TURN_METADATA_KEY = "agent_engine_cancelled_turn";
 export const CANCELLED_TURN_MESSAGE_ID_METADATA_KEY =
   "agent_engine_cancelled_turn_message_id";
+/**
+ * A fork carries the source thread's whole set of cancelled-opener ids onto its
+ * copied tip under this plural key: replay rebuilds checkpoints and drops the
+ * per-turn marker metadata, so the fork must re-record the set or a forked
+ * stopped turn would lose its badge.
+ */
+export const CANCELLED_TURN_MESSAGE_IDS_METADATA_KEY =
+  "agent_engine_cancelled_turn_message_ids";
 
 /**
  * Framework-owned channel carrying queued Send packets (the deep agents'
@@ -35,13 +43,6 @@ export const CANCELLED_TURN_MESSAGE_ID_METADATA_KEY =
  * as an empty queue.
  */
 export const TASKS_CHANNEL_KEY = "__pregel_tasks";
-
-/**
- * Wire kwarg on the persisted turn-opening message. The history readers pass
- * message kwargs through untouched, so the stopped status needs no marker
- * scan and survives exactly as long as the message does.
- */
-export const CANCELLED_TURN_MESSAGE_KWARG = "cancelled_turn";
 
 /** Duck-typed slice of the native saver the commit needs. */
 export interface CancelledTurnSaver {
@@ -127,21 +128,10 @@ export async function commitCancelledTurnCheckpoint(
     // The cancel beat even the input checkpoint: inject the user message
     // under its captured id or the turn cannot exist in history at all.
     resolvedId = turnMessageId ?? `msg-cancelled-${randomUUID()}`;
-    messages.push(
-      withCancelledStamp(
-        new HumanMessage({ content: userMessage, id: resolvedId }),
-      ),
-    );
+    messages.push(new HumanMessage({ content: userMessage, id: resolvedId }));
     channelVersions["messages"] = saver.getNextVersion(
       channelVersions["messages"],
     );
-  } else if (resolvedId !== undefined) {
-    for (let i = 0; i < messages.length; i++) {
-      const message = messages[i] as { id?: unknown } | null;
-      if (message?.id === resolvedId) {
-        messages[i] = withCancelledStamp(message);
-      }
-    }
   }
   channelValues["messages"] = messages;
 
@@ -260,24 +250,25 @@ function lastHumanMessageId(messages: unknown[]): string | undefined {
 }
 
 /**
- * Copy of `message` carrying the cancelled-turn kwarg. Never mutates the
- * deserialized original — checkpoint messages are shared state across reads.
+ * Opener ids a cancelled-turn checkpoint's metadata names.
+ *
+ * A marker checkpoint carries its own turn's singular opener id; a fork carries
+ * the source thread's whole set on its copied tip as a plural list. Never read
+ * from a message kwarg an agent could author, so both the reader and the fork
+ * resolve the same trusted set.
  */
-function withCancelledStamp<T>(message: T): T {
-  const clone = Object.assign(
-    Object.create(Object.getPrototypeOf(message)) as Record<string, unknown>,
-    message,
-  );
-  const existing = (clone["additional_kwargs"] ?? {}) as Record<
-    string,
-    unknown
-  >;
-  // Object.assign, not an index write: a generic intersection is read-only
-  // under indexing (TS2862).
-  return Object.assign(clone, {
-    additional_kwargs: {
-      ...existing,
-      [CANCELLED_TURN_MESSAGE_KWARG]: true,
-    },
-  }) as T;
+export function cancelledOpenerIdsFromMetadata(metadata: unknown): Set<string> {
+  const ids = new Set<string>();
+  if (metadata === null || typeof metadata !== "object") return ids;
+  const record = metadata as Record<string, unknown>;
+  if (record[CANCELLED_TURN_METADATA_KEY] !== true) return ids;
+  const messageId = record[CANCELLED_TURN_MESSAGE_ID_METADATA_KEY];
+  if (typeof messageId === "string" && messageId !== "") ids.add(messageId);
+  const carried = record[CANCELLED_TURN_MESSAGE_IDS_METADATA_KEY];
+  if (Array.isArray(carried)) {
+    for (const candidate of carried) {
+      if (typeof candidate === "string" && candidate !== "") ids.add(candidate);
+    }
+  }
+  return ids;
 }

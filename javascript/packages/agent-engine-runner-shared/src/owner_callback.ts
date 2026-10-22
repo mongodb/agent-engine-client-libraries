@@ -8,9 +8,9 @@
  * (never followed: the owner URL is only validated as a headless replica of
  * the service origin, so a 3xx could forward the body elsewhere), or any
  * other non-2xx — falls back to the service path. The owner is never retried
- * and this helper never throws. Response bodies are never read or logged
- * (externally influenced) and are cancelled so undici can reuse the
- * connection.
+ * and this helper never throws. Response bodies are never parsed, inspected,
+ * or logged (externally influenced); they are discarded solely so undici can
+ * reuse the keep-alive connection.
  */
 
 import { fetchPlatform } from "./tls_client.js";

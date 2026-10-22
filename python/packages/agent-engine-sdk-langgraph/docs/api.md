@@ -175,7 +175,8 @@ def tool(is_local: bool = True,
          timeout: int = 30,
          redact_fields: list[str] | None = None,
          response_format: Literal["content",
-                                  "content_and_artifact"] = "content")
+                                  "content_and_artifact"] = "content",
+         on_unknown_outcome: UnknownOutcomePolicy | None = None)
 ```
 
 Register a tool function.
@@ -199,6 +200,12 @@ for Tool Pod execution.
   round trip. Note it is still recorded in the execution log and is not
   covered by ``redact_fields`` (which redacts inputs only), so do not
   place secrets in it.
+- `on_unknown_outcome` - What a retry does when the platform lost the
+  runner while this tool was running in a durable workflow, so
+  nobody knows whether it ran. ``"rerun"`` runs the tool again
+  (at-least-once execution; declare it only for a tool that is
+  safe to run twice). ``"fail"`` refuses the retry, so the tool
+  never runs twice. Leave unset for the platform default.
 
 
 **Returns**:
@@ -869,8 +876,9 @@ Initialize the adapter with a compiled LangGraph.
   used verbatim (no workspace suffix). Appended after the
   established positional surface so existing positional
   callers keep binding ``output_parser`` / ``use_custom_parser``.
-- `durable_subgraphs` - Resolver for directly composed compiled subgraphs.
-  It is used only while an OE durable attempt is active.
+- `durable_subgraphs` - Resolver for compiled subgraphs and Send tasks.
+  It is used only while an OE durable attempt is active. When
+  None, a platform-checkpointed graph gets the default resolver.
 
 <a id="agent_engine_sdk_langgraph.agent.LangGraphBaseAgent.execute"></a>
 

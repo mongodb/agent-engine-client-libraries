@@ -539,7 +539,7 @@ class TestToolServerHandleExecute:
             oe_url="http://oe:8000",
         )
 
-        with patch("agent_engine_runner_shared.custom_events._get_client") as mock_get_client:
+        with patch("agent_engine_runner_shared.custom_events.get_shared_client") as mock_get_client:
             mock_client = MagicMock()
 
             def _post(url: str, json: dict) -> MagicMock:
@@ -549,8 +549,10 @@ class TestToolServerHandleExecute:
                 return resp
 
             mock_client.post.side_effect = _post
-            mock_client.stream.side_effect = lambda method, url, *, json, follow_redirects: (
-                _SyncPostStream(mock_client.post, url, json)
+            mock_client.stream.side_effect = (
+                lambda method, url, *, json, follow_redirects, timeout=None, **kwargs: (
+                    _SyncPostStream(mock_client.post, url, json)
+                )
             )
             mock_get_client.return_value = mock_client
             response = await server._handle_execute(request)
@@ -592,7 +594,7 @@ class TestToolServerHandleExecute:
             oe_owner_url=owner,
         )
 
-        with patch("agent_engine_runner_shared.progress._get_client") as get_client:
+        with patch("agent_engine_runner_shared.progress.get_shared_client") as get_client:
             client = get_client.return_value
             owner_response = MagicMock(is_success=True)
             owner_stream = MagicMock()
@@ -634,7 +636,7 @@ class TestToolServerHandleExecute:
             oe_owner_url="http://10-1-2-3.attacker-headless.example:8000",
         )
 
-        with patch("agent_engine_runner_shared.progress._get_client") as get_client:
+        with patch("agent_engine_runner_shared.progress.get_shared_client") as get_client:
             client = get_client.return_value
             service_response = MagicMock()
             service_response.raise_for_status.return_value = None
@@ -673,7 +675,7 @@ class TestToolServerHandleExecute:
             oe_url="http://oe:8000",
         )
 
-        with patch("agent_engine_runner_shared.custom_events._get_client") as mock_get_client:
+        with patch("agent_engine_runner_shared.custom_events.get_shared_client") as mock_get_client:
             response = await server._handle_execute(request)
 
         assert response.status == "error"
@@ -712,7 +714,7 @@ class TestToolServerHandleExecute:
             oe_url="http://oe:8000",
         )
 
-        with patch("agent_engine_runner_shared.custom_events._get_client") as mock_get_client:
+        with patch("agent_engine_runner_shared.custom_events.get_shared_client") as mock_get_client:
             mock_client = MagicMock()
 
             def _post(url: str, json: dict) -> MagicMock:
@@ -722,8 +724,10 @@ class TestToolServerHandleExecute:
                 return resp
 
             mock_client.post.side_effect = _post
-            mock_client.stream.side_effect = lambda method, url, *, json, follow_redirects: (
-                _SyncPostStream(mock_client.post, url, json)
+            mock_client.stream.side_effect = (
+                lambda method, url, *, json, follow_redirects, timeout=None, **kwargs: (
+                    _SyncPostStream(mock_client.post, url, json)
+                )
             )
             mock_get_client.return_value = mock_client
             response = await server._handle_execute(request)
@@ -758,7 +762,7 @@ class TestToolServerHandleExecute:
             oe_url="http://oe:8000",
         )
 
-        with patch("agent_engine_runner_shared.custom_events._get_client") as mock_get_client:
+        with patch("agent_engine_runner_shared.custom_events.get_shared_client") as mock_get_client:
             mock_client = Mock()
             mock_resp = Mock()
             mock_resp.raise_for_status = Mock()

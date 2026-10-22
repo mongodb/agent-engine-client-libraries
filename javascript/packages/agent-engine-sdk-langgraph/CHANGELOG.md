@@ -8,6 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- Durable sessions no longer fail at a human-in-the-loop pause inside a tool
+  call with `durable direct interrupt requires a stable LangGraph task path`
+  on `@langchain/langgraph` 1.5, which adds a boolean to the task path of
+  `Send`-dispatched tasks. A fresh-input hook that returns a plain object
+  tagged as a LangGraph `Command` is again rejected on LangGraph 1.4.21 and
+  later. A pause that is pending while an agent is redeployed across the
+  LangGraph 1.4 to 1.5 upgrade may not resume; the user restarts the turn.
 - Durable LLM activities now replay deterministically: LangGraph runtime keys
   injected into the model call options (`executionInfo` — per-attempt
   checkpoint/task UUIDs and `nodeFirstAttemptTime` — plus `durability` and

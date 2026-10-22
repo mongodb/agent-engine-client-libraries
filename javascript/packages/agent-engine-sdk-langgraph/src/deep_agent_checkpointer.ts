@@ -1,15 +1,16 @@
-/** Checkpointer policy for graphs created by Deep Agent. */
+/** Checkpointer view for graphs created by Deep Agent. */
 
 import type { BaseCheckpointSaver } from "@langchain/langgraph";
 
 import { PlatformCheckpointer } from "./platform_checkpointer.js";
 
 /**
- * Return the internal-routing view for a platform checkpointer, so a Deep
- * Agent graph participates in durable execution without rejecting its own
- * adapter routing (LangChain's agent factory routes pending ToolCalls through
- * LangGraph Send packets). The view shares the same platform scratch and
- * native savers. Other checkpointers pass through unchanged.
+ * Return the Deep Agent view for a platform checkpointer. LangChain's agent
+ * factory routes pending ToolCalls through LangGraph Send packets, and Deep
+ * Agent's recorded activity paths predate Send task segments, so the adapter
+ * recognizes this view and keeps those tasks on their parent path. The view
+ * shares the same platform scratch and native savers. Other checkpointers
+ * pass through unchanged.
  */
 export function checkpointerForDeepAgent<
   C extends BaseCheckpointSaver<string | number> | boolean | undefined,

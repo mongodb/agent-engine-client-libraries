@@ -38,7 +38,7 @@ const MAX_REDACT_DEPTH = 12;
 // and separator, redacts the value up to the next whitespace/comma/semicolon.
 const SECRET_INLINE_PATTERN =
   /\b(api[_-]?key|access[_-]?token|refresh[_-]?token|token|secret|password)(=|:)\s*([^\s,;]+)/gi;
-const BEARER_PATTERN = /\b(bearer)\s+[A-Za-z0-9._-]+/gi;
+const BEARER_PATTERN = /\b(bearer)\s+[A-Za-z0-9._\-+/=~]+/gi;
 const URL_USERINFO_PATTERN = /\b([a-z][a-z0-9+.-]*:\/\/)[^:/\s@]+:[^@\s/]+@/gi;
 // Bare-token form (scheme://token@host, no ":" separator) — e.g. a GitHub PAT
 // embedded as `https://ghp_xxx@github.com`. Applied after URL_USERINFO_PATTERN

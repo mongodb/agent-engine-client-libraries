@@ -18,10 +18,7 @@ from typing import Any, TypedDict
 from uuid import uuid4
 
 from agent_engine_runner_shared.generated.workflow.v1.runtime_pb2 import AttemptContext
-from agent_engine_runner_shared.workflow import (
-    current_attempt_context,
-    operation_path_resolver_scope,
-)
+from agent_engine_runner_shared.workflow import current_attempt_context
 from agent_engine_sdk import (
     AgentInput,
     AgentOutput,
@@ -41,7 +38,10 @@ from agent_engine_sdk_langgraph.checkpoint_branch import (
     pending_interrupts_from_state,
 )
 from agent_engine_sdk_langgraph.durable_errors import UnsupportedDurableGraphError
-from agent_engine_sdk_langgraph.durable_subgraphs import DurableSubgraphResolver
+from agent_engine_sdk_langgraph.durable_subgraphs import (
+    DurableSubgraphResolver,
+    SendTaskRecorder,
+)
 from agent_engine_sdk_langgraph.hooks import PrepareAgentInput, ResolveThreadId
 from agent_engine_sdk_langgraph.platform_checkpointer import (
     PlatformCheckpointer,
@@ -137,6 +137,9 @@ class ExecutionSession(ABC):
         self.prepare_input = prepare_input
         self._resolve_thread_id = resolve_thread_id
         self.durable_subgraphs = durable_subgraphs
+        # One recorder per run: a stream can resume a Send task's work in a
+        # later iteration than the one that started the task.
+        self.send_tasks = SendTaskRecorder()
         self.attempt = attempt
         self.use_custom_parser = use_custom_parser
 
@@ -222,7 +225,7 @@ class ExecutionSession(ABC):
         if resolver is None:
             yield
             return
-        with operation_path_resolver_scope(resolver):
+        with resolver.scope(self.send_tasks):
             yield
 
     def release_scratch(self) -> None:

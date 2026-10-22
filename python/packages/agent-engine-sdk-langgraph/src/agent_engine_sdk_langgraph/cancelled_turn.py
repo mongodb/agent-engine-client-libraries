@@ -4,16 +4,15 @@ Nothing checkpoints on cancel: LangGraph commits only at super-step
 boundaries, and the drain tears the loop down mid-super-step, so the turn
 vanishes from playground history. This writes one synthetic root-namespace
 checkpoint from the last committed state (never the in-flight super-step —
-its channel values are mid-mutation), stamps the turn-opening user message
-with ``cancelled_turn`` so the stopped status lives exactly as long as the
-message itself, and terminal-izes ``versions_seen`` for every graph node so
-the tip presents as completed: the cancelled super-step must never look
-resumable, and fork validation rejects snapshots with pending tasks.
+its channel values are mid-mutation), records the turn-opening message id in
+the checkpoint metadata so the history reader can classify it as stopped, and
+terminal-izes ``versions_seen`` for every graph node so the tip presents as
+completed: the cancelled super-step must never look resumable, and fork
+validation rejects snapshots with pending tasks.
 """
 
 from __future__ import annotations
 
-import copy
 import logging
 from collections.abc import Collection
 from typing import Any
@@ -26,16 +25,16 @@ _logger = logging.getLogger(__name__)
 
 CANCELLED_TURN_METADATA_KEY = "agent_engine_cancelled_turn"
 CANCELLED_TURN_MESSAGE_ID_METADATA_KEY = "agent_engine_cancelled_turn_message_id"
+# A fork carries the source thread's whole set of cancelled-opener ids onto its
+# copied tip under this plural key: replay rebuilds checkpoints and drops the
+# per-turn marker metadata, so the fork must re-record the set or a forked
+# stopped turn would lose its badge.
+CANCELLED_TURN_MESSAGE_IDS_METADATA_KEY = "agent_engine_cancelled_turn_message_ids"
 
 # Framework-owned channel carrying queued Send packets (the deep agents'
 # dispatched tool calls). Rebuilt from channel_values on read; absence reads
 # as an empty queue.
 TASKS_CHANNEL_KEY = "__pregel_tasks"
-
-# Wire kwarg on the persisted turn-opening message. The history readers pass
-# message kwargs through untouched, so the stopped status needs no marker
-# scan and survives exactly as long as the message does.
-CANCELLED_TURN_MESSAGE_KWARG = "cancelled_turn"
 
 
 async def commit_cancelled_turn(
@@ -95,21 +94,10 @@ async def commit_cancelled_turn(
         # The cancel beat even the input checkpoint: inject the user message
         # under its captured id or the turn cannot exist in history at all.
         resolved_id = turn_message_id or f"msg-cancelled-{uuid4()}"
-        messages.append(
-            _with_cancelled_stamp(HumanMessage(content=user_message, id=resolved_id))
-        )
+        messages.append(HumanMessage(content=user_message, id=resolved_id))
         channel_versions["messages"] = saver.get_next_version(
             channel_versions.get("messages"), None
         )
-    elif resolved_id is not None:
-        messages = [
-            (
-                _with_cancelled_stamp(message)
-                if getattr(message, "id", None) == resolved_id
-                else message
-            )
-            for message in messages
-        ]
     channel_values["messages"] = messages
 
     # Every graph node reads as caught up — including nodes that never ran and
@@ -210,18 +198,25 @@ def _last_human_message_id(messages: list[Any]) -> str | None:
     return None
 
 
-def _with_cancelled_stamp(message: Any) -> Any:
-    """Copy of ``message`` carrying the cancelled-turn kwarg.
+def cancelled_opener_ids_from_metadata(metadata: Any) -> set[str]:
+    """Opener ids a cancelled-turn checkpoint's metadata names.
 
-    Never mutates the deserialized original — checkpoint messages are shared
-    state across reads.
+    A marker checkpoint carries its own turn's singular opener id; a fork
+    carries the source thread's whole set on its copied tip as a plural list.
+    Never read from a message kwarg an agent could author, so both the reader
+    and the fork resolve the same trusted set.
     """
-    kwargs = {
-        **(getattr(message, "additional_kwargs", None) or {}),
-        CANCELLED_TURN_MESSAGE_KWARG: True,
-    }
-    if hasattr(message, "model_copy"):
-        return message.model_copy(update={"additional_kwargs": kwargs})
-    clone = copy.copy(message)
-    clone.additional_kwargs = kwargs
-    return clone
+    if not isinstance(metadata, dict) or not metadata.get(CANCELLED_TURN_METADATA_KEY):
+        return set()
+    ids: set[str] = set()
+    message_id = metadata.get(CANCELLED_TURN_MESSAGE_ID_METADATA_KEY)
+    if isinstance(message_id, str) and message_id:
+        ids.add(message_id)
+    carried = metadata.get(CANCELLED_TURN_MESSAGE_IDS_METADATA_KEY)
+    if isinstance(carried, list):
+        ids.update(
+            candidate
+            for candidate in carried
+            if isinstance(candidate, str) and candidate
+        )
+    return ids

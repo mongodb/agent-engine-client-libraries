@@ -577,6 +577,15 @@ class SessionMessage(BaseModel):
             "message is the result of. Empty/absent on non-tool messages."
         ),
     )
+    outcome: str = Field(
+        default="",
+        description=(
+            "Platform-owned classification of this row: 'cancelled' on a "
+            "stopped turn's opener, 'interrupted' on a tool call the platform "
+            "aborted, empty otherwise. Derived by the reader from the record "
+            "it trusts, never from agent-authorable message kwargs."
+        ),
+    )
     additional_kwargs: dict[str, JsonValue] | None = Field(
         default=None,
         description=(
@@ -593,6 +602,15 @@ class SessionMessagesResponse(BaseModel):
         description=(
             "Decoded conversation history in chronological order. Empty "
             "when the session has no persisted messages."
+        ),
+    )
+    outcome_supported: bool = Field(
+        default=True,
+        description=(
+            "True when the reader classifies each message's platform-owned "
+            "``outcome``. A consumer that renders stopped badges from "
+            "``outcome`` must fail closed when a reader predates this field "
+            "rather than silently dropping genuine classifications."
         ),
     )
 

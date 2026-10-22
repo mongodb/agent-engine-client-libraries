@@ -36,8 +36,14 @@ import { pathToFileURL } from "node:url";
 import { getLogger, setupLogging } from "./logger.js";
 import { runWithCustomerOrigin } from "./context.js";
 import { redactText } from "./error_reporting.js";
-import { materializeMcpOauthSecretCache } from "./mcp_oauth_secret.js";
+import {
+  materializeMcpOauthSecretCache,
+  mcpOauthSecretValues,
+} from "./mcp_oauth_secret.js";
 import { getRuntimeMode } from "./utils.js";
+import { onStartupComplete } from "./startup_state.js";
+import { fetchPlatform, getFetchOptionsWithTLS } from "./tls_client.js";
+import { isCredentialName } from "./tool_api_error.js";
 
 const logger = getLogger("agent_engine_runner_shared.launcher");
 
@@ -64,6 +70,94 @@ export function setTerminationLogPathForTest(path: string): void {
  */
 const TERMINATION_MESSAGE_MAX_BYTES = 4 * 1024;
 const TERMINATION_MESSAGE_MAX_LINES = 40;
+const STARTUP_REPORT_DEADLINE_MS = 2000;
+const STARTUP_REPORT_MAX_BYTES = 512;
+const STARTUP_REPORT_INPUT_BYTES = 4096;
+const BOOT_ID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+// eslint-disable-next-line no-control-regex -- untrusted errors must stay on one line
+const CONTROL_CHARS_RE = /[\x00-\x1f\x7f-\x9f\u2028\u2029]/g;
+let startupSecrets: string[] = [];
+
+/** Capture credential values before OAuth materialization removes them from the env. */
+function snapshotStartupSecrets(): string[] {
+  const values = new Set(mcpOauthSecretValues());
+  for (const [name, value] of Object.entries(process.env)) {
+    if (value && isCredentialName(name)) values.add(value);
+  }
+  values.delete("");
+  // Longest first so a secret containing another is replaced whole.
+  return [...values].sort((a, b) => b.length - a.length);
+}
+
+function startupReportText(text: string): string {
+  // Truncating before scrubbing could cut a credential in half and defeat redaction.
+  if (Buffer.byteLength(text) > STARTUP_REPORT_INPUT_BYTES) {
+    return "Startup error message exceeded the reporting limit";
+  }
+  // Known values go first: a pattern that redacts only part of a secret would
+  // leave the rest unmatchable by its exact value.
+  for (const value of startupSecrets)
+    text = text.replaceAll(value, "<redacted>");
+  text = redactText(text);
+  const bytes = Buffer.from(text.replace(CONTROL_CHARS_RE, " "), "utf-8");
+  let cut = Math.min(bytes.length, STARTUP_REPORT_MAX_BYTES);
+  // Step back off UTF-8 continuation bytes so the cut never splits a character.
+  while (cut > 0 && ((bytes[cut] ?? 0) & 0xc0) === 0x80) cut--;
+  return bytes.subarray(0, cut).toString("utf-8");
+}
+
+function bootErrorUrl(): string | undefined {
+  const bootId = process.env.AGENTIC_BOOT_ID ?? "";
+  const oeUrl = process.env.OE_URL ?? "";
+  if (!BOOT_ID_RE.test(bootId) || !URL.canParse(oeUrl)) return undefined;
+  const url = new URL(`${oeUrl.replace(/\/$/, "")}/boots/${bootId}/errors`);
+  if (
+    !["http:", "https:"].includes(url.protocol) ||
+    url.username ||
+    url.password
+  )
+    return undefined;
+  return url.href;
+}
+
+/** Best-effort POST of a scrubbed startup error to OE, bounded by one deadline. */
+async function reportStartupError(
+  summary: string,
+  err: Error | undefined,
+  code: number,
+): Promise<void> {
+  if (startupComplete) return;
+  try {
+    const url = bootErrorUrl();
+    if (url === undefined) {
+      logger.debug(
+        "Skipping startup report without a valid boot ID and OE URL",
+      );
+      return;
+    }
+    // The signal bounds the whole exchange; the body is never read.
+    const response = await fetchPlatform(url, {
+      ...getFetchOptionsWithTLS(url),
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        sandbox: resolveRunnerMode() === "tool" ? "tool" : "agent",
+        exitCode: code,
+        errorType: startupReportText(err?.name ?? "StartupError"),
+        message: startupReportText(
+          err ? `${summary}: ${err.message}` : summary,
+        ),
+      }),
+      redirect: "manual",
+      signal: AbortSignal.timeout(STARTUP_REPORT_DEADLINE_MS),
+    });
+    logger.debug(`Startup report returned status ${response.status}`);
+    void response.body?.cancel().catch(() => undefined);
+  } catch {
+    logger.debug("Startup report could not be delivered");
+  }
+}
 
 /**
  * Truncate `text` to at most `maxLines` lines or `maxBytes` UTF-8 bytes,
@@ -143,14 +237,62 @@ export function writeTerminationMessage(summary: string, err?: Error): void {
  * termination message always carries the real cause forward to
  * `ContainerStatus.LastTerminationState.Terminated.Message`.
  */
-function fatalWithTermination(summary: string, err?: Error, code = 1): never {
-  if (err !== undefined) {
-    logger.error(err, `${summary}: ${err.message}`);
-  } else {
-    logger.error(summary);
-  }
-  writeTerminationMessage(summary, err);
-  process.exit(code);
+let fatalPromise: Promise<never> | undefined;
+
+async function fatalWithTermination(
+  summary: string,
+  err?: Error,
+  code = 1,
+): Promise<never> {
+  if (fatalPromise !== undefined) return fatalPromise;
+  fatalPromise = (async () => {
+    if (err !== undefined) {
+      logger.error(err, `${summary}: ${err.message}`);
+    } else {
+      logger.error(summary);
+    }
+    writeTerminationMessage(summary, err);
+    await reportStartupError(summary, err, code);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    process.exit(code);
+    throw new Error("process.exit unexpectedly returned");
+  })();
+  void fatalPromise.catch(() => undefined);
+  return fatalPromise;
+}
+
+let startupComplete = false;
+let removeStartupCompleteListener: (() => void) | undefined;
+
+function installStartupFatalHandlers(): void {
+  const onUncaughtException = (error: Error): void => {
+    if (!startupComplete) {
+      void fatalWithTermination(
+        "Unhandled exception during startup",
+        toError(error),
+        EXIT_STARTUP_CRASH,
+      );
+    }
+  };
+  const onUnhandledRejection = (reason: unknown): void => {
+    if (!startupComplete) {
+      void fatalWithTermination(
+        "Unhandled rejection during startup",
+        toError(reason),
+        EXIT_STARTUP_CRASH,
+      );
+    }
+  };
+
+  removeStartupCompleteListener = onStartupComplete(() => {
+    startupComplete = true;
+    process.removeListener("uncaughtException", onUncaughtException);
+    process.removeListener("unhandledRejection", onUnhandledRejection);
+    removeStartupCompleteListener?.();
+    removeStartupCompleteListener = undefined;
+  });
+  process.on("uncaughtException", onUncaughtException);
+  process.on("unhandledRejection", onUnhandledRejection);
 }
 
 /**
@@ -246,10 +388,9 @@ export function resolveImportTarget(
 /**
  * Parse `AGENT_ENTRYPOINT` into `{ modulePath, exportName }`.
  *
- * Exits the process with `EXIT_NO_ENTRYPOINT` if the env var is unset or
- * malformed — matches Python `_resolve_entrypoint`'s equivalent exit code.
- * Exported so tests can spawn this in a subprocess and assert on exit
- * code / stderr.
+ * Throws if the env var is unset or malformed; `runLauncher` maps that throw
+ * to `EXIT_NO_ENTRYPOINT` and the termination message. Exported so tests can
+ * assert on the parse directly.
  */
 export function resolveEntrypoint(): ResolvedEntrypoint {
   // Surrounding whitespace is stripped because the build pipeline extracts this
@@ -258,11 +399,7 @@ export function resolveEntrypoint(): ResolvedEntrypoint {
   // looked up below.
   const raw = (process.env["AGENT_ENTRYPOINT"] ?? "").trim();
   if (!raw) {
-    fatalWithTermination(
-      "AGENT_ENTRYPOINT is not set",
-      undefined,
-      EXIT_NO_ENTRYPOINT,
-    );
+    throw new Error("AGENT_ENTRYPOINT is not set");
   }
 
   let modulePath: string;
@@ -277,10 +414,8 @@ export function resolveEntrypoint(): ResolvedEntrypoint {
   }
 
   if (!modulePath || !exportName) {
-    fatalWithTermination(
+    throw new Error(
       `Invalid AGENT_ENTRYPOINT '${raw}': both module path and export name must be non-empty`,
-      undefined,
-      EXIT_NO_ENTRYPOINT,
     );
   }
 
@@ -298,6 +433,10 @@ export function resolveEntrypoint(): ResolvedEntrypoint {
  * `.run()` returns.
  */
 export async function runLauncher(): Promise<void> {
+  startupSecrets = snapshotStartupSecrets();
+  startupComplete = false;
+  fatalPromise = undefined;
+  installStartupFatalHandlers();
   // Install before any import/entrypoint work. After this, console.error is
   // captured as WARNING (not ERROR), so failure paths must use the logger.
   setupLogging({ appName: "launcher", mode: resolveRunnerMode() });
@@ -309,13 +448,25 @@ export async function runLauncher(): Promise<void> {
   try {
     await materializeMcpOauthSecretCache();
   } catch (e) {
-    fatalWithTermination(
+    await fatalWithTermination(
       "Cannot materialize MCP OAuth credentials",
       toError(e),
+      EXIT_STARTUP_CRASH,
     );
   }
 
-  const { modulePath, exportName } = resolveEntrypoint();
+  let entrypoint: ResolvedEntrypoint;
+  try {
+    entrypoint = resolveEntrypoint();
+  } catch (e) {
+    await fatalWithTermination(
+      toError(e).message,
+      undefined,
+      EXIT_NO_ENTRYPOINT,
+    );
+    return;
+  }
+  const { modulePath, exportName } = entrypoint;
 
   logger.info(`Launcher: importing ${modulePath}:${exportName}`);
 
@@ -331,16 +482,17 @@ export async function runLauncher(): Promise<void> {
     // Include the resolved target so a cwd/WORKDIR mismatch or missing
     // compiled file is visible during on-call debugging, not just the dotted
     // module name the user wrote.
-    fatalWithTermination(
+    await fatalWithTermination(
       `Cannot import module '${modulePath}' (resolved to '${importTarget}')`,
       toError(e),
       EXIT_IMPORT_ERROR,
     );
+    return;
   }
 
   const target = mod[exportName];
   if (target === undefined) {
-    fatalWithTermination(
+    await fatalWithTermination(
       `Module '${modulePath}' has no export '${exportName}'`,
       undefined,
       EXIT_NO_ENTRYPOINT,
@@ -367,7 +519,7 @@ export async function runLauncher(): Promise<void> {
       // AsyncLocalStorage propagates across awaits inside the callback.
       await runWithCustomerOrigin(() => invoke());
     } catch (e) {
-      fatalWithTermination(
+      await fatalWithTermination(
         `Unhandled exception from agent entrypoint '${modulePath}:${exportName}'`,
         toError(e),
         EXIT_STARTUP_CRASH,
@@ -376,7 +528,7 @@ export async function runLauncher(): Promise<void> {
     return;
   }
 
-  fatalWithTermination(
+  await fatalWithTermination(
     `'${modulePath}:${exportName}' is not callable and has no callable 'run()' method`,
     undefined,
     EXIT_NO_ENTRYPOINT,
@@ -390,6 +542,10 @@ const isCliEntry =
   import.meta.url === pathToFileURL(process.argv[1]).href;
 if (isCliEntry) {
   runLauncher().catch((e) => {
-    fatalWithTermination("Launcher failed", toError(e));
+    return fatalWithTermination(
+      "Launcher failed",
+      toError(e),
+      EXIT_STARTUP_CRASH,
+    );
   });
 }

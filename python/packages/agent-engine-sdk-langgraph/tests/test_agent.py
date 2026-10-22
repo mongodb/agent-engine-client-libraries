@@ -61,6 +61,7 @@ from agent_engine_runner_shared.workflow import (
     DurableActivitySuspended,
     attempt_context_scope,
     current_operation_path,
+    operation_path_resolver_scope,
 )
 
 
@@ -1539,6 +1540,15 @@ class TestFindLastAIContent:
         assert find_last_ai_content([]) == ""
 
 
+def _nested_resolver() -> MagicMock:
+    """A resolver double whose scope binds it like DurableSubgraphResolver."""
+    resolver = MagicMock(
+        return_value=(ChildOperationBoundary("case_investigation", "task-a"),)
+    )
+    resolver.scope = lambda _send_tasks: operation_path_resolver_scope(resolver)
+    return resolver
+
+
 class TestLangGraphBaseAgent:
     """Tests for LangGraphBaseAgent."""
 
@@ -1983,9 +1993,7 @@ class TestLangGraphBaseAgent:
     async def test_durable_invoke_binds_nested_operation_resolver(
         self, mock_graph: MagicMock, agent_input: AgentInput
     ) -> None:
-        resolver = MagicMock(
-            return_value=(ChildOperationBoundary("case_investigation", "task-a"),)
-        )
+        resolver = _nested_resolver()
         agent = LangGraphBaseAgent(mock_graph, durable_subgraphs=resolver)
         seen: list[tuple[str, int]] = []
 
@@ -2015,9 +2023,7 @@ class TestLangGraphBaseAgent:
     async def test_native_invoke_does_not_bind_or_validate_nested_resolver(
         self, mock_graph: MagicMock, agent_input: AgentInput
     ) -> None:
-        resolver = MagicMock(
-            return_value=(ChildOperationBoundary("case_investigation", "task-a"),)
-        )
+        resolver = _nested_resolver()
         agent = LangGraphBaseAgent(mock_graph, durable_subgraphs=resolver)
         seen: list[tuple[str, int]] = []
 
@@ -2358,9 +2364,7 @@ class TestLangGraphBaseAgent:
     async def test_durable_stream_binds_and_restores_nested_operation_resolver(
         self, mock_graph: MagicMock, agent_input: AgentInput
     ) -> None:
-        resolver = MagicMock(
-            return_value=(ChildOperationBoundary("case_investigation", "task-a"),)
-        )
+        resolver = _nested_resolver()
         agent = LangGraphBaseAgent(mock_graph, durable_subgraphs=resolver)
         seen: list[tuple[str, int]] = []
 
@@ -2390,9 +2394,7 @@ class TestLangGraphBaseAgent:
     async def test_durable_stream_can_be_drained_by_another_task(
         self, mock_graph: MagicMock, agent_input: AgentInput
     ) -> None:
-        resolver = MagicMock(
-            return_value=(ChildOperationBoundary("case_investigation", "task-a"),)
-        )
+        resolver = _nested_resolver()
         agent = LangGraphBaseAgent(mock_graph, durable_subgraphs=resolver)
 
         async def stream_inner(

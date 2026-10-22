@@ -21,10 +21,21 @@ from collections.abc import Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
 from functools import partial
-from typing import TYPE_CHECKING, Any, Callable, Coroutine, Dict, Iterator, Literal, Optional
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Coroutine,
+    Dict,
+    Iterator,
+    Literal,
+    Optional,
+    TypeVar,
+)
 
 import httpx
 from fastapi import HTTPException
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError
 
 from agent_engine_runner_shared.context import (
     get_current_execution_id,
@@ -34,8 +45,13 @@ from agent_engine_runner_shared.context import (
     local_suspend_request_context,
     report_oe_owner_url_failure,
 )
-from agent_engine_runner_shared.generated.workflow.v1.activity_pb2 import ACTIVITY_KIND_TOOL
+from agent_engine_runner_shared.generated.workflow.v1.activity_pb2 import (
+    ACTIVITY_KIND_TOOL,
+    ACTIVITY_OUTCOME_KIND_SUSPENDED,
+    ActivityContext,
+)
 from agent_engine_runner_shared.models import (
+    ElicitationInfo,
     GuardrailMeta,
     SuspendPayload,
     ToolExecuteRequest,
@@ -51,7 +67,7 @@ from agent_engine_runner_shared.server.http_retry import (
     RETRY_AFTER_MAX_WAIT_S,
     parse_retry_after_seconds,
 )
-from agent_engine_runner_shared.tls_client import create_httpx_client_with_tls
+from agent_engine_runner_shared.tls_client import get_shared_client
 from agent_engine_runner_shared.tool_api_error import (
     ToolAPIError,
     classify_tool_api_error,
@@ -77,12 +93,28 @@ from agent_engine_runner_shared.workflow import (
     current_attempt_context,
     run_serial_activity,
 )
-from agent_engine_runner_shared.workflow.activity import semantic_input_from_json
+from agent_engine_runner_shared.workflow.activity import (
+    UnknownOutcomePolicy,
+    build_activity_command,
+    semantic_input_from_json,
+    unwrap_activity_outcome,
+    validate_on_unknown_outcome,
+)
+from agent_engine_runner_shared.workflow.client import ActivityReplay
 from agent_engine_runner_shared.workflow.context import (
     activity_requires_reconstruction,
-    allocate_activity_ordinal,
+    allocate_activity_position,
+    current_operation_path,
+    forget_oauth_authorization_wait,
+    interrupted_activity_answered,
+    is_oauth_authorization_wait,
+    note_activity_reconstruction_id,
+    note_oauth_authorization_wait,
+    record_interrupted_activity,
+    record_observed_activity,
     tool_activity_key,
 )
+from agent_engine_runner_shared.workflow.protojson import proto_struct_to_json
 
 if TYPE_CHECKING:
     from opentelemetry.trace import Span
@@ -119,6 +151,65 @@ _CALL_INTERRUPTED = _CallInterrupted()
 # key. The reserved key is stripped from genuine tool results before they are
 # recorded, so this exact shape can only ever mean an OE interrupt.
 _INTERRUPTED_WIRE_MARKER = {CALL_INTERRUPTED_ARTIFACT_KEY: True}
+
+
+class _OAuthResourceOutcome(BaseModel):
+    """A genuine OAuth tool result, nested so its content cannot impersonate consent."""
+
+    model_config = ConfigDict(extra="forbid")
+    kind: Literal["result"] = Field(default="result", description="Resource outcome discriminator.")
+    result: Any = Field(
+        description="The actual tool result, including ordinary control-looking data."
+    )
+
+
+class _OAuthChallengeOutcome(BaseModel):
+    """A typed OE consent challenge recorded before the framework wait."""
+
+    model_config = ConfigDict(extra="forbid")
+    kind: Literal["authorization_required"] = Field(
+        default="authorization_required", description="Consent outcome discriminator."
+    )
+    elicitation: ElicitationInfo = Field(description="The challenge returned by the OE token gate.")
+    activity_id: str = Field(
+        min_length=1, description="Recorded challenge activity identifying this one wait."
+    )
+    step: int = Field(ge=1, description="Operational-step watermark before the wait.")
+
+
+_OAUTH_OUTCOME = TypeAdapter(_OAuthResourceOutcome | _OAuthChallengeOutcome)
+
+
+class _OAuthAuthorizationRequired(Exception):
+    """Leave durable dispatch with typed consent control instead of interrupting its activity."""
+
+    def __init__(self, elicitation: ElicitationInfo, step: int) -> None:
+        """Carry the OE response to its activity boundary without exposing it in errors."""
+        super().__init__("OAuth authorization is required")
+        self.elicitation = elicitation
+        self.step = step
+
+
+def _oauth_outcome(value: Any) -> _OAuthResourceOutcome | _OAuthChallengeOutcome:
+    """Validate the platform-owned activity envelope without leaking stored input in errors."""
+    try:
+        return _OAUTH_OUTCOME.validate_python(value)
+    except ValidationError:
+        raise ToolExecutionError("Invalid recorded OAuth tool outcome") from None
+
+
+def oauth_authorization_wait_id(value: Any) -> str | None:
+    """Identify a consent wait only when this attempt recorded the platform's challenge."""
+    if not isinstance(value, dict) or value.get("suspend_reason") != "authorization_required":
+        return None
+    context = value.get("suspend_context")
+    flow_id = context.get("elicitation_id") if isinstance(context, dict) else None
+    return (
+        flow_id
+        if isinstance(flow_id, str)
+        and is_oauth_authorization_wait(value.get("oauth_authorization_wait"))
+        else None
+    )
 
 
 def _current_trace_context() -> tuple[Optional[str], Optional[str]]:
@@ -263,7 +354,16 @@ _TERMINAL_EXECUTION_REASONS = {
 }
 
 
-class TerminalExecutionError(ToolExecutionError):
+class ToolPlatformError(ToolExecutionError):
+    """Raised when the platform, not the tool, failed a tool call.
+
+    The tool may already have run, for example when OE rejects or never
+    acknowledges its result, so an adapter must not report this to the model as
+    a failed tool it could call again.
+    """
+
+
+class TerminalExecutionError(ToolPlatformError):
     """Raised when OE rejects a tool call because the execution already ended."""
 
 
@@ -365,6 +465,9 @@ def _encode_durable_tool_failure(error: Exception) -> str:
                 "elapsed_seconds": error.elapsed_seconds,
             }
         )
+    elif isinstance(error, ToolPlatformError):
+        # A replay must still keep a platform failure away from the model.
+        payload["kind"] = "platform"
     elif isinstance(error, ExternalAPICallError):
         payload.update(
             {
@@ -399,6 +502,8 @@ def _decode_durable_tool_failure(message: str) -> ToolExecutionError:
         except (TypeError, ValueError):
             return ToolExecutionError(failure_message)
         return ExternalAPICallError(failure_message, tool_api_error)
+    if kind == "platform":
+        return ToolPlatformError(failure_message)
     if kind != "timeout":
         return ToolExecutionError(failure_message)
     tool_name = payload.get("tool_name")
@@ -528,6 +633,28 @@ def request_oe_approval(
 # patch the module-global name `request_oe_approval`.
 _PUBLIC_REQUEST_OE_APPROVAL = request_oe_approval
 
+_T = TypeVar("_T")
+
+
+def _run_with_shared_client(oe_url: str, call: Callable[[httpx.Client], _T]) -> _T:
+    """Run ``call`` on the shared client, re-fetching once if it was closed.
+
+    Cert rotation and LRU eviction close the previous shared client; a callback
+    caught between ``get_shared_client`` and its first send then hits httpx's
+    bare ``RuntimeError`` (not an ``httpx.HTTPError``), which would otherwise
+    escape the transport-error handling that is supposed to retry or absorb it.
+    The failed send never reached the OE, so re-fetching the rebuilt client and
+    retrying once cannot duplicate the request.
+    """
+    client = get_shared_client(oe_url)
+    try:
+        return call(client)
+    except RuntimeError:
+        if not client.is_closed:
+            raise
+        logger.debug("shared OE client closed mid-call; retrying on rebuilt client")
+        return call(get_shared_client(oe_url))
+
 
 def _request_oe_approval(
     oe_url: str,
@@ -592,40 +719,44 @@ def _request_oe_approval(
         else httpx.Timeout(get_request_timeout(), read=TOOL_READ_TIMEOUT)
     )
     started = time.monotonic()
-    with create_httpx_client_with_tls(oe_url, client_timeout) as client:
-        try:
-            resp = client.post(f"{oe_url}/tool/execute", json=payload)
-            resp.raise_for_status()
-            return ToolExecuteResponse(**resp.json())
-        except httpx.ReadTimeout as e:
-            # Only a *read* timeout means the tool overran: the request reached the
-            # OE and we gave up waiting for its result. A connect/write/pool
-            # timeout never got the call to the OE, so it stays an unreachable-OE
-            # failure below rather than being blamed on the tool.
-            elapsed = time.monotonic() - started
-            logger.error(f"Step {step}: Tool '{tool_name}' timed out after {elapsed:.1f}s")
-            read_deadline = (
-                client_timeout.read
-                if isinstance(client_timeout, httpx.Timeout) and client_timeout.read is not None
-                else elapsed
-            )
-            raise ToolCallTimeoutError(tool_name, read_deadline, elapsed) from e
-        except httpx.HTTPStatusError as e:
-            if e.response.status_code == 503:
-                retry_after_s = parse_retry_after_seconds(e.response.headers.get("Retry-After"))
-                if retry_after_s is not None:
-                    raise OERetryAfterError(retry_after_s) from e
-            if _is_guardrail_review_refusal(e.response):
-                logger.error(f"Step {step}: OE refused to resolve the guardrail review")
-                raise LLMInvocationError(
-                    "Guardrail review could not resolve this call",
-                    error_code=GUARDRAIL_REVIEW_INVALID_CODE,
-                ) from e
-            logger.error(f"Step {step}: Failed to request OE approval: {e}", exc_info=True)
-            raise PolicyDeniedException("OE unreachable; blocking for safety") from e
-        except httpx.HTTPError as e:
-            logger.error(f"Step {step}: Failed to request OE approval: {e}", exc_info=True)
-            raise PolicyDeniedException("OE unreachable; blocking for safety") from e
+    try:
+        resp = _run_with_shared_client(
+            oe_url,
+            lambda client: client.post(
+                f"{oe_url}/tool/execute", json=payload, timeout=client_timeout
+            ),
+        )
+        resp.raise_for_status()
+        return ToolExecuteResponse(**resp.json())
+    except httpx.ReadTimeout as e:
+        # Only a *read* timeout means the tool overran: the request reached the
+        # OE and we gave up waiting for its result. A connect/write/pool
+        # timeout never got the call to the OE, so it stays an unreachable-OE
+        # failure below rather than being blamed on the tool.
+        elapsed = time.monotonic() - started
+        logger.error(f"Step {step}: Tool '{tool_name}' timed out after {elapsed:.1f}s")
+        read_deadline = (
+            client_timeout.read
+            if isinstance(client_timeout, httpx.Timeout) and client_timeout.read is not None
+            else elapsed
+        )
+        raise ToolCallTimeoutError(tool_name, read_deadline, elapsed) from e
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 503:
+            retry_after_s = parse_retry_after_seconds(e.response.headers.get("Retry-After"))
+            if retry_after_s is not None:
+                raise OERetryAfterError(retry_after_s) from e
+        if _is_guardrail_review_refusal(e.response):
+            logger.error(f"Step {step}: OE refused to resolve the guardrail review")
+            raise LLMInvocationError(
+                "Guardrail review could not resolve this call",
+                error_code=GUARDRAIL_REVIEW_INVALID_CODE,
+            ) from e
+        logger.error(f"Step {step}: Failed to request OE approval: {e}", exc_info=True)
+        raise PolicyDeniedException("OE unreachable; blocking for safety") from e
+    except httpx.HTTPError as e:
+        logger.error(f"Step {step}: Failed to request OE approval: {e}", exc_info=True)
+        raise PolicyDeniedException("OE unreachable; blocking for safety") from e
 
 
 def request_oe_approval_retryable(
@@ -739,13 +870,14 @@ def report_oe_result(
                 attempt_count += 1
                 owner_delivered_successfully = False
                 try:
-                    with create_httpx_client_with_tls(oe_url, get_request_timeout()) as client:
-                        owner_delivered_successfully = owner_delivered(
-                            client,
-                            owner_result_url,
-                            payload,
-                            lambda msg: logger.warning("/tool/result %s URL %s", msg, service_url),
-                        )
+                    client = get_shared_client(oe_url)
+                    owner_delivered_successfully = owner_delivered(
+                        client,
+                        owner_result_url,
+                        payload,
+                        lambda msg: logger.warning("/tool/result %s URL %s", msg, service_url),
+                        timeout=get_request_timeout(),
+                    )
                 except Exception as exc:  # noqa: BLE001 - owner is best-effort
                     if owner_delivered_successfully:
                         return
@@ -766,13 +898,17 @@ def report_oe_result(
                 service_delivered_successfully = False
                 retry_after_s: Optional[float] = None
                 try:
-                    with create_httpx_client_with_tls(oe_url, get_request_timeout()) as client:
-                        response = post_without_reading_response_body(client, service_url, payload)
-                        response.raise_for_status()
-                        service_delivered_successfully = True
+                    response = _run_with_shared_client(
+                        oe_url,
+                        lambda client: post_without_reading_response_body(
+                            client, service_url, payload, timeout=get_request_timeout()
+                        ),
+                    )
+                    response.raise_for_status()
+                    service_delivered_successfully = True
                 except httpx.HTTPStatusError as exc:
                     if 400 <= exc.response.status_code < 500:
-                        raise ToolExecutionError(
+                        raise ToolPlatformError(
                             f"OE rejected result settlement with HTTP {exc.response.status_code}"
                         ) from exc
                     last_error = exc
@@ -787,7 +923,7 @@ def report_oe_result(
                 except Exception as exc:
                     if service_delivered_successfully:
                         return
-                    raise ToolExecutionError("Failed to prepare OE result settlement") from exc
+                    raise ToolPlatformError("Failed to prepare OE result settlement") from exc
 
                 if service_delivered_successfully:
                     return
@@ -797,9 +933,7 @@ def report_oe_result(
                     else:
                         time.sleep(0.1 * (2**attempt))
 
-            raise ToolExecutionError(
-                "OE did not acknowledge tool result settlement"
-            ) from last_error
+            raise ToolPlatformError("OE did not acknowledge tool result settlement") from last_error
         finally:
             if span is not None:
                 span.set_attribute("attempt_count", attempt_count)
@@ -991,9 +1125,14 @@ class SecureToolWrapper:
         local_executor: Optional[Callable[[], Any]] = None,
         is_framework_control_flow: Optional[Callable[[BaseException], bool]] = None,
         call_channel_expected: bool = False,
+        on_unknown_outcome: Optional[UnknownOutcomePolicy] = None,
     ) -> Any:
         """
         Execute a tool call through OE.
+
+        Durable OAuth records a typed challenge before a separate framework
+        wait, then records the actual resource call after reauthorization.
+        Its consent answer never becomes a tool result or Memory content.
 
         Args:
             tool_name: Name of the tool
@@ -1010,6 +1149,9 @@ class SecureToolWrapper:
             is_local: Whether OE should return the approved call to this AER.
             local_executor: Callback that invokes the registered tool on the
                 current framework stack. Required for local tools.
+            on_unknown_outcome: What a retry does when the runner was lost while
+                this tool was in flight in a durable workflow: ``"rerun"`` runs it
+                again, ``"fail"`` refuses the retry.
 
         Returns:
             Result from execution or cached result
@@ -1047,10 +1189,9 @@ class SecureToolWrapper:
         # identity so OE can replay a recorded outcome (event-log replay)
         # instead of re-running the tool. OE owns hashing and replay; the
         # native path above is unchanged.
-        # Durable identity describes the application's tool invocation, not how
-        # the platform routes or authorizes it. Runtime metadata, ToolCall ids,
-        # providers, scopes, and local placement may change across a
-        # replacement without changing the business operation being replayed.
+        # Durable identity describes the application's tool invocation.
+        # Runtime metadata and placement do not redefine the operation. OAuth
+        # activities additionally encode their platform control/data outcome.
         # Ordinals come from the request-scoped allocator. Prefer ToolCall id
         # so parallel siblings keep stable identity. Without one, allocate the
         # next free ordinal and run exclusive so overlap cannot redefine
@@ -1058,19 +1199,20 @@ class SecureToolWrapper:
         semantic_input: Dict[str, Any] = {"arguments": arguments}
 
         keyed = bool(tool_call_id)
-        activity_ordinal = allocate_activity_ordinal(
+        tool_path, activity_ordinal = allocate_activity_position(
             tool_activity_key(tool_call_id) if keyed else None
         )
 
         def _execute(activity_context: Any) -> Any:
+            """Dispatch this resource phase or record typed consent before its wait."""
             try:
                 if (
                     is_local
                     and local_executor is not None
                     and activity_requires_reconstruction(activity_context.activity_id)
                 ):
-                    # ResolveActivities already authorized this exact activity
-                    # position. Re-enter its captured callback directly so the
+                    # OE history authorized this exact native wait at its
+                    # bound input and position. Re-enter its callback so the
                     # framework can recreate interrupt(); the tool-execute cache
                     # still contains the earlier interrupted invocation. The
                     # isolated suspend scope keeps a legacy app.suspend() marker
@@ -1099,6 +1241,20 @@ class SecureToolWrapper:
                         is_framework_control_flow=is_framework_control_flow,
                         call_channel_expected=call_channel_expected,
                     )
+            except _OAuthAuthorizationRequired as consent:
+                if authorization_attempt:
+                    raise _DurableToolActivityFailedError(
+                        _encode_durable_tool_failure(
+                            ToolExecutionError(
+                                "OAuth authorization is still required after continuation"
+                            )
+                        )
+                    ) from consent
+                return _OAuthChallengeOutcome(
+                    elicitation=consent.elicitation,
+                    step=consent.step,
+                    activity_id=activity_context.activity_id,
+                ).model_dump(mode="json")
             except PolicyDeniedException as denial:
                 # Record the denial as a DENIED outcome (not FAILED) so a
                 # replay reproduces policy-denial semantics.
@@ -1114,10 +1270,9 @@ class SecureToolWrapper:
                     _encode_durable_tool_failure(error)
                 ) from error
             if result is _CALL_INTERRUPTED:
-                return dict(_INTERRUPTED_WIRE_MARKER)
-            if isinstance(result, dict) and CALL_INTERRUPTED_ARTIFACT_KEY in result:
-                # A genuine tool result may not carry the reserved key, or it
-                # could replay as a forged interrupt marker.
+                result = dict(_INTERRUPTED_WIRE_MARKER)
+            elif isinstance(result, dict) and CALL_INTERRUPTED_ARTIFACT_KEY in result:
+                # A real result cannot forge the existing call-interruption marker.
                 result = {k: v for k, v in result.items() if k != CALL_INTERRUPTED_ARTIFACT_KEY}
             try:
                 # Validate before leaving the registered-tool boundary so a
@@ -1127,47 +1282,252 @@ class SecureToolWrapper:
                 raise _DurableToolActivityFailedError(
                     _encode_durable_tool_failure(error)
                 ) from error
-            return result
+            return (
+                _OAuthResourceOutcome(result=result).model_dump(mode="json")
+                if provider_type
+                else result
+            )
 
-        try:
-            result = run_serial_activity(
-                client=self.workflow,
+        def _synchronize(client: Any, context: Any, outcome: Any) -> None:
+            """Project only a resource result; consent contributes no conversation content."""
+            if self.durable_memory is None:
+                return
+            if provider_type:
+                recorded = _oauth_outcome(outcome)
+                if isinstance(recorded, _OAuthChallengeOutcome):
+                    self.durable_memory.acknowledge(client, context)
+                    return
+                outcome = recorded.result
+            self.durable_memory.synchronize_tool(
+                client,
+                context,
+                outcome,
+                user_id=get_current_user_id(),
+                tool_call_id=tool_call_id,
+                tool_name=tool_name,
+            )
+
+        def _replay_local_wait(context: ActivityContext, outcome: Any) -> Any:
+            """Recreate the shared boundary without repeating a completed local callback.
+
+            The callback's actual output occupies its own derived activity. A
+            later attempt reconstructs the original wait from trusted metadata,
+            then replays that output instead of running post-answer effects.
+            """
+            callback_ran = False
+
+            attempt = current_attempt_context()
+            assert attempt is not None
+            original = build_activity_command(
+                attempt=attempt,
                 kind=ACTIVITY_KIND_TOOL,
                 name=tool_name,
                 activity_ordinal=activity_ordinal,
                 semantic_input=semantic_input,
-                execute=_execute,
-                on_activity_resolved=(
-                    partial(
-                        self.durable_memory.synchronize_tool,
-                        user_id=get_current_user_id(),
-                        tool_call_id=tool_call_id,
-                        tool_name=tool_name,
-                    )
-                    if self.durable_memory is not None
-                    else None
-                ),
-                exclusive=not keyed,
+                operation_path=tool_path,
             )
-        except DurableActivityDeniedError as error:
-            # Re-raise the original live denial (with guardrail identity) when
-            # this attempt produced it; a replayed denial carries message only.
-            if isinstance(error.__cause__, PolicyDeniedException):
-                raise error.__cause__ from None
-            raise PolicyDeniedException(str(error)) from error
-        except (ReplayedActivityFailedError, _DurableToolActivityFailedError) as error:
-            raise _decode_durable_tool_failure(str(error)) from error
-        except WorkflowClientError:
-            raise
+            if not interrupted_activity_answered(original.position):
+                from agent_engine_runner_shared.hooks import get_suspend_handler
 
-        # The activity records an interrupt as the reserved wire marker (replay
-        # requires JSON); restore the sentinel here, on the caller's side of the
-        # replay boundary, so both routes coerce identically. Only the marker is
-        # restored — a genuine tool result can't collide with it because
-        # _execute strips the reserved key before the outcome is recorded.
-        if result == _INTERRUPTED_WIRE_MARKER:
-            return _CALL_INTERRUPTED if raw_on_interrupt else {"interrupted": True}
-        return result
+                interrupt = get_suspend_handler()
+                if interrupt is None:
+                    raise ToolExecutionError("No suspend handler registered for local wait replay")
+                value = proto_struct_to_json(outcome.suspension.context)["value"]
+                try:
+                    interrupt(value)
+                except BaseException as control:
+                    if is_framework_control_flow is not None and is_framework_control_flow(control):
+                        raise DurableActivityInterrupted(control) from control
+                    raise
+                raise ToolExecutionError("Local wait reconstruction requires a framework pause")
+
+            def resume_callback(resumed: ActivityContext) -> Any:
+                """Consume the recorded native answer once and capture the true callback output."""
+                nonlocal callback_ran
+                callback_ran = True
+                note_activity_reconstruction_id(resumed.activity_id)
+                try:
+                    return _execute(resumed)
+                except DurableActivityInterrupted as control:
+                    raise RuntimeError(
+                        "a durable local tool cannot raise another native interrupt "
+                        "after its recorded answer is resumed"
+                    ) from control
+
+            def acknowledge_phase(client: Any, resumed: ActivityContext, result: Any) -> None:
+                """Close the result phase; the original tool owner projects its output to Memory."""
+                if not callback_ran:
+                    from agent_engine_runner_shared.hooks import get_suspend_handler
+
+                    interrupt = get_suspend_handler()
+                    if interrupt is None:
+                        raise ToolExecutionError(
+                            "No suspend handler registered for local wait replay"
+                        )
+                    # The cached body no longer consumes its old native answer.
+                    # Consume that slot explicitly so a later app pause in this
+                    # same node receives its own answer, not the tool's choice.
+                    interrupt(proto_struct_to_json(outcome.suspension.context)["value"])
+                if self.durable_memory is not None:
+                    self.durable_memory.acknowledge(client, resumed)
+
+            path = current_operation_path()
+            path.segments.add(name="local:result", ordinal=activity_ordinal)
+            return run_serial_activity(
+                client=self.workflow,
+                kind=ACTIVITY_KIND_TOOL,
+                name=tool_name,
+                activity_ordinal=1,
+                semantic_input=semantic_input,
+                execute=resume_callback,
+                on_activity_resolved=acknowledge_phase,
+                operation_path=path,
+                exclusive=not keyed,
+                on_unknown_outcome=on_unknown_outcome,
+            )
+
+        # A consent challenge may wake once. Another challenge is an explicit
+        # failure, not a null result or an unbounded recovery loop.
+        operation_path = tool_path
+        for authorization_attempt in range(2):
+            try:
+                result = run_serial_activity(
+                    client=self.workflow,
+                    kind=ACTIVITY_KIND_TOOL,
+                    name=tool_name,
+                    activity_ordinal=activity_ordinal,
+                    semantic_input=semantic_input,
+                    execute=_execute,
+                    on_activity_resolved=_synchronize if self.durable_memory is not None else None,
+                    exclusive=not keyed,
+                    on_unknown_outcome=on_unknown_outcome,
+                    operation_path=operation_path,
+                    replay_local_wait=(
+                        _replay_local_wait
+                        if is_local
+                        and local_executor is not None
+                        and not provider_type
+                        and not scopes
+                        and is_framework_control_flow is not None
+                        else None
+                    ),
+                )
+            except DurableActivityDeniedError as error:
+                # Re-raise the original live denial (with guardrail identity) when
+                # this attempt produced it; a replayed denial carries message only.
+                if isinstance(error.__cause__, PolicyDeniedException):
+                    raise error.__cause__ from None
+                raise PolicyDeniedException(str(error)) from error
+            except (ReplayedActivityFailedError, _DurableToolActivityFailedError) as error:
+                raise _decode_durable_tool_failure(str(error)) from error
+            except WorkflowClientError:
+                raise
+
+            # The activity records an interrupt as the reserved wire marker (replay
+            # requires JSON); restore the sentinel here, on the caller's side of the
+            # replay boundary, so both routes coerce identically. Only the marker is
+            # restored — a genuine tool result can't collide with it because
+            # _execute strips the reserved key before the outcome is recorded.
+            if provider_type:
+                recorded = _oauth_outcome(result)
+                if isinstance(recorded, _OAuthChallengeOutcome):
+                    if authorization_attempt:
+                        raise ToolExecutionError(
+                            "OAuth authorization is still required after continuation"
+                        )
+                    self.observe_operational_step(recorded.step)
+                    self._await_oauth_authorization(
+                        recorded.elicitation,
+                        activity_id=recorded.activity_id,
+                        activity_ordinal=activity_ordinal,
+                        is_framework_control_flow=is_framework_control_flow,
+                    )
+                    # Derive a child position from the preallocated tool call.
+                    # A shared next ordinal would swap sibling results when
+                    # replacement workers pass consent in a different order.
+                    operation_path = current_operation_path()
+                    operation_path.segments.add(name="oauth:resource", ordinal=activity_ordinal)
+                    activity_ordinal = 1
+                    step = self.next_operational_step()
+                    continue
+                result = recorded.result
+            if result == _INTERRUPTED_WIRE_MARKER:
+                return _CALL_INTERRUPTED if raw_on_interrupt else {"interrupted": True}
+            return result
+
+        raise ToolExecutionError("OAuth authorization is still required after continuation")
+
+    def _await_oauth_authorization(
+        self,
+        elicitation: ElicitationInfo,
+        *,
+        activity_id: str,
+        activity_ordinal: int,
+        is_framework_control_flow: Optional[Callable[[BaseException], bool]],
+    ) -> None:
+        """Reconstruct the OE consent boundary once per attempt before any resource call.
+
+        Consent is a separate control activity. Its answer only wakes the
+        credential gate and never occupies the resource result or Memory.
+        """
+        from agent_engine_runner_shared.hooks import get_suspend_handler
+
+        interrupt = get_suspend_handler()
+        if interrupt is None:
+            raise ToolExecutionError("No suspend handler registered for OAuth authorization")
+        value = {
+            "suspend_reason": "authorization_required",
+            "suspend_context": elicitation.model_dump(mode="json"),
+            "oauth_authorization_wait": activity_id,
+        }
+        path = current_operation_path()
+        path.segments.add(name="oauth:authorization", ordinal=activity_ordinal)
+        attempt = current_attempt_context()
+        assert attempt is not None
+        command = build_activity_command(
+            attempt=attempt,
+            kind=ACTIVITY_KIND_TOOL,
+            name="oauth.authorization",
+            activity_ordinal=1,
+            operation_path=path,
+            semantic_input={"value": value},
+        )
+        started = self.workflow.start_activity(command)
+        record_observed_activity(command.position)
+        if (
+            isinstance(started, ActivityReplay)
+            and started.outcome.outcome_kind != ACTIVITY_OUTCOME_KIND_SUSPENDED
+        ):
+            # OE, rather than LangGraph's worker-positioned resume array, owns
+            # this answer. Replaying it must not consume a later app wait.
+            unwrap_activity_outcome(started.outcome)
+            if self.durable_memory is not None:
+                outcome = started.outcome
+                self.durable_memory.acknowledge(
+                    self.workflow,
+                    ActivityContext(
+                        workflow_identity=outcome.workflow_identity,
+                        activity_id=outcome.activity_id,
+                        attempt_id=outcome.attempt_id,
+                        fencing_token=outcome.fencing_token,
+                    ),
+                )
+            if interrupted_activity_answered(command.position):
+                forget_oauth_authorization_wait(activity_id)
+                return
+            # Reconstruct this completed boundary once per attempt before
+            # progressing. A sibling application wait must replay the same
+            # atomic frontier before either branch reaches a later pause.
+        note_oauth_authorization_wait(activity_id)
+        try:
+            interrupt(value)
+        except BaseException as control:
+            if is_framework_control_flow is not None and is_framework_control_flow(control):
+                record_interrupted_activity(command, control)
+            raise
+        # A hook can only wake the call. Broker still must authorize the later
+        # resource phase; a returning test/native hook is not its API result.
+        forget_oauth_authorization_wait(activity_id)
 
     def _execute_tool_native(
         self,
@@ -1186,26 +1546,42 @@ class SecureToolWrapper:
         is_framework_control_flow: Optional[Callable[[BaseException], bool]] = None,
         call_channel_expected: bool = False,
     ) -> Any:
+        """Execute one OE-gated phase, preserving typed OAuth control on the durable route.
+
+        Durable callers record consent before pausing outside the activity.
+        Native callers retain their checkpoint hook until the compatibility follow-up.
+        Resource results and ordinary rejections keep their existing semantics.
+        """
         effective_is_local = is_local and not provider_type and not scopes
         effective_local_executor = local_executor if effective_is_local else None
-        # 1. Request approval from OE
-        response = request_oe_approval_retryable(
-            request_oe_approval,
-            oe_url=self.oe_url,
-            execution_id=self.execution_id,
-            tool_name=tool_name,
-            arguments=arguments,
-            step=step,
-            is_local=effective_is_local,
-            redact_fields=redact_fields,
-            provider_type=provider_type,
-            scopes=scopes,
-            tool_call_id=tool_call_id,
-            metadata=metadata,
-            custom_headers=self.custom_headers,
-        )
-
-        if response.elicitation:
+        # 1. Request approval from OE. On a native resume interrupt() returns the
+        # Continue answer instead of pausing, so the token gate is asked once more;
+        # as on the durable route, a second challenge fails rather than yielding None.
+        continued = False
+        while True:
+            response = request_oe_approval_retryable(
+                request_oe_approval,
+                oe_url=self.oe_url,
+                execution_id=self.execution_id,
+                tool_name=tool_name,
+                arguments=arguments,
+                step=step,
+                is_local=effective_is_local,
+                redact_fields=redact_fields,
+                provider_type=provider_type,
+                scopes=scopes,
+                tool_call_id=tool_call_id,
+                metadata=metadata,
+                custom_headers=self.custom_headers,
+            )
+            if not response.elicitation:
+                break
+            if current_attempt_context() is not None:
+                raise _OAuthAuthorizationRequired(
+                    response.elicitation, max(step, response.latest_step_number or step)
+                )
+            if continued:
+                raise ToolExecutionError("OAuth authorization is still required after continuation")
             from agent_engine_runner_shared.hooks import get_suspend_handler
 
             interrupt = get_suspend_handler()
@@ -1226,7 +1602,7 @@ class SecureToolWrapper:
                     },
                 }
             )
-            return  # interrupt() raises GraphInterrupt; defensive guard
+            continued = True
 
         if not response.proceed:
             reason = response.reason or "Policy denied"
@@ -1242,14 +1618,14 @@ class SecureToolWrapper:
 
         if response.route_to == "callback":
             if not effective_is_local:
-                raise ToolExecutionError(
+                raise ToolPlatformError(
                     "OE returned a local callback route for a tool declared as remote"
                 )
             if effective_local_executor is None:
                 # Registered-tool adapters always install this executor. Merely
                 # running in AER is not enough for a low-level caller: the wrapper
                 # still needs the original framework tool object to invoke.
-                raise ToolExecutionError(
+                raise ToolPlatformError(
                     "Local callback route is missing its registered tool executor"
                 )
             return self._execute_local_tool(
@@ -1262,7 +1638,7 @@ class SecureToolWrapper:
                 call_channel_expected=call_channel_expected,
             )
         if response.route_to is not None:
-            raise ToolExecutionError(f"Unexpected OE tool route: {response.route_to}")
+            raise ToolPlatformError(f"Unexpected OE tool route: {response.route_to}")
 
         status = response.status or "error"
         result = response.result
@@ -1282,6 +1658,10 @@ class SecureToolWrapper:
         if status == "interrupted":
             return _CALL_INTERRUPTED if raw_on_interrupt else {"interrupted": True}
         if status == "error":
+            # OE marks only its own failures retryable, before dispatching the
+            # tool; this is the reply left after the retries ran out.
+            if response.retryable:
+                raise ToolPlatformError(error or "OE could not dispatch the tool")
             if response.tool_api_error is not None:
                 raise ExternalAPICallError(error or "Unknown error", response.tool_api_error)
             raise ToolExecutionError(error or "Unknown error")
@@ -1292,7 +1672,7 @@ class SecureToolWrapper:
         if status == "suspend":
             return self._handle_suspend(result)
         if status != "success":
-            raise ToolExecutionError(f"Unexpected OE tool status: {status}")
+            raise ToolPlatformError(f"Unexpected OE tool status: {status}")
 
         return result
 
@@ -1503,7 +1883,12 @@ class SecureToolWrapper:
                 parsed = None
 
         if isinstance(parsed, dict):
-            payload = SuspendPayload.model_validate(parsed)
+            try:
+                payload = SuspendPayload.model_validate(parsed)
+            except ValidationError as error:
+                raise ToolPlatformError(
+                    "OE reported suspend but the result is not a suspend payload"
+                ) from error
             from agent_engine_runner_shared.workflow import current_attempt_context
 
             if current_attempt_context() is not None:
@@ -1534,7 +1919,7 @@ class SecureToolWrapper:
                     f"Expected dict from HITL interrupt, got {type(human_decision).__name__}"
                 )
             return json.dumps(human_decision)
-        raise ToolExecutionError("OE reported suspend but the result is not a suspend payload")
+        raise ToolPlatformError("OE reported suspend but the result is not a suspend payload")
 
 
 # NOTE: SecureWrappedLLM has been moved to agent-engine-sdk-langgraph.secure_llm
@@ -1605,6 +1990,7 @@ def create_secure_tool_function(
     tool_declared_format: Optional[Literal["content", "content_and_artifact"]] = None,
     redact_fields: Optional[list[str]] = None,
     is_framework_control_flow: Optional[Callable[[BaseException], bool]] = None,
+    on_unknown_outcome: Optional[UnknownOutcomePolicy] = None,
 ) -> Callable:
     """
     Create a wrapped tool function that routes through SecureToolWrapper.
@@ -1623,6 +2009,9 @@ def create_secure_tool_function(
         tool_declared_format: The tool author's own original format, used only
             to decide whether a normal result gets shape-matched into a tuple.
             Defaults to ``response_format``.
+        on_unknown_outcome: What a retry does when the runner was lost while
+            this tool was in flight in a durable workflow: ``"rerun"`` runs it
+            again, ``"fail"`` refuses the retry.
 
     Returns:
         Wrapped function that routes through OE via SecureToolWrapper
@@ -1631,6 +2020,7 @@ def create_secure_tool_function(
 
     from agent_engine_runner_shared.context import get_current_wrapper
 
+    validate_on_unknown_outcome(on_unknown_outcome)
     effective_tool_format = (
         tool_declared_format if tool_declared_format is not None else response_format
     )
@@ -1711,6 +2101,7 @@ def create_secure_tool_function(
                 raw_on_interrupt=True,
                 redact_fields=redact_fields,
                 call_channel_expected=call_channel_expected,
+                on_unknown_outcome=on_unknown_outcome,
             )
         except ToolExecutionError as exc:
             logger.info(

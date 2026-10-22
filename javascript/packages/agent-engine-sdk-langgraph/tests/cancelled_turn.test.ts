@@ -34,7 +34,7 @@ const asBranchGraph = (graph: unknown): CompiledStateGraph<unknown, unknown> =>
 import { LangGraphBaseAgent } from "../src/agent.js";
 import {
   CANCELLED_TURN_MESSAGE_ID_METADATA_KEY,
-  CANCELLED_TURN_MESSAGE_KWARG,
+  CANCELLED_TURN_MESSAGE_IDS_METADATA_KEY,
   CANCELLED_TURN_METADATA_KEY,
   commitCancelledTurnCheckpoint,
 } from "../src/cancelled_turn.js";
@@ -140,9 +140,9 @@ describe("commitCancelledTurnCheckpoint", () => {
   test("identical consecutive prompts, cancel before input persistence", async () => {
     // Turn 1 "try again" committed; turn 2 "try again" cancelled before its
     // input checkpoint landed. The captured id is absent from the stored
-    // messages, so the commit injects a NEW stamped message under that id and
+    // messages, so the commit injects a NEW opener message under that id and
     // leaves the completed first turn unmarked — a content comparison would
-    // wrongly stamp h1 here.
+    // wrongly pick h1 here.
     const latest = makeTuple({
       checkpointId: "c2",
       messages: [
@@ -167,7 +167,6 @@ describe("commitCancelledTurnCheckpoint", () => {
     const stored = checkpoint.channel_values["messages"] as BaseMessage[];
     expect(stored.map((m) => m.id)).toEqual(["h1", "a1", "input:turn-2"]);
     expect(kwargsOf(stored[0])).toEqual({}); // completed turn 1 must not be marked
-    expect(kwargsOf(stored[2])[CANCELLED_TURN_MESSAGE_KWARG]).toBe(true);
     expect(checkpoint.channel_versions["messages"]).toBe(2); // bumped for the append
     expect(metadata[CANCELLED_TURN_MESSAGE_ID_METADATA_KEY]).toBe(
       "input:turn-2",
@@ -203,17 +202,13 @@ describe("commitCancelledTurnCheckpoint", () => {
     expect(checkpoint.id).not.toBe("c9");
     const stored = checkpoint.channel_values["messages"] as BaseMessage[];
     expect(stored.map((m) => m.id)).toEqual(["h1", "a1", "h2"]);
-    expect(stored.map(kwargsOf)).toEqual([
-      {},
-      {},
-      { [CANCELLED_TURN_MESSAGE_KWARG]: true },
-    ]);
     // Channel versions unchanged — nothing ran — but every node now reads as
     // caught up, so the tip presents no pending work.
     expect(checkpoint.channel_versions["messages"]).toBe(2);
     expect(checkpoint.versions_seen["node_a"]?.["messages"]).toBe(2);
     expect(metadata.step).toBe(5);
     expect(metadata.source).toBe("loop");
+    expect(metadata[CANCELLED_TURN_MESSAGE_ID_METADATA_KEY]).toBe("h2"); // h1 unmarked
     // The canned tip's own state must not be mutated through the copy.
     expect(latest.checkpoint.versions_seen["node_a"]?.["messages"]).toBe(1);
   });
@@ -246,15 +241,16 @@ describe("commitCancelledTurnCheckpoint", () => {
       "messages"
     ] as BaseMessage[];
     expect(stored.map((m) => m.id)).toEqual(["h1", "a1", "h2"]); // no append
-    expect(kwargsOf(stored[2])[CANCELLED_TURN_MESSAGE_KWARG]).toBe(true);
-    expect(kwargsOf(stored[0])).toEqual({});
+    expect(
+      onlyPut(saver).metadata[CANCELLED_TURN_MESSAGE_ID_METADATA_KEY],
+    ).toBe("h2");
   });
 
   test("no captured id appends a fresh opener for an identical prompt", async () => {
     // turnMessageId=null means the turn's input was never built (a cancel
     // during preparation). An identical earlier prompt must NOT be treated as
-    // this turn's opener: append a fresh stamped message and leave the
-    // earlier turn untouched.
+    // this turn's opener: append a fresh message and record that id, leaving
+    // the earlier turn untouched.
     const latest = makeTuple({
       checkpointId: "c9",
       messages: [
@@ -279,8 +275,9 @@ describe("commitCancelledTurnCheckpoint", () => {
       "messages"
     ] as BaseMessage[];
     expect(stored.map((m) => m.id)).toEqual(["h1", "a1", messageId]);
-    expect(kwargsOf(stored[0])).toEqual({}); // earlier identical prompt unmarked
-    expect(kwargsOf(stored[2])[CANCELLED_TURN_MESSAGE_KWARG]).toBe(true);
+    expect(
+      onlyPut(saver).metadata[CANCELLED_TURN_MESSAGE_ID_METADATA_KEY],
+    ).toBe(messageId);
   });
 
   test("no captured id injects with a fresh marker id", async () => {
@@ -310,15 +307,14 @@ describe("commitCancelledTurnCheckpoint", () => {
     expect(stored[2]).toBeInstanceOf(HumanMessage);
     expect(stored[2]?.content).toBe("never landed");
     expect(stored[2]?.id).toBe(messageId);
-    expect(kwargsOf(stored[2])[CANCELLED_TURN_MESSAGE_KWARG]).toBe(true);
     expect(checkpoint.channel_versions["messages"]).toBe(2); // bumped for the append
     expect(metadata[CANCELLED_TURN_MESSAGE_ID_METADATA_KEY]).toBe(messageId);
   });
 
-  test("the stamp lives only on the written checkpoint copy", async () => {
-    // The stamp mutates the copy inside the synthetic checkpoint; the
-    // deserialized source message object is shared read state and must stay
-    // untouched.
+  test("the commit does not mutate the shared source message", async () => {
+    // The opener is recorded in the checkpoint's metadata, not on the
+    // message; the deserialized source message object is shared read state
+    // and must stay untouched.
     const sourceOpener = new HumanMessage({ content: "stop this", id: "h2" });
     const latest = makeTuple({
       checkpointId: "c9",
@@ -343,9 +339,11 @@ describe("commitCancelledTurnCheckpoint", () => {
     const [, , written] = onlyPut(saver).checkpoint.channel_values[
       "messages"
     ] as BaseMessage[];
-    expect(kwargsOf(written)[CANCELLED_TURN_MESSAGE_KWARG]).toBe(true);
-    expect(written).not.toBe(sourceOpener);
+    expect(kwargsOf(written)).toEqual({});
     expect(sourceOpener.additional_kwargs).toEqual({});
+    expect(
+      onlyPut(saver).metadata[CANCELLED_TURN_MESSAGE_ID_METADATA_KEY],
+    ).toBe("h2");
   });
 
   test("a node that never ran is terminal-ized", async () => {
@@ -398,7 +396,6 @@ describe("commitCancelledTurnCheckpoint", () => {
     expect(messages).toHaveLength(1);
     expect(messages[0]?.content).toBe("hi there");
     expect(messages[0]?.id).toBe("input:turn-1");
-    expect(kwargsOf(messages[0])[CANCELLED_TURN_MESSAGE_KWARG]).toBe(true);
     expect(checkpoint.channel_versions["messages"]).toBe(1);
     expect(checkpoint.versions_seen).toEqual({ node_a: { messages: 1 } });
     expect(metadata[CANCELLED_TURN_METADATA_KEY]).toBe(true);
@@ -408,10 +405,10 @@ describe("commitCancelledTurnCheckpoint", () => {
     expect(metadata.step).toBe(0);
   });
 
-  test("empty message terminal-izes without stamping", async () => {
+  test("empty message terminal-izes without a turn opener", async () => {
     // Resume-cancel shape: no fresh user message. The marker tip still lands
     // (terminal-ized, so the cancelled super-step never looks resumable) but
-    // nothing is stamped or injected and no turn message id is recorded.
+    // no message is injected and no turn message id is recorded.
     const latest = makeTuple({
       checkpointId: "c9",
       messages: [
@@ -475,6 +472,16 @@ async function tipMessages(saver: MemorySaver): Promise<BaseMessage[]> {
       | BaseMessage[]
       | undefined) ?? []
   );
+}
+
+/** Metadata on the thread's tip checkpoint (real saver read). */
+async function tipMetadata(
+  saver: MemorySaver,
+): Promise<Record<string, unknown>> {
+  const tuple = await saver.getTuple({
+    configurable: { thread_id: "sess-1:ws-1" },
+  });
+  return (tuple?.metadata ?? {}) as Record<string, unknown>;
 }
 
 /** A → B with a compile-time interrupt before B, plus the call log. */
@@ -568,6 +575,13 @@ describe("real LangGraph graphs", () => {
     });
     expect(resolved).toBe("input:1");
 
+    const markerTip = await saver.getTuple(config);
+    expect(
+      (markerTip?.metadata as Record<string, unknown>)[
+        CANCELLED_TURN_MESSAGE_ID_METADATA_KEY
+      ],
+    ).toBe("input:1");
+
     const state = await graph.getState(config);
     expect(state.next).toEqual([]);
     expect(state.tasks).toEqual([]);
@@ -589,9 +603,6 @@ describe("real LangGraph graphs", () => {
     expect(calls).toEqual(["a", "a", "b"]);
     const finalState = await graph.getState(config);
     expect(finalState.next).toEqual([]);
-    const finalMessages = finalState.values["messages"] as BaseMessage[];
-    // The stamp on the cancelled turn's message survives into later commits.
-    expect(kwargsOf(finalMessages[0])[CANCELLED_TURN_MESSAGE_KWARG]).toBe(true);
   });
 
   test("stop during a dispatched Send tool leaves no pending work", async () => {
@@ -655,9 +666,21 @@ describe("real LangGraph graphs", () => {
     expect(copied.tasks).toEqual([]);
     const copiedMessages = copied.values["messages"] as BaseMessage[];
     expect(copiedMessages.map((m) => m.content)).toEqual(["go", "dispatch"]);
-    expect(kwargsOf(copiedMessages[0])[CANCELLED_TURN_MESSAGE_KWARG]).toBe(
-      true,
-    );
+    const copiedTip = await saver.getTuple({
+      configurable: { thread_id: "t-fork" },
+    });
+    expect(
+      (copiedTip?.metadata as Record<string, unknown>)[
+        CANCELLED_TURN_METADATA_KEY
+      ],
+    ).toBe(true);
+    // The source opener id rides onto the copy so the reader still classifies
+    // the forked opener as stopped.
+    expect(
+      (copiedTip?.metadata as Record<string, unknown>)[
+        CANCELLED_TURN_MESSAGE_ID_METADATA_KEY
+      ],
+    ).toBe(copiedMessages[0]?.id);
 
     const secondSource = await completedRootCheckpoint(asBranchGraph(graph), {
       threadId: "t-fork",
@@ -675,9 +698,14 @@ describe("real LangGraph graphs", () => {
     expect(copied2.tasks).toEqual([]);
     const copied2Messages = copied2.values["messages"] as BaseMessage[];
     expect(copied2Messages.map((m) => m.content)).toEqual(["go", "dispatch"]);
-    expect(kwargsOf(copied2Messages[0])[CANCELLED_TURN_MESSAGE_KWARG]).toBe(
-      true,
-    );
+    const copied2Tip = await saver.getTuple({
+      configurable: { thread_id: "t-fork-2" },
+    });
+    expect(
+      (copied2Tip?.metadata as Record<string, unknown>)[
+        CANCELLED_TURN_METADATA_KEY
+      ],
+    ).toBe(true);
 
     // Neither copy redispatches the cancelled work on a null-input resume...
     await graph.invoke(null, { configurable: { thread_id: "t-fork" } });
@@ -698,7 +726,7 @@ describe("real LangGraph graphs", () => {
 
   test("fork reproduces a stopped tip and later history", async () => {
     // Forking from a cancelled-turn marker tip — and from later history built
-    // on one — reproduces the authoritative state, stamp included.
+    // on one — reproduces the authoritative state, marker tip included.
     const saver = new MemorySaver();
     const { graph } = twoNodeGraph(saver);
     const config: RunnableConfig = { configurable: { thread_id: "t" } };
@@ -734,12 +762,17 @@ describe("real LangGraph graphs", () => {
     expect(copiedMessages.map((m) => m.content)).toEqual(
       sourceMessages.map((m) => m.content),
     );
-    expect(kwargsOf(copiedMessages[0])[CANCELLED_TURN_MESSAGE_KWARG]).toBe(
-      true,
-    );
+    const copiedTip = await saver.getTuple({
+      configurable: { thread_id: "t-fork" },
+    });
+    expect(
+      (copiedTip?.metadata as Record<string, unknown>)[
+        CANCELLED_TURN_METADATA_KEY
+      ],
+    ).toBe(true);
 
-    // A follow-up turn on the source, then fork again: the stamp and the full
-    // later history survive.
+    // A follow-up turn on the source, then fork again: the full later history
+    // survives.
     await graph.invoke(
       { messages: [new HumanMessage({ content: "again", id: "input:2" })] },
       config,
@@ -765,10 +798,18 @@ describe("real LangGraph graphs", () => {
       "a done",
       "b done",
     ]);
-    expect(kwargsOf(copied2Messages[0])[CANCELLED_TURN_MESSAGE_KWARG]).toBe(
-      true,
-    );
-    expect(kwargsOf(copied2Messages[2])).toEqual({}); // follow-up opener unmarked
+    // Replay rebuilds checkpoints and drops the per-turn marker metadata, so
+    // the fork re-records the source's cancelled openers on the copied tip —
+    // the earlier stopped opener keeps its id and stays classified on the fork.
+    const copied2Tip = await saver.getTuple({
+      configurable: { thread_id: "t-fork-2" },
+    });
+    const copied2Metadata = copied2Tip?.metadata as Record<string, unknown>;
+    expect(copied2Metadata[CANCELLED_TURN_METADATA_KEY]).toBe(true);
+    expect(copied2Messages[0]?.id).toBe("input:1");
+    expect(copied2Metadata[CANCELLED_TURN_MESSAGE_IDS_METADATA_KEY]).toEqual([
+      "input:1",
+    ]);
   });
 
   test("fork from a first turn cancelled before any checkpoint", async () => {
@@ -797,7 +838,21 @@ describe("real LangGraph graphs", () => {
     });
     const messages = copied.values["messages"] as BaseMessage[];
     expect(messages.map((m) => m.content)).toEqual(["never ran"]);
-    expect(kwargsOf(messages[0])[CANCELLED_TURN_MESSAGE_KWARG]).toBe(true);
+    const copiedTip = await saver.getTuple({
+      configurable: { thread_id: "t-fork" },
+    });
+    expect(
+      (copiedTip?.metadata as Record<string, unknown>)[
+        CANCELLED_TURN_METADATA_KEY
+      ],
+    ).toBe(true);
+    // The source opener id rides onto the copy so the reader still classifies
+    // the forked opener as stopped.
+    expect(
+      (copiedTip?.metadata as Record<string, unknown>)[
+        CANCELLED_TURN_MESSAGE_ID_METADATA_KEY
+      ],
+    ).toBe(messages[0]?.id);
   });
 
   test("second identical prompt cancelled during preparation", async () => {
@@ -833,10 +888,14 @@ describe("real LangGraph graphs", () => {
       "b done",
       "go",
     ]);
-    expect(messages[0]?.id).toBe("input:1");
-    expect(kwargsOf(messages[0])).toEqual({}); // turn 1's opener stays unmarked
+    expect(messages[0]?.id).toBe("input:1"); // turn 1's opener stays unmarked
     expect(messages[3]?.id).toBe(resolved);
-    expect(kwargsOf(messages[3])[CANCELLED_TURN_MESSAGE_KWARG]).toBe(true);
+    const markerTip = await saver.getTuple(config);
+    expect(
+      (markerTip?.metadata as Record<string, unknown>)[
+        CANCELLED_TURN_MESSAGE_ID_METADATA_KEY
+      ],
+    ).toBe(resolved);
   });
 
   test("a forked stopped tip is itself forkable", async () => {
@@ -886,7 +945,14 @@ describe("real LangGraph graphs", () => {
     expect(copied.tasks).toEqual([]);
     const messages = copied.values["messages"] as BaseMessage[];
     expect(messages.map((m) => m.content)).toEqual(["never ran"]);
-    expect(kwargsOf(messages[0])[CANCELLED_TURN_MESSAGE_KWARG]).toBe(true);
+    const copiedTip = await saver.getTuple({
+      configurable: { thread_id: "t-fork-2" },
+    });
+    expect(
+      (copiedTip?.metadata as Record<string, unknown>)[
+        CANCELLED_TURN_METADATA_KEY
+      ],
+    ).toBe(true);
   });
 
   test("agent hook commits the turn by captured identity after a real run", async () => {
@@ -921,14 +987,17 @@ describe("real LangGraph graphs", () => {
     expect(messages).toHaveLength(2); // no duplicate user message appended
     const opener = messages?.[0];
     expect(opener?.id).toMatch(/^input:/);
-    expect(kwargsOf(opener)[CANCELLED_TURN_MESSAGE_KWARG]).toBe(true);
-    expect(kwargsOf(messages?.[1])).toEqual({});
+    expect(
+      (tuple?.metadata as Record<string, unknown>)[
+        CANCELLED_TURN_MESSAGE_ID_METADATA_KEY
+      ],
+    ).toBe(opener?.id);
   });
 
-  test("agent hook stamps a hook-rewritten opener by its assigned id", async () => {
+  test("agent hook records a hook-rewritten opener by its assigned id", async () => {
     // A prepareInput hook rewrites content and drops ids. The run assigns and
-    // captures the opener's id at build time, so the cancel commit stamps the
-    // hook's own persisted message — never a duplicate raw-prompt append.
+    // captures the opener's id at build time, so the cancel commit records
+    // the hook's own persisted message — never a duplicate raw-prompt append.
     const saver = new MemorySaver();
     const graph = new StateGraph(MessagesAnnotation)
       .addNode("reply", async () => ({
@@ -964,14 +1033,18 @@ describe("real LangGraph graphs", () => {
     const opener = messages?.[0];
     expect(opener?.content).toBe("wrapped: original");
     expect(opener?.id).toMatch(/^input:/);
-    expect(kwargsOf(opener)[CANCELLED_TURN_MESSAGE_KWARG]).toBe(true);
+    expect(
+      (tuple?.metadata as Record<string, unknown>)[
+        CANCELLED_TURN_MESSAGE_ID_METADATA_KEY
+      ],
+    ).toBe(opener?.id);
   });
 
   // A hook may return supported message-likes instead of BaseMessages: the
   // input-build boundary converts them, so the id the graph persists is the
-  // id the teardown commit captured — one stamped opener before the completed
-  // step, never a duplicate raw-prompt append.
-  test("agent hook tuple opener is captured and stamped after a real run", async () => {
+  // id the teardown commit captured — one opener recorded before the
+  // completed step, never a duplicate raw-prompt append.
+  test("agent hook tuple opener is captured and recorded after a real run", async () => {
     const saver = new MemorySaver();
     const agent = new LangGraphBaseAgent(
       replyGraph(saver) as never,
@@ -987,8 +1060,9 @@ describe("real LangGraph graphs", () => {
     const messages = await tipMessages(saver);
     expect(messages.map((m) => m.content)).toEqual(["stop this", "reply done"]);
     expect(messages[0]?.id).toMatch(/^input:/);
-    expect(kwargsOf(messages[0])[CANCELLED_TURN_MESSAGE_KWARG]).toBe(true);
-    expect(kwargsOf(messages[1])).toEqual({});
+    expect(
+      (await tipMetadata(saver))[CANCELLED_TURN_MESSAGE_ID_METADATA_KEY],
+    ).toBe(messages[0]?.id);
   });
 
   test("agent hook role-dict opener keeps a given id", async () => {
@@ -1010,7 +1084,9 @@ describe("real LangGraph graphs", () => {
     const messages = await tipMessages(saver);
     expect(messages.map((m) => m.content)).toEqual(["stop this", "reply done"]);
     expect(messages[0]?.id).toBe("hook-1");
-    expect(kwargsOf(messages[0])[CANCELLED_TURN_MESSAGE_KWARG]).toBe(true);
+    expect(
+      (await tipMetadata(saver))[CANCELLED_TURN_MESSAGE_ID_METADATA_KEY],
+    ).toBe("hook-1");
   });
 
   test("agent hook role-dict opener without an id gets the captured id", async () => {
@@ -1029,10 +1105,12 @@ describe("real LangGraph graphs", () => {
     const messages = await tipMessages(saver);
     expect(messages).toHaveLength(2); // no duplicate opener
     expect(messages[0]?.id).toMatch(/^input:/);
-    expect(kwargsOf(messages[0])[CANCELLED_TURN_MESSAGE_KWARG]).toBe(true);
+    expect(
+      (await tipMetadata(saver))[CANCELLED_TURN_MESSAGE_ID_METADATA_KEY],
+    ).toBe(messages[0]?.id);
   });
 
-  test("agent hook Overwrite opener replaces history and is stamped", async () => {
+  test("agent hook Overwrite opener replaces history and is recorded", async () => {
     // Overwrite survives the build-time conversion: the hook's list replaces
     // prior history wholesale, and the new opener is what the cancel commits.
     const saver = new MemorySaver();
@@ -1063,13 +1141,15 @@ describe("real LangGraph graphs", () => {
       "reply done",
     ]);
     expect(messages[0]?.id).toMatch(/^input:/);
-    expect(kwargsOf(messages[0])[CANCELLED_TURN_MESSAGE_KWARG]).toBe(true);
+    expect(
+      (await tipMetadata(saver))[CANCELLED_TURN_MESSAGE_ID_METADATA_KEY],
+    ).toBe(messages[0]?.id);
   });
 
-  test("agent hook serialized __overwrite__ opener is captured and stamped", async () => {
+  test("agent hook serialized __overwrite__ opener is captured and recorded", async () => {
     // The serialized wire shape crosses a serialization boundary: same
     // replacement semantics through the build-boundary conversion — prior
-    // history replaced, one stamped opener, no duplicate.
+    // history replaced, one recorded opener, no duplicate.
     const saver = new MemorySaver();
     const ctx = { sessionId: "sess-1", workspaceId: "ws-1" } as RequestContext;
     await new LangGraphBaseAgent(replyGraph(saver) as never).invoke(ctx, {
@@ -1096,6 +1176,8 @@ describe("real LangGraph graphs", () => {
       "reply done",
     ]);
     expect(messages[0]?.id).toMatch(/^input:/);
-    expect(kwargsOf(messages[0])[CANCELLED_TURN_MESSAGE_KWARG]).toBe(true);
+    expect(
+      (await tipMetadata(saver))[CANCELLED_TURN_MESSAGE_ID_METADATA_KEY],
+    ).toBe(messages[0]?.id);
   });
 });

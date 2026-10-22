@@ -167,6 +167,7 @@ export interface SecureLLMWrapper {
   };
   nextOperationalStep(): number;
   observeOperationalStep(n: number): void;
+  throwIfPlatformFailed?(): void;
 }
 
 /** Callable that returns the active wrapper, or `null` if no execution context. */
@@ -369,6 +370,9 @@ export class SecureWrappedLLM extends _BaseChatModel {
           "outside of an execution context. Ensure the graph is invoked via AER's /execute endpoint.",
       );
     }
+    // A platform failure in an earlier tool call ends the turn; ToolNode
+    // would otherwise hand it to the model, which could call the tool again.
+    wrapper.throwIfPlatformFailed?.();
     return wrapper;
   }
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import http.server
 import json
 import threading
@@ -38,7 +39,7 @@ def _set_ctx(execution_id: str, oe_url: str):
 def test_emit_step_posts_step_chunk() -> None:
     tokens = _set_ctx("exec-1", "http://oe:8000")
     try:
-        with patch("agent_engine_runner_shared.progress._get_client") as mock_get_client:
+        with patch("agent_engine_runner_shared.progress.get_shared_client") as mock_get_client:
             mock_client = MagicMock()
             _wire_stream_to_post(mock_client)
             mock_get_client.return_value = mock_client
@@ -60,7 +61,7 @@ def test_emit_step_posts_step_chunk() -> None:
 def test_emit_step_strips_trailing_slash_from_oe_url() -> None:
     tokens = _set_ctx("exec-2", "http://oe:8000/")
     try:
-        with patch("agent_engine_runner_shared.progress._get_client") as mock_get_client:
+        with patch("agent_engine_runner_shared.progress.get_shared_client") as mock_get_client:
             mock_client = MagicMock()
             _wire_stream_to_post(mock_client)
             mock_get_client.return_value = mock_client
@@ -81,7 +82,7 @@ def test_emit_accepts_arbitrary_event_type() -> None:
     """The general emit() API lets tools choose the chunk_type."""
     tokens = _set_ctx("exec-emit", "http://oe:8000")
     try:
-        with patch("agent_engine_runner_shared.progress._get_client") as mock_get_client:
+        with patch("agent_engine_runner_shared.progress.get_shared_client") as mock_get_client:
             mock_client = MagicMock()
             _wire_stream_to_post(mock_client)
             mock_get_client.return_value = mock_client
@@ -107,7 +108,7 @@ def test_emit_accepts_arbitrary_event_type() -> None:
 
 def test_emit_is_noop_outside_context() -> None:
     """Called with no execution context set — must not raise or make HTTP calls."""
-    with patch("agent_engine_runner_shared.progress._client") as mock_client:
+    with _patched_client() as mock_client:
         emit_step("should be ignored")
         emit(event="step", data="also ignored")
         mock_client.post.assert_not_called()
@@ -121,8 +122,7 @@ def test_emit_is_noop_outside_context() -> None:
 def test_emit_swallows_http_error() -> None:
     tokens = _set_ctx("exec-3", "http://oe:8000")
     try:
-        with patch("agent_engine_runner_shared.progress._client") as mock_client:
-            _wire_stream_to_post(mock_client)
+        with _patched_client() as mock_client:
             mock_client.post.side_effect = httpx.ConnectError("connection refused")
 
             # Must not raise
@@ -141,7 +141,7 @@ def test_emit_rejects_reserved_event_types(reserved_event: str) -> None:
     """Reserved infrastructure event types must raise ValueError and not POST."""
     tokens = _set_ctx("exec-reserved", "http://oe:8000")
     try:
-        with patch("agent_engine_runner_shared.progress._client") as mock_client:
+        with _patched_client() as mock_client:
             with pytest.raises(ValueError, match="reserved"):
                 emit(event=reserved_event, data="should not be sent")
             mock_client.post.assert_not_called()
@@ -151,7 +151,7 @@ def test_emit_rejects_reserved_event_types(reserved_event: str) -> None:
 
 def test_emit_rejects_reserved_event_before_checking_context() -> None:
     """Reserved-event check fires even outside execution context (programmer error wins)."""
-    with patch("agent_engine_runner_shared.progress._client") as mock_client:
+    with _patched_client() as mock_client:
         with pytest.raises(ValueError, match="reserved"):
             emit(event=DONE, data="x")
         mock_client.post.assert_not_called()
@@ -165,8 +165,7 @@ def test_emit_rejects_reserved_event_before_checking_context() -> None:
 def test_emit_swallows_invalid_url() -> None:
     tokens = _set_ctx("exec-invalid-url", "http://oe:8000")
     try:
-        with patch("agent_engine_runner_shared.progress._client") as mock_client:
-            _wire_stream_to_post(mock_client)
+        with _patched_client() as mock_client:
             mock_client.post.side_effect = httpx.InvalidURL("malformed url")
 
             # Must not raise
@@ -178,8 +177,7 @@ def test_emit_swallows_invalid_url() -> None:
 def test_emit_swallows_non_2xx_response() -> None:
     tokens = _set_ctx("exec-4", "http://oe:8000")
     try:
-        with patch("agent_engine_runner_shared.progress._client") as mock_client:
-            _wire_stream_to_post(mock_client)
+        with _patched_client() as mock_client:
             mock_response = MagicMock()
             mock_response.raise_for_status.side_effect = httpx.HTTPStatusError(
                 "500", request=MagicMock(), response=MagicMock()
@@ -193,40 +191,28 @@ def test_emit_swallows_non_2xx_response() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Connection reuse — module-level client is shared across calls
+# Connection reuse — emit uses the process-wide shared client
 # ---------------------------------------------------------------------------
 
 
-def test_emit_reuses_module_level_client() -> None:
-    """Multiple emit calls must reuse the module-level _client, not create new ones."""
-    import agent_engine_runner_shared.progress as progress_module
-
-    # Clear module-level client state before test
-    progress_module._client = None
-    progress_module._client_oe_url = None
-
+def test_emit_uses_shared_client_with_progress_timeout() -> None:
+    """Every emit goes through get_shared_client (pooled, keep-alive) and
+    carries the 5s best-effort budget per request rather than per client."""
     tokens = _set_ctx("exec-reuse", "http://oe:8000")
     try:
-        with patch(
-            "agent_engine_runner_shared.progress.create_httpx_client_with_tls"
-        ) as mock_create_client:
+        with patch("agent_engine_runner_shared.progress.get_shared_client") as mock_get_shared:
             mock_client = MagicMock()
             _wire_stream_to_post(mock_client)
-            mock_create_client.return_value = mock_client
+            mock_get_shared.return_value = mock_client
 
             emit_step("first")
             emit_step("second")
             emit_step("third")
 
-            # create_httpx_client_with_tls should be called once (on first emit)
-            # _get_client caches the returned client for subsequent calls
-            mock_create_client.assert_called_once_with("http://oe:8000", 5.0)
-            # The same client instance should be used for all three emits
+            assert [c.args for c in mock_get_shared.call_args_list] == [("http://oe:8000",)] * 3
             assert mock_client.post.call_count == 3
+            assert [c.kwargs["timeout"] for c in mock_client.stream.call_args_list] == [5.0] * 3
     finally:
-        # Clean up module-level state
-        progress_module._client = None
-        progress_module._client_oe_url = None
         clear_execution_context(tokens)
 
 
@@ -305,15 +291,26 @@ class _SyncPostStream:
 
 
 def _wire_stream_to_post(mock_client: MagicMock) -> None:
-    mock_client.stream.side_effect = lambda method, url, *, json, follow_redirects: _SyncPostStream(
-        mock_client, url, json
+    mock_client.stream.side_effect = (
+        lambda method, url, *, json, follow_redirects, timeout=None, **kwargs: _SyncPostStream(
+            mock_client, url, json
+        )
     )
+
+
+@contextlib.contextmanager
+def _patched_client():
+    with patch("agent_engine_runner_shared.progress.get_shared_client") as mock_get_shared:
+        mock_client = MagicMock()
+        _wire_stream_to_post(mock_client)
+        mock_get_shared.return_value = mock_client
+        yield mock_client
 
 
 def test_emit_prefers_owner_url() -> None:
     tokens = _set_ctx_owner("exec-o1", _SERVICE, _OWNER)
     try:
-        with patch("agent_engine_runner_shared.progress._get_client") as mock_get_client:
+        with patch("agent_engine_runner_shared.progress.get_shared_client") as mock_get_client:
             mock_client = MagicMock()
             _wire_stream_to_post(mock_client)
             mock_get_client.return_value = mock_client
@@ -328,7 +325,7 @@ def test_emit_prefers_owner_url() -> None:
 def test_emit_falls_back_to_service_on_owner_transport_error() -> None:
     tokens = _set_ctx_owner("exec-o2", _SERVICE, _OWNER)
     try:
-        with patch("agent_engine_runner_shared.progress._get_client") as mock_get_client:
+        with patch("agent_engine_runner_shared.progress.get_shared_client") as mock_get_client:
             mock_client = MagicMock()
             _wire_stream_to_post(mock_client)
             mock_get_client.return_value = mock_client
@@ -355,7 +352,7 @@ def test_emit_falls_back_to_service_on_owner_transport_error() -> None:
 def test_emit_falls_back_to_service_on_owner_http_error() -> None:
     tokens = _set_ctx_owner("exec-o4", _SERVICE, _OWNER)
     try:
-        with patch("agent_engine_runner_shared.progress._get_client") as mock_get_client:
+        with patch("agent_engine_runner_shared.progress.get_shared_client") as mock_get_client:
             mock_client = MagicMock()
             _wire_stream_to_post(mock_client)
             mock_get_client.return_value = mock_client
@@ -382,7 +379,7 @@ def test_emit_falls_back_to_service_on_owner_http_error() -> None:
 def test_emit_without_owner_uses_service_only() -> None:
     tokens = _set_ctx_owner("exec-o3", _SERVICE, None)
     try:
-        with patch("agent_engine_runner_shared.progress._get_client") as mock_get_client:
+        with patch("agent_engine_runner_shared.progress.get_shared_client") as mock_get_client:
             mock_client = MagicMock()
             _wire_stream_to_post(mock_client)
             mock_get_client.return_value = mock_client
@@ -400,7 +397,7 @@ def test_emit_owner_failure_latches_for_later_emits() -> None:
     the owner pre-attempt timeout on every event."""
     tokens = _set_ctx_owner("exec-o5", _SERVICE, _OWNER)
     try:
-        with patch("agent_engine_runner_shared.progress._get_client") as mock_get_client:
+        with patch("agent_engine_runner_shared.progress.get_shared_client") as mock_get_client:
             mock_client = MagicMock()
             _wire_stream_to_post(mock_client)
             mock_get_client.return_value = mock_client
@@ -431,7 +428,7 @@ def test_emit_owner_failure_latch_is_per_execution() -> None:
     def run_once(execution_id: str) -> list:
         tokens = _set_ctx_owner(execution_id, _SERVICE, _OWNER)
         try:
-            with patch("agent_engine_runner_shared.progress._get_client") as mock_get_client:
+            with patch("agent_engine_runner_shared.progress.get_shared_client") as mock_get_client:
                 mock_client = MagicMock()
                 _wire_stream_to_post(mock_client)
                 mock_get_client.return_value = mock_client

@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
+import hashlib
+import json
 import logging
 import os
 import threading
@@ -15,22 +18,6 @@ from typing import TYPE_CHECKING, Annotated, Any, Literal, cast
 if TYPE_CHECKING:
     from agent_engine_sdk_langgraph.hooks import PrepareAgentInput, ResolveThreadId
 
-from agent_engine_sdk_memory import Memory
-from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import ToolMessage
-from langchain_core.tools import StructuredTool
-from langchain_core.tools import tool as lc_tool
-from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
-from langgraph.errors import GraphBubbleUp
-from langgraph.prebuilt.tool_node import msg_content_output
-from agent_engine_sdk import BaseApp, OutputParser, ToolDefinition
-
-from agent_engine_runner_shared.memory_appbound import (
-    AppBoundCrudClient,
-    AppBoundRuntime,
-)
-from agent_engine_sdk_langgraph.platform_checkpointer import PlatformCheckpointer
-from agent_engine_sdk_langgraph.secure_llm import SecureWrappedLLM
 from agent_engine_runner_shared import (
     RuntimeAgentConfig,
     RuntimeMode,
@@ -41,6 +28,7 @@ from agent_engine_runner_shared import (
     request_session_finish,
 )
 from agent_engine_runner_shared.context import get_current_wrapper
+from agent_engine_runner_shared.generated.workflow.v1.common_pb2 import OperationPath
 from agent_engine_runner_shared.mcp_tools import (
     MCPConfigError,
     MCPToolBinding,
@@ -49,13 +37,40 @@ from agent_engine_runner_shared.mcp_tools import (
     make_sync_mcp_tool_callable,
     mcp_server_network_hosts,
 )
+from agent_engine_runner_shared.memory_appbound import (
+    AppBoundCrudClient,
+    AppBoundRuntime,
+)
 from agent_engine_runner_shared.utils import (
     get_env_bool,
     get_env_float,
     normalize_optional_str,
 )
-from agent_engine_runner_shared.workflow import current_attempt_context
-from agent_engine_runner_shared.workflow.context import current_step_ordinal
+from agent_engine_runner_shared.workflow import (
+    UnknownOutcomePolicy,
+    current_attempt_context,
+    validate_on_unknown_outcome,
+)
+from agent_engine_runner_shared.workflow.context import (
+    current_operation_path,
+    current_step_ordinal,
+    in_spawned_task,
+    operation_path_scope,
+)
+from agent_engine_sdk import BaseApp, OutputParser, ToolDefinition
+from agent_engine_sdk_memory import Memory
+from langchain_core.language_models import BaseChatModel
+from langchain_core.messages import ToolMessage
+from langchain_core.tools import StructuredTool
+from langchain_core.tools import tool as lc_tool
+from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
+from langgraph.config import get_config
+from langgraph.errors import GraphBubbleUp
+from langgraph.func import task
+from langgraph.prebuilt.tool_node import msg_content_output
+
+from agent_engine_sdk_langgraph.platform_checkpointer import PlatformCheckpointer
+from agent_engine_sdk_langgraph.secure_llm import SecureWrappedLLM
 
 logger = logging.getLogger(__name__)
 
@@ -98,11 +113,20 @@ def _durable_tool_message_id(tool_call_id: str) -> str | None:
     attempt = current_attempt_context()
     if attempt is None:
         return None
-    return (
+    message_id = (
         "durable-tool-result:"
         f"{attempt.workflow_identity.execution_id}:"
         f"{current_step_ordinal()}:{tool_call_id}"
     )
+    if not in_spawned_task():
+        return message_id
+    # Send workers in one step may see the same ToolCall ID, so their results
+    # also carry the worker's path. Other IDs keep their recorded form.
+    path = json.dumps(
+        [[s.name, s.ordinal] for s in current_operation_path().segments],
+        separators=(",", ":"),
+    ).encode()
+    return f"{message_id}:{hashlib.sha256(path).hexdigest()}"
 
 
 def _with_durable_tool_result_identity(
@@ -136,6 +160,81 @@ def _with_durable_tool_result_identity(
         return message, None
 
     return invoke
+
+
+def _with_durable_oauth_task(
+    wrapped_func: Callable[..., Any], *, tool_name: str
+) -> tuple[Callable[..., Any], Callable[..., Any]]:
+    """Isolate each OAuth wait from sibling ToolNode calls while OE retains effect identity.
+
+    A completed framework task carries only the genuine resource result. Its
+    parent can pause again without consuming the consent answer. Native calls
+    retain their existing path until the compatibility slice.
+    """
+
+    @task(name=f"delegated_oauth_{tool_name}")
+    def dispatch(arguments: dict[str, Any], segments: list[tuple[str, int]]) -> Any:
+        """Keep OE activities at the original graph path despite the task's native namespace."""
+        path = OperationPath()
+        for name, ordinal in segments:
+            path.segments.add(name=name, ordinal=ordinal)
+        with operation_path_scope(path):
+            return arguments, wrapped_func(**dict(arguments))
+
+    def restore(arguments: dict[str, Any], outcome: Any) -> tuple[Any, Any]:
+        """Bind a task-cache result to its original call and restore its content/artifact pair."""
+        recorded_arguments, result = outcome
+        if recorded_arguments != arguments:
+            if current_attempt_context() is not None and recorded_arguments.get(
+                "tool_call_id"
+            ) != arguments.get("tool_call_id"):
+                # Native task slots follow worker admission. OE owns the
+                # durable call identity, including its already-answered wait.
+                # Reenter that owner instead of returning a sibling's cache.
+                return wrapped_func(**dict(arguments))
+            raise ToolExecutionError(
+                "OAuth tool arguments changed during checkpoint replay"
+            )
+        # Scratch JSON normalizes tuples to lists. The outer pair is platform
+        # metadata; arbitrary resource content remains inside the result.
+        content, artifact = result
+        return content, artifact
+
+    def position() -> list[tuple[str, int]] | None:
+        """Capture the graph position before entering the framework task, or use direct execution."""
+        if current_attempt_context() is None:
+            return None
+        try:
+            get_config()
+        except RuntimeError:
+            return None
+        return [
+            (segment.name, segment.ordinal)
+            for segment in current_operation_path().segments
+        ]
+
+    @wraps(wrapped_func)
+    def invoke(**kwargs: Any) -> Any:
+        """Run a synchronous OAuth call in its isolated task when inside a durable graph."""
+        segments = position()
+        return (
+            wrapped_func(**kwargs)
+            if segments is None
+            else restore(kwargs, dispatch(kwargs, segments).result())
+        )
+
+    @wraps(wrapped_func)
+    async def ainvoke(**kwargs: Any) -> Any:
+        """Admit the task in graph order and restore synchronous OE replay off the event loop."""
+        segments = position()
+        if segments is None:
+            return await asyncio.to_thread(wrapped_func, **kwargs)
+        outcome = await dispatch(kwargs, segments)
+        # A reordered cached slot reenters the synchronous OE/Memory owner.
+        # Keep that I/O off the loop while preserving its request ContextVars.
+        return await asyncio.to_thread(restore, kwargs, outcome)
+
+    return invoke, ainvoke
 
 
 def _args_schema_with_injected_tool_call_id(args_schema: Any) -> Any:
@@ -530,6 +629,7 @@ class App(BaseApp):
         langchain_tool: Any | None = None,
         additional_metadata: dict[str, Any] | None = None,
         source: Literal["decorator", "mcp", "connector"] = "decorator",
+        on_unknown_outcome: UnknownOutcomePolicy | None = None,
     ) -> None:
         if name in self._runtime._tools or name in self._lc_tools:
             message = f"tool {name!r} is already registered"
@@ -552,6 +652,8 @@ class App(BaseApp):
             "timeout_seconds": timeout_seconds,
             "redact_fields": redact_fields,
         }
+        if on_unknown_outcome is not None:
+            metadata["on_unknown_outcome"] = on_unknown_outcome
         if additional_metadata:
             metadata.update(additional_metadata)
 
@@ -589,6 +691,7 @@ class App(BaseApp):
         timeout: int = 30,
         redact_fields: list[str] | None = None,
         response_format: Literal["content", "content_and_artifact"] = "content",
+        on_unknown_outcome: UnknownOutcomePolicy | None = None,
     ):
         """Register a tool function.
 
@@ -610,11 +713,18 @@ class App(BaseApp):
                 round trip. Note it is still recorded in the execution log and is not
                 covered by ``redact_fields`` (which redacts inputs only), so do not
                 place secrets in it.
+            on_unknown_outcome: What a retry does when the platform lost the
+                runner while this tool was running in a durable workflow, so
+                nobody knows whether it ran. ``"rerun"`` runs the tool again
+                (at-least-once execution; declare it only for a tool that is
+                safe to run twice). ``"fail"`` refuses the retry, so the tool
+                never runs twice. Leave unset for the platform default.
 
         Returns:
             Decorator function
         """
         app = self
+        validate_on_unknown_outcome(on_unknown_outcome)
 
         def wrapper(fn: Callable[..., Any]) -> Any:
             effective_network = network or []
@@ -634,6 +744,7 @@ class App(BaseApp):
                 timeout_seconds=timeout,
                 redact_fields=effective_redact,
                 langchain_tool=langchain_tool,
+                on_unknown_outcome=on_unknown_outcome,
             )
 
             return fn
@@ -856,7 +967,6 @@ class App(BaseApp):
             )
 
         from .agent import LangGraphBaseAgent
-        from .durable_subgraphs import DurableSubgraphResolver
         from .node_logger_adapter import LangGraphCallbackAdapter
 
         # Wrap BaseExecutionCallback instances as LangChain callbacks.
@@ -893,12 +1003,8 @@ class App(BaseApp):
             register_workflow_adapter,
         )
 
-        durable_subgraphs = None
         if isinstance(getattr(graph, "checkpointer", None), PlatformCheckpointer):
             register_workflow_adapter("langgraph", _adapter_version())
-            resolver = DurableSubgraphResolver(graph)
-            if resolver.has_compiled_children:
-                durable_subgraphs = resolver
         else:
             # Register-or-clear each materialization so eligibility always
             # reflects the latest graph and cannot drift if builder or
@@ -911,7 +1017,6 @@ class App(BaseApp):
             output_parser=self._output_parser_cls,
             use_custom_parser=use_custom_parser,
             resolve_thread_id=self._resolve_thread_id_fn,
-            durable_subgraphs=durable_subgraphs,
         )
 
     def run(self, **kwargs) -> None:
@@ -993,13 +1098,14 @@ class App(BaseApp):
     @staticmethod
     def _register_hooks() -> None:
         """Register framework-specific hooks."""
-        from agent_engine_sdk_langgraph.llm_adapter import LangChainLLMAdapter
         from agent_engine_runner_shared.hooks import (
             register_durable_activity_suspend_handler,
             register_instrumentor,
             register_llm_adapter_factory,
             register_suspend_handler,
         )
+
+        from agent_engine_sdk_langgraph.llm_adapter import LangChainLLMAdapter
 
         register_suspend_handler(_suspend)
         register_durable_activity_suspend_handler(_suspend_durable_activity)
@@ -1295,10 +1401,9 @@ class App(BaseApp):
 
             native: Any | None = None
             if self._runtime.mongodb_uri:
+                from agent_engine_runner_shared.db_config import resolve_store_db_name
                 from langgraph.checkpoint.mongodb import MongoDBSaver
                 from pymongo import MongoClient
-
-                from agent_engine_runner_shared.db_config import resolve_store_db_name
 
                 server_selection_timeout_ms = _checkpointer_timeout_ms(
                     CHECKPOINTER_SERVER_SELECTION_TIMEOUT_ENV, 5.0
@@ -1471,14 +1576,22 @@ class App(BaseApp):
                 is_framework_control_flow=lambda error: isinstance(
                     error, GraphBubbleUp
                 ),
+                on_unknown_outcome=tool_metadata.get("on_unknown_outcome"),
             )
             wrapper_func = _with_durable_tool_result_identity(
                 wrapper_func,
                 tool_name=tool_name,
             )
 
+            oauth_coroutine = None
+            if provider_type:
+                wrapper_func, oauth_coroutine = _with_durable_oauth_task(
+                    wrapper_func, tool_name=tool_name
+                )
+
             wrapped_tool = StructuredTool.from_function(
                 func=wrapper_func,
+                coroutine=oauth_coroutine,
                 name=tool_obj.name,
                 description=tool_obj.description,
                 # Extend the schema with an injected tool_call_id so LangChain

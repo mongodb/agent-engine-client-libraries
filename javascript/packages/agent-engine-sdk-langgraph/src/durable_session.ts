@@ -7,7 +7,6 @@ import type { RunnableConfig } from "@langchain/core/runnables";
 import {
   Command,
   GraphInterrupt,
-  isCommand,
   isGraphInterrupt,
   type CompiledStateGraph,
   type Interrupt,
@@ -19,7 +18,6 @@ import type {
   RequestContext,
 } from "@mongodb-js/agent-engine-sdk";
 import {
-  runWithOperationPathResolver,
   ActivityOutcomeKind,
   ActivityKind,
   ActivityContextSchema,
@@ -52,7 +50,10 @@ import {
   type SecureToolWrapper,
 } from "@mongodb-js/agent-engine-runner-shared";
 
-import { rejectNodeRetryPolicies } from "./durable_subgraphs.js";
+import {
+  SendTaskRecorder,
+  rejectNodeRetryPolicies,
+} from "./durable_subgraphs.js";
 import { takeRaisedInterruptIds } from "./raised_interrupts.js";
 import {
   ExecutionSession,
@@ -178,6 +179,19 @@ function directInterruptId(activity: InterruptedActivity): string | undefined {
     : undefined;
 }
 
+// Besides node names and indexes, LangGraph task paths carry a boolean
+// (LangGraph 1.5 appends `false` to Send tasks; functional-API calls end in
+// `true`) and a functional-API call's parent path as a nested array. All of
+// these serialize deterministically, so they key replay positions safely.
+function isStableTaskPathPart(part: unknown): boolean {
+  return (
+    typeof part === "string" ||
+    typeof part === "boolean" ||
+    (typeof part === "number" && Number.isSafeInteger(part)) ||
+    (Array.isArray(part) && part.every(isStableTaskPathPart))
+  );
+}
+
 function recordDirectInterrupts(
   attempt: AttemptContext,
   state: StateSnapshotLike,
@@ -216,14 +230,7 @@ function recordDirectInterrupts(
     const owned = taskInterrupts(task);
     if (owned.length === 0) continue;
     const path = task.path;
-    if (
-      !path?.length ||
-      path.some(
-        (part) =>
-          typeof part !== "string" &&
-          !(typeof part === "number" && Number.isSafeInteger(part)),
-      )
-    ) {
+    if (!path?.length || !path.every(isStableTaskPathPart)) {
       throw new UnsupportedDurableGraphError(
         "durable direct interrupt requires a stable LangGraph task path",
       );
@@ -397,6 +404,10 @@ export class DurableSession extends ExecutionSession {
   private readonly executionId: string;
   private readonly openerContent: string;
   private readonly resumeActivityIds: ReadonlySet<string>;
+  // One recorder per invocation, which is this session's lifetime: a stream
+  // can resume a Send task's work in a later iteration than the one that
+  // started the task, so the recorder must outlive each graph call.
+  private readonly sendTasks = new SendTaskRecorder();
   private resumeFrontierSettled = false;
 
   constructor(
@@ -472,11 +483,21 @@ export class DurableSession extends ExecutionSession {
       ...this.baseConfig(),
       durability: "sync",
     } as RunnableConfig;
+    if (this.durableSubgraphs !== null) {
+      config.callbacks = [
+        ...((config.callbacks as unknown[] | undefined) ?? []),
+        this.sendTasks,
+      ] as NonNullable<RunnableConfig["callbacks"]>;
+    }
     const freshInput = this.freshGraphInput(
       prepareContext,
       `durable-input:${this.executionId}`,
     );
-    if (isCommand(freshInput)) {
+    // Match the tag, not `isCommand`: since LangGraph 1.4.21 `isCommand`
+    // ignores plain objects. A Command from a duplicate LangGraph install is
+    // not an instance of this copy's class, so `isCommand` misses it, while
+    // the `lg_name` tag is the same in every copy.
+    if ((freshInput as { lg_name?: unknown } | null)?.lg_name === "Command") {
       throw new UnsupportedDurableGraphError(
         "Command input is not supported on durable_workflow sessions",
       );
@@ -767,6 +788,6 @@ export class DurableSession extends ExecutionSession {
   override runInGraphScope<T>(fn: () => T): T {
     return this.durableSubgraphs === null
       ? fn()
-      : runWithOperationPathResolver(this.durableSubgraphs.resolve, fn);
+      : this.durableSubgraphs.scope(this.sendTasks, fn);
   }
 }

@@ -99,6 +99,21 @@ class TestHTTPSWithoutCerts:
         error_msg = str(exc_info.value)
         assert "HTTPS URL requires mTLS configuration" in error_msg
 
+    def test_uppercase_https_scheme_is_treated_as_https(self, clear_tls_env):
+        """A non-canonical HTTPS scheme must still require certs (fail-closed).
+
+        The shared-client key normalizes the scheme, so the TLS decision must
+        use the same normalization or a certless client would be built (and
+        cached) for what is really an HTTPS origin.
+        """
+        with pytest.raises(ValueError, match="fail-closed"):
+            create_httpx_client_with_tls("HTTPS://oe-service:8443", 30.0)
+
+    @pytest.mark.asyncio
+    async def test_async_uppercase_https_scheme_is_treated_as_https(self, clear_tls_env):
+        with pytest.raises(ValueError, match="fail-closed"):
+            await create_async_httpx_client_with_tls("HTTPS://oe-service:8443", 30.0)
+
 
 class TestPartialCertConfig:
     """Test fail-closed behavior with incomplete certificate configuration."""

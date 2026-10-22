@@ -4,7 +4,7 @@
 
 OpenAI Agents SDK adapter for the MongoDB Atlas Agent Engine SDK.
 
-> **Status:** under construction. The CLI and the build service accept
+> **Status:** experimental. The CLI and the build service accept
 > `framework: openai-agents`; a platform build needs an environment that
 > publishes the Python Lite runner base.
 
@@ -49,20 +49,31 @@ the turn. A non-string tool result, including nested models,
 dataclasses, enums, and datetimes, reaches the model as JSON text. The text is
 canonical, so a replayed turn sends the model the same text: keys are sorted
 and a whole-number float such as `164.0` is written `164`. An integer beyond
-2**53 in a tool's result or arguments fails the call, because the durable
-record cannot keep it exactly; pass such a value as a string.
+2**53 in a tool's result fails the call, and in its arguments fails the turn,
+because the durable record cannot keep it exactly; pass such a value as a
+string.
 
 Each invocation runs one native `Runner` turn and commits it to the
-Orchestration Engine before returning the result. A failed tool call fails
-the turn with the error the platform's tool path reports, such as a tool
-execution error carrying the tool's message or a policy denial; a cancelled or
-user-stopped call fails it too. Nothing is committed in any of these cases.
+Orchestration Engine before returning the result. A tool that raises is
+reported to the model as the OpenAI Agents SDK does by default, with the text
+of the installed SDK's `default_tool_error_function`, and the turn continues.
+Releases before 0.23 include the tool's error message in that text; later
+releases send a fixed message without it. The Orchestration Engine records the
+failure, so a replayed turn sends the model the same text. A call the platform
+stops or fails instead fails the turn with the error its tool path reports: a
+policy denial, a cancelled or user-stopped call, or a platform failure such as
+the Orchestration Engine not acknowledging a tool's result. A platform failure
+is never reported to the model as a failed tool, because the tool may already
+have run. Nothing is committed in these cases. One exception remains: when the
+Orchestration Engine cannot reach a remote tool's Tool Pod, it records the
+failure as the tool's own, so the model is told the tool failed.
 When the model calls several tools at once, they run concurrently. Each call
 keeps the Orchestration Engine activity of its call id, and their results reach
 the model in the order the model made the calls, whichever finishes first. If
 one of them waits for approval, the calls that ran before the wait keep their
 outputs ahead of the approved call's, as the SDK records them. When one call
-fails, the turn fails once the calls still running beside it have finished.
+fails the turn, it fails once the calls still running beside it have
+finished.
 Agent hooks, hosted prompts, dynamic instructions, and a custom
 `tool_use_behavior` are not supported yet. An agent's own input and output
 guardrails run as described under
@@ -94,9 +105,10 @@ belongs in the workspace's secrets, or in `.env` for local development.
 A call to one of these tools is an Orchestration Engine tool activity like any
 other and runs in the Tool Pod, which holds the server's credentials and
 network access. `allowed_tools` limits which of the server's tools the agent
-gets. A failed call or an MCP error result fails the turn. So does a
-structured result holding an integer at or beyond 2**53, which a durable
-record cannot keep exactly; have the server return such a value as a string.
+gets. A failed call or an MCP error result is reported to the model like any
+failed tool. A structured result holding an integer at or beyond 2**53, which
+a durable record cannot keep exactly, fails the turn; have the server return
+such a value as a string.
 
 A server that cannot be reached when the agent starts stops it from starting;
 `timeout_seconds` bounds each request of that discovery, as it bounds a call.
@@ -319,6 +331,24 @@ empty output among that run's items when a response of that agent was
 reviewed; they name the review, never the held response. Each review takes one
 of the run's `max_turns`. A tool or handoff
 with that name, or a model response that calls it, fails the turn.
+
+## Memory
+
+With `memory: true` in `agent.yaml`, tools read and write the project's
+long-term Memory through `app.memory`, the same facade the LangGraph and ADK
+apps use:
+
+```python
+@app.tool()
+def remember_preference(preference: str) -> str:
+    """Remember how the customer likes to be contacted."""
+    result = app.memory.save_semantic(text=preference, label="contact_preference")
+    return "saved" if result.acknowledged else "not saved"
+```
+
+Calls made while a request is executing use that request's user. A write is
+live rather than a durable activity: if a tool call is replayed after a crash,
+its write runs again, so prefer writes that are safe to repeat.
 
 ## Durable state
 

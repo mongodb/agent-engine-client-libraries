@@ -32,8 +32,10 @@ import {
 import {
   currentAttemptContext,
   currentCancelledHistory,
+  getCurrentWrapper,
   getLogger,
   type CancelledHistoryCapture,
+  type SecureToolWrapper,
 } from "@mongodb-js/agent-engine-runner-shared";
 import { commitCancelledTurnCheckpoint } from "./cancelled_turn.js";
 import {
@@ -334,6 +336,37 @@ function stashTurnMessageId(ctx: RequestContext, graphInput: unknown): void {
   }
 }
 
+/** Return the durable identity resolver a graph needs, if any. */
+function defaultDurableSubgraphs(
+  graph: CompiledStateGraph<unknown, unknown>,
+): DurableSubgraphResolver | null {
+  const checkpointer = (graph as { checkpointer?: unknown }).checkpointer;
+  // Deep Agent routes each ToolCall through an internal Send. Its recorded
+  // paths predate Send task segments, so it keeps them.
+  if (
+    checkpointer instanceof PlatformCheckpointer &&
+    checkpointer.isDeepAgentView
+  ) {
+    const resolver = new DurableSubgraphResolver(graph, {
+      scopeSendTasks: false,
+    });
+    return resolver.hasCompiledChildren ? resolver : null;
+  }
+  return new DurableSubgraphResolver(graph);
+}
+
+/**
+ * End the turn with the platform failure a tool call in this execution hit.
+ *
+ * ToolNode reports a tool's error to the model. A graph that ends after its
+ * tools step makes no further model call to refuse, and without a
+ * checkpointer no save is refused either, so the run itself must not report
+ * completion or a suspension.
+ */
+function throwIfPlatformFailed(): void {
+  (getCurrentWrapper() as SecureToolWrapper | null)?.throwIfPlatformFailed?.();
+}
+
 // ---------------------------------------------------------------------------
 // LangGraphBaseAgent
 // ---------------------------------------------------------------------------
@@ -354,10 +387,7 @@ export class LangGraphBaseAgent implements BaseAgent {
   ) {
     this.graph = graph;
     installDurableMessageIdentity(this.graph);
-    const durableSubgraphs = new DurableSubgraphResolver(this.graph);
-    this.durableSubgraphs = durableSubgraphs.hasCompiledChildren
-      ? durableSubgraphs
-      : null;
+    this.durableSubgraphs = defaultDurableSubgraphs(this.graph);
     this.callbacks = callbacks ?? [];
     this.prepareInput = prepareInput ?? null;
     this.resolveThreadIdFn = resolveThreadId ?? null;
@@ -470,6 +500,7 @@ export class LangGraphBaseAgent implements BaseAgent {
         string,
         unknown
       >;
+      throwIfPlatformFailed();
       const messages = Array.isArray(result["messages"])
         ? (result["messages"] as BaseMessage[])
         : [];
@@ -759,6 +790,7 @@ export class LangGraphBaseAgent implements BaseAgent {
         }
         throw streamError;
       }
+      throwIfPlatformFailed();
 
       const interrupt = await session.streamInterrupt(
         config,

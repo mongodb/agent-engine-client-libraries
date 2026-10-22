@@ -50,6 +50,7 @@ attempt 3: replay step 1 → replay frontier 2 → COMPLETED → commit step 2 �
 | [`stream.py`](src/agent_engine_sdk_adk/stream.py) `stream_invocation` | Continue through resolved frontiers until the next fresh wait or completion |
 | [`route.py`](src/agent_engine_sdk_adk/route.py) | Bind canonical ADK node paths to shared durable operation paths |
 | [`agent_route.py`](src/agent_engine_sdk_adk/agent_route.py) | Reserve configured sub-agent transfers under their canonical parent paths |
+| [`adk_workarounds/`](src/agent_engine_sdk_adk/adk_workarounds/) | Temporary patches for ADK resume bugs, one module per bug; see [ADK compatibility](#adk-compatibility) |
 | [`suspend.py`](src/agent_engine_sdk_adk/suspend.py) | Map native waits to one ordered frontier and build the response batch |
 | [`workflow.py`](src/agent_engine_sdk_adk/workflow.py) `resolve_wait_frontier` | Finalize all waits atomically and match OE outcomes by durable position |
 | [`runtime.py`](src/agent_engine_sdk_adk/runtime.py) | `@app.tool` registers; `app.tools()` applies the Atlas Agent Engine secure wrapper; Tool Pod `request_confirmation` is blocked |
@@ -215,6 +216,11 @@ same-type node created dynamically at runtime.
 On resume, cached configured transfers stay inside ADK's transfer loop, and a
 resolved waiting transfer target runs to completion. This preserves the final
 agent response instead of exposing the raw resume value as Workflow output.
+The adapter achieves this by setting ADK's `rerun_on_resume=True` on
+configured transfer agents and their parent agents; an agent that sets
+`rerun_on_resume` explicitly keeps its own value. The adapter sets the field on
+the application's agent objects for the life of the process, so running the
+same objects with plain ADK in that process also re-runs them on resume.
 
 An agent collaboration tree may start at any statically configured agent node
 in a nested, serial, or parallel Workflow graph. This does not admit agents or
@@ -283,6 +289,48 @@ the first turn, naming an event id, or targeting a turn owned by another
 session fails. Calling `rewind_async()` outside an active durable invocation
 also fails; out-of-turn administrative rewind is not supported. Each retry is a
 new branch request; there is no client idempotency key.
+
+## ADK compatibility
+
+Applications choose their google-adk 2.x release (2.9.0 or newer). CI tests
+this SDK with the minimum release and the locked one, recorded as
+`TESTED_ADK_MIN` and `TESTED_ADK_MAX` in `adk_compat.py`. The adapter relies on
+a few ADK interfaces, some of them private, and reacts to a release that
+changes one of them in two ways:
+
+- **Required by a feature.** Durable parallel workers need ADK's private
+  parallel-worker internals, and every agent needs the parameters of the
+  public `BaseNode.run`. If they change, only applications using that
+  feature fail, before any model or tool call, with an
+  `UnsupportedDurableADKError` naming the installed and tested versions.
+  Pin `google-adk` to the tested release, or for parallel workers, use
+  parallel Workflow branches. Applications without parallel workers do not
+  depend on the private worker internals.
+- **Workarounds for ADK bugs.** These cover rare resume cases: a slow re-run
+  child stalling siblings replayed behind it, several completed nested
+  Workflows replaying out of order, replayed children counting toward
+  `max_concurrency`, and, on ADK 2.9 only, a sub-agent transfer inside a
+  Workflow that is not followed on resume. If ADK changes the code a
+  workaround patches, the workaround steps aside with one warning and runs
+  continue with stock ADK behavior. An ADK bug gets a workaround only when
+  the fix is small and cannot affect other behavior. Each workaround is a
+  module in [`adk_workarounds/`](src/agent_engine_sdk_adk/adk_workarounds/),
+  and [`tests/adk_bugs/`](tests/adk_bugs/) reproduces each bug the locked ADK
+  release still has; a reproduction that fails on a newer release means that
+  release fixed the bug and the workaround can be removed. The ADK 2.9-only
+  transfer workaround is removed when this package's google-adk floor
+  reaches 2.10.
+
+Other ADK bugs are known limitations, with no workaround:
+
+- **A nested Workflow's output recorded before its parallel branches
+  finish.** On resume, ADK replays the nested Workflow at the time its
+  output was recorded instead of when it completed. If a sibling completed in
+  between and both feed a `rerun_on_resume` node that requests human input,
+  the resumed node can receive the other sibling's input with the recorded
+  answer. To avoid it, end the nested Workflow's parallel branches in a
+  `JoinNode`, so its output is recorded only after every branch finishes.
+  `tests/adk_bugs/` reproduces this bug too.
 
 ## Quick Start
 

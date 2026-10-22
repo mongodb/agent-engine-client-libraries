@@ -45,6 +45,10 @@ from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.mongodb import MongoDBSaver
 from pydantic import JsonValue, TypeAdapter, ValidationError
 
+from .cancelled_turn import (
+    CANCELLED_TURN_METADATA_KEY,
+    cancelled_opener_ids_from_metadata,
+)
 from .thread_id import (
     session_id_from_thread_id,
     thread_ids_for_query,
@@ -80,7 +84,19 @@ _MAX_CHECKPOINTS_PER_SESSION = 500
 # AER's event loop. The asyncio bound is set higher to allow maxTimeMS
 # to surface its own error first when both fire.
 _AGGREGATION_TIMEOUT_MS = 15_000
-_MESSAGE_READ_TIMEOUT_SECONDS = 20.0
+
+# The OE bounds its session-messages proxy at 10s, so the whole AER read —
+# message window plus cancelled-turn classification — must finish inside that
+# budget with room left for message conversion, serialization, and transport.
+# The cancelled-turn lookup takes only what remains after the message read
+# rather than adding a second full upstream timeout, so a slow lookup degrades
+# to "no stopped turns" instead of failing an otherwise-successful transcript.
+_SESSION_READ_BUDGET_SECONDS = 8.0
+_CANCELLED_TURN_READ_BUDGET_SECONDS = 3.0
+
+# Cap on the cancelled turns the lookup resolves. Markers are one per cancelled
+# turn, so this bounds cancelled turns, not checkpoints.
+_MAX_CANCELLED_TURNS_PER_SESSION = 1000
 
 # Cap on how many per-session checkpoint scans the summaries path runs at
 # once. A sessions-list request can name hundreds of sessions; without a bound
@@ -98,6 +114,10 @@ _ROLE_MAP = {
     "tool": "tool",
     "function": "tool",
 }
+
+# Platform-owned outcome the reader stamps on a cancelled turn's opener. Mirrors
+# the OE's ``outcome`` vocabulary on the session-messages wire.
+MESSAGE_OUTCOME_CANCELLED = "cancelled"
 
 
 class LangGraphQueryPlugin:
@@ -171,11 +191,13 @@ class LangGraphQueryPlugin:
     async def get_messages_for_session(
         self, session_id: str
     ) -> SessionMessagesResponse:
-        authoritative = await self._load_authoritative_messages(session_id)
+        deadline = asyncio.get_running_loop().time() + _SESSION_READ_BUDGET_SECONDS
+        authoritative = await self._load_authoritative_messages(session_id, deadline)
         if authoritative is None:
             return SessionMessagesResponse(messages=[])
 
         authoritative_messages, first_appearance_by_index = authoritative
+        cancelled_openers = await self._cancelled_turn_message_ids(session_id, deadline)
         return SessionMessagesResponse(
             messages=[
                 _to_session_message(
@@ -183,13 +205,71 @@ class LangGraphQueryPlugin:
                     session_id=session_id,
                     message_index=message_index,
                     timestamp=first_appearance_by_index.get(message_index, ""),
+                    cancelled_openers=cancelled_openers,
                 )
                 for message_index, message in enumerate(authoritative_messages)
             ]
         )
 
+    async def _cancelled_turn_message_ids(
+        self, session_id: str, deadline: float
+    ) -> set[str]:
+        """Message ids the platform recorded as a cancelled turn's opener.
+
+        Resolved with a dedicated, thread-scoped lookup filtered on the
+        cancelled-turn checkpoint metadata, so a stopped turn's classification
+        does not expire when its marker checkpoint falls outside the bounded
+        message window. Reads the marker's singular opener id and the plural
+        set a fork carries onto its copied tip. Never reads a message kwarg an
+        agent could author.
+
+        The lookup takes only what remains of the session budget after the
+        message read, so a slow lookup degrades to "no stopped turns" instead of
+        pushing the request past the OE's deadline and failing the whole read.
+        """
+        budget = min(
+            _CANCELLED_TURN_READ_BUDGET_SECONDS,
+            deadline - asyncio.get_running_loop().time(),
+        )
+        if budget <= 0:
+            return set()
+        thread_ids = thread_ids_for_query(session_id, self._effective_workspace_id())
+        try:
+            return await asyncio.wait_for(
+                self._collect_cancelled_turn_message_ids(thread_ids),
+                timeout=budget,
+            )
+        except Exception as exc:  # noqa: BLE001 — classification is non-essential
+            # Mirror the TypeScript reader: a failed lookup degrades to "no
+            # stopped turns" rather than failing the transcript read.
+            logger.warning(
+                "cancelled-turn lookup failed for session %s; stopped openers "
+                "may render unmarked: %s",
+                session_id,
+                exc,
+            )
+            return set()
+
+    async def _collect_cancelled_turn_message_ids(
+        self, thread_ids: list[str]
+    ) -> set[str]:
+        message_ids: set[str] = set()
+        for thread_id in thread_ids:
+            config: RunnableConfig = {"configurable": {"thread_id": thread_id}}
+            async for checkpoint_tuple in self._checkpointer.alist(
+                config,
+                filter={CANCELLED_TURN_METADATA_KEY: True},
+                limit=_MAX_CANCELLED_TURNS_PER_SESSION,
+            ):
+                message_ids.update(
+                    cancelled_opener_ids_from_metadata(
+                        getattr(checkpoint_tuple, "metadata", None)
+                    )
+                )
+        return message_ids
+
     async def _load_authoritative_messages(
-        self, session_id: str
+        self, session_id: str, deadline: float
     ) -> tuple[list[Any], dict[int, str]] | None:
         """Resolve a session's authoritative message list.
 
@@ -208,9 +288,10 @@ class LangGraphQueryPlugin:
         # caller rather than being silently skipped: that's the right call for
         # state-store corruption.
         thread_ids = thread_ids_for_query(session_id, self._effective_workspace_id())
+        remaining = max(0.001, deadline - asyncio.get_running_loop().time())
         checkpoints_newest_first = await asyncio.wait_for(
             self._collect_checkpoints_for_thread_ids(thread_ids),
-            timeout=_MESSAGE_READ_TIMEOUT_SECONDS,
+            timeout=remaining,
         )
 
         # Keep only checkpoints whose ``messages`` channel is a usable list;
@@ -259,7 +340,14 @@ class LangGraphQueryPlugin:
         for offset in range(0, len(session_ids), _MESSAGE_COUNT_CONCURRENCY):
             batch = session_ids[offset : offset + _MESSAGE_COUNT_CONCURRENCY]
             results = await asyncio.gather(
-                *(self._load_authoritative_messages(sid) for sid in batch),
+                *(
+                    self._load_authoritative_messages(
+                        sid,
+                        asyncio.get_running_loop().time()
+                        + _SESSION_READ_BUDGET_SECONDS,
+                    )
+                    for sid in batch
+                ),
                 return_exceptions=True,
             )
             for session_id, result in zip(batch, results, strict=True):
@@ -573,12 +661,16 @@ def _to_session_message(
     session_id: str,
     message_index: int,
     timestamp: str,
+    cancelled_openers: set[str],
 ) -> SessionMessage:
     raw_message_type = getattr(message, "type", "") or ""
     role = _ROLE_MAP.get(raw_message_type, raw_message_type)
     name = getattr(message, "name", "") or ""
     message_id = getattr(message, "id", "") or f"msg-{session_id}-{message_index}"
     additional_kwargs = _json_safe_metadata(getattr(message, "additional_kwargs", None))
+    # The stopped classification is platform-owned: it comes from the
+    # cancelled-turn checkpoint metadata, never from an agent-authorable kwarg.
+    outcome = MESSAGE_OUTCOME_CANCELLED if message_id in cancelled_openers else ""
     return SessionMessage(
         id=message_id,
         role=role,
@@ -590,6 +682,7 @@ def _to_session_message(
         # ToolMessage.tool_call_id is the id of the assistant tool call this
         # message answers; absent on every other message type.
         tool_call_id=getattr(message, "tool_call_id", None) or None,
+        outcome=outcome,
         additional_kwargs=additional_kwargs,
     )
 

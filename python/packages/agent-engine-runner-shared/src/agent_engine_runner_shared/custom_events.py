@@ -31,8 +31,10 @@ from agent_engine_runner_shared.context import (
     get_current_oe_owner_url,
     report_oe_owner_url_failure,
 )
-from agent_engine_runner_shared.progress import _get_client, _post_chunk_owner_first
+from agent_engine_runner_shared.progress import _post_chunk_owner_first
 from agent_engine_runner_shared.server.chunk_types import CUSTOM_EVENT
+from agent_engine_runner_shared.tls_client import get_shared_client
+from agent_engine_runner_shared.utils import PROGRESS_TIMEOUT_SECS
 
 logger = logging.getLogger(__name__)
 _JSON_OBJECT_ADAPTER = TypeAdapter(dict[str, JsonValue], config=ConfigDict(allow_inf_nan=False))
@@ -154,7 +156,7 @@ class OEHTTPCustomEventTransport:
         if not execution_id or not oe_url:
             return
         try:
-            client = _get_client(oe_url)
+            client = get_shared_client(oe_url)
             _post_chunk_owner_first(
                 client,
                 service_url=f"{oe_url.rstrip('/')}/stream/chunk",
@@ -165,6 +167,7 @@ class OEHTTPCustomEventTransport:
                     "custom_event": dict(payload),
                 },
                 on_owner_failure=report_oe_owner_url_failure,
+                timeout=PROGRESS_TIMEOUT_SECS,
             )
         except Exception as exc:  # noqa: BLE001 - best-effort; never fail the tool
             logger.debug("emit_custom_event: failed to send chunk: %s", exc)

@@ -1,14 +1,15 @@
 /**
  * Durable nested operation paths across compiled subgraphs, reused graphs,
- * nested suspension replay, and the durable Send rejection.
+ * and nested suspension replay, including pauses in Send workers.
  *
- * Ports the replay cases of Python's `test_durable_subgraphs_integration.py`
- * and `test_platform_checkpointer` Send rejection.
+ * Ports the replay cases of Python's `test_durable_subgraphs_integration.py`.
+ * Send fan-out replay itself is covered in `durable_send.test.ts`.
  */
 
 import { create } from "@bufbuild/protobuf";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  Annotation,
   END,
   MessagesAnnotation,
   Send,
@@ -16,6 +17,7 @@ import {
   StateGraph,
   interrupt,
 } from "@langchain/langgraph";
+import { AIMessage } from "@langchain/core/messages";
 import type { AgentInput, StreamEvent } from "@mongodb-js/agent-engine-sdk";
 import {
   ActivityKind,
@@ -155,6 +157,10 @@ function nestedGraph(client: ReplayClient, effects: string[]) {
     .compile();
 }
 
+afterEach(() => {
+  vi.unstubAllGlobals();
+});
+
 describe("durable compiled-subgraph paths", () => {
   it("reconstructs child and grandchild paths on replay", async () => {
     const client = new ReplayClient();
@@ -244,114 +250,6 @@ describe("durable compiled-subgraph paths", () => {
   });
 });
 
-describe("durable Send rejection", () => {
-  it("fails closed when a durable checkpoint carries Send fan-out", async () => {
-    const finalizeStep = vi.fn(async () => []);
-    const saver = new PlatformCheckpointer({
-      native: null,
-      clientFactory: () => ({
-        finalizeStep,
-        completeExecution: async () => undefined,
-      }),
-    });
-    const baseCheckpoint: Record<string, unknown> = {
-      v: 1,
-      id: "chk-1",
-      ts: "2026-09-14",
-      channel_values: {},
-      channel_versions: {},
-      versions_seen: {},
-      parents: {},
-    };
-    const config = { configurable: { thread_id: "t" } } as never;
-
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(
-        async () =>
-          new Response(JSON.stringify({ entries: [] }), {
-            status: 200,
-            headers: { "Content-Type": "application/json" },
-          }),
-      ),
-    );
-    await runWithExecutionContext(
-      { executionId: "execution", wrapper: null, oeUrl: "http://oe" },
-      () =>
-        runWithAttemptContext(attempt("attempt-1"), async () => {
-          await expect(
-            saver.put(
-              config,
-              baseCheckpoint as never,
-              { source: "loop", step: 1, parents: {} },
-              {},
-            ),
-          ).resolves.toBeDefined();
-          const finalizedBefore = finalizeStep.mock.calls.length;
-          await expect(
-            saver.put(
-              config,
-              {
-                ...baseCheckpoint,
-                // Topic.checkpoint() stores the TASKS channel as
-                // [seen, values]; the Send packets live in `values`.
-                channel_values: {
-                  __pregel_tasks: [[], [new Send("worker", { messages: [] })]],
-                },
-              } as never,
-              { source: "loop", step: 1, parents: {} },
-              {},
-            ),
-          ).rejects.toThrow(/LangGraph Send is not supported/);
-          // The rejection fires before the producer step can finalize.
-          expect(finalizeStep).toHaveBeenCalledTimes(finalizedBefore);
-          await expect(
-            saver.put(
-              config,
-              {
-                ...baseCheckpoint,
-                channel_values: {
-                  __pregel_tasks: [new Send("worker", { messages: [] })],
-                },
-              } as never,
-              { source: "loop", step: 1, parents: {} },
-              {},
-            ),
-          ).rejects.toThrow(/LangGraph Send is not supported/);
-          await expect(
-            saver.putWrites(
-              config,
-              [
-                ["__pregel_tasks", new Send("worker", { messages: [] })],
-              ] as never,
-              "task-1",
-            ),
-          ).rejects.toThrow(/LangGraph Send is not supported/);
-          // A Send constructed from a different module copy of
-          // @langchain/langgraph fails instanceof; the SendInterface shape
-          // ({node, args}) must still reject.
-          await expect(
-            saver.put(
-              config,
-              {
-                ...baseCheckpoint,
-                channel_values: {
-                  __pregel_tasks: [
-                    ["seen-hash"],
-                    [{ node: "worker", args: { messages: [] } }],
-                  ],
-                },
-              } as never,
-              { source: "loop", step: 1, parents: {} },
-              {},
-            ),
-          ).rejects.toThrow(/LangGraph Send is not supported/);
-          expect(finalizeStep).toHaveBeenCalledTimes(1);
-        }),
-    );
-  });
-});
-
 describe("durable nested suspension replay", () => {
   function nestedInterruptAgent(saver: PlatformCheckpointer) {
     const child = new StateGraph(MessagesAnnotation)
@@ -377,16 +275,23 @@ describe("durable nested suspension replay", () => {
     return events;
   }
 
-  it("suspends inside a nested graph, records the child occurrence, and resumes", async () => {
-    let settlement: "suspended" | "completed" = "suspended";
-    const finalizeStep = vi.fn(async () => []);
-    const completeExecution = vi.fn(async () => undefined);
-    const finalizeBodies: Record<string, unknown>[] = [];
-    const saver = new PlatformCheckpointer({
-      native: null,
-      clientFactory: () => ({ finalizeStep, completeExecution }),
-    });
-    const agent = nestedInterruptAgent(saver);
+  type SuspensionBody = {
+    suspensions?: {
+      position: {
+        operation_path?: { segments?: { name: string }[] };
+        activity_ordinal?: string | number;
+      };
+    }[];
+  };
+
+  /** Stubs OE settlement; each suspension settles as `settlement.kind`. */
+  function stubOeSettlement() {
+    const settlement = {
+      kind: "suspended" as "suspended" | "completed",
+      bodies: [] as SuspensionBody[],
+      /** The resume value OE returns for a completed suspension. */
+      result: (_segment: string): unknown => "approved",
+    };
     vi.stubGlobal(
       "fetch",
       vi.fn(async (_request: unknown, init?: RequestInit) => {
@@ -396,7 +301,7 @@ describe("durable nested suspension replay", () => {
           attempt_id?: string;
           fencing_token?: string;
         };
-        finalizeBodies.push(body);
+        settlement.bodies.push(body as SuspensionBody);
         return new Response(
           JSON.stringify({
             entries: (body.suspensions ?? []).map((suspension, index) => ({
@@ -407,10 +312,17 @@ describe("durable nested suspension replay", () => {
                 attempt_id: body.attempt_id,
                 fencing_token: body.fencing_token,
                 outcome_kind:
-                  settlement === "suspended"
+                  settlement.kind === "suspended"
                     ? "ACTIVITY_OUTCOME_KIND_SUSPENDED"
                     : "ACTIVITY_OUTCOME_KIND_COMPLETED",
-                ...(settlement === "completed" ? { result: "approved" } : {}),
+                ...(settlement.kind === "completed"
+                  ? {
+                      result: settlement.result(
+                        suspendedSegments({ suspensions: [suspension] })[0] ??
+                          "",
+                      ),
+                    }
+                  : {}),
               },
             })),
           }),
@@ -418,57 +330,237 @@ describe("durable nested suspension replay", () => {
         );
       }),
     );
+    return settlement;
+  }
 
-    await runWithExecutionContext(
-      { executionId: "execution", wrapper: null, oeUrl: "http://oe" },
-      () =>
-        runWithAttemptContext(attempt("attempt-1"), async () => {
-          const events = await collect(agent.stream(baseContext, input));
-          expect(events.map((event) => event.event)).toEqual(["suspend"]);
-          const data = events[0]?.data as {
-            interrupts?: Array<{ id: string; position?: unknown }>;
-          };
-          expect(data.interrupts).toEqual([
-            { id: "wait-1", value: { question: "child approve?" } },
-          ]);
-          // The synthetic interrupt position is the root hosting task path —
-          // the occurrence that owns the suspended child.
-          const position = (
-            finalizeBodies[0] as {
-              suspensions?: {
-                position: {
-                  operation_path?: { segments?: { name: string }[] };
-                  activity_ordinal?: string | number;
-                };
-              }[];
-            }
-          )?.suspensions?.[0]?.position;
-          expect(
-            position?.operation_path?.segments?.map((segment) => segment.name),
-          ).toEqual(['langgraph.task:["__pregel_pull","nested"]']);
-          // A single pause inside a compiled child is the task's first.
-          expect(Number(position?.activity_ordinal)).toBe(1);
-        }),
-    );
+  function suspendedSegments(body: SuspensionBody | undefined): string[] {
+    return (
+      body?.suspensions?.[0]?.position.operation_path?.segments ?? []
+    ).map((segment) => segment.name);
+  }
 
-    settlement = "completed";
-    await runWithExecutionContext(
+  function platformSaver() {
+    const completeExecution = vi.fn(async () => undefined);
+    const saver = new PlatformCheckpointer({
+      native: null,
+      clientFactory: () => ({
+        finalizeStep: vi.fn(async () => []),
+        completeExecution,
+      }),
+    });
+    return { saver, completeExecution };
+  }
+
+  async function inAttempt<T>(
+    attemptId: string,
+    replay: boolean,
+    fn: () => Promise<T>,
+  ): Promise<T> {
+    return runWithExecutionContext(
       { executionId: "execution", wrapper: null, oeUrl: "http://oe" },
-      () =>
-        runWithAttemptContext(attempt("attempt-2", true), async () => {
-          const events = await collect(
-            agent.stream(
-              {
-                ...baseContext,
-                resume: true,
-                resumeData: { "wait-1": "approved" },
-              } as never,
-              input,
-            ),
-          );
-          expect(events[events.length - 1]?.event).toBe("result");
-        }),
+      () => runWithAttemptContext(attempt(attemptId, replay), fn),
     );
+  }
+
+  const resumeContext = {
+    ...baseContext,
+    resume: true,
+    resumeData: { "wait-1": "approved" },
+  } as never;
+
+  it("suspends inside a nested graph, records the child occurrence, and resumes", async () => {
+    const { saver, completeExecution } = platformSaver();
+    const agent = nestedInterruptAgent(saver);
+    const settlement = stubOeSettlement();
+
+    await inAttempt("attempt-1", false, async () => {
+      const events = await collect(agent.stream(baseContext, input));
+      expect(events.map((event) => event.event)).toEqual(["suspend"]);
+      const data = events[0]?.data as {
+        interrupts?: Array<{ id: string; position?: unknown }>;
+      };
+      expect(data.interrupts).toEqual([
+        { id: "wait-1", value: { question: "child approve?" } },
+      ]);
+    });
+    // The synthetic interrupt position is the root hosting task path —
+    // the occurrence that owns the suspended child.
+    expect(suspendedSegments(settlement.bodies[0])).toEqual([
+      'langgraph.task:["__pregel_pull","nested"]',
+    ]);
+    // A single pause inside a compiled child is the task's first.
+    expect(
+      Number(settlement.bodies[0]?.suspensions?.[0]?.position.activity_ordinal),
+    ).toBe(1);
+
+    settlement.kind = "completed";
+    await inAttempt("attempt-2", true, async () => {
+      const events = await collect(agent.stream(resumeContext, input));
+      expect(events[events.length - 1]?.event).toBe("result");
+    });
     expect(completeExecution).toHaveBeenCalledTimes(1);
+  });
+
+  it("suspends and resumes a pause inside a Send-dispatched task", async () => {
+    // LangChain agents dispatch each tool call with Send, so a
+    // human-in-the-loop pause inside a tool runs in a PUSH task.
+    const { saver, completeExecution } = platformSaver();
+    const graph = new StateGraph(MessagesAnnotation)
+      .addNode("fan", async () => ({ messages: [] }))
+      .addNode("worker", async () => {
+        const answer = interrupt({ question: "send approve?" }) as string;
+        return { messages: [new AIMessage({ content: `worker:${answer}` })] };
+      })
+      .addEdge(START, "fan")
+      .addConditionalEdges("fan", () => [new Send("worker", { messages: [] })])
+      .addEdge("worker", END)
+      .compile({ checkpointer: saver as never });
+    const agent = new LangGraphBaseAgent(graph as never);
+    const settlement = stubOeSettlement();
+
+    await inAttempt("attempt-1", false, async () => {
+      const events = await collect(agent.stream(baseContext, input));
+      expect(events.map((event) => event.event)).toEqual(["suspend"]);
+    });
+    // LangGraph 1.5 appends `false` to the Send task path.
+    expect(suspendedSegments(settlement.bodies[0])).toEqual([
+      expect.stringMatching(/^langgraph\.task:\["__pregel_push",0(,false)?\]$/),
+    ]);
+
+    settlement.kind = "completed";
+    await inAttempt("attempt-2", true, async () => {
+      const events = await collect(agent.stream(resumeContext, input));
+      expect(events[events.length - 1]?.event).toBe("result");
+      expect(JSON.stringify(events[events.length - 1]?.data)).toContain(
+        "worker:approved",
+      );
+    });
+    expect(completeExecution).toHaveBeenCalledTimes(1);
+  });
+
+  it("pauses and resumes each Send worker with its own answer", async () => {
+    const { saver, completeExecution } = platformSaver();
+    const Worker = Annotation.Root({
+      ...MessagesAnnotation.spec,
+      caseId: Annotation<string>,
+    });
+    const graph = new StateGraph(Worker)
+      .addNode("worker", async (state: typeof Worker.State) => {
+        const answer = interrupt({ question: `approve ${state.caseId}?` });
+        return {
+          messages: [new AIMessage(`${state.caseId}:${String(answer)}`)],
+        };
+      })
+      .addConditionalEdges(
+        START,
+        () =>
+          ["billing", "access"].map((caseId) => new Send("worker", { caseId })),
+        ["worker"],
+      )
+      .addEdge("worker", END)
+      .compile({ checkpointer: saver as never });
+    const agent = new LangGraphBaseAgent(graph as never);
+    const settlement = stubOeSettlement();
+
+    await inAttempt("attempt-1", false, async () => {
+      const events = await collect(agent.stream(baseContext, input));
+      expect(events.map((event) => event.event)).toEqual(["suspend"]);
+    });
+    const paused = (settlement.bodies[0]?.suspensions ?? []).map(
+      (suspension) => suspendedSegments({ suspensions: [suspension] })[0] ?? "",
+    );
+    expect(paused.sort()).toEqual([
+      expect.stringMatching(/^langgraph\.task:\["__pregel_push",0(,false)?\]$/),
+      expect.stringMatching(/^langgraph\.task:\["__pregel_push",1(,false)?\]$/),
+    ]);
+
+    // Each worker's pause settles with an answer naming its own task index.
+    settlement.kind = "completed";
+    settlement.result = (segment) =>
+      `answer-${segment.includes('"__pregel_push",0') ? 0 : 1}`;
+    await inAttempt("attempt-2", true, async () => {
+      const events = await collect(
+        agent.stream(
+          {
+            ...baseContext,
+            resume: true,
+            resumeData: { "wait-1": "unused", "wait-2": "unused" },
+          } as never,
+          input,
+        ),
+      );
+      expect(events[events.length - 1]?.event).toBe("result");
+      const result = JSON.stringify(events[events.length - 1]?.data);
+      // Send index 0 is billing and index 1 is access.
+      expect(result).toContain("billing:answer-0");
+      expect(result).toContain("access:answer-1");
+    });
+    expect(completeExecution).toHaveBeenCalledTimes(1);
+  });
+
+  /**
+   * A graph whose only task pauses at `path`, as getState reports it. The
+   * stream event and getState snapshot mirror what the adapter reads from
+   * LangGraph; the real-Send test above is the check that they still match.
+   */
+  function pausedTaskAgent(saver: PlatformCheckpointer, path: unknown[]) {
+    const pause = { id: "approval", value: { question: "Proceed?" } };
+    const graph = {
+      checkpointer: saver,
+      stream: vi.fn(async () =>
+        (async function* () {
+          yield [[], "updates", { __interrupt__: [pause] }];
+        })(),
+      ),
+      getState: vi.fn(async () => ({
+        next: ["worker"],
+        tasks: [{ path, interrupts: [pause] }],
+      })),
+    };
+    return new LangGraphBaseAgent(graph as never);
+  }
+
+  it.each([
+    {
+      kind: "Send task",
+      path: ["__pregel_push", 0, false],
+      segment: 'langgraph.task:["__pregel_push",0,false]',
+    },
+    {
+      kind: "functional-API call",
+      path: ["__pregel_push", ["__pregel_pull", "agent"], 0, true],
+      segment:
+        'langgraph.task:["__pregel_push",["__pregel_pull","agent"],0,true]',
+    },
+  ])(
+    "keys a pause in a $kind by its full task path",
+    async ({ path, segment }) => {
+      const { saver } = platformSaver();
+      const agent = pausedTaskAgent(saver, path);
+      const settlement = stubOeSettlement();
+
+      await inAttempt("attempt-1", false, async () => {
+        const events = await collect(agent.stream(baseContext, input));
+        expect(events.map((event) => event.event)).toEqual(["suspend"]);
+      });
+      expect(suspendedSegments(settlement.bodies[0])).toEqual([segment]);
+    },
+  );
+
+  it.each([
+    ["a fractional index", ["__pregel_push", 0.5]],
+    ["an object nested in the parent path", ["__pregel_push", [{}], 0, true]],
+  ])("rejects a pause whose task path has %s", async (_case, path) => {
+    const { saver, completeExecution } = platformSaver();
+    const agent = pausedTaskAgent(saver, path);
+    const settlement = stubOeSettlement();
+
+    await expect(
+      inAttempt("attempt-1", false, () =>
+        collect(agent.stream(baseContext, input)),
+      ),
+    ).rejects.toThrow(/requires a stable LangGraph task path/);
+    expect(settlement.bodies).toEqual([]);
+    expect(completeExecution).not.toHaveBeenCalled();
   });
 });

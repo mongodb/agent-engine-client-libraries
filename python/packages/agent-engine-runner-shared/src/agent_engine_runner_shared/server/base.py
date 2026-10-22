@@ -20,12 +20,14 @@ import uvicorn
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from uvicorn.config import LOGGING_CONFIG as UVICORN_LOGGING_CONFIG
+from uvicorn.config import STARTUP_FAILURE
 
 from agent_engine_runner_shared.models import HealthResponse, HealthStatus
 from agent_engine_runner_shared.server.auth import register_auth_middleware
 from agent_engine_runner_shared.server.call_interrupt import register_call_interrupt_route
 from agent_engine_runner_shared.server.cors import resolve_cors_policy
 from agent_engine_runner_shared.server.drain import DrainRegistry, register_drain_route
+from agent_engine_runner_shared.startup_state import mark_startup_complete
 
 if TYPE_CHECKING:
     from agent_engine_runner_shared.runtime import TenantRuntime
@@ -207,6 +209,11 @@ class BaseServer(ABC):
     # servers built without __init__ (test harnesses) still read None first.
     _drain_registry: Optional[DrainRegistry] = None
 
+    # Cause of a startup-hook failure, recorded by the lifespan so ``run`` can
+    # re-raise it after uvicorn exits. Class-level default so servers built
+    # without __init__ (test harnesses) still read None first.
+    _startup_error: Optional[BaseException] = None
+
     def __init__(self, runtime: "TenantRuntime"):
         """
         Initialize the server.
@@ -266,7 +273,13 @@ class BaseServer(ABC):
         async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             # Startup
             logger.info(f"Starting {server.mode_name} server...")
-            await server.on_startup()
+            try:
+                await server.on_startup()
+            except BaseException as exc:
+                # uvicorn exits with STARTUP_FAILURE on a lifespan error without
+                # preserving the cause, so record it for run() to re-raise.
+                server._startup_error = exc
+                raise
             logger.info(f"{server.mode_name.title()} server started")
             yield
             # Shutdown
@@ -309,6 +322,13 @@ class BaseServer(ABC):
 
         # Register mode-specific routes
         self.register_routes(app)
+
+        # Classify an Atlas SRV DNS failure during agent setup.
+        from agent_engine_runner_shared.server.atlas_dns import (
+            register_atlas_dns_error_handler,
+        )
+
+        register_atlas_dns_error_handler(app)
 
         self._app = app
         return app
@@ -418,5 +438,36 @@ class BaseServer(ABC):
                 _shutdown_grace_period_seconds() if self.mode_name == "aer" else None
             ),
         )
-        server = uvicorn.Server(config)
-        await server.serve()
+        self._startup_error = None
+
+        # Defined here, not at module scope: the subclass must bind to whatever
+        # ``uvicorn.Server`` is at call time so tests can patch it.
+        class _StartupAwareServer(uvicorn.Server):
+            """Marks startup complete once the listener is bound, ending launcher startup reports."""
+
+            async def startup(self, sockets: Optional[list[Any]] = None) -> None:
+                await super().startup(sockets=sockets)
+                if self.started:
+                    mark_startup_complete()
+
+        server = _StartupAwareServer(config)
+        try:
+            await server.serve()
+        except SystemExit as exc:
+            if exc.code != STARTUP_FAILURE:
+                raise
+            # uvicorn exits with STARTUP_FAILURE on a lifespan startup failure
+            # or a bind error. SystemExit would otherwise bypass the launcher's
+            # Exception handler, so re-raise the recorded cause (or a
+            # descriptive bind error) for the launcher to classify and report.
+            raise self._startup_failure_error() from exc
+
+    def _startup_failure_error(self) -> BaseException:
+        """Return the error to raise in place of uvicorn's startup-failure exit.
+
+        Prefers the startup-hook failure recorded by the lifespan; falls back
+        to a bind failure when no startup-hook error was recorded.
+        """
+        if self._startup_error is not None:
+            return self._startup_error
+        return RuntimeError("Server failed to start: the listen socket could not be bound")

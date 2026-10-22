@@ -23,8 +23,6 @@ from agent_engine_runner_shared.workflow import (
     preallocate_child_operation_ordinals,
 )
 
-_TRANSFER_AGENT_PROVENANCE_ATTRIBUTE = "_agent_engine_durable_transfer_provenance"
-
 
 def configured_sub_agents(root: BaseNode) -> tuple[BaseAgent, ...]:
     """Return configured transfer targets anywhere in the static topology."""
@@ -85,25 +83,15 @@ class AgentRouteAdapter:
             while current is not None:
                 transfer_agents[id(current)] = current
                 current = current.parent_agent
-        transfer_provenance: set[object] = set()
         for node in transfer_agents.values():
-            provenance = getattr(node, _TRANSFER_AGENT_PROVENANCE_ATTRIBUTE, None)
-            if provenance is None:
-                provenance = object()
-                object.__setattr__(
-                    node, _TRANSFER_AGENT_PROVENANCE_ATTRIBUTE, provenance
-                )
-            transfer_provenance.add(provenance)
-        self._transfer_agent_provenance = frozenset(transfer_provenance)
+            # ADK defaults rerun_on_resume to False, so on resume it returns a
+            # transfer agent's recorded transfer or raw approval as its output
+            # instead of re-entering the agent to follow or finish it. The
+            # agent's recorded model and tool calls replay from history.
+            if "rerun_on_resume" not in node.model_fields_set:
+                node.rerun_on_resume = True
         self._transfer_agent_suffixes = frozenset(
             _configured_agent_suffix(node) for node in transfer_agents.values()
-        )
-
-    def is_configured_transfer_agent(self, node: BaseNode) -> bool:
-        """Whether this node descends from a configured transfer template."""
-        return (
-            getattr(node, _TRANSFER_AGENT_PROVENANCE_ATTRIBUTE, None)
-            in self._transfer_agent_provenance
         )
 
     def is_transfer_agent_path(self, node_path: str) -> bool:

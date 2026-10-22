@@ -3,24 +3,25 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
-from langchain_core.messages.tool import ToolCall
-from langchain_core.utils.function_calling import convert_to_openai_tool
+from agent_engine_runner_shared.connectors import (
+    CONNECTOR_BUNDLE_PATH_ENV,
+    ConnectorBundleError,
+)
+from agent_engine_runner_shared.context import (
+    clear_execution_context,
+    set_execution_context,
+)
+from agent_engine_runner_shared.mcp_tools import MCPConfigError
 from agent_engine_sdk import BaseApp
+from langchain_core.messages.tool import ToolCall
+from langchain_core.runnables import RunnableConfig
+from langchain_core.utils.function_calling import convert_to_openai_tool
 
 from agent_engine_sdk_langgraph import App, LangGraphOutputParser, Memory
 from agent_engine_sdk_langgraph.memory_appbound import (
     AppBoundCrudClient,
     AppBoundRuntime,
 )
-from agent_engine_runner_shared.context import (
-    clear_execution_context,
-    set_execution_context,
-)
-from agent_engine_runner_shared.connectors import (
-    CONNECTOR_BUNDLE_PATH_ENV,
-    ConnectorBundleError,
-)
-from agent_engine_runner_shared.mcp_tools import MCPConfigError
 
 
 def _write_connector_bundle(
@@ -964,6 +965,39 @@ class TestApp:
         mock_create_secure.assert_called_once()
         assert mock_create_secure.call_args.kwargs["redact_fields"] == ["card_number"]
 
+    @patch("agent_engine_runner_shared.secure_wrapper.create_secure_tool_function")
+    def test_get_tools_forwards_the_unknown_outcome_policy(self, mock_create_secure):
+        from agent_engine_runner_shared import RuntimeMode
+
+        app = App(app_name="Test Agent")
+        app._runtime.mode = RuntimeMode.AER
+
+        @app.tool(on_unknown_outcome="rerun")
+        def lookup_policy(policy_id: str) -> str:
+            """Look up a policy."""
+            return policy_id
+
+        @app.tool()
+        def send_email(to: str) -> str:
+            """Send an email."""
+            return to
+
+        mock_create_secure.return_value = lambda **kwargs: "wrapped"
+
+        app.get_tools()
+
+        declared = {
+            call.kwargs["tool_name"]: call.kwargs["on_unknown_outcome"]
+            for call in mock_create_secure.call_args_list
+        }
+        assert declared == {"lookup_policy": "rerun", "send_email": None}
+
+    def test_tool_rejects_an_unknown_outcome_policy_it_does_not_know(self):
+        app = App(app_name="Test Agent")
+
+        with pytest.raises(ValueError, match="on_unknown_outcome"):
+            app.tool(on_unknown_outcome="retry")  # type: ignore[arg-type]
+
     def test_get_tools_injects_tool_call_id_to_oe(self):
         """A ToolCall id reaches SecureToolWrapper.execute_tool as tool_call_id.
 
@@ -1016,8 +1050,6 @@ class TestApp:
 
     def test_get_tools_assigns_durable_tool_result_identity(self):
         """Platform tool results keep stable, step-scoped IDs across replay."""
-        from langchain_core.messages import ToolMessage
-
         from agent_engine_runner_shared import RuntimeMode
         from agent_engine_runner_shared.generated.workflow.v1.common_pb2 import (
             WorkflowIdentity,
@@ -1029,6 +1061,7 @@ class TestApp:
             advance_step_ordinal,
             attempt_context_scope,
         )
+        from langchain_core.messages import ToolMessage
 
         app = App(app_name="Test Agent")
         app._runtime.mode = RuntimeMode.AER
@@ -1085,6 +1118,74 @@ class TestApp:
         assert repeated.id == "durable-tool-result:exec-1:2:call_1"
         assert first.content == "summary AAPL"
         assert first.artifact == {"ticker": "AAPL"}
+
+    def test_get_tools_scopes_tool_result_identity_to_send_workers(self):
+        """Send workers that see one ToolCall ID keep distinct, stable results."""
+        from agent_engine_runner_shared import RuntimeMode
+        from agent_engine_runner_shared.generated.workflow.v1.common_pb2 import (
+            WorkflowIdentity,
+        )
+        from agent_engine_runner_shared.generated.workflow.v1.runtime_pb2 import (
+            AttemptContext,
+        )
+        from agent_engine_runner_shared.workflow.context import (
+            ChildOperationBoundary,
+            attempt_context_scope,
+            operation_path_resolver_scope,
+        )
+
+        app = App(app_name="Test Agent")
+        app._runtime.mode = RuntimeMode.AER
+
+        @app.tool(is_local=True, response_format="content_and_artifact")
+        def get_sections(ticker: str) -> tuple[str, dict]:
+            """Fetch sections."""
+            return f"summary {ticker}", {"ticker": ticker}
+
+        wrapped = app.get_tools()[0]
+        tool_call = {
+            "name": "get_sections",
+            "args": {"ticker": "AAPL"},
+            "id": "call_1",
+            "type": "tool_call",
+        }
+        mock_wrapper = MagicMock()
+        mock_wrapper.execute_tool.return_value = ["summary AAPL", {"ticker": "AAPL"}]
+        boundaries: list[ChildOperationBoundary] = []
+
+        def run(attempt_id: str, workers: list[str]) -> dict[str, str | None]:
+            ids: dict[str, str | None] = {}
+            with attempt_context_scope(
+                AttemptContext(
+                    attempt_id=attempt_id,
+                    workflow_identity=WorkflowIdentity(execution_id="exec-1"),
+                )
+            ):
+                with operation_path_resolver_scope(lambda: boundaries):
+                    for worker in workers:
+                        boundaries[:] = [
+                            ChildOperationBoundary(worker, worker, spawned_task=True)
+                        ]
+                        ids[worker] = wrapped.invoke(tool_call).id
+                    boundaries[:] = []
+                    ids["root"] = wrapped.invoke(tool_call).id
+            return ids
+
+        tokens = set_execution_context(
+            execution_id="exec-1",
+            wrapper=mock_wrapper,
+            oe_url="http://localhost:8080",
+        )
+        try:
+            first = run("attempt-1", ["worker-0", "worker-1"])
+            replay = run("attempt-2", ["worker-1", "worker-0"])
+        finally:
+            clear_execution_context(tokens)
+
+        assert first["worker-0"] != first["worker-1"]
+        assert replay == first
+        # Outside a Send worker the ID keeps its recorded form.
+        assert first["root"] == "durable-tool-result:exec-1:1:call_1"
 
     def test_tool_decorator_defaults_response_format_to_content(self):
         """@app.tool() without response_format keeps LangChain's default."""
@@ -1214,9 +1315,8 @@ class TestApp:
         be injected and forwarded for them (LangChain skips injection on dict
         schemas, so the wrapper must wrap them in a model first).
         """
-        from langchain_core.tools import StructuredTool
-
         from agent_engine_runner_shared import RuntimeMode
+        from langchain_core.tools import StructuredTool
 
         app = App(app_name="Test Agent")
         app._runtime.mode = RuntimeMode.AER
@@ -1264,10 +1364,11 @@ class TestApp:
 
     def test_checkpointer_wraps_mongodb_saver_in_aer_mode(self):
         """App.checkpointer() returns a PlatformCheckpointer over the Mongo saver."""
+        from agent_engine_runner_shared import RuntimeMode
+
         from agent_engine_sdk_langgraph.platform_checkpointer import (
             PlatformCheckpointer,
         )
-        from agent_engine_runner_shared import RuntimeMode
 
         app = App(app_name="Test Agent")
         mock_runtime = MagicMock()
@@ -1399,8 +1500,9 @@ class TestApp:
 
     def test_run_registers_query_plugin_in_aer_mode_when_checkpointer_available(self):
         """AER mode + working checkpointer → LangGraphQueryPlugin registered."""
-        from agent_engine_sdk_langgraph.query import LangGraphQueryPlugin
         from agent_engine_runner_shared import RuntimeMode
+
+        from agent_engine_sdk_langgraph.query import LangGraphQueryPlugin
 
         app = App(app_name="Test Agent")
         app._builder_fn = lambda: MagicMock()  # bypass the no-entrypoint guard
@@ -1591,8 +1693,15 @@ class TestAppCheckpointer:
     ):
         """Durable eligibility follows the materialized graph's checkpointer."""
         import agent_engine_runner_shared.hooks as hooks
+
         from agent_engine_sdk_langgraph.platform_checkpointer import (
             PlatformCheckpointer,
+        )
+        from agent_engine_sdk_langgraph.deep_agent_checkpointer import (
+            checkpointer_for_deep_agent,
+        )
+        from agent_engine_sdk_langgraph.durable_subgraphs import (
+            DurableSubgraphResolver,
         )
 
         # Platform-checkpointed graph: registers the adapter.
@@ -1603,9 +1712,18 @@ class TestAppCheckpointer:
         app._builder_fn = lambda: graph
         agent = app.get_agent()
         assert hooks.get_workflow_adapter() is not None
-        # The graph remains durable, but an empty compiled-child topology must
-        # retain the existing root operation path (including Deep Agent graphs).
-        assert agent._durable_subgraphs is None
+        # Every durable graph binds the resolver so Send tasks get their own
+        # operation-path segment.
+        assert isinstance(agent._durable_subgraphs, DurableSubgraphResolver)
+
+        # A Deep Agent graph without compiled children keeps its root paths.
+        deep_app = App(app_name="Deep Agent")
+        deep_graph = MagicMock()
+        deep_graph.checkpointer = checkpointer_for_deep_agent(
+            PlatformCheckpointer(native=None)
+        )
+        deep_app._builder_fn = lambda: deep_graph
+        assert deep_app.get_agent()._durable_subgraphs is None
 
         # Custom-saver graph: stays native (no registration) — and clears a
         # previously registered adapter so eligibility follows the latest
@@ -1779,8 +1897,9 @@ class TestAppSuspend:
         assert result == '{"suspend_reason": "needs_approval"}'
 
     def test_durable_tool_wait_is_rejected_with_native_interrupt_guidance(self):
-        from agent_engine_sdk_langgraph.runtime import _suspend_durable_activity
         from agent_engine_runner_shared import ToolExecutionError
+
+        from agent_engine_sdk_langgraph.runtime import _suspend_durable_activity
 
         with pytest.raises(ToolExecutionError) as raised:
             _suspend_durable_activity(
@@ -1797,11 +1916,12 @@ class TestAppSuspend:
         assert "langgraph.types.interrupt()" in raised.value.error
 
     def test_native_suspend_is_available_in_a_durable_attempt(self):
-        from agent_engine_sdk_langgraph.runtime import _suspend
         from agent_engine_runner_shared.generated.workflow.v1.runtime_pb2 import (
             AttemptContext,
         )
         from agent_engine_runner_shared.workflow import attempt_context_scope
+
+        from agent_engine_sdk_langgraph.runtime import _suspend
 
         payload = {
             "suspend_reason": "guardrail_require_review",
@@ -1817,13 +1937,13 @@ class TestAppSuspend:
 
     @pytest.mark.anyio
     async def test_durable_tool_wait_rejection_survives_the_default_tool_node(self):
+        from agent_engine_runner_shared import ToolExecutionError
         from langchain_core.messages import AIMessage
         from langchain_core.tools import tool
         from langgraph.prebuilt import ToolNode
         from langgraph.prebuilt.tool_node import ToolRuntime
 
         from agent_engine_sdk_langgraph.runtime import _suspend_durable_activity
-        from agent_engine_runner_shared import ToolExecutionError
 
         @tool
         async def wait_for_review() -> str:
@@ -2311,3 +2431,133 @@ class TestAppDeepAgent:
         self._call_deep_agent(app)
 
         assert get_named_llm("researcher") is subagent_llm
+
+
+@pytest.mark.anyio
+async def test_oauth_task_cache_rejects_changed_call_arguments() -> None:
+    """A cached framework slot must fail before delivering another call's data or repeating effects."""
+    from typing import TypedDict
+
+    from agent_engine_runner_shared.generated.workflow.v1.common_pb2 import (
+        WorkflowIdentity,
+    )
+    from agent_engine_runner_shared.generated.workflow.v1.runtime_pb2 import (
+        AttemptContext,
+    )
+    from agent_engine_runner_shared.secure_wrapper import ToolExecutionError
+    from agent_engine_runner_shared.workflow import attempt_context_scope
+    from langgraph.checkpoint.memory import InMemorySaver
+    from langgraph.graph import END, START, StateGraph
+    from langgraph.types import Command, interrupt
+
+    from agent_engine_sdk_langgraph.runtime import _with_durable_oauth_task
+
+    class State(TypedDict):
+        results: dict
+
+    effects = []
+    reverse = False
+
+    def resource(**arguments):
+        """Observe this task's real dispatch separately from its cached result."""
+        effects.append(arguments["case"])
+        return {"requested": arguments["case"]}, None
+
+    _, call = _with_durable_oauth_task(resource, tool_name="cache-binding")
+
+    async def node(state):
+        """Reproduce changed worker admission into the framework's positional cache."""
+        keys = ["a", "b"]
+        results = {
+            key: await call(
+                case="changed" if reverse and key == "a" else key, tool_call_id=key
+            )
+            for key in keys
+        }
+        interrupt("continue")
+        return {"results": results}
+
+    builder = StateGraph(State)
+    builder.add_node("tools", node)
+    builder.add_edge(START, "tools")
+    builder.add_edge("tools", END)
+    graph = builder.compile(checkpointer=InMemorySaver())
+    config: RunnableConfig = {"configurable": {"thread_id": "cache-binding"}}
+    initial_state: State = {"results": {}}
+    attempt = AttemptContext(
+        workflow_identity=WorkflowIdentity(execution_id="execution"),
+        attempt_id="attempt",
+        fencing_token=1,
+    )
+    with attempt_context_scope(attempt):
+        first = await graph.ainvoke(initial_state, config)
+        reverse = True
+        with pytest.raises(ToolExecutionError, match="arguments changed"):
+            await graph.ainvoke(
+                Command(resume={first["__interrupt__"][0].id: True}), config
+            )
+    assert effects == ["a", "b"]
+
+
+@pytest.mark.anyio
+async def test_oauth_reordered_cache_replays_sync_owner_off_event_loop() -> None:
+    """Reordered cached task slots must replay their OE owner without blocking the event loop."""
+    import threading
+    from typing import TypedDict
+
+    from agent_engine_runner_shared.generated.workflow.v1.common_pb2 import (
+        WorkflowIdentity,
+    )
+    from agent_engine_runner_shared.generated.workflow.v1.runtime_pb2 import (
+        AttemptContext,
+    )
+    from agent_engine_runner_shared.workflow import attempt_context_scope
+    from langgraph.checkpoint.memory import InMemorySaver
+    from langgraph.graph import END, START, StateGraph
+    from langgraph.types import Command, interrupt
+
+    from agent_engine_sdk_langgraph.runtime import _with_durable_oauth_task
+
+    class State(TypedDict):
+        results: dict
+
+    loop_thread = threading.get_ident()
+    owner_calls: list[str] = []
+    reverse = False
+
+    def replay_owner(**arguments):
+        """Observe the synchronous replay boundary independently of framework cache contents."""
+        assert threading.get_ident() != loop_thread, "sync replay ran on the event loop"
+        owner_calls.append(arguments["case"])
+        return {"requested": arguments["case"]}, None
+
+    _, call = _with_durable_oauth_task(replay_owner, tool_name="reordered-replay")
+
+    async def node(state):
+        """Reverse admission after the pause so each cached slot belongs to its sibling."""
+        keys = ["b", "a"] if reverse else ["a", "b"]
+        results = {key: (await call(case=key, tool_call_id=key))[0] for key in keys}
+        interrupt("continue")
+        return {"results": results}
+
+    builder = StateGraph(State)
+    builder.add_node("tools", node)
+    builder.add_edge(START, "tools")
+    builder.add_edge("tools", END)
+    graph = builder.compile(checkpointer=InMemorySaver())
+    config: RunnableConfig = {"configurable": {"thread_id": "reordered-replay"}}
+    initial_state: State = {"results": {}}
+    attempt = AttemptContext(
+        workflow_identity=WorkflowIdentity(execution_id="execution"),
+        attempt_id="attempt",
+        fencing_token=1,
+    )
+    with attempt_context_scope(attempt):
+        first = await graph.ainvoke(initial_state, config)
+        reverse = True
+        final = await graph.ainvoke(
+            Command(resume={first["__interrupt__"][0].id: True}), config
+        )
+
+    assert final["results"] == {"a": {"requested": "a"}, "b": {"requested": "b"}}
+    assert owner_calls == ["a", "b", "b", "a"]

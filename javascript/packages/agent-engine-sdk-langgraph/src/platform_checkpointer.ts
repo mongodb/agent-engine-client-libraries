@@ -6,7 +6,6 @@ import {
   BaseCheckpointSaver,
   MemorySaver,
   emptyCheckpoint,
-  Send,
 } from "@langchain/langgraph";
 import type {
   ChannelVersions,
@@ -24,9 +23,11 @@ import {
   currentStepOrdinal,
   finalizeCurrentStepCommand,
   getCurrentOeUrl,
+  getCurrentWrapper,
   WorkflowClient,
   StateSnapshotSchema,
   type AttemptContext,
+  type SecureToolWrapper,
 } from "@mongodb-js/agent-engine-runner-shared";
 
 import { noteRaisedInterrupts } from "./raised_interrupts.js";
@@ -64,9 +65,6 @@ export function scratchThreadId(attempt: AttemptContext): string {
   return `${executionId}:${attempt.attemptId}:${attempt.fencingToken.toString()}`;
 }
 
-/** LangGraph's dynamic-fan-out channel; Send packets on it are unsupported. */
-const PREGEL_TASKS_CHANNEL = "__pregel_tasks";
-
 /**
  * Absolute OE step ordinal recorded on committed root-loop scratch
  * checkpoints so session-fork target selection never reconstructs LangGraph's
@@ -77,37 +75,14 @@ const PREGEL_TASKS_CHANNEL = "__pregel_tasks";
 export const OE_STEP_ORDINAL_METADATA_KEY = "agent_engine_oe_step_ordinal";
 
 /**
- * Topic.checkpoint() stores this channel as `[seen, values]`, so Send packets
- * sit one array deeper than the checkpoint value itself. Scan arrays to a
- * bounded depth instead of matching only the top level.
- *
- * Recognize a packet by LangGraph's stable SendInterface shape
- * (`{node, args}`) in addition to `instanceof Send`: a tenant application can
- * load its own copy of `@langchain/langgraph`, and a Send from that copy
- * fails a same-module instanceof check while behaving identically here.
+ * Refuse to save anything once a tool call in this execution hit a platform
+ * failure. ToolNode turns that failure into a message for the model; a saved
+ * checkpoint or pending write would hand it to the model on a retry or the
+ * next turn, since LangGraph restores a finished task's writes without
+ * running it again.
  */
-function containsSendPacket(value: unknown, depth = 0): boolean {
-  if (depth > 4) return false;
-  if (Array.isArray(value)) {
-    return value.some((item) => containsSendPacket(item, depth + 1));
-  }
-  if (value instanceof Send) return true;
-  return (
-    typeof value === "object" &&
-    value !== null &&
-    typeof (value as { node?: unknown }).node === "string" &&
-    (value as { args?: unknown }).args !== undefined
-  );
-}
-
-function rejectUnsupportedSendPackets(channel: string, value: unknown): void {
-  if (channel !== PREGEL_TASKS_CHANNEL) return;
-  if (containsSendPacket(value)) {
-    throw new UnsupportedDurableGraphError(
-      "LangGraph Send is not supported on durable_workflow sessions; " +
-        "use fixed graph edges, compiled subgraphs, or Deep Agent task delegation",
-    );
-  }
+function throwIfPlatformFailed(): void {
+  (getCurrentWrapper() as SecureToolWrapper | null)?.throwIfPlatformFailed();
 }
 
 export class PlatformCheckpointer extends BaseCheckpointSaver<string | number> {
@@ -115,22 +90,22 @@ export class PlatformCheckpointer extends BaseCheckpointSaver<string | number> {
   private readonly scratch: MemorySaver;
   private readonly clientFactory: WorkflowClientFactory;
   /**
-   * Deep-agent graphs route pending ToolCalls through LangGraph Send packets
-   * the adapter owns; when set, the Send rejection does not apply. The flag
-   * keeps the wrapper sharing the same platform scratch and native savers.
+   * Marks the view a Deep Agent graph uses. Deep Agent routes each ToolCall
+   * through an internal Send, and its recorded activity paths predate Send
+   * task segments, so the adapter keeps those tasks on their parent path.
    */
-  private readonly allowSendPackets: boolean;
+  readonly isDeepAgentView: boolean;
 
   constructor(args: {
     native: BaseCheckpointSaver<string | number> | null;
     scratch?: MemorySaver;
     clientFactory?: WorkflowClientFactory;
-    allowSendPackets?: boolean;
+    deepAgentView?: boolean;
   }) {
     super(args.native?.serde);
     this.native = args.native;
     this.scratch = args.scratch ?? new MemorySaver();
-    this.allowSendPackets = args.allowSendPackets ?? false;
+    this.isDeepAgentView = args.deepAgentView ?? false;
     this.clientFactory =
       args.clientFactory ?? ((oeUrl) => new WorkflowClient(oeUrl));
   }
@@ -141,7 +116,7 @@ export class PlatformCheckpointer extends BaseCheckpointSaver<string | number> {
 
   /**
    * A checkpointer view that shares this instance's platform state and test
-   * seams but tolerates the adapter-owned Send routing Deep Agent graphs use
+   * seams and marks the graph as Deep Agent-owned
    * (see `checkpointerForDeepAgent`).
    */
   deepAgentView(): PlatformCheckpointer {
@@ -149,7 +124,7 @@ export class PlatformCheckpointer extends BaseCheckpointSaver<string | number> {
       native: this.native,
       scratch: this.scratch,
       clientFactory: this.clientFactory,
-      allowSendPackets: true,
+      deepAgentView: true,
     });
   }
 
@@ -237,6 +212,7 @@ export class PlatformCheckpointer extends BaseCheckpointSaver<string | number> {
     metadata: CheckpointMetadata,
     newVersions: ChannelVersions,
   ): Promise<RunnableConfig> {
+    throwIfPlatformFailed();
     const attempt = currentAttemptContext();
     if (attempt === null) {
       return this.requireNative().put(
@@ -253,13 +229,6 @@ export class PlatformCheckpointer extends BaseCheckpointSaver<string | number> {
     }
 
     const durableConfig = this.durableConfig(config, attempt);
-    // Reject where LangGraph synchronously commits the producer step: the
-    // fanned-out workers must never start on a durable attempt.
-    for (const [channel, value] of Object.entries(
-      checkpoint.channel_values as Record<string, unknown>,
-    )) {
-      this.rejectUnsupportedSendPackets(channel, value);
-    }
     const durableMetadata = this.durableMetadata(metadata, durableConfig);
     const result = await this.scratch.put(
       durableConfig,
@@ -309,15 +278,11 @@ export class PlatformCheckpointer extends BaseCheckpointSaver<string | number> {
     writes: PendingWrite[],
     taskId: string,
   ): Promise<void> {
+    throwIfPlatformFailed();
     const attempt = currentAttemptContext();
     if (attempt === null) {
       await this.requireNative().putWrites(config, writes, taskId);
       return;
-    }
-    // Reject dynamic fan-out where LangGraph backgrounds the write: a PUSH
-    // worker could start before this callback fails.
-    for (const [channel, value] of writes) {
-      this.rejectUnsupportedSendPackets(channel, value);
     }
     noteRaisedInterrupts(attempt, writes);
     await this.scratch.putWrites(
@@ -347,19 +312,6 @@ export class PlatformCheckpointer extends BaseCheckpointSaver<string | number> {
       );
     }
     return this.scratch.getNextVersion(current);
-  }
-
-  /**
-   * Reject application-authored dynamic fan-out in durable graphs. Deep-agent
-   * graphs route their own adapter-owned Send packets through the same
-   * platform state, so they opt out via `allowSendPackets`.
-   */
-  protected rejectUnsupportedSendPackets(
-    channel: string,
-    value: unknown,
-  ): void {
-    if (this.allowSendPackets) return;
-    rejectUnsupportedSendPackets(channel, value);
   }
 
   private requireNative(): BaseCheckpointSaver<string | number> {

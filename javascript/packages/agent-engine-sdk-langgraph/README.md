@@ -25,7 +25,7 @@ npm install @mongodb-js/agent-engine-sdk-langgraph
 | `src/node_logger_adapter.ts` | LangGraph callbacks → `NodeExecutionLogger` |
 | `src/deep_agent.ts` | `deepagents` library wrapper |
 | `src/deep_agent_task.ts` | Deep Agent `task` tool-call parsing |
-| `src/deep_agent_checkpointer.ts` | Deep Agent checkpointer policy (tolerates adapter-owned Send routing) |
+| `src/deep_agent_checkpointer.ts` | Marks the checkpointer as a Deep Agent view, which keeps Deep Agent's own task identities instead of naming `Send` workers |
 | `src/durable_deep_agent.ts` | Durable `task` dispatch: child operation paths + message-id stamping |
 | `src/session_fork.ts` | Session fork: native copy + durable OE branch, wrapped into `updateState` |
 | `src/backends/toolpod.ts` | `AgentEngineToolPodBackend` (sandbox backend) |
@@ -98,6 +98,14 @@ app.entrypoint(() => {
 
 // On the agent AER pod, set CHECKPOINT_DB_NAME to the exact shared database.
 ```
+
+## Tool failures
+
+A tool's own failure follows LangGraph.js: the stock `ToolNode` reports it to the model as a `ToolMessage`. A platform failure during a tool call is different, because the tool may already have run: for example, the Orchestration Engine's answer is lost, or it rejects or never acknowledges the tool's result. Instead of reaching the model, a platform failure ends the turn. The next model call, the next tool call, and any save of the step that holds the failure, its pending writes included, are refused, and a turn whose last step was that tool call fails instead of completing, so neither a retry nor the next turn hands the failure to the model.
+
+The refused saves rely on the platform checkpointer from `app.checkpointer()`. A graph compiled with a saver of its own, such as a plain `MemorySaver`, still fails the turn, but that saver keeps the step, so the next turn can show the failure to the model. A streamed turn ends with the platform failure as its error, after the client has already received the tools step whose `ToolMessage` carries the failure text.
+
+One exception remains: when the Orchestration Engine cannot reach a remote tool's Tool Pod, it records the failure as the tool's own, so the model is told the tool failed.
 
 ## Differences from the Python SDK
 

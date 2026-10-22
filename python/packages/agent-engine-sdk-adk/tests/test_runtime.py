@@ -155,6 +155,37 @@ class TestAppTools:
         mock_secure.assert_called_once()
         assert mock_secure.call_args.kwargs["redact_fields"] == ["card_number"]
 
+    def test_tools_forwards_the_unknown_outcome_policy(self) -> None:
+        app = _make_app(mode=RuntimeMode.AER)
+
+        registered_metadata: dict[str, dict] = {}
+        app._runtime.register_tool.side_effect = lambda name, func, metadata: (
+            registered_metadata.__setitem__(name, metadata)
+        )
+        app._runtime.get_tool_metadata.side_effect = lambda name: (
+            registered_metadata.get(name, {})
+        )
+
+        @app.tool(on_unknown_outcome="fail")
+        def send_email(to: str) -> str:
+            """Send an email."""
+            return to
+
+        with patch(
+            "agent_engine_sdk_adk.runtime.create_secure_tool_function",
+            side_effect=lambda **kw: kw["original_tool"],
+        ) as mock_secure:
+            app.tools()
+
+        mock_secure.assert_called_once()
+        assert mock_secure.call_args.kwargs["on_unknown_outcome"] == "fail"
+
+    def test_tool_rejects_an_unknown_outcome_policy_it_does_not_know(self) -> None:
+        app = _make_app(mode=RuntimeMode.AER)
+
+        with pytest.raises(ValueError, match="on_unknown_outcome"):
+            app.tool(on_unknown_outcome="retry")  # type: ignore[arg-type]
+
     def test_in_pod_request_confirmation_fails_closed(self) -> None:
         app = _make_app(mode=RuntimeMode.TOOL)
 

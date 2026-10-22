@@ -111,8 +111,9 @@ namespace later.
 
 ## Bind the resolver to execution
 
-Invoke and stream execution bind the same resolver through agent-engine-runner-shared's
-[`operation_path_resolver_scope`](../../agent-engine-runner-shared/src/agent_engine_runner_shared/workflow/context.py):
+Invoke and stream execution bind the same resolver, together with the run's
+`SendTaskRecorder` (see [Send workers](#send-workers)), through
+`DurableSubgraphResolver.scope`:
 
 - [`ExecutionSession.invoke_scopes`](../src/agent_engine_sdk_langgraph/execution_session.py)
   covers a complete `invoke` call.
@@ -147,6 +148,9 @@ continues beneath an ordinary node cannot be explained by the compiled topology
 and is rejected. This prevents an unfamiliar framework path from silently
 collapsing onto a valid durable identity.
 
+A graph without compiled children skips namespace parsing: its effects stay on
+the root path unless they run in a `Send` worker.
+
 Runner-shared combines the returned boundaries with the fixed `agent/1` root,
 the current workflow step, and the effect's activity ordinal. That complete
 position is what OE uses for record or replay.
@@ -162,13 +166,59 @@ executing the external effect again.
 Only secure LLM and Tool wrappers trigger this resolution. Ordinary graph work
 can move through compiled children without creating OE activities.
 
+## Send workers
+
+LangGraph runs every [`Send`](https://docs.langchain.com/oss/python/langgraph/graph-api#send)
+worker of a superstep concurrently, so arrival order cannot identify a worker's
+effects. Each worker instead gets its own operation-path segment,
+`langgraph.task:__pregel_push:<step>:<index>`. The step is the LangGraph
+superstep that runs the worker (`langgraph_step`), which keeps successive
+`Send` rounds of one graph run apart; the index is the worker's position in
+that superstep's send list.
+
+Both numbers are stable across attempts. Every attempt seeds its scratch
+thread from the same committed state, so LangGraph counts supersteps from the
+same start, the producer emits the same sends, and LangGraph applies each
+superstep's writes in task-path order, so the send list has the same order. The
+Pregel task ID and the namespace's occurrence key are derived from the
+attempt's checkpoint ID and change on every attempt.
+
+The resolver finds the worker's step and index in two places:
+
+- **The running node is the worker.** LangGraph's run metadata
+  (`langgraph_path`) is `("__pregel_push", <index>, ...)`, and the resolver
+  appends the worker's segment.
+- **The worker is a compiled child.** Inside the child, the metadata describes
+  only the child's own node and the namespace names the worker by its runtime
+  task ID. `SendTaskRecorder`, a LangChain callback registered for the
+  duration of the run, records each `Send` task's namespace segment and index
+  when the task starts. The resolver places the worker's segment before that
+  child's boundary.
+
+```text
+agent/1 / langgraph.task:__pregel_push:1:0 / research/1   <- first worker's child
+agent/1 / langgraph.task:__pregel_push:1:1 / research/1   <- second worker's child
+```
+
+A Tool that a worker's model requested keeps the position its model reserved,
+even when it executes in another task (see
+[Durable activity identity](durable-activity-identity.md)).
+
+Graphs created by `app.deep_agent()` keep their existing paths: LangChain's
+agent factory routes each ToolCall through an internal `Send`, and Deep Agent's
+recorded activities predate these segments.
+
 ## Supported boundary
 
 Durable compiled-subgraph identity supports statically materialized child
-graphs that inherit the root platform checkpointer. It does not support
-application-authored LangGraph `Send` fan-out. Fixed edges and compiled child
-graphs are the supported ways for application graphs to express nested durable
-work.
+graphs that inherit the root platform checkpointer, and `Send` workers sent from
+any graph level. Plain nodes that run in parallel on fixed edges share their
+parent's path and take activity ordinals in arrival order, so a replacement
+attempt can reject them as nondeterministic; put model calls in such branches
+inside compiled children. A `Send` worker that runs its own graph from node
+code is supported only in a graph without compiled children. A graph run from
+node code adds its own namespace segment, so in a graph with compiled children
+it is outside the compiled topology and its first activity is rejected.
 
 ## Call-site map
 
@@ -177,6 +227,7 @@ work.
 | Materialize the graph and create the resolver | [`runtime.py`](../src/agent_engine_sdk_langgraph/runtime.py) |
 | Discover and translate compiled topology | [`durable_subgraphs.py`](../src/agent_engine_sdk_langgraph/durable_subgraphs.py) |
 | Validate the topology before durable execution | [`durable_session.py`](../src/agent_engine_sdk_langgraph/durable_session.py) |
+| Record `Send` worker indexes | [`durable_subgraphs.py`](../src/agent_engine_sdk_langgraph/durable_subgraphs.py) |
 | Bind identity during `invoke` | [`execution_session.py`](../src/agent_engine_sdk_langgraph/execution_session.py) |
 | Bind identity during each stream iteration | [`stream_scope.py`](../src/agent_engine_sdk_langgraph/stream_scope.py) |
 | Convert child boundaries into an operation path | [`context.py`](../../agent-engine-runner-shared/src/agent_engine_runner_shared/workflow/context.py) |
@@ -192,7 +243,9 @@ When upgrading LangGraph:
    above.
 2. Run topology, namespace parsing, invalid-shape, and invocation-scope scenarios
    in [`test_durable_subgraphs.py`](../tests/test_durable_subgraphs.py).
-3. Run compiled-child replay and sibling identity scenarios in
+3. Run compiled-child replay, sibling identity, and `Send` worker scenarios in
    [`test_durable_subgraphs_integration.py`](../tests/test_durable_subgraphs_integration.py).
+   They depend on LangGraph's `langgraph_path`, `langgraph_step`, and
+   `langgraph_checkpoint_ns` run metadata and on task-path-ordered `Send` writes.
 4. Run invoke and stream coverage in
    [`test_agent.py`](../tests/test_agent.py).

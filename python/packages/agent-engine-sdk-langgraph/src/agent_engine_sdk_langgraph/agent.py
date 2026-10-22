@@ -53,6 +53,9 @@ from agent_engine_sdk_langgraph.checkpoint_branch import (
     checkpoint_metadata,
     initialize_checkpoint_branch,
 )
+from agent_engine_sdk_langgraph.deep_agent_checkpointer import (
+    DeepAgentPlatformCheckpointer,
+)
 from agent_engine_sdk_langgraph.durable_message_identity import (
     install_durable_message_identity,
 )
@@ -186,6 +189,21 @@ async def _failed_stream_epilogue(
             yield event
 
 
+def _default_durable_subgraphs(
+    graph: CompiledStateGraph,
+) -> DurableSubgraphResolver | None:
+    """Return the durable identity resolver a platform-checkpointed graph needs."""
+    checkpointer = getattr(graph, "checkpointer", None)
+    if not isinstance(checkpointer, PlatformCheckpointer):
+        return None
+    # Deep Agent routes each ToolCall through an internal Send. Its recorded
+    # paths predate Send task segments, so it keeps them.
+    if isinstance(checkpointer, DeepAgentPlatformCheckpointer):
+        resolver = DurableSubgraphResolver(graph, scope_send_tasks=False)
+        return resolver if resolver.has_compiled_children else None
+    return DurableSubgraphResolver(graph)
+
+
 class LangGraphBaseAgent(BaseAgent):
     """LangGraph adapter implementing the BaseAgent protocol.
 
@@ -256,8 +274,9 @@ class LangGraphBaseAgent(BaseAgent):
                 used verbatim (no workspace suffix). Appended after the
                 established positional surface so existing positional
                 callers keep binding ``output_parser`` / ``use_custom_parser``.
-            durable_subgraphs: Resolver for directly composed compiled subgraphs.
-                It is used only while an OE durable attempt is active.
+            durable_subgraphs: Resolver for compiled subgraphs and Send tasks.
+                It is used only while an OE durable attempt is active. When
+                None, a platform-checkpointed graph gets the default resolver.
         """
         self._graph = graph
         self._callbacks = callbacks or []
@@ -265,7 +284,11 @@ class LangGraphBaseAgent(BaseAgent):
         self._output_parser = output_parser
         self._use_custom_parser = use_custom_parser
         self._resolve_thread_id = resolve_thread_id
-        self._durable_subgraphs = durable_subgraphs
+        self._durable_subgraphs = (
+            durable_subgraphs
+            if durable_subgraphs is not None
+            else _default_durable_subgraphs(graph)
+        )
         install_durable_message_identity(self._graph)
         # The platform maps live update_state to a new session+thread, not LangGraph
         # same-thread time-travel. See docs/session-fork.md.

@@ -48,7 +48,9 @@
   - [CreateAgentEngineDeepAgentOptions](#api-createagentenginedeepagentoptions)
   - [DeepAgentOptions](#api-deepagentoptions)
   - [LangGraphQueryPluginParams](#api-langgraphquerypluginparams)
+  - [ToolDecoratorOptions](#api-tooldecoratoroptions)
 - **Type Aliases**
+  - [OnUnknownOutcome](#api-onunknownoutcome)
   - [PrepareAgentInput](#api-prepareagentinput-1)
   - [ResolveThreadId](#api-resolvethreadid-2)
   - [SessionFinishStatus](#api-sessionfinishstatus)
@@ -952,7 +954,7 @@ and returns the function unchanged. Mirrors Python's `@app.tool()` shape.
 
 | Parameter | Type |
 | :------ | :------ |
-| `options` | `ToolDecoratorOptions` |
+| `options` | [`ToolDecoratorOptions`](#api-tooldecoratoroptions) |
 
 **Returns**
 
@@ -1244,6 +1246,7 @@ new LangGraphQueryPlugin(params): LangGraphQueryPlugin;
 ```ts
 getMessagesForSession(sessionId): Promise<{
   messages: object[];
+  outcome_supported: boolean;
 }>;
 ```
 
@@ -1257,6 +1260,7 @@ getMessagesForSession(sessionId): Promise<{
 
 `Promise`\<\{
   `messages`: `object`[];
+  `outcome_supported`: `boolean`;
 \}\>
 
 <a id="api-getsummariesforsessions"></a>
@@ -1333,15 +1337,48 @@ Options for [App.deepAgent](#api-deepagent).
 
 #### Properties
 
-| Property | Type |
-| :------ | :------ |
-| <a id="api-property-client"></a> `client` | `MongoClient` |
-| <a id="api-property-dbname"></a> `dbName` | `string` |
-| <a id="api-property-saver"></a> `saver` | `MongoDBSaver` |
-| <a id="api-property-workspaceid"></a> `workspaceId?` | `string` |
-| <a id="api-property-workspaceidresolver"></a> `workspaceIdResolver?` | () => `string` \| `null` \| `undefined` |
+| Property | Type | Description |
+| :------ | :------ | :------ |
+| <a id="api-property-cancelledturnreadbudgetms"></a> `cancelledTurnReadBudgetMs?` | `number` | Cancelled-turn lookup budget in ms. Defaults to CANCELLED_TURN_READ_BUDGET_MS. |
+| <a id="api-property-client"></a> `client` | `MongoClient` | - |
+| <a id="api-property-dbname"></a> `dbName` | `string` | - |
+| <a id="api-property-saver"></a> `saver` | `MongoDBSaver` | - |
+| <a id="api-property-sessionreadbudgetms"></a> `sessionReadBudgetMs?` | `number` | Whole session-messages read budget in ms. Defaults to SESSION_READ_BUDGET_MS. |
+| <a id="api-property-workspaceid"></a> `workspaceId?` | `string` | - |
+| <a id="api-property-workspaceidresolver"></a> `workspaceIdResolver?` | () => `string` \| `null` \| `undefined` | - |
+
+***
+
+<a id="api-tooldecoratoroptions"></a>
+
+### ToolDecoratorOptions
+
+#### Properties
+
+| Property | Type | Description |
+| :------ | :------ | :------ |
+| <a id="api-property-description"></a> `description?` | `string` | Human-readable description shown to the LLM (mirrors Python's docstring). TypeScript has no docstring introspection, so callers pass it explicitly. |
+| <a id="api-property-islocal"></a> `isLocal?` | `boolean` | - |
+| <a id="api-property-name-1"></a> `name?` | `string` | Override the registered tool name. Defaults to the wrapped function's `name`. |
+| <a id="api-property-network"></a> `network?` | readonly `string`[] | - |
+| <a id="api-property-onunknownoutcome"></a> `onUnknownOutcome?` | [`OnUnknownOutcome`](#api-onunknownoutcome) | What a retry does when the platform lost the runner while this tool was running in a durable workflow, so nobody knows whether it ran. `"rerun"` runs the tool again (at-least-once execution; declare it only for a tool that is safe to run twice). `"fail"` refuses the retry, so the tool never runs twice. Leave unset for the platform default. |
+| <a id="api-property-providertype"></a> `providerType?` | `string` | - |
+| <a id="api-property-redactfields"></a> `redactFields?` | readonly `string`[] | - |
+| <a id="api-property-schema"></a> `schema?` | `ZodType`\<`unknown`, `unknown`, `$ZodTypeInternals`\<`unknown`, `unknown`\>\> | Zod schema describing the tool's arguments. Without it, the LLM has no structured view of the parameters and tool calling will fail. Mirrors the type hints + Pydantic-style auto-schema that Python's `@app.tool()` derives from the function signature. |
+| <a id="api-property-scopes"></a> `scopes?` | readonly `string`[] | - |
+| <a id="api-property-timeout"></a> `timeout?` | `number` | - |
 
 ## Type Aliases
+
+<a id="api-onunknownoutcome"></a>
+
+### OnUnknownOutcome
+
+```ts
+type OnUnknownOutcome = "fail" | "rerun";
+```
+
+***
 
 <a id="api-prepareagentinput-1"></a>
 

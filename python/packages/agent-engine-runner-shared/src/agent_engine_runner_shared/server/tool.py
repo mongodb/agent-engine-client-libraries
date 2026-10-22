@@ -23,6 +23,10 @@ from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from agent_engine_runner_shared.caller_trace import (
+    runner_trace_scope,
+    trace_state_marks_runner_root,
+)
 from agent_engine_runner_shared.error_reporting import _redact_text
 from agent_engine_runner_shared.guardrails_evaluator import evaluate_guardrail_check
 from agent_engine_runner_shared.hooks import (
@@ -611,6 +615,91 @@ class ToolExecution:
         return make_mcp_tool_pod_callable(binding)
 
 
+# One large prompt must not reject the whole span document. The traces
+# collection keeps this text; metadata-only export redacts input.value.
+_GUARDRAIL_SPAN_TEXT_LIMIT = 4000
+
+
+def _parent_is_inbound_caller(span: Any) -> bool:
+    """True when ``span`` joined a caller trace that was already bound.
+
+    ``parent.is_remote`` is not enough: AER roots ``aer.execute`` with no
+    inbound traceparent, and tls_client forwards that root. The tool then
+    sees a remote parent for a trace this runner created. The tracestate
+    marker is what separates that hop from an inbound caller.
+    """
+    parent = getattr(span, "parent", None)
+    if parent is None or not getattr(parent, "is_valid", False):
+        return False
+    if not getattr(parent, "is_remote", False):
+        return False
+    return not trace_state_marks_runner_root(getattr(parent, "trace_state", None))
+
+
+def _record_guardrail_span_io(
+    request: GuardrailCheckRequest, response: GuardrailCheckResponse
+) -> None:
+    """Copy the check's input and decision onto the current tool.guardrails_check span.
+
+    The span is opened only to join the invocation trace. Without these
+    attributes the traces panel shows a name and a duration and nothing about
+    what was checked or what the policies decided.
+    """
+    try:
+        from opentelemetry import trace
+        from opentelemetry.trace import Status, StatusCode
+    except Exception:
+        return
+
+    span = trace.get_current_span()
+    if not span.is_recording():
+        return
+    # A request with no traceparent still roots a span, and a runner that
+    # created its own root propagates that root as a remote parent. Content
+    # belongs only on a span whose parent was bound from an inbound caller.
+    if not _parent_is_inbound_caller(span):
+        return
+
+    text = request.input.text
+    stage = request.stage.value if hasattr(request.stage, "value") else str(request.stage)
+    decision = (
+        response.decision.value if hasattr(response.decision, "value") else str(response.decision)
+    )
+    payload_out: dict[str, Any] = {
+        "decision": decision,
+        "allowed": response.allowed,
+        "triggered_policy_ids": list(response.triggered_policy_ids),
+        "reason": response.reason,
+        "evidence": [
+            {"policy_id": item.policy_id, "message": item.message} for item in response.evidence
+        ],
+    }
+    transformed = response.transformed_text
+    # Empty string is a real rewrite (a modify/redact policy cleared the text).
+    # Only None means the evaluator left the field unset.
+    if transformed is not None and transformed != text:
+        payload_out["transformed_text"] = transformed[:_GUARDRAIL_SPAN_TEXT_LIMIT]
+        payload_out["transformed_text_truncated"] = len(transformed) > _GUARDRAIL_SPAN_TEXT_LIMIT
+
+    span.set_attribute(
+        "input.value",
+        json.dumps(
+            {
+                "stage": stage,
+                "text": text[:_GUARDRAIL_SPAN_TEXT_LIMIT],
+                "text_truncated": len(text) > _GUARDRAIL_SPAN_TEXT_LIMIT,
+                "policies": [
+                    {"id": policy.id, "type": policy.type, "action": policy.action}
+                    for policy in request.policies
+                ],
+            },
+            default=str,
+        ),
+    )
+    span.set_attribute("output.value", json.dumps(payload_out, default=str))
+    span.set_status(Status(StatusCode.OK))
+
+
 class ToolServer(ToolExecution, BaseServer):
     """
     Tool Executor server - executes tool functions.
@@ -834,12 +923,15 @@ class ToolServer(ToolExecution, BaseServer):
         carrier = dict(headers.items())
         parent_context = TraceContextTextMapPropagator().extract(carrier=carrier)
         tracer = get_tracer("agent-engine-runner-shared.tool")
-        with tracer.start_as_current_span(
-            span_name,
-            context=parent_context,
-            attributes={OPENINFERENCE_SPAN_KIND: span_kind.value},
-        ):
-            return await handler()
+        # Same binding as AER: nested platform calls must not treat a root
+        # created here as a caller trace once it is propagated.
+        with runner_trace_scope(parent_context):
+            with tracer.start_as_current_span(
+                span_name,
+                context=parent_context,
+                attributes={OPENINFERENCE_SPAN_KIND: span_kind.value},
+            ):
+                return await handler()
 
     async def _stream_with_inbound_trace_context(
         self,
@@ -872,14 +964,15 @@ class ToolServer(ToolExecution, BaseServer):
         carrier = dict(headers.items())
         parent_context = TraceContextTextMapPropagator().extract(carrier=carrier)
         tracer = get_tracer("agent-engine-runner-shared.tool")
-        span = tracer.start_span(
-            span_name,
-            context=parent_context,
-            attributes={OPENINFERENCE_SPAN_KIND: span_kind.value},
-        )
-        with otel_trace.use_span(span, end_on_exit=True):
-            async for chunk in chunks:
-                yield chunk
+        with runner_trace_scope(parent_context):
+            span = tracer.start_span(
+                span_name,
+                context=parent_context,
+                attributes={OPENINFERENCE_SPAN_KIND: span_kind.value},
+            )
+            with otel_trace.use_span(span, end_on_exit=True):
+                async for chunk in chunks:
+                    yield chunk
 
     @with_metrics("tool_pod_guardrails_check", record_errors=False)
     async def _handle_guardrails_check(
@@ -889,7 +982,9 @@ class ToolServer(ToolExecution, BaseServer):
         # there is no cancellable await to signal; a drain waits it out.
         drain_handle = self.drain_registry.begin_work(request.execution_id)
         try:
-            return evaluate_guardrail_check(request)
+            response = evaluate_guardrail_check(request)
+            _record_guardrail_span_io(request, response)
+            return response
         finally:
             self.drain_registry.end_work(drain_handle)
 

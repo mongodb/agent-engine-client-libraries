@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextvars
 import json
+import operator
 import threading
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from types import SimpleNamespace
-from typing import Any, TypedDict, cast
+from typing import Annotated, Any, Required, TypedDict, cast
 from unittest.mock import MagicMock
 
 import pytest
@@ -16,9 +19,13 @@ from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.prebuilt.tool_node import ToolRuntime
-from agent_engine_sdk.models import LLMStreamChunk
+from langgraph.types import Send
+from agent_engine_sdk.models import LLMStreamChunk, ToolCallChunk
 
-from agent_engine_sdk_langgraph.durable_subgraphs import DurableSubgraphResolver
+from agent_engine_sdk_langgraph.durable_subgraphs import (
+    DurableSubgraphResolver,
+    SendTaskRecorder,
+)
 from agent_engine_sdk_langgraph.durable_deep_agent import DurableDeepAgentMiddleware
 from agent_engine_sdk_langgraph.secure_llm import SecureWrappedLLM
 from agent_engine_runner_shared.generated.workflow.v1.activity_pb2 import (
@@ -30,7 +37,10 @@ from agent_engine_runner_shared.generated.workflow.v1.activity_pb2 import (
 from agent_engine_runner_shared.generated.workflow.v1.common_pb2 import WorkflowIdentity
 from agent_engine_runner_shared.generated.workflow.v1.runtime_pb2 import AttemptContext
 from agent_engine_runner_shared.secure_llm_proxy import SecureLLMProxy
-from agent_engine_runner_shared.secure_wrapper import OperationalStepAllocator
+from agent_engine_runner_shared.secure_wrapper import (
+    OperationalStepAllocator,
+    SecureToolWrapper,
+)
 from agent_engine_runner_shared.workflow import (
     ChildOperationBoundary,
     attempt_context_scope,
@@ -144,6 +154,7 @@ def _wrapped_llm(
     monkeypatch: pytest.MonkeyPatch,
     client: _ReplayClient,
     side_effects: list[str],
+    tool_call: Callable[[str], ToolCallChunk | None] = lambda _: None,
 ) -> tuple[SimpleNamespace, SecureWrappedLLM]:
     class _DurableTestProxy(SecureLLMProxy):
         def __init__(self, *args: Any, **kwargs: Any) -> None:
@@ -155,7 +166,11 @@ def _wrapped_llm(
         ) -> Iterator[LLMStreamChunk]:
             prompt = str(invoke_request.messages[-1].content)
             side_effects.append(prompt)
-            yield LLMStreamChunk(content=f"resolved:{prompt}")
+            call = tool_call(prompt)
+            if call is None:
+                yield LLMStreamChunk(content=f"resolved:{prompt}")
+            else:
+                yield LLMStreamChunk(tool_calls=[call])
 
     monkeypatch.setattr(
         "agent_engine_sdk_langgraph.secure_llm.SecureLLMProxy", _DurableTestProxy
@@ -1008,3 +1023,363 @@ async def test_reviewed_model_call_pauses_after_its_activity_and_resolves_from_o
         current_user_id.reset(user_token)
         current_wrapper.reset(wrapper_token)
         current_oe_url.reset(url_token)
+
+
+class _SendWork(TypedDict, total=False):
+    case_id: Required[str]
+    done: Annotated[list[str], operator.add]
+
+
+class _OrderGate:
+    """Make the worker named first in each round call its model first."""
+
+    def __init__(self) -> None:
+        self.first = ""
+        self._events: dict[str, threading.Event] = {}
+        self._lock = threading.Lock()
+
+    def reset(self, first: str) -> None:
+        self.first = first
+        self._events.clear()
+
+    def _event(self, round_key: str) -> threading.Event:
+        with self._lock:
+            return self._events.setdefault(round_key, threading.Event())
+
+    @contextmanager
+    def turn(self, case_id: str) -> Iterator[None]:
+        name, _, round_key = case_id.partition("#")
+        event = self._event(round_key)
+        if name != self.first:
+            assert event.wait(timeout=5)
+        yield
+        if name == self.first:
+            event.set()
+
+
+class _RoundState(TypedDict, total=False):
+    cases: list[str]
+    rounds: int
+    done: Annotated[list[str], operator.add]
+
+
+def _round_worker(
+    llm: SecureWrappedLLM,
+    gate: _OrderGate,
+    answers: list[tuple[str, str]],
+    shape: str,
+) -> Any:
+    def ask(state: _SendWork) -> dict[str, Any]:
+        case_id = state["case_id"]
+        with gate.turn(case_id):
+            result = llm._generate([HumanMessage(content=f"work for {case_id}")])
+        answers.append((case_id, str(result.generations[0].message.content)))
+        return {"done": [case_id]}
+
+    if shape == "plain":
+        return ask
+    inner = StateGraph(_SendWork, output_schema=_RoundState)
+    inner.add_node("ask", ask)
+    inner.add_edge(START, "ask")
+    inner.add_edge("ask", END)
+    compiled = inner.compile()
+    if shape == "compiled":
+        return compiled
+
+    # A plain worker that runs its own graph, outside the compiled topology.
+    def run_inner(state: _SendWork) -> dict[str, Any]:
+        return {"done": compiled.invoke(state)["done"]}
+
+    return run_inner
+
+
+def _send_rounds(cases: list[str], round_number: int) -> list[Send]:
+    return [Send("work", {"case_id": f"{case}#{round_number}"}) for case in cases]
+
+
+def _run_send_attempts(
+    graph: CompiledStateGraph,
+    gate: _OrderGate,
+    wrapper: SimpleNamespace,
+    graph_input: dict[str, Any],
+    *,
+    use_async: bool = False,
+) -> None:
+    resolver = DurableSubgraphResolver(graph)
+    for first, attempt in (
+        ("billing", _attempt("attempt-1", 1, replay=False)),
+        ("access", _attempt("attempt-2", 2, replay=True)),
+    ):
+        gate.reset(first)
+        wrapper.operational_steps = OperationalStepAllocator()
+        with attempt_context_scope(attempt), resolver.scope(SendTaskRecorder()):
+            if use_async:
+                asyncio.run(graph.ainvoke(graph_input))
+            else:
+                graph.invoke(graph_input)
+
+
+# A worker that runs its own graph inside a compiled parent is outside the
+# compiled topology and is rejected, as it was before Send support.
+@pytest.mark.parametrize("shape", ["plain", "compiled"])
+def test_send_rounds_inside_a_compiled_coordinator_replay_per_worker(
+    monkeypatch: pytest.MonkeyPatch, shape: str
+) -> None:
+    client = _ReplayClient()
+    side_effects: list[str] = []
+    wrapper, llm = _wrapped_llm(monkeypatch, client, side_effects)
+    gate = _OrderGate()
+    answers: list[tuple[str, str]] = []
+
+    def gather(state: _RoundState) -> dict[str, Any]:
+        return {"rounds": state.get("rounds", 0) + 1}
+
+    coordinator = StateGraph(_RoundState)
+    coordinator.add_node("work", _round_worker(llm, gate, answers, shape))
+    coordinator.add_node("gather", gather)
+    coordinator.add_conditional_edges(
+        START, lambda state: _send_rounds(state["cases"], 1), ["work"]
+    )
+    coordinator.add_edge("work", "gather")
+    coordinator.add_conditional_edges(
+        "gather",
+        lambda state: (_send_rounds(state["cases"], 2) if state["rounds"] < 2 else END),
+        ["work", END],
+    )
+    root = StateGraph(_RoundState)
+    root.add_node("coordinate", coordinator.compile())
+    root.add_edge(START, "coordinate")
+    root.add_edge("coordinate", END)
+    graph = root.compile()
+
+    _run_send_attempts(graph, gate, wrapper, {"cases": ["billing", "access"]})
+
+    cases = ["billing#1", "access#1", "billing#2", "access#2"]
+    assert sorted(answers) == sorted(
+        (case, f"resolved:work for {case}") for case in cases * 2
+    )
+    assert sorted(side_effects) == sorted(f"work for {case}" for case in cases)
+
+
+@pytest.mark.parametrize("use_async", [False, True])
+@pytest.mark.parametrize("shape", ["plain", "compiled", "invoked"])
+def test_send_workers_replay_their_own_results_by_worker_shape(
+    monkeypatch: pytest.MonkeyPatch, shape: str, use_async: bool
+) -> None:
+    client = _ReplayClient()
+    side_effects: list[str] = []
+    wrapper, llm = _wrapped_llm(monkeypatch, client, side_effects)
+    gate = _OrderGate()
+    answers: list[tuple[str, str]] = []
+
+    root = StateGraph(_RoundState)
+    root.add_node("work", _round_worker(llm, gate, answers, shape))
+    root.add_conditional_edges(
+        START, lambda state: _send_rounds(state["cases"], 1), ["work"]
+    )
+    root.add_edge("work", END)
+    graph = root.compile()
+
+    _run_send_attempts(
+        graph, gate, wrapper, {"cases": ["billing", "access"]}, use_async=use_async
+    )
+
+    cases = ["billing#1", "access#1"]
+    assert sorted(answers) == sorted(
+        (case, f"resolved:work for {case}") for case in cases * 2
+    )
+    assert sorted(side_effects) == sorted(f"work for {case}" for case in cases)
+    assert {_command_path(command)[:2] for command in client.commands} == {
+        (("agent", 1), ("langgraph.task:__pregel_push:1:0", 1)),
+        (("agent", 1), ("langgraph.task:__pregel_push:1:1", 1)),
+    }
+
+
+class _ToolState(TypedDict, total=False):
+    cases: list[str]
+    calls: Annotated[list[dict[str, Any]], operator.add]
+    done: Annotated[list[str], operator.add]
+
+
+class _ToolWork(TypedDict, total=False):
+    case_id: Required[str]
+    call: Required[dict[str, Any]]
+    calls: Annotated[list[dict[str, Any]], operator.add]
+    done: Annotated[list[str], operator.add]
+
+
+@pytest.mark.parametrize("compiled_worker", [False, True])
+def test_send_worker_tools_replay_at_their_model_positions_from_other_tasks(
+    monkeypatch: pytest.MonkeyPatch, compiled_worker: bool
+) -> None:
+    """Each model's ToolCall runs in its own Send task, not the model's task."""
+    client = _ReplayClient()
+    side_effects: list[str] = []
+    wrapper, llm = _wrapped_llm(
+        monkeypatch,
+        client,
+        side_effects,
+        tool_call=lambda prompt: ToolCallChunk(
+            id=f"call-{prompt.split()[-1]}",
+            name=f"lookup_{prompt.split()[-1]}",
+            args="{}",
+            index=0,
+        ),
+    )
+    tools = SecureToolWrapper("http://oe:8000", "support-execution")
+    tools._workflow = client
+    gate = _OrderGate()
+    results: list[tuple[str, Any]] = []
+
+    def native_tool(*, tool_name: str, **_: Any) -> dict[str, str]:
+        side_effects.append(tool_name)
+        return {"answer": tool_name}
+
+    monkeypatch.setattr(tools, "_execute_tool_native", native_tool)
+
+    def plan(state: _ToolWork) -> dict[str, Any]:
+        with gate.turn(state["case_id"]):
+            result = llm._generate([HumanMessage(content=f"plan {state['case_id']}")])
+        return {"calls": cast(AIMessage, result.generations[0].message).tool_calls}
+
+    def run_tool(state: _ToolWork) -> dict[str, Any]:
+        call = state["call"]
+        with gate.turn(call["name"].removeprefix("lookup_")):
+            result = tools.execute_tool(
+                call["name"], call["args"], tool_call_id=call["id"], is_local=True
+            )
+        results.append((call["name"], result))
+        return {"done": [call["name"]]}
+
+    def dispatch(state: dict[str, Any]) -> list[Send]:
+        return [Send("tool", {"call": call}) for call in reversed(state["calls"])]
+
+    if compiled_worker:
+        worker = StateGraph(_ToolWork, output_schema=_ToolState)
+        worker.add_node("plan", plan)
+        worker.add_node("tool", run_tool)
+        worker.add_edge(START, "plan")
+        worker.add_conditional_edges("plan", dispatch, ["tool"])
+        worker.add_edge("tool", END)
+        root = StateGraph(_ToolState)
+        root.add_node("work", worker.compile())
+        root.add_edge("work", END)
+    else:
+        root = StateGraph(_ToolState)
+        root.add_node("work", plan)
+        root.add_node("tool", run_tool)
+        # One task sends every worker's Tool, so the Tool runs in a task other
+        # than its model's, at a different Send index.
+        root.add_node("collect", lambda state: {})
+        root.add_edge("work", "collect")
+        root.add_conditional_edges("collect", dispatch, ["tool"])
+        root.add_edge("tool", END)
+    root.add_conditional_edges(
+        START,
+        lambda state: [Send("work", {"case_id": case}) for case in state["cases"]],
+        ["work"],
+    )
+    graph = root.compile()
+    resolver = DurableSubgraphResolver(graph)
+
+    for first, attempt in (
+        ("billing", _attempt("attempt-1", 1, replay=False)),
+        ("access", _attempt("attempt-2", 2, replay=True)),
+    ):
+        gate.reset(first)
+        wrapper.operational_steps = OperationalStepAllocator()
+        with attempt_context_scope(attempt), resolver.scope(SendTaskRecorder()):
+            graph.invoke({"cases": ["billing", "access"]})
+
+    assert sorted(results) == sorted(
+        (name, {"answer": name}) for name in ["lookup_billing", "lookup_access"] * 2
+    )
+    assert sorted(side_effects) == [
+        "lookup_access",
+        "lookup_billing",
+        "plan access",
+        "plan billing",
+    ]
+    # Each Tool replays at the position its model reserved, in the model's path.
+    model_paths = {
+        f"lookup_{case}": _command_path(command)
+        for case, command in zip(
+            ["billing", "access"],
+            sorted(
+                (
+                    c
+                    for c in client.commands[:4]
+                    if c.activity_kind != ACTIVITY_KIND_TOOL
+                ),
+                key=_command_path,
+            ),
+        )
+    }
+    for command in client.commands:
+        if command.activity_kind == ACTIVITY_KIND_TOOL:
+            assert _command_path(command) == model_paths[command.activity_name]
+            assert command.position.activity_ordinal == 2
+
+
+def test_tool_handed_to_a_sibling_subgraph_records_in_that_subgraph(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without Send, a Tool records where it runs, as before Send support."""
+    client = _ReplayClient()
+    side_effects: list[str] = []
+    wrapper, llm = _wrapped_llm(
+        monkeypatch,
+        client,
+        side_effects,
+        tool_call=lambda prompt: ToolCallChunk(
+            id="call-billing", name="lookup_billing", args="{}", index=0
+        ),
+    )
+    tools = SecureToolWrapper("http://oe:8000", "support-execution")
+    tools._workflow = client
+
+    def native_tool(*, tool_name: str, **_: Any) -> dict[str, str]:
+        side_effects.append(tool_name)
+        return {"answer": tool_name}
+
+    monkeypatch.setattr(tools, "_execute_tool_native", native_tool)
+
+    def plan(state: _ToolState) -> dict[str, Any]:
+        result = llm._generate([HumanMessage(content="plan billing")])
+        return {"calls": cast(AIMessage, result.generations[0].message).tool_calls}
+
+    def run_tools(state: _ToolState) -> dict[str, Any]:
+        calls = state.get("calls", [])
+        for call in calls:
+            tools.execute_tool(
+                call["name"], call["args"], tool_call_id=call["id"], is_local=True
+            )
+        return {"done": [call["name"] for call in calls]}
+
+    planner = StateGraph(_ToolState)
+    planner.add_node("plan", plan)
+    planner.add_edge(START, "plan")
+    planner.add_edge("plan", END)
+    executor = StateGraph(_ToolState)
+    executor.add_node("run", run_tools)
+    executor.add_edge(START, "run")
+    executor.add_edge("run", END)
+    root = StateGraph(_ToolState)
+    root.add_node("planner", planner.compile())
+    root.add_node("tools", executor.compile())
+    root.add_edge(START, "planner")
+    root.add_edge("planner", "tools")
+    root.add_edge("tools", END)
+    graph = root.compile()
+    resolver = DurableSubgraphResolver(graph)
+
+    wrapper.operational_steps = OperationalStepAllocator()
+    with attempt_context_scope(_attempt("attempt-1", 1, replay=False)):
+        with resolver.scope(SendTaskRecorder()):
+            graph.invoke({"cases": ["billing"]})
+
+    model, tool = client.commands
+    assert tool.activity_kind == ACTIVITY_KIND_TOOL
+    assert [name for name, _ in _command_path(model)] == ["agent", "planner"]
+    assert [name for name, _ in _command_path(tool)] == ["agent", "tools"]
+    assert tool.position.activity_ordinal == 1

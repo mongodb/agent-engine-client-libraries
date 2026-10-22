@@ -22,12 +22,13 @@ import {
   resetHooks,
   runWithExecutionContext,
   SecureToolWrapper,
+  ToolExecutionError,
 } from "@mongodb-js/agent-engine-runner-shared";
 import { describe, expect, it, vi } from "vitest";
 import { z } from "zod";
 
 import { LangGraphBaseAgent } from "../src/agent.js";
-import { CANCELLED_TURN_MESSAGE_KWARG } from "../src/cancelled_turn.js";
+import { CANCELLED_TURN_MESSAGE_ID_METADATA_KEY } from "../src/cancelled_turn.js";
 import { App } from "../src/runtime.js";
 
 const input: AgentInput = { payload: { message: "start" } };
@@ -170,9 +171,9 @@ describe("LangGraphBaseAgent native interrupt resume", () => {
     expect(received).toEqual(["approved"]);
   });
 
-  it("stamps the persisted opener when a native resume is cancelled", async () => {
-    // A resume opens no new user message: the cancel must stamp the opener the
-    // first execution persisted, not append a second copy of the prompt.
+  it("records the persisted opener when a native resume is cancelled", async () => {
+    // A resume opens no new user message: the cancel must record the opener
+    // the first execution persisted, not append a second copy of the prompt.
     const received: JsonValue[] = [];
     const agent = singleInterruptAgent("question", received);
     const sessionId = "resume-cancel";
@@ -206,13 +207,13 @@ describe("LangGraphBaseAgent native interrupt resume", () => {
     const humans = messages.filter((message) => message.getType() === "human");
     expect(humans).toHaveLength(1);
     expect(
-      (humans[0]?.additional_kwargs as Record<string, unknown>)[
-        CANCELLED_TURN_MESSAGE_KWARG
+      (mustGet(tip).metadata as Record<string, unknown>)[
+        CANCELLED_TURN_MESSAGE_ID_METADATA_KEY
       ],
-    ).toBe(true);
+    ).toBe(humans[0]?.id);
   });
 
-  it("stamps the persisted opener when a resume is cancelled during preparation", async () => {
+  it("records the persisted opener when a resume is cancelled during preparation", async () => {
     // The Stop beats the resumed step: the commit recovers the opener from the
     // checkpoint it already loaded, so no interruptible lookup can miss it.
     const received: JsonValue[] = [];
@@ -244,13 +245,13 @@ describe("LangGraphBaseAgent native interrupt resume", () => {
     const humans = messages.filter((message) => message.getType() === "human");
     expect(humans).toHaveLength(1);
     expect(
-      (humans[0]?.additional_kwargs as Record<string, unknown>)[
-        CANCELLED_TURN_MESSAGE_KWARG
+      (mustGet(tip).metadata as Record<string, unknown>)[
+        CANCELLED_TURN_MESSAGE_ID_METADATA_KEY
       ],
-    ).toBe(true);
+    ).toBe(humans[0]?.id);
   });
 
-  it("stamps the persisted opener when a resume is cancelled mid-continuation", async () => {
+  it("records the persisted opener when a resume is cancelled mid-continuation", async () => {
     // The continuation is still running when Stop lands: step_one has
     // committed its intermediate message and the next step is gated. The
     // teardown commit must recover the persisted opener and retain the
@@ -307,10 +308,10 @@ describe("LangGraphBaseAgent native interrupt resume", () => {
     expect(humans).toHaveLength(1);
     expect(humans[0]?.content).toBe("start");
     expect(
-      (humans[0]?.additional_kwargs as Record<string, unknown>)[
-        CANCELLED_TURN_MESSAGE_KWARG
+      (mustGet(tip).metadata as Record<string, unknown>)[
+        CANCELLED_TURN_MESSAGE_ID_METADATA_KEY
       ],
-    ).toBe(true);
+    ).toBe(humans[0]?.id);
 
     // A fresh turn preserves the stopped opener and the completed step.
     await collect(
@@ -329,11 +330,6 @@ describe("LangGraphBaseAgent native interrupt resume", () => {
         .filter((m) => m.getType() === "human")
         .map((m) => m.content),
     ).toEqual(["start", "next"]);
-    expect(
-      (afterMessages[0]?.additional_kwargs as Record<string, unknown>)[
-        CANCELLED_TURN_MESSAGE_KWARG
-      ],
-    ).toBe(true);
   });
 
   it("delivers a legacy human_review dict as one interrupt answer", async () => {
@@ -381,6 +377,99 @@ describe("LangGraphBaseAgent native interrupt resume", () => {
       expect(received).toEqual([answer]);
       expect(typeof received[0]).toBe(typeof answer);
       expect(Array.isArray(received[0])).toBe(Array.isArray(answer));
+    },
+  );
+
+  it.each([
+    {
+      consented: false,
+      expected:
+        "error: Tool execution error: OAuth authorization is still required after continuation",
+    },
+    { consented: true, expected: '["qualification-repo"]' },
+  ])(
+    "never runs an OAuth tool without a token after Continue (consented: $consented)",
+    async ({ consented, expected }) => {
+      registerSuspendHandler(interrupt as never);
+      const challenge = {
+        proceed: false,
+        reason: "authorization required",
+        status: "suspend",
+        elicitation: {
+          elicitation_id: "elic-1",
+          authorization_url: "https://idp.example/authorize?state=elic-1",
+          message: "Connect Keycloak",
+          created: true,
+        },
+      };
+      // Before consent the resumed node is challenged again, and once more
+      // after interrupt() returns the answer; after consent its gate proceeds.
+      const replies: unknown[] = consented
+        ? [
+            challenge,
+            {
+              proceed: true,
+              status: "success",
+              result: '["qualification-repo"]',
+              duration_ms: 1,
+            },
+          ]
+        : [challenge, challenge, challenge];
+      const approvals = replies.length;
+      const fetchMock = vi.fn(async () =>
+        Promise.resolve(
+          new Response(JSON.stringify(replies.shift()), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          }),
+        ),
+      );
+      vi.stubGlobal("fetch", fetchMock);
+      const wrapper = new SecureToolWrapper("http://oe:8000", "exec-oauth");
+      const received: JsonValue[] = [];
+      const graph = new StateGraph(MessagesAnnotation)
+        .addNode("tool", async () => {
+          try {
+            received.push(
+              (await wrapper.executeTool(
+                "list_repos",
+                {},
+                { providerType: "keycloak", scopes: ["repo"], isLocal: false },
+              )) as JsonValue,
+            );
+          } catch (error) {
+            if (!(error instanceof ToolExecutionError)) throw error;
+            received.push(`error: ${error.message}`);
+          }
+          return { messages: [new AIMessage({ content: "tool done" })] };
+        })
+        .addEdge(START, "tool")
+        .addEdge("tool", END)
+        .compile({ checkpointer: new MemorySaver() });
+      const agent = new LangGraphBaseAgent(graph as never);
+
+      try {
+        const { data, metadata } = await suspend(agent, "oauth-continue");
+        const interrupts = data["interrupts"] as Array<{
+          id: string;
+          value: Record<string, JsonValue>;
+        }>;
+        const pendingInterrupt = mustGet(interrupts[0]);
+        expect(pendingInterrupt.value["suspend_reason"]).toBe(
+          "authorization_required",
+        );
+
+        const events = await resume(agent, "oauth-continue", metadata, {
+          [pendingInterrupt.id]: { decision: "approve" },
+        });
+
+        expect(events.map((event) => event.event)).toEqual(["result"]);
+        expect(received).toEqual([expected]);
+        expect(fetchMock).toHaveBeenCalledTimes(approvals);
+      } finally {
+        vi.unstubAllGlobals();
+        resetHooks();
+      }
     },
   );
 

@@ -460,6 +460,69 @@ describe("App.getTools() — AER mode wrapping", () => {
     }
   });
 
+  it("forwards each tool's unknown-outcome policy to the wrapper only when declared", async () => {
+    const app = new App({ appName: "Test Agent" });
+    app.tool({
+      onUnknownOutcome: "rerun",
+      description: "Look up an order.",
+      schema: z.object({ order: z.string() }),
+    })(function lookup_order({ order }: { order: string }): string {
+      return order;
+    });
+    app.tool({
+      description: "Refund an order.",
+      schema: z.object({ order: z.string() }),
+    })(function refund_order({ order }: { order: string }): string {
+      return order;
+    });
+    const internals = privateOf<{ runtime: TenantRuntime }>(app);
+    expect(
+      internals.runtime.getToolMetadata("lookup_order")["on_unknown_outcome"],
+    ).toBe("rerun");
+    expect(
+      internals.runtime.getToolMetadata("refund_order"),
+    ).not.toHaveProperty("on_unknown_outcome");
+
+    const executeTool = vi.fn().mockResolvedValue("ok");
+    await runWithExecutionContext(
+      {
+        executionId: "exec-1",
+        wrapper: { executeTool },
+        oeUrl: "http://localhost:8080",
+      },
+      async () => {
+        for (const tool of app.getTools() as unknown as {
+          name: string;
+          invoke: (input: unknown) => Promise<unknown>;
+        }[]) {
+          await tool.invoke({
+            name: tool.name,
+            args: { order: "A1" },
+            id: `call_${tool.name}`,
+            type: "tool_call",
+          });
+        }
+      },
+    );
+    const optionsByTool = new Map(
+      executeTool.mock.calls.map((call) => [call[0] as string, call[2]]),
+    );
+    expect(optionsByTool.get("lookup_order")).toMatchObject({
+      onUnknownOutcome: "rerun",
+    });
+    expect(optionsByTool.get("refund_order")).not.toHaveProperty(
+      "onUnknownOutcome",
+    );
+  });
+
+  it("rejects an undeclared unknown-outcome policy when the tool is registered", () => {
+    const app = new App({ appName: "Test Agent" });
+    expect(() => app.tool({ onUnknownOutcome: "retry" as never })).toThrow(
+      /onUnknownOutcome must be "fail", "rerun", or undefined/,
+    );
+    expect(app.getToolDefinitions()).toEqual([]);
+  });
+
   it("carries the per-call Stop opt-in from registration through to the wrapper", async () => {
     const prev = process.env["RUNNER_MODE"];
     process.env["RUNNER_MODE"] = "aer";
@@ -951,6 +1014,24 @@ describe("App — MCP tool registration", () => {
     const app = new App({ appName: "Test Agent" });
     await app.ready();
     expect(discoverMcpToolsMock).not.toHaveBeenCalled();
+  });
+
+  it("handles MCP discovery rejection until ready() surfaces the original error", async () => {
+    writeAgentYamlWithMcpServer();
+    const discoveryFailure = new Error("MCP discovery failed");
+    discoverMcpToolsMock.mockRejectedValue(discoveryFailure);
+
+    const app = new App({ appName: "Test Agent" });
+    const unhandledRejection = vi.fn();
+    process.on("unhandledRejection", unhandledRejection);
+
+    try {
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(unhandledRejection).not.toHaveBeenCalled();
+      await expect(app.ready()).rejects.toBe(discoveryFailure);
+    } finally {
+      process.removeListener("unhandledRejection", unhandledRejection);
+    }
   });
 
   it("registers discovered MCP tools as tool definitions and LangChain tools", async () => {

@@ -4,14 +4,15 @@ build-backend = "hatchling.build"
 
 [project]
 name = "agent-engine-sdk-openai-agents"
-version = "0.11.9"
+version = "0.11.10"
 description = "OpenAI Agents SDK adapter for Atlas Agent Engine"
 readme = "README.md"
 license = {text = "Apache-2.0"}
 requires-python = ">=3.11"
 dependencies = [
-    "agent-engine-sdk==0.11.9",
-    "agent-engine-runner-shared[mongodb,tracing]==0.11.9",
+    "agent-engine-sdk-memory==0.11.10",
+    "agent-engine-sdk==0.11.10",
+    "agent-engine-runner-shared[mongodb,tracing]==0.11.10",
     # The application chooses the version. The floor is the oldest release the
     # test suite runs against (scripts/test.sh sdk-openai-agents).
     "openai-agents>=0.22.0,<1",
@@ -41,5 +42,6 @@ testpaths = ["tests"]
 asyncio_mode = "auto"
 
 [tool.uv.sources]
+agent-engine-sdk-memory = { workspace = true }
 agent-engine-sdk = { workspace = true }
 agent-engine-runner-shared = { workspace = true }

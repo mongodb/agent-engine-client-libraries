@@ -76,6 +76,15 @@ DEFAULT_MODELS = {
     "gemini": "gemini-3-flash-preview",
     "openai": "gpt-5.6-luna",
 }
+# An OpenAI request occasionally stalls without ever responding. Without a
+# timeout the SDK waits 600 s, longer than a turn should take. The timeout
+# bounds silence between bytes, not the whole response. The platform's tool
+# pod already retries an LLM call that timed out before any output (3
+# attempts), so the client does not retry as well: retries in both layers
+# would multiply. 3 x 30 s fits inside the 120-180 s per-turn budgets of the
+# integration suites that run this agent.
+OPENAI_TIMEOUT_S = 30
+OPENAI_MAX_RETRIES = 0
 
 
 def _llm_provider_api_keys() -> dict[str, str]:
@@ -165,6 +174,8 @@ def _build_runtime_llm(
             model_name,
             temperature_display,
         )
+        _set_default_llm_option(llm_options, "timeout", OPENAI_TIMEOUT_S)
+        _set_default_llm_option(llm_options, "max_retries", OPENAI_MAX_RETRIES)
         openai_base_url = _configured_openai_base_url()
         if openai_base_url and "grove-foundry" in openai_base_url:
             llm_options["base_url"] = openai_base_url.split("/v1")[0] + "/v1"

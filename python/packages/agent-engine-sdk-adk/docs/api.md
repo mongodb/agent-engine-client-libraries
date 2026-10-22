@@ -148,11 +148,21 @@ def tool(
     *,
     network: list[str] | None = None,
     timeout: int = 30,
-    redact_fields: list[str] | None = None
+    redact_fields: list[str] | None = None,
+    on_unknown_outcome: UnknownOutcomePolicy | None = None
 ) -> Callable[[Callable[..., Any]], Callable[..., Any]]
 ```
 
 Register a tool function with the platform.
+
+**Arguments**:
+
+- `on_unknown_outcome` - What a retry does when the platform lost the
+  runner while this tool was running in a durable workflow, so
+  nobody knows whether it ran. ``"rerun"`` runs the tool again
+  (at-least-once execution; declare it only for a tool that is
+  safe to run twice). ``"fail"`` refuses the retry, so the tool
+  never runs twice. Leave unset for the platform default.
 
 <a id="agent_engine_sdk_adk.runtime.App.entrypoint"></a>
 

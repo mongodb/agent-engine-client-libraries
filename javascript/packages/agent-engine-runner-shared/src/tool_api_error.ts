@@ -51,6 +51,7 @@ const MAX_ENVELOPE_BODY = 4096;
 // with a non-whitespace authority. Encoded or nested spellings are accepted
 // risk, not chased.
 const PROTOCOL_RELATIVE_URL = /(?<![A-Za-z0-9])\/\/(?=\S)/;
+const URL_MARKER = new RegExp(`://|${PROTOCOL_RELATIVE_URL.source}`);
 
 /**
  * Request-local credential values that must never be surfaced. Combines the
@@ -86,6 +87,11 @@ const CREDENTIAL_NAME_MARKERS = [
   "AUTH",
 ];
 
+export function isCredentialName(name: string): boolean {
+  const upper = name.toUpperCase();
+  return CREDENTIAL_NAME_MARKERS.some((marker) => upper.includes(marker));
+}
+
 /**
  * Credential values a name marks as secrets, at any length.
  *
@@ -98,13 +104,7 @@ const CREDENTIAL_NAME_MARKERS = [
  */
 export function requestNamedCredentialValues(): string[] {
   const values = Object.entries(tenantEnvVars())
-    .filter(
-      ([name, value]) =>
-        Boolean(value) &&
-        CREDENTIAL_NAME_MARKERS.some((marker) =>
-          name.toUpperCase().includes(marker),
-        ),
-    )
+    .filter(([name, value]) => Boolean(value) && isCredentialName(name))
     .map(([, value]) => value);
   const token = getCurrentAuthorization()?.token;
   if (token && !values.includes(token)) values.push(token);
@@ -275,7 +275,7 @@ function safeEnvelopeText(
   maxLen: number,
   credentials: readonly string[] = [],
 ): string | null {
-  let printable = text.replace(/\p{C}/gu, "");
+  let printable = withoutControlCharacters(text);
   if (printable.includes("://") || PROTOCOL_RELATIVE_URL.test(printable)) {
     return null;
   }
@@ -298,18 +298,75 @@ async function extractEnvelope(
 
   // Axios-shaped: response.data is the already-parsed body. It gets the same
   // encoded-size limit as a native streamed body, so an oversized document
-  // cannot supply a visible reason.
+  // cannot supply a visible reason. A body Axios could not parse as JSON
+  // arrives as a string.
   const data = r["data"];
   if (data && typeof data === "object" && !Array.isArray(data)) {
     if (!isWithinEnvelopeLimit(data)) return [null, null];
     return extractFromBody(data as Record<string, unknown>, credentials);
   }
+  if (typeof data === "string") {
+    const raw = new TextEncoder().encode(data);
+    if (raw.byteLength > MAX_ENVELOPE_BODY) return [null, null];
+    return [null, plainTextReason(raw, credentials)];
+  }
 
-  const body = await boundedJsonBody(r);
+  const raw = await boundedBody(r);
+  if (raw === null) return [null, null];
+  let body: unknown;
+  try {
+    body = JSON.parse(Buffer.from(raw).toString("utf8"));
+  } catch {
+    return [null, plainTextReason(raw, credentials)];
+  }
   if (body && typeof body === "object" && !Array.isArray(body)) {
     return extractFromBody(body as Record<string, unknown>, credentials);
   }
   return [null, null];
+}
+
+/**
+ * The explanation in a body that is not JSON. Some providers and gateways
+ * refuse with a bare sentence, whatever content type they declare, often
+ * followed by documentation links. Only the text before the first link is
+ * kept, so the explanation survives the URL rule. Markup is skipped so an HTML
+ * error page never becomes the reason, and an undecodable body supplies none,
+ * including one a caller already decoded with replacement characters.
+ */
+function plainTextReason(
+  raw: Uint8Array,
+  credentials: readonly string[] = [],
+): string | null {
+  let text: string;
+  try {
+    text = new TextDecoder("utf-8", { fatal: true }).decode(raw);
+  } catch {
+    return null;
+  }
+  if (text.includes("\ufffd")) return null;
+  text = normalizeText(text);
+  if (text.startsWith("<")) return null;
+  const marker = URL_MARKER.exec(text);
+  if (marker) {
+    text = text
+      .slice(0, text.lastIndexOf(" ", marker.index) + 1)
+      .replace(/[\s([:,;-]+$/, "");
+  }
+  if (!text) return null;
+  // The markup and link checks read the provider's own text; redaction then
+  // covers each credential as sent and as the normalization above respells it.
+  const spellings = [...credentials, ...credentials.map(normalizeText)];
+  return safeEnvelopeText(text, MAX_REASON_LEN, spellings);
+}
+
+/** `text` with whitespace runs collapsed and control characters dropped. */
+function normalizeText(text: string): string {
+  return withoutControlCharacters(text.split(/\s+/).filter(Boolean).join(" "));
+}
+
+/** `text` without control characters, so none can hide a URL marker. */
+function withoutControlCharacters(text: string): string {
+  return text.replace(/\p{C}/gu, "");
 }
 
 // The 4 KB limit is a per-binding heuristic: Axios exposes only parsed data,
@@ -325,9 +382,10 @@ function isWithinEnvelopeLimit(value: unknown): boolean {
   }
 }
 
-async function boundedJsonBody(
+/** A streamed body's bytes, or null when absent, unreadable, or over 4 KB. */
+async function boundedBody(
   r: Record<string, unknown>,
-): Promise<unknown | null> {
+): Promise<Uint8Array | null> {
   const stream = r["body"] as ReadableStream<Uint8Array> | null | undefined;
   if (stream && typeof stream.getReader === "function") {
     const reader = stream.getReader();
@@ -347,11 +405,7 @@ async function boundedJsonBody(
     } catch {
       return null;
     }
-    try {
-      return JSON.parse(Buffer.concat(chunks).toString("utf8"));
-    } catch {
-      return null;
-    }
+    return Buffer.concat(chunks);
   }
   return null;
 }

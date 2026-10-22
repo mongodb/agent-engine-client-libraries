@@ -41,6 +41,10 @@ class _Resp:
         if self.status_code >= 400:
             raise httpx.HTTPStatusError("error", request=Mock(), response=self)
 
+    async def aiter_raw(self):
+        return
+        yield b""  # pragma: no cover - makes this an async generator
+
 
 # Each scripted action is either a response to return or an exception to raise.
 _Action = Union[_Resp, BaseException]
@@ -173,7 +177,10 @@ async def test_owner_5xx_falls_back_to_service() -> None:
     assert client.urls() == [OWNER_URL, SERVICE_URL]
 
 
-async def test_owner_response_body_is_never_read() -> None:
+async def test_owner_response_body_is_drained_but_never_exposed(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # Drained so the keep-alive connection can be pooled, never surfaced.
     body = _TrackingAsyncBody(b"internal diagnostics")
 
     async def handler(request: httpx.Request) -> httpx.Response:
@@ -181,23 +188,111 @@ async def test_owner_response_body_is_never_read() -> None:
             return httpx.Response(500, stream=body)
         return httpx.Response(200)
 
+    caplog.set_level("DEBUG")
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         await post_json_with_retries(client, SERVICE_URL, PAYLOAD, owner_url=OWNER_URL)
 
-    assert body.read is False
+    assert body.read is True
+    assert "internal diagnostics" not in caplog.text
 
 
-async def test_service_response_body_is_never_read() -> None:
+async def test_service_response_body_is_drained_but_never_exposed(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     body = _TrackingAsyncBody(b"internal diagnostics")
 
     async def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(503, stream=body)
 
+    caplog.set_level("DEBUG")
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        with pytest.raises(httpx.HTTPStatusError):
+        with pytest.raises(httpx.HTTPStatusError) as exc_info:
             await post_json_with_retries(client, SERVICE_URL, PAYLOAD, max_attempts=1)
 
-    assert body.read is False
+    assert body.read is True
+    assert "internal diagnostics" not in str(exc_info.value)
+    assert "internal diagnostics" not in caplog.text
+
+
+class _InfiniteAsyncBody(httpx.AsyncByteStream):
+    def __init__(self) -> None:
+        self.bytes_yielded = 0
+
+    async def __aiter__(self):
+        while True:
+            self.bytes_yielded += 8192
+            yield b"x" * 8192
+
+
+async def test_drain_is_bounded() -> None:
+    # A hostile peer streaming an endless body must not pin the callback.
+    body = _InfiniteAsyncBody()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, stream=body)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        await post_json_with_retries(client, SERVICE_URL, PAYLOAD)
+
+    assert body.bytes_yielded <= http_retry.MAX_DISCARD_BYTES + 8192
+
+
+class _AdvancingClock:
+    """Monotonic clock advancing a fixed step per call; deterministic, no sleeping."""
+
+    def __init__(self, step: float) -> None:
+        self._now = 0.0
+        self._step = step
+
+    def monotonic(self) -> float:
+        current = self._now
+        self._now += self._step
+        return current
+
+
+class _ByteDripBody(httpx.AsyncByteStream):
+    """One byte per read — a slow drip once the clock advances per read."""
+
+    def __init__(self) -> None:
+        self.bytes_yielded = 0
+
+    async def __aiter__(self):
+        while True:
+            self.bytes_yielded += 1
+            yield b"x"
+
+
+async def test_drain_is_time_bounded(monkeypatch) -> None:
+    # A peer that trickles bytes never trips the per-read timeout, so the byte
+    # cap alone would let the drain run unbounded. The module-wide `_no_sleep`
+    # fixture makes real sleeps instant, so advance the clock one second per
+    # read instead: the wall-clock budget must stop the drain well before the
+    # 64 KiB byte cap.
+    monkeypatch.setattr(http_retry, "time", _AdvancingClock(1.0))
+    body = _ByteDripBody()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, stream=body)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        await post_json_with_retries(client, SERVICE_URL, PAYLOAD)
+
+    assert body.bytes_yielded < http_retry.MAX_DISCARD_BYTES
+
+
+async def test_drain_budget_is_clamped_to_the_client_timeout(monkeypatch) -> None:
+    # The wall-clock budget is clamped to the client's per-request timeout, so a
+    # client configured for 2s does not drain for the full MAX_DISCARD_SECONDS.
+    monkeypatch.setattr(http_retry, "time", _AdvancingClock(1.0))
+    body = _ByteDripBody()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, stream=body)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler), timeout=2.0) as client:
+        await post_json_with_retries(client, SERVICE_URL, PAYLOAD)
+
+    assert body.bytes_yielded <= 3
 
 
 async def test_owner_is_never_retried() -> None:

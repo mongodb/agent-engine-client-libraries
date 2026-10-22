@@ -215,7 +215,7 @@ def test_session_messages_returns_empty_list_when_plugin_finds_nothing() -> None
     client = _make_client(plugin=plugin)
     response = client.get("/query/sessions/unknown/messages")
     assert response.status_code == 200
-    assert response.json() == {"messages": []}
+    assert response.json() == {"messages": [], "outcome_supported": True}
     assert plugin.message_calls == ["unknown"]
 
 

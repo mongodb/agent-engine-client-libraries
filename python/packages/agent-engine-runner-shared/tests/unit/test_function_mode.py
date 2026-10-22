@@ -493,7 +493,7 @@ async def test_function_mode_emits_custom_event_via_installed_transport(
         side_effect=lambda name, default=False: name == "use_custom_parser"
     )
 
-    with patch("agent_engine_runner_shared.custom_events._get_client") as mock_get_client:
+    with patch("agent_engine_runner_shared.custom_events.get_shared_client") as mock_get_client:
         mock_client = MagicMock()
 
         def _post(url: str, json: dict[str, Any]) -> MagicMock:
@@ -503,8 +503,10 @@ async def test_function_mode_emits_custom_event_via_installed_transport(
             return resp
 
         mock_client.post.side_effect = _post
-        mock_client.stream.side_effect = lambda method, url, *, json, follow_redirects: (
-            _SyncPostStream(mock_client.post, url, json)
+        mock_client.stream.side_effect = (
+            lambda method, url, *, json, follow_redirects, timeout=None, **kwargs: _SyncPostStream(
+                mock_client.post, url, json
+            )
         )
         mock_get_client.return_value = mock_client
         await _run(
@@ -754,11 +756,15 @@ async def test_emit_owner_failure_suppresses_final_result_owner_attempt(tmp_path
         return MagicMock()
 
     progress_client.post.side_effect = progress_post
-    progress_client.stream.side_effect = lambda method, url, *, json, follow_redirects: (
-        _SyncPostStream(progress_client.post, url, json)
+    progress_client.stream.side_effect = (
+        lambda method, url, *, json, follow_redirects, timeout=None, **kwargs: _SyncPostStream(
+            progress_client.post, url, json
+        )
     )
 
-    with patch("agent_engine_runner_shared.progress._get_client", return_value=progress_client):
+    with patch(
+        "agent_engine_runner_shared.progress.get_shared_client", return_value=progress_client
+    ):
         await _run(_make_runtime({"greet": greet}), client=result_client, metadata_dir=meta_dir)
 
     assert [url for url, _ in result_client.calls] == [f"{_SERVICE}/tool/result"]

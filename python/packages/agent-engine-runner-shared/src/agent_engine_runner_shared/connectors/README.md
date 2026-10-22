@@ -107,14 +107,17 @@ Only GET, HEAD and OPTIONS retry 429/503, at most three times; `Retry-After` is 
 at 30 seconds. Each invocation carries a 30-second budget between requests, redirects,
 response chunks and retry waits. Every request
 uses its remaining budget for HTTPX's standard connect, read, write and pool timeouts;
-the read timeout bounds each blocking read, as defined by HTTPX.
+the read timeout bounds each blocking read, as defined by HTTPX. Requests carry
+`User-Agent: agent-engine-connector` unless the connector sets its own in
+`auth.headers`, matched case-insensitively.
 
 HTTP failures, including rejected provider redirects, use `httpx.HTTPStatusError`,
 and transport failures use the existing
 timeout/connection exception types recognized by `classify_tool_api_error`. An HTTP
 error may retain a bounded provider error body (at most 4 KB) so the shared classifier
-can surface the provider's own explanation. The retained body is never logged; the
-classifier applies rudimentary hygiene to the extracted explanation — control
-characters dropped, URL-shaped text rejected, exact credential values redacted, result
-bounded. This is best-effort, not a guarantee. Oversized bodies, redirect locations,
+can surface the provider's own explanation: a recognized JSON error field, or a
+plain-text body that is not HTML markup, up to its first link. The retained body is
+never logged; the classifier applies rudimentary hygiene to the extracted explanation
+— control characters dropped, URL-shaped text rejected, exact credential values
+redacted, result bounded. This is best-effort, not a guarantee. Oversized bodies, redirect locations,
 and credential-bearing request objects are never retained.

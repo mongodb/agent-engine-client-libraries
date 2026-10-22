@@ -12,7 +12,7 @@ import pytest
 
 from agent_engine_runner_shared.secure_wrapper import (
     PolicyDeniedException,
-    ToolExecutionError,
+    ToolPlatformError,
     request_oe_approval,
 )
 
@@ -131,7 +131,7 @@ class TestReportOeResultHTTPSFailClosed:
 
         https_oe_url = "https://oe-service:8443"
 
-        with pytest.raises(ToolExecutionError, match="Failed to prepare OE result settlement"):
+        with pytest.raises(ToolPlatformError, match="Failed to prepare OE result settlement"):
             report_oe_result(
                 oe_url=https_oe_url,
                 execution_id="test-exec-123",

@@ -3,21 +3,114 @@
 LangGraph exposes the active nested graph path through documented
 ``checkpoint_ns`` runtime config:
 https://docs.langchain.com/oss/python/langgraph/persistence#checkpoint-namespace
+
+``Send`` workers run concurrently in one superstep, so each one gets its own
+operation-path segment named by its superstep and its index in that superstep's
+send list. LangGraph orders the send list the same way on every attempt; the
+task id and namespace change per attempt.
+
+Importing this module registers a process-wide LangChain configure hook that
+adds the active ``SendTaskRecorder`` to every callback manager. Outside a durable
+invocation no recorder is active and the hook adds nothing.
 """
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import Any
 
 from dataclasses import dataclass
 
+from langchain_core.callbacks import BaseCallbackHandler
+from langchain_core.tracers.context import register_configure_hook
 from langgraph.config import get_config
 from langgraph.graph.state import CompiledStateGraph
 
 from agent_engine_sdk_langgraph.durable_errors import UnsupportedDurableGraphError
-from agent_engine_runner_shared.workflow import ChildOperationBoundary
+from agent_engine_runner_shared.workflow import (
+    ChildOperationBoundary,
+    operation_path_resolver_scope,
+)
 
-__all__ = ["DurableSubgraphResolver"]
+__all__ = ["DurableSubgraphResolver", "SendTaskRecorder"]
+
+# LangGraph's task-path tag for tasks created by ``Send``.
+_PUSH = "__pregel_push"
+
+
+def _send_task_boundary(metadata: dict[str, Any]) -> ChildOperationBoundary | None:
+    """Name a top-level Send task by its superstep and send index.
+
+    The superstep keeps successive Send rounds of one graph run apart. Other
+    tasks get no segment.
+    """
+    task_path = metadata.get("langgraph_path")
+    step = metadata.get("langgraph_step")
+    if (
+        not isinstance(task_path, (tuple, list))
+        or len(task_path) < 2
+        or task_path[0] != _PUSH
+        or not _is_index(task_path[1])
+        or not _is_index(step)
+    ):
+        return None
+    name = f"langgraph.task:{_PUSH}:{step}:{task_path[1]}"
+    return ChildOperationBoundary(name, name, spawned_task=True)
+
+
+def _is_index(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+class SendTaskRecorder(BaseCallbackHandler):
+    """Remember which checkpoint namespace segments belong to Send tasks.
+
+    Inside a compiled child, LangGraph metadata describes only the child's own
+    task, and the namespace names the parent Send task by an attempt-local id.
+    A task's start callback carries both its namespace and its task path, so
+    recording it lets the resolver name the enclosing Send worker. One recorder
+    lives for one durable invocation.
+    """
+
+    # Record before the task's own work starts, including under async managers.
+    run_inline = True
+
+    def __init__(self) -> None:
+        super().__init__()
+        # Concurrent task starts write distinct keys and readers look up single
+        # keys, so the dict needs no lock.
+        self._boundaries: dict[str, ChildOperationBoundary] = {}
+
+    def on_chain_start(
+        self,
+        serialized: dict[str, Any] | None,
+        inputs: Any,
+        *,
+        metadata: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> None:
+        del serialized, inputs, kwargs
+        if not metadata:
+            return
+        boundary = _send_task_boundary(metadata)
+        namespace = metadata.get("langgraph_checkpoint_ns")
+        if boundary is None or not isinstance(namespace, str) or not namespace:
+            return
+        self._boundaries[namespace.rpartition("|")[2]] = boundary
+
+    def boundary_for(self, namespace_segment: str) -> ChildOperationBoundary | None:
+        """Return the Send task boundary for one ``node:task_id`` segment."""
+        return self._boundaries.get(namespace_segment)
+
+
+_SEND_TASKS: ContextVar[SendTaskRecorder | None] = ContextVar(
+    "agent_engine_langgraph_send_tasks", default=None
+)
+# Adds the active recorder to every LangChain callback manager, including the
+# ones LangGraph creates for each task, without changing the invocation config.
+register_configure_hook(_SEND_TASKS, inheritable=True)
 
 
 @dataclass(frozen=True)
@@ -36,10 +129,13 @@ class DurableSubgraphResolver:
     LangGraph checkpoint namespace and resolve it against that saved topology.
     """
 
-    def __init__(self, graph: CompiledStateGraph) -> None:
+    def __init__(
+        self, graph: CompiledStateGraph, *, scope_send_tasks: bool = True
+    ) -> None:
         errors: list[str] = []
         self._topology = _discover(graph, (), set(), errors)
         self._validation_errors = tuple(errors)
+        self._scope_send_tasks = scope_send_tasks
 
     def validate(self) -> None:
         """Reject graph shapes that cannot participate in a durable attempt."""
@@ -51,6 +147,16 @@ class DurableSubgraphResolver:
         """Whether the root graph directly composes any compiled child graph."""
         return bool(self._topology.children)
 
+    @contextmanager
+    def scope(self, send_tasks: SendTaskRecorder) -> Iterator[None]:
+        """Bind this resolver and the invocation's Send task recorder."""
+        token = _SEND_TASKS.set(send_tasks if self._scope_send_tasks else None)
+        try:
+            with operation_path_resolver_scope(self):
+                yield
+        finally:
+            _SEND_TASKS.reset(token)
+
     def __call__(self) -> tuple[ChildOperationBoundary, ...]:
         """Resolve the LangGraph node that is admitting a durable activity.
 
@@ -60,8 +166,12 @@ class DurableSubgraphResolver:
         an activity command.
 
         The output contains one framework-neutral boundary for every compiled
-        child graph in the active namespace. The root graph returns an empty
-        tuple; agent-engine-runner-shared adds the fixed ``agent/1`` root segment.
+        child graph in the active namespace, each preceded by a Send task
+        boundary when a Send started that child, and a final Send task boundary
+        when the running node is itself a Send task. In a graph without
+        compiled children, a Send task that runs a nested graph itself also
+        contributes its boundary. The root graph returns an empty tuple;
+        agent-engine-runner-shared adds the fixed ``agent/1`` root segment.
         """
         config = get_config()
         configurable = config.get("configurable", {})
@@ -70,11 +180,29 @@ class DurableSubgraphResolver:
             raise UnsupportedDurableGraphError(
                 "LangGraph checkpoint namespace must be a string"
             )
-        return self.resolve_namespace(namespace)
+        send_tasks = _SEND_TASKS.get()
+        if self.has_compiled_children:
+            boundaries = self.resolve_namespace(namespace, send_tasks)
+        elif send_tasks is not None:
+            # Without compiled children only Send tasks add segments. A Send
+            # worker that runs a graph itself appears as an outer segment.
+            outer = namespace.split("|")[:-1] if namespace else []
+            boundaries = tuple(
+                boundary
+                for boundary in map(send_tasks.boundary_for, outer)
+                if boundary is not None
+            )
+        else:
+            boundaries = ()
+        if not self._scope_send_tasks:
+            return boundaries
+        send_task = _send_task_boundary(config.get("metadata") or {})
+        return boundaries if send_task is None else (*boundaries, send_task)
 
     def resolve_namespace(
         self,
         namespace: str,
+        send_tasks: SendTaskRecorder | None = None,
     ) -> tuple[ChildOperationBoundary, ...]:
         """Translate one checkpoint namespace into compiled-child boundaries.
 
@@ -90,6 +218,8 @@ class DurableSubgraphResolver:
             two ``ChildOperationBoundary`` values. The final ordinary node
             (``review``) is validated against the topology but omitted because it
             is not a graph boundary. An empty namespace returns an empty tuple.
+            A child segment that ``send_tasks`` recorded as a Send task is
+            preceded by that task's boundary.
         Raises:
             UnsupportedDurableGraphError: If the namespace cannot be explained
                 completely by the topology discovered at construction time.
@@ -118,6 +248,9 @@ class DurableSubgraphResolver:
                         f"unsupported LangGraph checkpoint namespace {namespace!r}"
                     )
                 break
+            send_task = send_tasks.boundary_for(segment) if send_tasks else None
+            if send_task is not None:
+                boundaries.append(send_task)
             boundaries.append(ChildOperationBoundary(name, occurrence_key))
             topology = child
         return tuple(boundaries)

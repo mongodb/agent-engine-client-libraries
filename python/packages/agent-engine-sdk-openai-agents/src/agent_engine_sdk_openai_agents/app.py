@@ -7,6 +7,7 @@ from importlib.metadata import PackageNotFoundError, version
 from typing import Any, cast
 
 from agent_engine_sdk import BaseApp, ToolDefinition
+from agent_engine_sdk_memory import Memory
 from agents import (
     Agent,
     FunctionTool,
@@ -37,7 +38,15 @@ from agent_engine_runner_shared.mcp_tools import (
     make_mcp_tool_pod_callable,
     mcp_server_network_hosts,
 )
+from agent_engine_runner_shared.memory_appbound import (
+    AppBoundCrudClient,
+    AppBoundRuntime,
+)
 from agent_engine_runner_shared.utils import get_env_bool
+from agent_engine_runner_shared.workflow import (
+    UnknownOutcomePolicy,
+    validate_on_unknown_outcome,
+)
 from agent_engine_sdk_openai_agents.agent import OpenAIAgentsBaseAgent
 from agent_engine_sdk_openai_agents.llm_adapter import OpenAIAgentsLLM, RegisteredModel
 from agent_engine_sdk_openai_agents.secure_model import SecureModel
@@ -99,7 +108,9 @@ class App(BaseApp):
         self._tool_defs: list[ToolDefinition] = []
         self._tool_schemas: dict[str, FuncSchema] = {}
         self._tool_approvals: dict[str, bool] = {}
+        self._tool_unknown_outcomes: dict[str, UnknownOutcomePolicy | None] = {}
         self._mcp_tools: dict[str, MCPToolBinding] = {}
+        self._memory: Memory | None = None
         # As in the LangGraph adapter: only the AER discovers MCP tools. The
         # Tool Pod finds a call's server from agent.yaml when the call arrives.
         if self._runtime.mode == RuntimeMode.AER:
@@ -113,6 +124,22 @@ class App(BaseApp):
     @property
     def agent_config(self) -> RuntimeAgentConfig:
         return self._runtime.agent_config
+
+    @property
+    def memory(self) -> Memory:
+        """Return the unified Memory facade over app-bound adapters.
+
+        The same facade as the LangGraph and ADK apps: methods return typed
+        results, and identity comes from per-call args, ``bind``, or the
+        executing request's context. A write is live, not a durable activity,
+        so a replayed tool call writes again.
+        """
+        if self._memory is None:
+            self._memory = Memory(
+                runtime=AppBoundRuntime(self._runtime),
+                client=AppBoundCrudClient(self._runtime),
+            )
+        return self._memory
 
     def get_current_user_id(self) -> str | None:
         """Return the user id of the request currently executing, if any."""
@@ -129,13 +156,22 @@ class App(BaseApp):
         timeout: int = 30,
         redact_fields: list[str] | None = None,
         needs_approval: bool = False,
+        on_unknown_outcome: UnknownOutcomePolicy | None = None,
     ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
         """Register a function tool and its platform execution policy.
 
         ``needs_approval`` is the SDK's ``function_tool(needs_approval=...)``,
         passed through to the ``FunctionTool`` that ``tools()`` returns: the
         turn pauses before each call until a caller approves or rejects it.
+
+        ``on_unknown_outcome`` says what a retry does when the platform lost
+        the runner while this tool was running, so nobody knows whether it ran.
+        ``"rerun"`` runs the tool again (at-least-once execution; declare it
+        only for a tool that is safe to run twice). ``"fail"`` refuses the
+        retry, so the tool never runs twice. Leave unset for the platform
+        default.
         """
+        validate_on_unknown_outcome(on_unknown_outcome)
 
         def register(fn: Callable[..., Any]) -> Callable[..., Any]:
             schema = tool_schema(fn)
@@ -148,6 +184,7 @@ class App(BaseApp):
                 )
             self._tool_schemas[schema.name] = schema
             self._tool_approvals[schema.name] = needs_approval
+            self._tool_unknown_outcomes[schema.name] = on_unknown_outcome
             run = json_result(fn)
             description = schema.description or ""
             self._runtime.register_tool(  # type: ignore[attr-defined]
@@ -245,6 +282,7 @@ class App(BaseApp):
                 allow_direct=allow_direct,
                 issuer=self,
                 needs_approval=self._tool_approvals[tool.name],
+                on_unknown_outcome=self._tool_unknown_outcomes[tool.name],
             )
             for tool in self._tool_defs
         ]

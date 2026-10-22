@@ -11,16 +11,41 @@
  */
 
 import { readFileSync, statSync } from "node:fs";
-import { context } from "@opentelemetry/api";
+import { context, type Context } from "@opentelemetry/api";
 import {
   suppressTracing,
   W3CTraceContextPropagator,
 } from "@opentelemetry/core";
 import { Agent as UndiciAgent } from "undici";
 import { getLogger } from "./logger.js";
+import {
+  activeTraceIsRunnerRooted,
+  mergeRunnerRootTraceState,
+} from "./tracing/caller_trace.js";
 
 const logger = getLogger("agent_engine_runner_shared.tls_client");
 const traceContextPropagator = new W3CTraceContextPropagator();
+
+/**
+ * Inject the active trace, marking roots this runner created.
+ *
+ * A locally created root is a remote parent on the next hop. The tracestate
+ * marker lets the tool pod keep guardrail content off that trace while still
+ * joining it. An inbound caller trace is injected unchanged.
+ */
+export function injectPlatformTraceHeaders(
+  headers: Record<string, string>,
+  activeContext: Context = context.active(),
+): void {
+  traceContextPropagator.inject(activeContext, headers, {
+    set(carrier, key, value) {
+      carrier[key] = value;
+    },
+  });
+  if (headers.traceparent && activeTraceIsRunnerRooted(activeContext)) {
+    headers.tracestate = mergeRunnerRootTraceState(headers.tracestate);
+  }
+}
 
 /** Carry the active trace across a platform RPC without recording transport. */
 export function fetchPlatform(
@@ -32,11 +57,7 @@ export function fetchPlatform(
   const headers = {
     ...((init.headers as Record<string, string> | undefined) ?? {}),
   };
-  traceContextPropagator.inject(activeContext, headers, {
-    set(carrier, key, value) {
-      carrier[key] = value;
-    },
-  });
+  injectPlatformTraceHeaders(headers, activeContext);
 
   return context.with(suppressTracing(activeContext), () =>
     fetchImpl(url, { ...init, headers }),
@@ -280,7 +301,7 @@ export function getFetchOptionsWithTLS(url: string): RequestInit | undefined {
     agentCache.set(baseUrl, agent);
     agentMtimeCache.set(baseUrl, currentMtimes);
 
-    logger.info(
+    logger.debug(
       {
         base_url: baseUrl,
         has_cert: !!connect?.cert,

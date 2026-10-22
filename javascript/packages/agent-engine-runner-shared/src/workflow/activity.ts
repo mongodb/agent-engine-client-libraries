@@ -10,6 +10,7 @@ import {
   ActivityOutcomeSchema,
   type ActivityCommand,
   type ActivityContext,
+  UnknownOutcomePolicy,
   type ActivityKind,
   type ActivityOutcome,
 } from "../generated/workflow/v1/activity_pb.js";
@@ -89,6 +90,38 @@ export function valueToJson(value: Value | undefined): unknown {
   return toJson(ValueSchema, value);
 }
 
+// What OE does with a tool call whose runner was lost before it reported an
+// outcome: "rerun" runs the tool again on retry (at-least-once execution);
+// "fail" refuses the retry so the tool never runs twice.
+export type OnUnknownOutcome = "fail" | "rerun";
+
+const UNKNOWN_OUTCOME_POLICIES: Record<OnUnknownOutcome, UnknownOutcomePolicy> =
+  {
+    fail: UnknownOutcomePolicy.FAIL,
+    rerun: UnknownOutcomePolicy.RERUN,
+  };
+
+/**
+ * Return a tool's declared unknown-outcome policy, rejecting other values.
+ *
+ * SDKs call this when a tool is registered so a typo fails at startup rather
+ * than on the tool's first call; JavaScript callers bypass the type.
+ */
+export function validateOnUnknownOutcome(
+  value: unknown,
+): OnUnknownOutcome | undefined {
+  if (value === undefined) return undefined;
+  if (
+    typeof value !== "string" ||
+    !Object.hasOwn(UNKNOWN_OUTCOME_POLICIES, value)
+  ) {
+    throw new Error(
+      `onUnknownOutcome must be "fail", "rerun", or undefined, got ${JSON.stringify(value) ?? String(value)}`,
+    );
+  }
+  return value as OnUnknownOutcome;
+}
+
 export function buildActivityCommand(args: {
   attempt: AttemptContext;
   kind: ActivityKind;
@@ -97,6 +130,7 @@ export function buildActivityCommand(args: {
   semanticInput: unknown;
   stepOrdinal?: number;
   operationPath?: OperationPath;
+  onUnknownOutcome?: OnUnknownOutcome | undefined;
 }): ActivityCommand {
   if (!args.attempt.workflowIdentity?.executionId) {
     throw new WorkflowClientError(
@@ -133,7 +167,17 @@ export function buildActivityCommand(args: {
     activityKind: args.kind,
     activityName: args.name,
     semanticInput: semanticInputFromJson(args.semanticInput),
+    onUnknownOutcome: unknownOutcomeToProto(args.onUnknownOutcome),
   });
+}
+
+function unknownOutcomeToProto(
+  value: OnUnknownOutcome | undefined,
+): UnknownOutcomePolicy {
+  const policy = validateOnUnknownOutcome(value);
+  return policy === undefined
+    ? UnknownOutcomePolicy.UNSPECIFIED
+    : UNKNOWN_OUTCOME_POLICIES[policy];
 }
 
 export function completedOutcome(
@@ -346,8 +390,12 @@ export async function runSerialActivity<T>(args: {
   onActivityResolved?: ActivityResolvedHook<T>;
   attempt?: AttemptContext;
   stepOrdinal?: number;
+  /** Defaults to the current operation path. */
+  operationPath?: OperationPath;
   /** False only when the framework has assigned a stable activity identity. */
   exclusive?: boolean;
+  /** The tool's declared policy for a retry after its runner was lost; unset uses OE's default. */
+  onUnknownOutcome?: OnUnknownOutcome | undefined;
 }): Promise<T> {
   const attempt = requireAttempt(args.attempt, "runSerialActivity");
   return withActivitySlot(
@@ -360,7 +408,9 @@ export async function runSerialActivity<T>(args: {
         name: args.name,
         activityOrdinal: args.activityOrdinal,
         stepOrdinal: args.stepOrdinal,
+        operationPath: args.operationPath,
         semanticInput: args.semanticInput,
+        onUnknownOutcome: args.onUnknownOutcome,
       });
       return runDispatchedActivity(
         args.client,

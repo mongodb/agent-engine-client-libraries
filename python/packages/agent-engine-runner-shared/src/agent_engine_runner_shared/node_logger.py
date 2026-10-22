@@ -15,7 +15,8 @@ from typing import Any, Dict, Optional
 
 from agent_engine_sdk.interfaces import BaseExecutionCallback
 
-from agent_engine_runner_shared.tls_client import create_httpx_client_with_tls
+from agent_engine_runner_shared.tls_client import get_shared_client
+from agent_engine_runner_shared.utils import NODE_EVENT_TIMEOUT_SECS
 
 logger = logging.getLogger(__name__)
 
@@ -205,8 +206,9 @@ class NodeExecutionLogger(BaseExecutionCallback):
             payload["duration_ms"] = duration_ms
 
         try:
-            with create_httpx_client_with_tls(self._oe_url, 2.0) as client:
-                client.post(f"{self._oe_url}/node/execution", json=payload)
+            get_shared_client(self._oe_url).post(
+                f"{self._oe_url}/node/execution", json=payload, timeout=NODE_EVENT_TIMEOUT_SECS
+            )
         except Exception as e:
             # Best-effort: swallow ALL errors including ValueError from missing TLS
             # certs (fail-closed policy). A missing cert must not abort node execution.

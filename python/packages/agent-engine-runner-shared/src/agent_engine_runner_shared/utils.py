@@ -397,6 +397,13 @@ LLM_READ_TIMEOUT = float(
 # still happily running, leaving the SDK with no result to report.
 TOOL_READ_TIMEOUT = float(os.environ.get("RUNNER_TOOL_READ_TIMEOUT", "600.0"))  # seconds
 
+# Best-effort callback timeouts (seconds). Chunk emits and node-execution events
+# are fire-and-forget: a slow or unreachable OE must not delay the tool function
+# or the graph step, so both are short. Shared here so the emit paths and the
+# custom-event transport that reuses the chunk timeout cannot drift apart.
+PROGRESS_TIMEOUT_SECS = 5.0
+NODE_EVENT_TIMEOUT_SECS = 2.0
+
 
 def oe_stream_retry_delay_s(retry_after_ms: float | None = None) -> float:
     """Honor a server-provided SSE retry_after_ms, capped.

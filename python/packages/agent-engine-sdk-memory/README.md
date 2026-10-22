@@ -335,11 +335,10 @@ raises `ValueError`. Project API keys can no longer be minted over HTTP, so new
 integrations must use a service-account token.
 
 A service account is the right credential for a **multi-user** application: it
-may name any end user as `user_id`. A human credential may only name an end user
-other than the caller when the project enables end-user delegation; otherwise a
-`user_id` naming another user is rejected with `403`, and updates or deletes of
-another user's record are refused whatever its visibility (a project owner may
-still delete it).
+may name any end user as `user_id`. Once the project enforces identity, a
+human credential may no longer name an end user other than the caller: such a
+`user_id` is rejected with `403`, and updates or deletes of another user's record
+are refused whatever its visibility (a project owner may still delete it).
 
 ### Local development
 

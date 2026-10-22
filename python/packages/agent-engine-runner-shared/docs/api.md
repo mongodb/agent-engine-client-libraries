@@ -174,10 +174,14 @@
     * [response\_from\_stream\_chunks](#agent_engine_runner_shared.secure_llm_proxy.SecureLLMProxy.response_from_stream_chunks)
     * [stream](#agent_engine_runner_shared.secure_llm_proxy.SecureLLMProxy.stream)
 * [agent\_engine\_runner\_shared.secure\_wrapper](#agent_engine_runner_shared.secure_wrapper)
+  * [\_OAuthAuthorizationRequired](#agent_engine_runner_shared.secure_wrapper._OAuthAuthorizationRequired)
+    * [\_\_init\_\_](#agent_engine_runner_shared.secure_wrapper._OAuthAuthorizationRequired.__init__)
+  * [oauth\_authorization\_wait\_id](#agent_engine_runner_shared.secure_wrapper.oauth_authorization_wait_id)
   * [extract\_usage](#agent_engine_runner_shared.secure_wrapper.extract_usage)
   * [PolicyDeniedException](#agent_engine_runner_shared.secure_wrapper.PolicyDeniedException)
   * [OERetryAfterError](#agent_engine_runner_shared.secure_wrapper.OERetryAfterError)
   * [ToolExecutionError](#agent_engine_runner_shared.secure_wrapper.ToolExecutionError)
+  * [ToolPlatformError](#agent_engine_runner_shared.secure_wrapper.ToolPlatformError)
   * [TerminalExecutionError](#agent_engine_runner_shared.secure_wrapper.TerminalExecutionError)
   * [raise\_for\_oe\_rejection](#agent_engine_runner_shared.secure_wrapper.raise_for_oe_rejection)
   * [ToolCallTimeoutError](#agent_engine_runner_shared.secure_wrapper.ToolCallTimeoutError)
@@ -2733,6 +2737,36 @@ This module provides:
 
 HITL is handled via LangGraph's native interrupt() / Command(resume=...) API.
 
+<a id="agent_engine_runner_shared.secure_wrapper._OAuthAuthorizationRequired"></a>
+
+## \_OAuthAuthorizationRequired
+
+```python
+class _OAuthAuthorizationRequired(Exception)
+```
+
+Leave durable dispatch with typed consent control instead of interrupting its activity.
+
+<a id="agent_engine_runner_shared.secure_wrapper._OAuthAuthorizationRequired.__init__"></a>
+
+#### \_\_init\_\_
+
+```python
+def __init__(elicitation: ElicitationInfo, step: int) -> None
+```
+
+Carry the OE response to its activity boundary without exposing it in errors.
+
+<a id="agent_engine_runner_shared.secure_wrapper.oauth_authorization_wait_id"></a>
+
+#### oauth\_authorization\_wait\_id
+
+```python
+def oauth_authorization_wait_id(value: Any) -> str | None
+```
+
+Identify a consent wait only when this attempt recorded the platform's challenge.
+
 <a id="agent_engine_runner_shared.secure_wrapper.extract_usage"></a>
 
 #### extract\_usage
@@ -2783,12 +2817,26 @@ class ToolExecutionError(Exception)
 
 Raised when tool execution fails.
 
+<a id="agent_engine_runner_shared.secure_wrapper.ToolPlatformError"></a>
+
+## ToolPlatformError
+
+```python
+class ToolPlatformError(ToolExecutionError)
+```
+
+Raised when the platform, not the tool, failed a tool call.
+
+The tool may already have run, for example when OE rejects or never
+acknowledges its result, so an adapter must not report this to the model as
+a failed tool it could call again.
+
 <a id="agent_engine_runner_shared.secure_wrapper.TerminalExecutionError"></a>
 
 ## TerminalExecutionError
 
 ```python
-class TerminalExecutionError(ToolExecutionError)
+class TerminalExecutionError(ToolPlatformError)
 ```
 
 Raised when OE rejects a tool call because the execution already ended.
@@ -3077,23 +3125,29 @@ Clean up resources owned by this execution's wrapper.
 #### execute\_tool
 
 ```python
-def execute_tool(tool_name: str,
-                 arguments: Dict[str, Any],
-                 *,
-                 metadata: Optional[Dict[str, Any]] = None,
-                 provider_type: Optional[str] = None,
-                 scopes: Optional[list[str]] = None,
-                 tool_call_id: Optional[str] = None,
-                 raw_on_interrupt: bool = False,
-                 redact_fields: Optional[list[str]] = None,
-                 is_local: bool = True,
-                 local_executor: Optional[Callable[[], Any]] = None,
-                 is_framework_control_flow: Optional[Callable[[BaseException],
-                                                              bool]] = None,
-                 call_channel_expected: bool = False) -> Any
+def execute_tool(
+        tool_name: str,
+        arguments: Dict[str, Any],
+        *,
+        metadata: Optional[Dict[str, Any]] = None,
+        provider_type: Optional[str] = None,
+        scopes: Optional[list[str]] = None,
+        tool_call_id: Optional[str] = None,
+        raw_on_interrupt: bool = False,
+        redact_fields: Optional[list[str]] = None,
+        is_local: bool = True,
+        local_executor: Optional[Callable[[], Any]] = None,
+        is_framework_control_flow: Optional[Callable[[BaseException],
+                                                     bool]] = None,
+        call_channel_expected: bool = False,
+        on_unknown_outcome: Optional[UnknownOutcomePolicy] = None) -> Any
 ```
 
 Execute a tool call through OE.
+
+Durable OAuth records a typed challenge before a separate framework
+wait, then records the actual resource call after reauthorization.
+Its consent answer never becomes a tool result or Memory content.
 
 **Arguments**:
 
@@ -3111,6 +3165,9 @@ Execute a tool call through OE.
 - `is_local` - Whether OE should return the approved call to this AER.
 - `local_executor` - Callback that invokes the registered tool on the
   current framework stack. Required for local tools.
+- `on_unknown_outcome` - What a retry does when the runner was lost while
+  this tool was in flight in a durable workflow: ``"rerun"`` runs it
+  again, ``"fail"`` refuses the retry.
 
 
 **Returns**:
@@ -3132,20 +3189,22 @@ Execute a tool call through OE.
 
 ```python
 def create_secure_tool_function(
-    original_tool: Any,
-    tool_name: str,
-    *,
-    allow_direct: bool = False,
-    metadata: Optional[Dict[str, Any]] = None,
-    is_local: bool = True,
-    provider_type: Optional[str] = None,
-    scopes: Optional[list[str]] = None,
-    response_format: Literal["content", "content_and_artifact"] = "content",
-    tool_declared_format: Optional[Literal["content",
-                                           "content_and_artifact"]] = None,
-    redact_fields: Optional[list[str]] = None,
-    is_framework_control_flow: Optional[Callable[[BaseException], bool]] = None
-) -> Callable
+        original_tool: Any,
+        tool_name: str,
+        *,
+        allow_direct: bool = False,
+        metadata: Optional[Dict[str, Any]] = None,
+        is_local: bool = True,
+        provider_type: Optional[str] = None,
+        scopes: Optional[list[str]] = None,
+        response_format: Literal["content",
+                                 "content_and_artifact"] = "content",
+        tool_declared_format: Optional[Literal["content",
+                                               "content_and_artifact"]] = None,
+        redact_fields: Optional[list[str]] = None,
+        is_framework_control_flow: Optional[Callable[[BaseException],
+                                                     bool]] = None,
+        on_unknown_outcome: Optional[UnknownOutcomePolicy] = None) -> Callable
 ```
 
 Create a wrapped tool function that routes through SecureToolWrapper.
@@ -3165,6 +3224,9 @@ to be built before execution context exists.
 - `tool_declared_format` - The tool author's own original format, used only
   to decide whether a normal result gets shape-matched into a tuple.
   Defaults to ``response_format``.
+- `on_unknown_outcome` - What a retry does when the runner was lost while
+  this tool was in flight in a durable workflow: ``"rerun"`` runs it
+  again, ``"fail"`` refuses the retry.
 
 
 **Returns**:

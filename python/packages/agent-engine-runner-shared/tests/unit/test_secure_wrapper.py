@@ -3,7 +3,7 @@
 import asyncio
 import json
 from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import httpx
 import pytest
@@ -337,8 +337,10 @@ class TestOeRoundTripSpans:
             def __exit__(self, exc_type, exc, tb) -> bool:
                 return False
 
-        client.stream.side_effect = lambda method, url, *, json, follow_redirects: _SyncPostStream(
-            url, json
+        client.stream.side_effect = (
+            lambda method, url, *, json, follow_redirects, timeout=None, **kwargs: _SyncPostStream(
+                url, json
+            )
         )
 
     def test_request_oe_approval_retryable_emits_span_on_first_try_success(self) -> None:
@@ -396,9 +398,9 @@ class TestOeRoundTripSpans:
 
         tracer, exporter = self._tracer_with_exporter()
         with patch(
-            "agent_engine_runner_shared.secure_wrapper.create_httpx_client_with_tls"
+            "agent_engine_runner_shared.secure_wrapper.get_shared_client"
         ) as mock_create_client:
-            mock_client = mock_create_client.return_value.__enter__.return_value
+            mock_client = mock_create_client.return_value
             self._wire_stream_to_post(mock_client)
             mock_client.post.return_value = httpx.Response(
                 200, request=httpx.Request("POST", "http://localhost:8080/tool/result")
@@ -427,10 +429,8 @@ class TestOeRoundTripSpans:
         request_obj = httpx.Request("POST", "http://localhost:8080/tool/result")
         unavailable = httpx.Response(503, request=request_obj)
         accepted = httpx.Response(200, request=request_obj)
-        with patch(
-            "agent_engine_runner_shared.secure_wrapper.create_httpx_client_with_tls"
-        ) as create_client:
-            client = create_client.return_value.__enter__.return_value
+        with patch("agent_engine_runner_shared.secure_wrapper.get_shared_client") as create_client:
+            client = create_client.return_value
             self._wire_stream_to_post(client)
             client.post.side_effect = [unavailable, accepted]
             with patch("agent_engine_runner_shared.secure_wrapper.time.sleep"):
@@ -453,20 +453,18 @@ class TestOeRoundTripSpans:
     def test_report_oe_result_span_records_error_when_oe_never_acknowledges(self) -> None:
         from opentelemetry.trace import StatusCode
 
-        from agent_engine_runner_shared.secure_wrapper import ToolExecutionError, report_oe_result
+        from agent_engine_runner_shared.secure_wrapper import ToolPlatformError, report_oe_result
 
         tracer, exporter = self._tracer_with_exporter()
         request_obj = httpx.Request("POST", "http://localhost:8080/tool/result")
         down = httpx.Response(500, request=request_obj)
-        with patch(
-            "agent_engine_runner_shared.secure_wrapper.create_httpx_client_with_tls"
-        ) as create_client:
-            client = create_client.return_value.__enter__.return_value
+        with patch("agent_engine_runner_shared.secure_wrapper.get_shared_client") as create_client:
+            client = create_client.return_value
             self._wire_stream_to_post(client)
             client.post.return_value = down
             with patch("agent_engine_runner_shared.secure_wrapper.time.sleep"):
                 with patch("opentelemetry.trace.get_tracer", return_value=tracer):
-                    with pytest.raises(ToolExecutionError):
+                    with pytest.raises(ToolPlatformError):
                         report_oe_result(
                             oe_url="http://localhost:8080",
                             execution_id="exec-123",
@@ -496,9 +494,9 @@ class TestSecureToolWrapper:
         request_error = httpx.ConnectError("connection refused")
 
         with patch(
-            "agent_engine_runner_shared.secure_wrapper.create_httpx_client_with_tls"
+            "agent_engine_runner_shared.secure_wrapper.get_shared_client"
         ) as mock_client_cls:
-            mock_client = mock_client_cls.return_value.__enter__.return_value
+            mock_client = mock_client_cls.return_value
             mock_client.post.side_effect = request_error
 
             with pytest.raises(PolicyDeniedException, match="OE unreachable; blocking for safety"):
@@ -529,9 +527,9 @@ class TestSecureToolWrapper:
         )
 
         with patch(
-            "agent_engine_runner_shared.secure_wrapper.create_httpx_client_with_tls"
+            "agent_engine_runner_shared.secure_wrapper.get_shared_client"
         ) as mock_client_cls:
-            mock_client = mock_client_cls.return_value.__enter__.return_value
+            mock_client = mock_client_cls.return_value
             mock_client.post.side_effect = [unavailable, approved]
             with patch("agent_engine_runner_shared.secure_wrapper.time.sleep") as sleep:
                 response = request_oe_approval_retryable(
@@ -562,9 +560,9 @@ class TestSecureToolWrapper:
         )
 
         with patch(
-            "agent_engine_runner_shared.secure_wrapper.create_httpx_client_with_tls"
+            "agent_engine_runner_shared.secure_wrapper.get_shared_client"
         ) as mock_client_cls:
-            mock_client = mock_client_cls.return_value.__enter__.return_value
+            mock_client = mock_client_cls.return_value
             mock_client.post.return_value = unavailable
             with patch("agent_engine_runner_shared.secure_wrapper.time.sleep") as sleep:
                 with pytest.raises(
@@ -592,9 +590,9 @@ class TestSecureToolWrapper:
         unavailable = httpx.Response(503, request=request_obj)
 
         with patch(
-            "agent_engine_runner_shared.secure_wrapper.create_httpx_client_with_tls"
+            "agent_engine_runner_shared.secure_wrapper.get_shared_client"
         ) as mock_client_cls:
-            mock_client = mock_client_cls.return_value.__enter__.return_value
+            mock_client = mock_client_cls.return_value
             mock_client.post.return_value = unavailable
             with patch("agent_engine_runner_shared.secure_wrapper.time.sleep") as sleep:
                 with pytest.raises(
@@ -611,6 +609,69 @@ class TestSecureToolWrapper:
 
         assert mock_client.post.call_count == 1
         sleep.assert_not_called()
+
+    def test_request_oe_approval_retries_when_shared_client_closed(self) -> None:
+        """A rotation/eviction that closes the client between the fetch and the
+        send must be retried on the rebuilt client, not leak httpx's bare
+        RuntimeError out of a blocking path."""
+        from agent_engine_runner_shared.secure_wrapper import request_oe_approval
+
+        request_obj = httpx.Request("POST", "http://localhost:8080/tool/execute")
+        approved = httpx.Response(
+            200,
+            json={"proceed": True, "status": "success", "result": {"ok": True}},
+            request=request_obj,
+        )
+
+        closed = MagicMock()
+        closed.is_closed = True
+        closed.post.side_effect = RuntimeError(
+            "Cannot send a request, as the client has been closed."
+        )
+        rebuilt = MagicMock()
+        rebuilt.is_closed = False
+        rebuilt.post.return_value = approved
+
+        with patch(
+            "agent_engine_runner_shared.secure_wrapper.get_shared_client"
+        ) as mock_get_client:
+            mock_get_client.side_effect = [closed, rebuilt]
+            response = request_oe_approval(
+                oe_url="http://localhost:8080",
+                execution_id="exec-123",
+                tool_name="demo_tool",
+                arguments={"value": 1},
+                step=1,
+            )
+
+        assert response.proceed is True
+        assert response.result == {"ok": True}
+        closed.post.assert_called_once()
+        rebuilt.post.assert_called_once()
+        assert mock_get_client.call_count == 2
+
+    def test_request_oe_approval_propagates_unrelated_runtime_error(self) -> None:
+        """Only a *closed* client is retried; an unrelated RuntimeError still raises."""
+        from agent_engine_runner_shared.secure_wrapper import request_oe_approval
+
+        client = MagicMock()
+        client.is_closed = False
+        client.post.side_effect = RuntimeError("adapter exploded")
+
+        with patch(
+            "agent_engine_runner_shared.secure_wrapper.get_shared_client",
+            return_value=client,
+        ):
+            with pytest.raises(RuntimeError, match="adapter exploded"):
+                request_oe_approval(
+                    oe_url="http://localhost:8080",
+                    execution_id="exec-123",
+                    tool_name="demo_tool",
+                    arguments={"value": 1},
+                    step=1,
+                )
+
+        client.post.assert_called_once()
 
     def test_execute_tool_accepts_oe_owned_result(self) -> None:
         from agent_engine_runner_shared.models import ToolExecuteResponse
@@ -766,7 +827,7 @@ class TestSecureToolWrapper:
 
     def test_credentialed_tool_cannot_use_local_callback_route(self) -> None:
         from agent_engine_runner_shared.models import ToolExecuteResponse
-        from agent_engine_runner_shared.secure_wrapper import SecureToolWrapper, ToolExecutionError
+        from agent_engine_runner_shared.secure_wrapper import SecureToolWrapper, ToolPlatformError
 
         invoked = False
 
@@ -780,7 +841,7 @@ class TestSecureToolWrapper:
             "agent_engine_runner_shared.secure_wrapper.request_oe_approval",
             return_value=ToolExecuteResponse(proceed=True, route_to="callback"),
         ) as approval:
-            with pytest.raises(ToolExecutionError, match="declared as remote"):
+            with pytest.raises(ToolPlatformError, match="declared as remote"):
                 wrapper.execute_tool(
                     "github_tool",
                     {},
@@ -792,6 +853,69 @@ class TestSecureToolWrapper:
 
         assert approval.call_args.kwargs["is_local"] is False
         assert invoked is False
+
+    @pytest.mark.parametrize(
+        ("response", "local_executor", "message"),
+        [
+            ({"route_to": "pod"}, None, "Unexpected OE tool route"),
+            ({"status": "pending"}, None, "Unexpected OE tool status"),
+            ({"route_to": "callback"}, None, "missing its registered tool executor"),
+        ],
+    )
+    def test_unexpected_oe_reply_is_a_platform_failure(
+        self, response: dict[str, str], local_executor: None, message: str
+    ) -> None:
+        from agent_engine_runner_shared.models import ToolExecuteResponse
+        from agent_engine_runner_shared.secure_wrapper import SecureToolWrapper, ToolPlatformError
+
+        wrapper = SecureToolWrapper("http://localhost:8080", "exec-123")
+        with (
+            patch(
+                "agent_engine_runner_shared.secure_wrapper.request_oe_approval",
+                return_value=ToolExecuteResponse(proceed=True, **response),
+            ),
+            pytest.raises(ToolPlatformError, match=message),
+        ):
+            wrapper.execute_tool("lookup", {}, local_executor=local_executor)
+
+    def test_retryable_oe_failure_is_a_platform_failure_once_retries_run_out(self) -> None:
+        from agent_engine_runner_shared.models import ToolExecuteResponse
+        from agent_engine_runner_shared.secure_wrapper import (
+            OE_RETRYABLE_MAX_ATTEMPTS,
+            SecureToolWrapper,
+            ToolPlatformError,
+        )
+
+        wrapper = SecureToolWrapper("http://localhost:8080", "exec-123")
+        reservation_lost = ToolExecuteResponse(
+            proceed=True, status="error", error="session reservation lost", retryable=True
+        )
+        with (
+            patch(
+                "agent_engine_runner_shared.secure_wrapper.request_oe_approval",
+                return_value=reservation_lost,
+            ) as approval,
+            pytest.raises(ToolPlatformError, match="session reservation lost"),
+        ):
+            wrapper.execute_tool("lookup", {})
+
+        assert approval.call_count == OE_RETRYABLE_MAX_ATTEMPTS
+
+    def test_retryable_oe_failure_that_recovers_returns_the_tool_result(self) -> None:
+        from agent_engine_runner_shared.models import ToolExecuteResponse
+        from agent_engine_runner_shared.secure_wrapper import SecureToolWrapper
+
+        wrapper = SecureToolWrapper("http://localhost:8080", "exec-123")
+        with patch(
+            "agent_engine_runner_shared.secure_wrapper.request_oe_approval",
+            side_effect=[
+                ToolExecuteResponse(
+                    proceed=True, status="error", error="session reservation lost", retryable=True
+                ),
+                ToolExecuteResponse(proceed=True, status="success", result="found"),
+            ],
+        ):
+            assert wrapper.execute_tool("lookup", {}) == "found"
 
     def test_execute_local_tool_preserves_framework_control_flow(self) -> None:
         from agent_engine_runner_shared.models import ToolExecuteResponse
@@ -1425,9 +1549,9 @@ class TestSecureToolWrapper:
         from agent_engine_runner_shared.secure_wrapper import request_oe_approval
 
         with patch(
-            "agent_engine_runner_shared.secure_wrapper.create_httpx_client_with_tls"
+            "agent_engine_runner_shared.secure_wrapper.get_shared_client"
         ) as mock_client_cls:
-            mock_client = mock_client_cls.return_value.__enter__.return_value
+            mock_client = mock_client_cls.return_value
             mock_response = MagicMock()
             mock_response.json.return_value = ToolExecuteResponse(proceed=True).model_dump()
             mock_client.post.return_value = mock_response
@@ -1451,9 +1575,9 @@ class TestSecureToolWrapper:
         from agent_engine_runner_shared.secure_wrapper import request_oe_approval
 
         with patch(
-            "agent_engine_runner_shared.secure_wrapper.create_httpx_client_with_tls"
+            "agent_engine_runner_shared.secure_wrapper.get_shared_client"
         ) as mock_client_cls:
-            mock_client = mock_client_cls.return_value.__enter__.return_value
+            mock_client = mock_client_cls.return_value
             mock_response = MagicMock()
             mock_response.json.return_value = ToolExecuteResponse(proceed=True).model_dump()
             mock_client.post.return_value = mock_response
@@ -1477,9 +1601,9 @@ class TestSecureToolWrapper:
 
         headers = {"authorization": "Bearer request-token", "x-tenant-id": "tenant-42"}
         with patch(
-            "agent_engine_runner_shared.secure_wrapper.create_httpx_client_with_tls"
+            "agent_engine_runner_shared.secure_wrapper.get_shared_client"
         ) as mock_client_cls:
-            mock_client = mock_client_cls.return_value.__enter__.return_value
+            mock_client = mock_client_cls.return_value
             mock_response = MagicMock()
             mock_response.json.return_value = ToolExecuteResponse(proceed=True).model_dump()
             mock_client.post.return_value = mock_response
@@ -1506,9 +1630,9 @@ class TestSecureToolWrapper:
         tracer = TracerProvider().get_tracer("test")
 
         with patch(
-            "agent_engine_runner_shared.secure_wrapper.create_httpx_client_with_tls"
+            "agent_engine_runner_shared.secure_wrapper.get_shared_client"
         ) as mock_client_cls:
-            mock_client = mock_client_cls.return_value.__enter__.return_value
+            mock_client = mock_client_cls.return_value
             mock_response = MagicMock()
             mock_response.json.return_value = ToolExecuteResponse(proceed=True).model_dump()
             mock_client.post.return_value = mock_response
@@ -1532,9 +1656,9 @@ class TestSecureToolWrapper:
         from agent_engine_runner_shared.secure_wrapper import request_oe_approval
 
         with patch(
-            "agent_engine_runner_shared.secure_wrapper.create_httpx_client_with_tls"
+            "agent_engine_runner_shared.secure_wrapper.get_shared_client"
         ) as mock_client_cls:
-            mock_client = mock_client_cls.return_value.__enter__.return_value
+            mock_client = mock_client_cls.return_value
             mock_response = MagicMock()
             mock_response.json.return_value = ToolExecuteResponse(proceed=True).model_dump()
             mock_client.post.return_value = mock_response
@@ -1570,9 +1694,9 @@ class TestSecureToolWrapper:
         tracer = provider.get_tracer("test")
 
         with patch(
-            "agent_engine_runner_shared.secure_wrapper.create_httpx_client_with_tls"
+            "agent_engine_runner_shared.secure_wrapper.get_shared_client"
         ) as mock_create_client:
-            mock_client = mock_create_client.return_value.__enter__.return_value
+            mock_client = mock_create_client.return_value
             self._wire_stream_to_post(mock_client)
 
             with patch("opentelemetry.trace.get_tracer", return_value=tracer):
@@ -1602,10 +1726,8 @@ class TestSecureToolWrapper:
         request = httpx.Request("POST", "http://localhost:8080/tool/result")
         unavailable = httpx.Response(503, request=request)
         accepted = httpx.Response(200, request=request)
-        with patch(
-            "agent_engine_runner_shared.secure_wrapper.create_httpx_client_with_tls"
-        ) as create_client:
-            client = create_client.return_value.__enter__.return_value
+        with patch("agent_engine_runner_shared.secure_wrapper.get_shared_client") as create_client:
+            client = create_client.return_value
             self._wire_stream_to_post(client)
             client.post.side_effect = [unavailable, accepted]
             with patch("agent_engine_runner_shared.secure_wrapper.time.sleep"):
@@ -1627,17 +1749,15 @@ class TestSecureToolWrapper:
         )
 
     def test_report_oe_result_rejects_4xx_without_retry(self) -> None:
-        from agent_engine_runner_shared.secure_wrapper import ToolExecutionError, report_oe_result
+        from agent_engine_runner_shared.secure_wrapper import ToolPlatformError, report_oe_result
 
         request = httpx.Request("POST", "http://localhost:8080/tool/result")
         rejected = httpx.Response(400, request=request)
-        with patch(
-            "agent_engine_runner_shared.secure_wrapper.create_httpx_client_with_tls"
-        ) as create_client:
-            client = create_client.return_value.__enter__.return_value
+        with patch("agent_engine_runner_shared.secure_wrapper.get_shared_client") as create_client:
+            client = create_client.return_value
             self._wire_stream_to_post(client)
             client.post.return_value = rejected
-            with pytest.raises(ToolExecutionError, match="HTTP 400"):
+            with pytest.raises(ToolPlatformError, match="HTTP 400"):
                 report_oe_result(
                     oe_url="http://localhost:8080",
                     execution_id="exec-123",
@@ -1664,9 +1784,9 @@ class TestSecureToolWrapper:
         from agent_engine_runner_shared.secure_wrapper import report_oe_result
 
         with patch(
-            "agent_engine_runner_shared.secure_wrapper.create_httpx_client_with_tls"
+            "agent_engine_runner_shared.secure_wrapper.get_shared_client"
         ) as mock_create_client:
-            mock_client = mock_create_client.return_value.__enter__.return_value
+            mock_client = mock_create_client.return_value
             self._wire_stream_to_post(mock_client)
 
             with patch("opentelemetry.trace.get_tracer", return_value=NoOpTracer()):
@@ -1697,9 +1817,9 @@ class TestSecureToolWrapper:
         monkeypatch.setitem(sys.modules, "agent_engine_runner_shared.tracing.setup", None)
 
         with patch(
-            "agent_engine_runner_shared.secure_wrapper.create_httpx_client_with_tls"
+            "agent_engine_runner_shared.secure_wrapper.get_shared_client"
         ) as mock_client_cls:
-            mock_client = mock_client_cls.return_value.__enter__.return_value
+            mock_client = mock_client_cls.return_value
             mock_response = MagicMock()
             mock_response.json.return_value = ToolExecuteResponse(proceed=True).model_dump()
             mock_client.post.return_value = mock_response
@@ -1725,9 +1845,9 @@ class TestSecureToolWrapper:
         monkeypatch.setitem(sys.modules, "agent_engine_runner_shared.tracing.setup", None)
 
         with patch(
-            "agent_engine_runner_shared.secure_wrapper.create_httpx_client_with_tls"
+            "agent_engine_runner_shared.secure_wrapper.get_shared_client"
         ) as mock_create_client:
-            mock_client = mock_create_client.return_value.__enter__.return_value
+            mock_client = mock_create_client.return_value
             self._wire_stream_to_post(mock_client)
 
             report_oe_result(
@@ -1763,18 +1883,18 @@ class TestSecureToolWrapper:
             def __exit__(self, exc_type, exc, tb) -> bool:
                 return False
 
-        client.stream.side_effect = lambda method, url, *, json, follow_redirects: _SyncPostStream(
-            url, json
+        client.stream.side_effect = (
+            lambda method, url, *, json, follow_redirects, timeout=None, **kwargs: _SyncPostStream(
+                url, json
+            )
         )
 
     def test_report_oe_result_prefers_owner_url(self) -> None:
         from agent_engine_runner_shared.secure_wrapper import report_oe_result
 
         request = httpx.Request("POST", f"{self._OWNER}/tool/result")
-        with patch(
-            "agent_engine_runner_shared.secure_wrapper.create_httpx_client_with_tls"
-        ) as create_client:
-            client = create_client.return_value.__enter__.return_value
+        with patch("agent_engine_runner_shared.secure_wrapper.get_shared_client") as create_client:
+            client = create_client.return_value
             self._wire_stream_to_post(client)
             client.post.return_value = httpx.Response(200, request=request)
             report_oe_result(
@@ -1792,6 +1912,71 @@ class TestSecureToolWrapper:
         client.post.assert_called_once()
         assert client.post.call_args.args[0] == f"{self._OWNER}/tool/result"
 
+    def test_report_oe_result_reuses_shared_client_across_calls(self) -> None:
+        """Per-callback clients re-handshake mTLS every time and throttle the OE."""
+        from agent_engine_runner_shared.secure_wrapper import report_oe_result
+        from agent_engine_runner_shared.utils import get_request_timeout
+
+        request = httpx.Request("POST", f"{self._SERVICE}/tool/result")
+        with patch("agent_engine_runner_shared.secure_wrapper.get_shared_client") as get_client:
+            client = get_client.return_value
+            self._wire_stream_to_post(client)
+            client.post.return_value = httpx.Response(200, request=request)
+            for step in (1, 2):
+                report_oe_result(
+                    oe_url=self._SERVICE,
+                    execution_id="exec-123",
+                    tool_name="get_weather",
+                    step=step,
+                    status="success",
+                    result={"ok": True},
+                    error=None,
+                    duration_ms=12.0,
+                )
+
+        assert get_client.call_args_list == [call(self._SERVICE), call(self._SERVICE)]
+        assert client.post.call_count == 2
+        for stream_call in client.stream.call_args_list:
+            assert stream_call.kwargs["timeout"] == get_request_timeout()
+        client.close.assert_not_called()
+        client.__exit__.assert_not_called()
+
+    def test_report_oe_result_retries_when_shared_client_closed(self) -> None:
+        """A closed shared client mid-settlement is retried on the rebuilt client
+        instead of aborting the acknowledgement loop."""
+        from agent_engine_runner_shared.secure_wrapper import report_oe_result
+
+        request = httpx.Request("POST", f"{self._SERVICE}/tool/result")
+        accepted = httpx.Response(200, request=request)
+
+        closed = MagicMock()
+        closed.is_closed = True
+        closed.stream.side_effect = RuntimeError(
+            "Cannot send a request, as the client has been closed."
+        )
+        rebuilt = MagicMock()
+        rebuilt.is_closed = False
+        self._wire_stream_to_post(rebuilt)
+        rebuilt.post.return_value = accepted
+
+        with patch(
+            "agent_engine_runner_shared.secure_wrapper.get_shared_client"
+        ) as mock_get_client:
+            mock_get_client.side_effect = [closed, rebuilt]
+            report_oe_result(
+                oe_url=self._SERVICE,
+                execution_id="exec-123",
+                tool_name="get_weather",
+                step=1,
+                status="success",
+                result={"ok": True},
+                error=None,
+                duration_ms=12.0,
+            )
+
+        rebuilt.post.assert_called_once()
+        assert mock_get_client.call_count == 2
+
     def test_report_oe_result_falls_back_to_service_on_owner_transport_error(self) -> None:
         from agent_engine_runner_shared.secure_wrapper import report_oe_result
 
@@ -1802,10 +1987,8 @@ class TestSecureToolWrapper:
                 raise httpx.ConnectError("owner replica refused")
             return httpx.Response(200, request=request)
 
-        with patch(
-            "agent_engine_runner_shared.secure_wrapper.create_httpx_client_with_tls"
-        ) as create_client:
-            client = create_client.return_value.__enter__.return_value
+        with patch("agent_engine_runner_shared.secure_wrapper.get_shared_client") as create_client:
+            client = create_client.return_value
             self._wire_stream_to_post(client)
             client.post.side_effect = side_effect
             with patch("agent_engine_runner_shared.secure_wrapper.time.sleep"):
@@ -1833,12 +2016,12 @@ class TestSecureToolWrapper:
 
         request = httpx.Request("POST", f"{self._SERVICE}/tool/result")
         service_cm = MagicMock()
-        service_client = service_cm.__enter__.return_value
+        service_client = service_cm
         self._wire_stream_to_post(service_client)
         service_client.post.return_value = httpx.Response(200, request=request)
 
         with patch(
-            "agent_engine_runner_shared.secure_wrapper.create_httpx_client_with_tls",
+            "agent_engine_runner_shared.secure_wrapper.get_shared_client",
             side_effect=[RuntimeError("owner tls unavailable"), service_cm],
         ) as create_client:
             report_oe_result(
@@ -1870,10 +2053,8 @@ class TestSecureToolWrapper:
                 return httpx.Response(500, request=owner_req)
             return httpx.Response(200, request=service_req)
 
-        with patch(
-            "agent_engine_runner_shared.secure_wrapper.create_httpx_client_with_tls"
-        ) as create_client:
-            client = create_client.return_value.__enter__.return_value
+        with patch("agent_engine_runner_shared.secure_wrapper.get_shared_client") as create_client:
+            client = create_client.return_value
             self._wire_stream_to_post(client)
             client.post.side_effect = side_effect
             with patch("agent_engine_runner_shared.secure_wrapper.time.sleep"):
@@ -1909,10 +2090,8 @@ class TestSecureToolWrapper:
                 raise httpx.ConnectError("owner replica refused")
             return service_actions.pop(0)
 
-        with patch(
-            "agent_engine_runner_shared.secure_wrapper.create_httpx_client_with_tls"
-        ) as create_client:
-            client = create_client.return_value.__enter__.return_value
+        with patch("agent_engine_runner_shared.secure_wrapper.get_shared_client") as create_client:
+            client = create_client.return_value
             self._wire_stream_to_post(client)
             client.post.side_effect = side_effect
             with patch("agent_engine_runner_shared.secure_wrapper.time.sleep"):
@@ -1942,10 +2121,8 @@ class TestSecureToolWrapper:
         from agent_engine_runner_shared.secure_wrapper import report_oe_result
 
         request = httpx.Request("POST", f"{self._SERVICE}/tool/result")
-        with patch(
-            "agent_engine_runner_shared.secure_wrapper.create_httpx_client_with_tls"
-        ) as create_client:
-            client = create_client.return_value.__enter__.return_value
+        with patch("agent_engine_runner_shared.secure_wrapper.get_shared_client") as create_client:
+            client = create_client.return_value
             self._wire_stream_to_post(client)
             client.post.return_value = httpx.Response(200, request=request)
             report_oe_result(
@@ -1969,10 +2146,8 @@ class TestSecureToolWrapper:
         request = httpx.Request("POST", f"{self._SERVICE}/tool/result")
         unavailable = httpx.Response(503, headers={"Retry-After": "999"}, request=request)
         accepted = httpx.Response(200, request=request)
-        with patch(
-            "agent_engine_runner_shared.secure_wrapper.create_httpx_client_with_tls"
-        ) as create_client:
-            client = create_client.return_value.__enter__.return_value
+        with patch("agent_engine_runner_shared.secure_wrapper.get_shared_client") as create_client:
+            client = create_client.return_value
             self._wire_stream_to_post(client)
             client.post.side_effect = [unavailable, accepted]
             with patch("agent_engine_runner_shared.secure_wrapper.time.sleep") as sleep_mock:
@@ -2455,9 +2630,9 @@ class TestToolCallDeadlineReporting:
         )
 
         with patch(
-            "agent_engine_runner_shared.secure_wrapper.create_httpx_client_with_tls"
+            "agent_engine_runner_shared.secure_wrapper.get_shared_client"
         ) as mock_client_cls:
-            mock_client = mock_client_cls.return_value.__enter__.return_value
+            mock_client = mock_client_cls.return_value
             mock_client.post.side_effect = httpx.ReadTimeout("read timed out")
 
             with pytest.raises(ToolCallTimeoutError) as exc_info:
@@ -2494,9 +2669,9 @@ class TestToolCallDeadlineReporting:
         )
 
         with patch(
-            "agent_engine_runner_shared.secure_wrapper.create_httpx_client_with_tls"
+            "agent_engine_runner_shared.secure_wrapper.get_shared_client"
         ) as mock_client_cls:
-            mock_client = mock_client_cls.return_value.__enter__.return_value
+            mock_client = mock_client_cls.return_value
             mock_client.post.side_effect = exc
 
             with pytest.raises(PolicyDeniedException) as exc_info:
@@ -2517,9 +2692,9 @@ class TestToolCallDeadlineReporting:
         )
 
         with patch(
-            "agent_engine_runner_shared.secure_wrapper.create_httpx_client_with_tls"
+            "agent_engine_runner_shared.secure_wrapper.get_shared_client"
         ) as mock_client_cls:
-            mock_client = mock_client_cls.return_value.__enter__.return_value
+            mock_client = mock_client_cls.return_value
             mock_client.post.side_effect = httpx.ConnectError("connection refused")
 
             with pytest.raises(PolicyDeniedException, match="OE unreachable"):
@@ -2536,12 +2711,8 @@ class TestToolCallDeadlineReporting:
         from agent_engine_runner_shared.secure_wrapper import request_oe_approval
         from agent_engine_runner_shared.utils import TOOL_READ_TIMEOUT
 
-        with patch(
-            "agent_engine_runner_shared.secure_wrapper.create_httpx_client_with_tls"
-        ) as mock_factory:
-            mock_factory.return_value.__enter__.return_value.post.side_effect = httpx.ConnectError(
-                "stop here"
-            )
+        with patch("agent_engine_runner_shared.secure_wrapper.get_shared_client") as mock_factory:
+            mock_factory.return_value.post.side_effect = httpx.ConnectError("stop here")
             with pytest.raises(Exception):
                 request_oe_approval(
                     oe_url="http://localhost:8080",
@@ -2551,7 +2722,8 @@ class TestToolCallDeadlineReporting:
                     step=1,
                 )
 
-        timeout = mock_factory.call_args[0][1]
+        mock_factory.assert_called_once_with("http://localhost:8080")
+        timeout = mock_factory.return_value.post.call_args.kwargs["timeout"]
         assert isinstance(timeout, httpx.Timeout)
         assert timeout.read == TOOL_READ_TIMEOUT
 
@@ -2640,6 +2812,69 @@ class TestDurableTimeoutOutcome:
         assert replayed.value.tool_name == live.value.tool_name
         assert replayed.value.timeout_seconds == live.value.timeout_seconds
         assert replayed.value.elapsed_seconds == live.value.elapsed_seconds
+
+    def test_platform_failure_preserves_its_type_live_and_on_replay(self) -> None:
+        from agent_engine_runner_shared.generated.workflow.v1.common_pb2 import (
+            WORKFLOW_ERROR_CODE_OUTCOME_UNKNOWN,
+            WorkflowIdentity,
+        )
+        from agent_engine_runner_shared.generated.workflow.v1.runtime_pb2 import AttemptContext
+        from agent_engine_runner_shared.secure_wrapper import (
+            SecureToolWrapper,
+            ToolPlatformError,
+        )
+        from agent_engine_runner_shared.workflow import (
+            ReplayedActivityFailedError,
+            attempt_context_scope,
+        )
+
+        # The tool ran, but OE never acknowledged its result: adapters must be
+        # able to keep this away from the model on replay too.
+        wrapper = SecureToolWrapper(oe_url="http://localhost:8080", execution_id="exec-123")
+        unacknowledged = ToolPlatformError("OE did not acknowledge tool result settlement")
+        attempt = AttemptContext(
+            attempt_id="attempt-1",
+            fencing_token=1,
+            owner_id="aer-1",
+            workflow_identity=WorkflowIdentity(
+                session_id="session-1",
+                execution_id="exec-123",
+            ),
+        )
+        recorded_failures: list[str] = []
+
+        def fake_run_serial_activity(*, execute, **_kwargs):
+            try:
+                return execute(None)
+            except Exception as error:
+                recorded_failures.append(str(error))
+                raise
+
+        with attempt_context_scope(attempt):
+            with (
+                patch.object(wrapper, "_execute_tool_native", side_effect=unacknowledged),
+                patch(
+                    "agent_engine_runner_shared.secure_wrapper.run_serial_activity",
+                    side_effect=fake_run_serial_activity,
+                ),
+                pytest.raises(ToolPlatformError) as live,
+            ):
+                wrapper.execute_tool(tool_name="refund_order", arguments={})
+
+        with attempt_context_scope(attempt):
+            with (
+                patch(
+                    "agent_engine_runner_shared.secure_wrapper.run_serial_activity",
+                    side_effect=ReplayedActivityFailedError(
+                        WORKFLOW_ERROR_CODE_OUTCOME_UNKNOWN,
+                        recorded_failures[0],
+                    ),
+                ),
+                pytest.raises(ToolPlatformError) as replayed,
+            ):
+                wrapper.execute_tool(tool_name="refund_order", arguments={})
+
+        assert live.value.error == replayed.value.error == unacknowledged.error
 
     @pytest.mark.parametrize(
         ("failure", "expected_message"),
@@ -2929,6 +3164,58 @@ class TestDurableTimeoutOutcome:
         assert execute_native.call_args.kwargs["tool_call_id"] == "call-1"
         assert execute_native.call_args.kwargs["is_local"] is True
         assert execute_native.call_args.kwargs["local_executor"]() == "must-not-run"
+
+    @pytest.mark.parametrize("policy", ["fail", "rerun"])
+    def test_durable_tool_sends_its_declared_unknown_outcome_policy(self, policy: str) -> None:
+        from agent_engine_runner_shared.context import current_wrapper
+        from agent_engine_runner_shared.generated.workflow.v1.common_pb2 import WorkflowIdentity
+        from agent_engine_runner_shared.generated.workflow.v1.runtime_pb2 import AttemptContext
+        from agent_engine_runner_shared.secure_wrapper import (
+            SecureToolWrapper,
+            create_secure_tool_function,
+        )
+        from agent_engine_runner_shared.workflow import attempt_context_scope
+
+        def lookup_policy(policy_id: str) -> str:
+            return policy_id
+
+        secure = create_secure_tool_function(
+            original_tool=lookup_policy,
+            tool_name="lookup_policy",
+            on_unknown_outcome=policy,
+        )
+        wrapper = SecureToolWrapper("http://localhost:8080", "exec-123")
+        attempt = AttemptContext(
+            attempt_id="attempt-1",
+            fencing_token=1,
+            owner_id="aer-1",
+            workflow_identity=WorkflowIdentity(session_id="session-1", execution_id="exec-123"),
+        )
+
+        token = current_wrapper.set(wrapper)
+        try:
+            with (
+                attempt_context_scope(attempt),
+                patch(
+                    "agent_engine_runner_shared.secure_wrapper.run_serial_activity",
+                    return_value="POL-1",
+                ) as run_activity,
+            ):
+                secure(policy_id="POL-1")
+        finally:
+            current_wrapper.reset(token)
+
+        assert run_activity.call_args.kwargs["on_unknown_outcome"] == policy
+
+    def test_wrapping_a_tool_rejects_an_unknown_outcome_policy_it_does_not_know(self) -> None:
+        from agent_engine_runner_shared.secure_wrapper import create_secure_tool_function
+
+        with pytest.raises(ValueError, match="on_unknown_outcome"):
+            create_secure_tool_function(
+                original_tool=lambda: None,
+                tool_name="lookup_policy",
+                on_unknown_outcome="retry",
+            )
 
     def test_durable_framework_control_flow_leaves_the_tool_started(self) -> None:
         from agent_engine_runner_shared.generated.workflow.v1.activity_pb2 import ActivityContext
@@ -3618,6 +3905,7 @@ class TestExternalAPICallError:
             ExternalAPICallError,
             SecureToolWrapper,
             ToolExecutionError,
+            ToolPlatformError,
         )
 
         wrapper = SecureToolWrapper(oe_url="http://localhost:8080", execution_id="exec-123")
@@ -3634,3 +3922,5 @@ class TestExternalAPICallError:
                 wrapper.execute_tool("demo_tool", {"value": 1})
 
         assert not isinstance(exc_info.value, ExternalAPICallError)
+        # The tool's own failure, recorded by OE, is not a platform failure.
+        assert not isinstance(exc_info.value, ToolPlatformError)

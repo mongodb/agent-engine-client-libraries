@@ -31,6 +31,7 @@ import {
   type SessionSummary,
 } from "@mongodb-js/agent-engine-sdk";
 import { getLogger } from "@mongodb-js/agent-engine-runner-shared";
+import { cancelledOpenerIdsFromMetadata } from "./cancelled_turn.js";
 import {
   sessionIdFromThreadId,
   threadIdsForQuery,
@@ -59,7 +60,18 @@ const MAX_CHECKPOINTS_PER_SESSION = 500;
 // Time budgets on the read paths so a slow / hung MongoDB fails the request
 // fast instead of pinning it.
 const AGGREGATION_TIMEOUT_MS = 15_000;
-const MESSAGE_READ_TIMEOUT_MS = 20_000;
+
+// The OE bounds its session-messages proxy at 10s, so the whole AER read —
+// message window plus cancelled-turn classification — must finish inside that
+// budget with room left for message conversion, serialization, and transport.
+// The cancelled-turn lookup takes only what remains after the message read
+// rather than adding a second full upstream timeout.
+const SESSION_READ_BUDGET_MS = 8_000;
+const CANCELLED_TURN_READ_BUDGET_MS = 3_000;
+
+// Cap on the cancelled turns the lookup resolves. Markers are one per cancelled
+// turn, so this bounds cancelled turns, not checkpoints.
+const MAX_CANCELLED_TURNS_PER_SESSION = 1000;
 
 // Cap on how many per-session checkpoint scans the summaries path runs at
 // once. A sessions-list request can name hundreds of sessions; without a bound
@@ -80,6 +92,10 @@ const ROLE_MAP: Record<string, string> = {
   function: "tool",
 };
 
+// Platform-owned outcome the reader stamps on a cancelled turn's opener.
+// Mirrors the OE's `outcome` vocabulary on the session-messages wire.
+const MESSAGE_OUTCOME_CANCELLED = "cancelled";
+
 /** Minimal structural view of a CheckpointTuple from `MongoDBSaver.list()`. */
 interface CheckpointTupleLike {
   checkpoint?: unknown;
@@ -91,6 +107,10 @@ export interface LangGraphQueryPluginParams {
   dbName: string;
   workspaceId?: string;
   workspaceIdResolver?: () => string | null | undefined;
+  /** Whole session-messages read budget in ms. Defaults to SESSION_READ_BUDGET_MS. */
+  sessionReadBudgetMs?: number;
+  /** Cancelled-turn lookup budget in ms. Defaults to CANCELLED_TURN_READ_BUDGET_MS. */
+  cancelledTurnReadBudgetMs?: number;
 }
 
 /** AERQueryPlugin backed by LangGraph's MongoDBSaver. */
@@ -102,6 +122,8 @@ export class LangGraphQueryPlugin {
   private readonly workspaceIdResolver:
     | (() => string | null | undefined)
     | undefined;
+  private readonly sessionReadBudgetMs: number;
+  private readonly cancelledTurnReadBudgetMs: number;
 
   constructor(params: LangGraphQueryPluginParams) {
     this.saver = params.saver;
@@ -114,6 +136,10 @@ export class LangGraphQueryPlugin {
     );
     this.workspaceId = params.workspaceId ?? "";
     this.workspaceIdResolver = params.workspaceIdResolver;
+    this.sessionReadBudgetMs =
+      params.sessionReadBudgetMs ?? SESSION_READ_BUDGET_MS;
+    this.cancelledTurnReadBudgetMs =
+      params.cancelledTurnReadBudgetMs ?? CANCELLED_TURN_READ_BUDGET_MS;
   }
 
   /**
@@ -153,12 +179,20 @@ export class LangGraphQueryPlugin {
   async getMessagesForSession(
     sessionId: string,
   ): Promise<SessionMessagesResponse> {
-    const authoritative = await this.loadAuthoritativeMessages(sessionId);
+    const deadline = Date.now() + this.sessionReadBudgetMs;
+    const authoritative = await this.loadAuthoritativeMessages(
+      sessionId,
+      deadline,
+    );
     if (authoritative === null) {
-      return { messages: [] };
+      return { messages: [], outcome_supported: true };
     }
 
     const { messages, firstAppearanceByIndex } = authoritative;
+    const cancelledOpeners = await this.cancelledTurnMessageIds(
+      sessionId,
+      deadline,
+    );
     return {
       messages: messages.map((message, messageIndex) =>
         toSessionMessage({
@@ -166,9 +200,109 @@ export class LangGraphQueryPlugin {
           sessionId,
           messageIndex,
           timestamp: firstAppearanceByIndex.get(messageIndex) ?? "",
+          cancelledOpeners,
         }),
       ),
+      outcome_supported: true,
     };
+  }
+
+  /**
+   * Message ids the platform recorded as a cancelled turn's opener.
+   *
+   * Resolved with a dedicated, thread-scoped lookup of the checkpoint metadata,
+   * so a stopped turn's classification does not expire when its marker
+   * checkpoint falls outside the bounded message window. Reads the marker's
+   * singular opener id and the plural set a fork carries onto its copied tip.
+   * Never reads a message kwarg an agent could author.
+   *
+   * The JS `MongoDBSaver` stores `metadata` as a single serialized blob, so its
+   * `list(filter=...)` cannot select on `metadata.<key>`; the metadata has to be
+   * decoded per checkpoint. The scan is bounded by a database-side `maxTimeMS`
+   * and closes its cursor on exit, so an expired read stops its work instead of
+   * leaving a whole-thread traversal running. A failed lookup degrades to "no
+   * stopped turns" rather than failing the whole read.
+   */
+  private async cancelledTurnMessageIds(
+    sessionId: string,
+    deadline: number,
+  ): Promise<Set<string>> {
+    const messageIds = new Set<string>();
+    const budgetMs = Math.min(
+      this.cancelledTurnReadBudgetMs,
+      deadline - Date.now(),
+    );
+    if (budgetMs <= 0) return messageIds;
+    const threadIds = threadIdsForQuery(sessionId, this.effectiveWorkspaceId());
+    try {
+      await this.collectCancelledTurnMessageIds(
+        threadIds,
+        messageIds,
+        budgetMs,
+      );
+    } catch (exc) {
+      logger.warn(
+        `cancelled-turn lookup failed for session ${sessionId}; stopped ` +
+          `openers may render unmarked: ${String(exc)}`,
+      );
+    }
+    return messageIds;
+  }
+
+  private async collectCancelledTurnMessageIds(
+    threadIds: string[],
+    messageIds: Set<string>,
+    budgetMs: number,
+  ): Promise<void> {
+    // One absolute client-side deadline for the whole lookup, covering every
+    // scoped thread query. Aborting the signal interrupts a pending socket read
+    // and rejects the cursor's next(), so an expired lookup stops its work and
+    // releases the cursor instead of leaving a stalled traversal running — a
+    // race that merely abandons the traversal would not. maxTimeMS still bounds
+    // the server side, and the marker cap stops a pathological thread early.
+    const controller = new AbortController();
+    const timer = setTimeout(
+      () => controller.abort(new Error("cancelled-turn lookup budget expired")),
+      budgetMs,
+    );
+    try {
+      for (const threadId of threadIds) {
+        const cursor = this.checkpointsCollection.find(
+          { thread_id: threadId },
+          {
+            projection: { type: 1, metadata: 1 },
+            maxTimeMS: budgetMs,
+            signal: controller.signal,
+          },
+        );
+        try {
+          for await (const doc of cursor) {
+            const metadata = await this.decodeCheckpointMetadata(doc);
+            for (const openerId of cancelledOpenerIdsFromMetadata(metadata)) {
+              messageIds.add(openerId);
+            }
+            if (messageIds.size >= MAX_CANCELLED_TURNS_PER_SESSION) return;
+          }
+        } finally {
+          await cursor.close().catch(() => undefined);
+        }
+      }
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  private async decodeCheckpointMetadata(doc: Document): Promise<unknown> {
+    const serdeTypeTag = doc["type"];
+    const serdeData = toSerdeData(doc["metadata"]);
+    if (typeof serdeTypeTag !== "string" || serdeTypeTag === "") return null;
+    if (serdeData === null) return null;
+    try {
+      return await this.saver.serde.loadsTyped(serdeTypeTag, serdeData);
+    } catch (exc) {
+      logger.warn(`checkpoint metadata decode failed: ${String(exc)}`);
+      return null;
+    }
   }
 
   /**
@@ -181,7 +315,10 @@ export class LangGraphQueryPlugin {
    * from this so the two always agree — `message_count` reports the
    * number of messages, not the number of checkpoints.
    */
-  private async loadAuthoritativeMessages(sessionId: string): Promise<{
+  private async loadAuthoritativeMessages(
+    sessionId: string,
+    deadline: number,
+  ): Promise<{
     messages: unknown[];
     firstAppearanceByIndex: Map<number, string>;
   } | null> {
@@ -190,8 +327,10 @@ export class LangGraphQueryPlugin {
     // the messages endpoint it surfaces as a 500; `collectMessageCounts`
     // downgrades it per session so one bad session can't fail a whole list.
     const threadIds = threadIdsForQuery(sessionId, this.effectiveWorkspaceId());
-    const checkpointsNewestFirst =
-      await this.collectCheckpointsForThreadIds(threadIds);
+    const checkpointsNewestFirst = await this.collectCheckpointsForThreadIds(
+      threadIds,
+      deadline,
+    );
 
     // The most recent checkpoint with a usable `messages` list is the
     // authoritative message list.
@@ -228,11 +367,13 @@ export class LangGraphQueryPlugin {
    */
   private async collectCheckpointsForThreadIds(
     threadIds: string[],
+    deadline: number,
   ): Promise<CheckpointTupleLike[]> {
+    const remainingMs = Math.max(1, deadline - Date.now());
     return withDeadline(
       this.streamCheckpointsForThreadIds(threadIds),
-      MESSAGE_READ_TIMEOUT_MS,
-      `session message read timed out after ${MESSAGE_READ_TIMEOUT_MS}ms`,
+      remainingMs,
+      `session message read timed out after ${remainingMs}ms`,
     );
   }
 
@@ -341,9 +482,12 @@ export class LangGraphQueryPlugin {
       );
       await Promise.all(
         chunk.map(async (sessionId) => {
+          const deadline = Date.now() + this.sessionReadBudgetMs;
           try {
-            const authoritative =
-              await this.loadAuthoritativeMessages(sessionId);
+            const authoritative = await this.loadAuthoritativeMessages(
+              sessionId,
+              deadline,
+            );
             counts.set(sessionId, authoritative?.messages.length ?? 0);
             const preview = firstHumanMessagePreview(
               authoritative?.messages ?? [],
@@ -709,6 +853,7 @@ function toSessionMessage(args: {
   sessionId: string;
   messageIndex: number;
   timestamp: string;
+  cancelledOpeners: Set<string>;
 }): SessionMessage {
   const candidate =
     args.message !== null && typeof args.message === "object"
@@ -726,6 +871,11 @@ function toSessionMessage(args: {
       ? candidate.id
       : `msg-${args.sessionId}-${args.messageIndex}`;
   const kwargs = jsonSafeMetadata(candidate.additional_kwargs);
+  // The stopped classification is platform-owned: it comes from the
+  // cancelled-turn checkpoint metadata, never from an agent-authorable kwarg.
+  const outcome = args.cancelledOpeners.has(messageId)
+    ? MESSAGE_OUTCOME_CANCELLED
+    : "";
   return {
     id: messageId,
     role,
@@ -735,6 +885,7 @@ function toSessionMessage(args: {
     name,
     tool_calls: toolCalls(args.message),
     tool_call_id: toolCallId(args.message),
+    outcome,
     additional_kwargs: kwargs,
   };
 }

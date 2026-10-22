@@ -486,32 +486,19 @@ class TestPlatformCheckpointerRouting:
             "current"
         ]
 
-    def test_durable_send_write_is_rejected(self) -> None:
-        saver = PlatformCheckpointer(native=InMemorySaver())
-
-        with attempt_context_scope(_attempt()):
-            with pytest.raises(UnsupportedDurableGraphError, match="Send"):
-                saver.put_writes(
-                    _config("ignored"),
-                    [("__pregel_tasks", [Send("research", {"query": "alpha"})])],
-                    "producer-task",
-                )
-
-    def test_durable_send_graph_is_rejected_before_child_starts(
+    def test_durable_send_graph_runs_its_worker(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         saver = PlatformCheckpointer(native=InMemorySaver())
-        monkeypatch.setattr(saver, "_finalize_step_sync", MagicMock())
-        child_started = False
+        finalize = MagicMock()
+        monkeypatch.setattr(saver, "_finalize_step_sync", finalize)
 
         def dispatch(state: _GraphState) -> list[Send]:
             return [Send("child", state)]
 
         def child(state: _GraphState) -> _GraphState:
-            nonlocal child_started
-            child_started = True
-            return state
+            return {"value": f"{state['value']} researched"}
 
         graph: StateGraph[Any] = StateGraph(_GraphState)
         graph.add_node("child", child)
@@ -520,45 +507,30 @@ class TestPlatformCheckpointerRouting:
         compiled = graph.compile(checkpointer=saver)
 
         with attempt_context_scope(_attempt()):
-            with pytest.raises(UnsupportedDurableGraphError, match="Send"):
-                compiled.invoke(
-                    {"value": "alpha"},
-                    _config("ignored"),
-                    durability="sync",
-                )
+            result = compiled.invoke(
+                {"value": "alpha"},
+                _config("ignored"),
+                durability="sync",
+            )
 
-        assert child_started is False
-
-    @pytest.mark.anyio
-    async def test_durable_async_send_write_is_rejected(
-        self,
-    ) -> None:
-        saver = PlatformCheckpointer(native=InMemorySaver())
-
-        with attempt_context_scope(_attempt()):
-            with pytest.raises(UnsupportedDurableGraphError, match="Send"):
-                await saver.aput_writes(
-                    _config("ignored"),
-                    [("__pregel_tasks", Send("research", {"query": "alpha"}))],
-                    "producer-task",
-                )
+        assert result == {"value": "alpha researched"}
+        # The Send worker runs in its own superstep after the producer's.
+        assert finalize.call_count >= 2
 
     @pytest.mark.anyio
-    async def test_durable_async_send_graph_is_rejected_before_child_starts(
+    async def test_durable_async_send_graph_runs_its_worker(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         saver = PlatformCheckpointer(native=InMemorySaver())
-        monkeypatch.setattr(saver, "_finalize_step_async", AsyncMock())
-        child_started = False
+        finalize = AsyncMock()
+        monkeypatch.setattr(saver, "_finalize_step_async", finalize)
 
         def dispatch(state: _GraphState) -> list[Send]:
             return [Send("child", state)]
 
         async def child(state: _GraphState) -> _GraphState:
-            nonlocal child_started
-            child_started = True
-            return state
+            return {"value": f"{state['value']} researched"}
 
         graph: StateGraph[Any] = StateGraph(_GraphState)
         graph.add_node("child", child)
@@ -567,14 +539,14 @@ class TestPlatformCheckpointerRouting:
         compiled = graph.compile(checkpointer=saver)
 
         with attempt_context_scope(_attempt()):
-            with pytest.raises(UnsupportedDurableGraphError, match="Send"):
-                await compiled.ainvoke(
-                    {"value": "alpha"},
-                    _config("ignored"),
-                    durability="sync",
-                )
+            result = await compiled.ainvoke(
+                {"value": "alpha"},
+                _config("ignored"),
+                durability="sync",
+            )
 
-        assert child_started is False
+        assert result == {"value": "alpha researched"}
+        assert finalize.await_count >= 2
 
     def test_durable_update_and_fork_puts_are_rejected(self) -> None:
         saver = PlatformCheckpointer(native=InMemorySaver())
@@ -1122,6 +1094,181 @@ class TestAgentDurableLifecycle:
         )
 
     @pytest.mark.anyio
+    @pytest.mark.parametrize("method", ["invoke", "stream"])
+    async def test_send_worker_message_ids_are_distinct_on_replay(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        method: str,
+    ) -> None:
+        from langgraph.graph import MessagesState
+        from agent_engine_sdk import AgentInput
+
+        from agent_engine_sdk_langgraph import platform_checkpointer as module
+
+        client = _WorkflowClient()
+        monkeypatch.setattr(module, "AsyncWorkflowClient", lambda _: client)
+
+        class WorkerState(MessagesState):
+            topic: str
+
+        def respond(state: WorkerState) -> dict[str, Any]:
+            return {"messages": [AIMessage(content=state["topic"])]}
+
+        worker: StateGraph[Any] = StateGraph(WorkerState, output_schema=MessagesState)
+        worker.add_node("respond", respond)
+        worker.add_edge(START, "respond")
+        worker.add_edge("respond", END)
+
+        saver = PlatformCheckpointer(native=InMemorySaver())
+        builder: StateGraph[Any] = StateGraph(MessagesState)
+        builder.add_node("worker", worker.compile())
+        builder.add_conditional_edges(
+            START,
+            lambda _: [
+                Send("worker", {"messages": [], "topic": topic})
+                for topic in ("left", "right")
+            ],
+            ["worker"],
+        )
+        builder.add_edge("worker", END)
+        graph = builder.compile(checkpointer=saver)
+        # Constructed directly, as the API reference shows: the adapter
+        # installs Send task identity without an explicit resolver.
+        agent = LangGraphBaseAgent(graph)
+        ctx = RequestContext(user_id="user-1", session_id="session-1")
+
+        async def run() -> None:
+            agent_input = AgentInput(payload={"message": "hi"})
+            if method == "invoke":
+                await agent.invoke(ctx, agent_input)
+                return
+            async for _ in agent.stream(ctx, agent_input):
+                pass
+
+        url_token = current_oe_url.set("http://oe")
+        try:
+            with attempt_context_scope(_attempt()):
+                await run()
+            replay = _attempt(attempt_id="attempt-2", fencing_token=2)
+            replay.replay_mode = True
+            with attempt_context_scope(replay):
+                await run()
+        finally:
+            current_oe_url.reset(url_token)
+
+        def emitted(call_index: int) -> dict[str, str]:
+            return {
+                message.content.string_value: message.id
+                for message in client.completions[call_index].state.messages
+                if message.content.string_value in {"left", "right"}
+            }
+
+        first = emitted(0)
+        assert set(first) == {"left", "right"}
+        assert first == emitted(1)
+        assert len(set(first.values())) == 2
+
+    @pytest.mark.anyio
+    @pytest.mark.parametrize("method", ["invoke", "stream"])
+    @pytest.mark.parametrize("compiled_worker", [False, True])
+    async def test_send_round_message_ids_are_distinct_inside_a_coordinator(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        method: str,
+        compiled_worker: bool,
+    ) -> None:
+        """Two Send rounds in one root step keep every worker's message."""
+        from langgraph.graph import MessagesState
+        from agent_engine_sdk import AgentInput
+
+        from agent_engine_sdk_langgraph import platform_checkpointer as module
+
+        client = _WorkflowClient()
+        monkeypatch.setattr(module, "AsyncWorkflowClient", lambda _: client)
+
+        class WorkerState(MessagesState):
+            topic: str
+
+        class CoordinatorState(MessagesState):
+            rounds: int
+
+        def respond(state: WorkerState) -> dict[str, Any]:
+            return {"messages": [AIMessage(content=state["topic"])]}
+
+        work: Any = respond
+        if compiled_worker:
+            worker: StateGraph[Any] = StateGraph(
+                WorkerState, output_schema=MessagesState
+            )
+            worker.add_node("respond", respond)
+            worker.add_edge(START, "respond")
+            worker.add_edge("respond", END)
+            work = worker.compile()
+
+        def sends(round_number: int) -> list[Send]:
+            return [
+                Send("work", {"messages": [], "topic": f"{side}#{round_number}"})
+                for side in ("left", "right")
+            ]
+
+        coordinator: StateGraph[Any] = StateGraph(CoordinatorState)
+        coordinator.add_node("work", work)
+
+        def gather(state: CoordinatorState) -> dict[str, Any]:
+            return {"rounds": state.get("rounds", 0) + 1}
+
+        coordinator.add_node("gather", gather)
+        coordinator.add_conditional_edges(START, lambda _: sends(1), ["work"])
+        coordinator.add_edge("work", "gather")
+        coordinator.add_conditional_edges(
+            "gather",
+            lambda state: sends(2) if state["rounds"] < 2 else END,
+            ["work", END],
+        )
+        builder: StateGraph[Any] = StateGraph(MessagesState)
+        builder.add_node("coordinate", coordinator.compile())
+        builder.add_edge(START, "coordinate")
+        builder.add_edge("coordinate", END)
+        graph = builder.compile(
+            checkpointer=PlatformCheckpointer(native=InMemorySaver())
+        )
+        agent = LangGraphBaseAgent(graph)
+        ctx = RequestContext(user_id="user-1", session_id="session-1")
+
+        async def run() -> None:
+            agent_input = AgentInput(payload={"message": "hi"})
+            if method == "invoke":
+                await agent.invoke(ctx, agent_input)
+                return
+            async for _ in agent.stream(ctx, agent_input):
+                pass
+
+        url_token = current_oe_url.set("http://oe")
+        try:
+            with attempt_context_scope(_attempt()):
+                await run()
+            replay = _attempt(attempt_id="attempt-2", fencing_token=2)
+            replay.replay_mode = True
+            with attempt_context_scope(replay):
+                await run()
+        finally:
+            current_oe_url.reset(url_token)
+
+        topics = {"left#1", "right#1", "left#2", "right#2"}
+
+        def emitted(call_index: int) -> dict[str, str]:
+            return {
+                message.content.string_value: message.id
+                for message in client.completions[call_index].state.messages
+                if message.content.string_value in topics
+            }
+
+        first = emitted(0)
+        assert set(first) == topics
+        assert first == emitted(1)
+        assert len(set(first.values())) == 4
+
+    @pytest.mark.anyio
     async def test_invoke_releases_the_attempt_scratch(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -1576,12 +1723,23 @@ class TestAgentDurableLifecycle:
                 )
 
             def resolve(self, activity_id: str, value: str) -> None:
+                """Retain the captured native wait contract when recording its answer."""
                 # The replacement named by the resume map re-enters the tool;
                 # later attempts replay this answer without re-entering it.
                 outcome = ActivityOutcome(
                     activity_id=activity_id,
                     outcome_kind=ACTIVITY_OUTCOME_KIND_COMPLETED,
                 )
+                # Real OE retains the original native wait contract on replay;
+                # a wait without an OAuth sibling must still return its cache.
+                entry = next(
+                    entry
+                    for commit in client.commits
+                    for entry in commit.suspensions
+                    if entry.position.SerializeToString(deterministic=True)
+                    == self.positions[activity_id]
+                )
+                outcome.suspension.CopyFrom(entry.suspension)
                 outcome.result.string_value = value
                 self.recorded[self.positions[activity_id]] = outcome
 
@@ -1969,6 +2127,7 @@ class TestAgentDurableLifecycle:
                 )
 
             def resolve(self, activity_id: str, value: str) -> None:
+                """Retain the captured native wait contract when recording its answer."""
                 # ResolveActivities runs before OE dispatches the replacement.
                 # StartActivity then replays the completed answer for the exact
                 # activity selected by the replacement request's resume map.
@@ -1978,6 +2137,14 @@ class TestAgentDurableLifecycle:
                     fencing_token=2,
                     outcome_kind=ACTIVITY_OUTCOME_KIND_COMPLETED,
                 )
+                entry = next(
+                    entry
+                    for commit in client.commits
+                    for entry in commit.suspensions
+                    if entry.position.SerializeToString(deterministic=True)
+                    == self.positions[activity_id]
+                )
+                outcome.suspension.CopyFrom(entry.suspension)
                 outcome.result.string_value = value
                 self.recorded[self.positions[activity_id]] = outcome
 

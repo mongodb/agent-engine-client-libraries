@@ -2,12 +2,24 @@ import { AIMessage, HumanMessage } from "@langchain/core/messages";
 import type { MongoDBSaver } from "@langchain/langgraph-checkpoint-mongodb";
 import type { MongoClient } from "mongodb";
 import { describe, expect, test } from "vitest";
+import {
+  CANCELLED_TURN_MESSAGE_ID_METADATA_KEY,
+  CANCELLED_TURN_MESSAGE_IDS_METADATA_KEY,
+  CANCELLED_TURN_METADATA_KEY,
+} from "../src/cancelled_turn.js";
 import { LangGraphQueryPlugin } from "../src/query.js";
+
+function emptyCursor() {
+  return {
+    [Symbol.asyncIterator]: async function* () {},
+    close: async () => {},
+  };
+}
 
 function fakeClient(): MongoClient {
   return {
     db: () => ({
-      collection: () => ({}),
+      collection: () => ({ find: () => emptyCursor() }),
     }),
   } as unknown as MongoClient;
 }
@@ -121,37 +133,124 @@ describe("LangGraphQueryPlugin", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Cancelled-turn stamps (mirror of Python test_query.py's stamp section)
+// Cancelled-turn outcome (mirror of Python test_query.py's outcome section)
 //
-// The write path stamps the turn-opening message's own additional_kwargs with
-// `cancelled_turn` (see cancelled_turn.ts). The reader never scans for marker
-// checkpoints: the stamp flows through the standard kwargs passthrough, so it
-// survives exactly as long as the message itself — independent of the bounded
-// checkpoint window.
+// The write path records the turn-opening message id in the cancelled-turn
+// checkpoint's metadata (see cancelled_turn.ts). The reader classifies a
+// message as stopped only when its id matches that metadata — never from an
+// agent-authorable message kwarg.
 // ---------------------------------------------------------------------------
 
-function plainTuple(ts: string, messages: unknown[]) {
+function plainTuple(
+  ts: string,
+  messages: unknown[],
+  metadata?: Record<string, unknown>,
+) {
   return {
     checkpoint: { ts, channel_values: { messages } },
     config: { configurable: { thread_id: "t", checkpoint_ns: "" } },
-    metadata: { source: "loop", step: 1, parents: {} },
+    metadata: { source: "loop", step: 1, parents: {}, ...metadata },
   };
 }
 
-function tupleSaver(tuples: unknown[]): MongoDBSaver {
-  return {
+/**
+ * Saver + client stubs whose checkpoint collection exposes the tuples'
+ * metadata, mirroring the blob the JS `MongoDBSaver` stores — the
+ * cancelled-turn lookup decodes it per checkpoint.
+ */
+function tupleHarness(tuples: unknown[]): {
+  saver: MongoDBSaver;
+  client: MongoClient;
+  cursorCloses: { count: number };
+} {
+  const cursorCloses = { count: 0 };
+  const saver = {
     checkpointCollectionName: "checkpoints",
     checkpointWritesCollectionName: "checkpoint_writes",
+    serde: {
+      loadsTyped: async (_type: string, data: unknown) =>
+        JSON.parse(String(data)) as unknown,
+    },
     list: async function* () {
       yield* tuples;
     },
   } as unknown as MongoDBSaver;
+  const client = {
+    db: () => ({
+      collection: () => ({
+        find: () => {
+          const docs = tuples
+            .map(
+              (tuple) =>
+                (tuple as { metadata?: Record<string, unknown> }).metadata,
+            )
+            .filter((metadata): metadata is Record<string, unknown> =>
+              Boolean(metadata),
+            )
+            .map((metadata) => ({
+              type: "json",
+              metadata: { value: () => JSON.stringify(metadata) },
+            }));
+          return {
+            [Symbol.asyncIterator]: async function* () {
+              yield* docs;
+            },
+            close: async () => {
+              cursorCloses.count += 1;
+            },
+          };
+        },
+      }),
+    }),
+  } as unknown as MongoClient;
+  return { saver, client, cursorCloses };
 }
 
-function cancelledStamps(result: {
-  messages: Array<{ additional_kwargs?: unknown }>;
+/**
+ * Client whose checkpoint cursor never yields: `next()` hangs until the lookup's
+ * abort signal fires, then rejects. Records find calls, aborts, and closes so a
+ * test can prove the lookup aborts a stalled read and releases the cursor.
+ */
+function stalledMarkerClient(record: {
+  findCalls: number;
+  aborted: number;
+  closed: number;
+}): MongoClient {
+  return {
+    db: () => ({
+      collection: () => ({
+        find: (_query: unknown, options?: { signal?: AbortSignal }) => {
+          record.findCalls += 1;
+          const signal = options?.signal;
+          return {
+            [Symbol.asyncIterator]: () => ({
+              next: () =>
+                new Promise<void>((_resolve, reject) => {
+                  const onAbort = () => {
+                    record.aborted += 1;
+                    reject(signal?.reason);
+                  };
+                  if (signal?.aborted) {
+                    onAbort();
+                    return;
+                  }
+                  signal?.addEventListener("abort", onAbort, { once: true });
+                }),
+            }),
+            close: async () => {
+              record.closed += 1;
+            },
+          };
+        },
+      }),
+    }),
+  } as unknown as MongoClient;
+}
+
+function outcomes(result: {
+  messages: Array<{ outcome?: unknown }>;
 }): unknown[] {
-  return result.messages.map((m) => m.additional_kwargs ?? null);
+  return result.messages.map((m) => m.outcome ?? "");
 }
 
 /** Saver + client stubs rich enough for the summaries path. */
@@ -199,108 +298,257 @@ function summariesHarness(args: {
   return { saver, client };
 }
 
-describe("LangGraphQueryPlugin cancelled-turn stamps", () => {
-  test("a stamped user message carries the cancelled_turn kwarg", async () => {
-    const plugin = new LangGraphQueryPlugin({
-      saver: tupleSaver([
-        plainTuple("2026-01-02T03:04:06.000Z", [
+describe("LangGraphQueryPlugin cancelled-turn outcome", () => {
+  test("a marked opener gets the cancelled outcome", async () => {
+    const { saver, client } = tupleHarness([
+      plainTuple(
+        "2026-01-02T03:04:06.000Z",
+        [
           new HumanMessage({ content: "first", id: "h1" }),
           new AIMessage({ content: "first reply", id: "a1" }),
-          new HumanMessage({
-            content: "stop this",
-            id: "h2",
-            additional_kwargs: { cancelled_turn: true },
-          }),
-        ]),
-        plainTuple("2026-01-02T03:04:05.000Z", [
-          new HumanMessage({ content: "first", id: "h1" }),
-          new AIMessage({ content: "first reply", id: "a1" }),
-        ]),
+          new HumanMessage({ content: "stop this", id: "h2" }),
+        ],
+        {
+          [CANCELLED_TURN_METADATA_KEY]: true,
+          [CANCELLED_TURN_MESSAGE_ID_METADATA_KEY]: "h2",
+        },
+      ),
+      plainTuple("2026-01-02T03:04:05.000Z", [
+        new HumanMessage({ content: "first", id: "h1" }),
+        new AIMessage({ content: "first reply", id: "a1" }),
       ]),
-      client: fakeClient(),
+    ]);
+    const plugin = new LangGraphQueryPlugin({
+      saver,
+      client,
       dbName: "unused",
     });
 
     const result = await plugin.getMessagesForSession("s1");
 
-    expect(cancelledStamps(result)).toEqual([
+    expect(outcomes(result)).toEqual(["", "", "cancelled"]);
+  });
+
+  test("a marker on an older checkpoint still classifies the opener", async () => {
+    // The marker lives on an older checkpoint in the read window, not on the
+    // tip — the reader scans the whole window, so an old cancelled turn keeps
+    // its status while later turns are served unmarked.
+    const { saver, client } = tupleHarness([
+      plainTuple("2026-01-02T03:04:07.000Z", [
+        new HumanMessage({ content: "first", id: "h1" }),
+        new AIMessage({ content: "first reply", id: "a1" }),
+        new HumanMessage({ content: "stop this", id: "h2" }),
+        new HumanMessage({ content: "try again", id: "h3" }),
+        new AIMessage({ content: "ok this time", id: "a3" }),
+      ]),
+      plainTuple(
+        "2026-01-02T03:04:06.000Z",
+        [
+          new HumanMessage({ content: "first", id: "h1" }),
+          new AIMessage({ content: "first reply", id: "a1" }),
+          new HumanMessage({ content: "stop this", id: "h2" }),
+        ],
+        {
+          [CANCELLED_TURN_METADATA_KEY]: true,
+          [CANCELLED_TURN_MESSAGE_ID_METADATA_KEY]: "h2",
+        },
+      ),
+    ]);
+    const plugin = new LangGraphQueryPlugin({
+      saver,
+      client,
+      dbName: "unused",
+    });
+
+    const result = await plugin.getMessagesForSession("s1");
+
+    expect(outcomes(result)).toEqual(["", "", "cancelled", "", ""]);
+    // The reader leaves additional_kwargs untouched.
+    expect(result.messages.map((m) => m.additional_kwargs ?? null)).toEqual([
       null,
+      null,
+      null,
+      null,
+      null,
+    ]);
+  });
+
+  test("unmarked checkpoints carry no cancelled outcome", async () => {
+    const { saver, client } = tupleHarness([
+      plainTuple("2026-01-02T03:04:05.000Z", [
+        new HumanMessage({ content: "hi", id: "h1" }),
+      ]),
+    ]);
+    const plugin = new LangGraphQueryPlugin({
+      saver,
+      client,
+      dbName: "unused",
+    });
+
+    const result = await plugin.getMessagesForSession("s1");
+
+    expect(outcomes(result)).toEqual([""]);
+  });
+
+  test("a hand-written kwarg without marker metadata does not classify", async () => {
+    // The stopped classification is platform-owned: a `cancelled_turn` entry
+    // in a message's additional_kwargs — something an agent could write —
+    // must never mark a turn cancelled on its own.
+    const { saver, client } = tupleHarness([
+      plainTuple("2026-01-02T03:04:05.000Z", [
+        new HumanMessage({ content: "first", id: "h1" }),
+        new HumanMessage({
+          content: "stop this",
+          id: "h2",
+          additional_kwargs: { cancelled_turn: true },
+        }),
+      ]),
+    ]);
+    const plugin = new LangGraphQueryPlugin({
+      saver,
+      client,
+      dbName: "unused",
+    });
+
+    const result = await plugin.getMessagesForSession("s1");
+
+    expect(outcomes(result)).toEqual(["", ""]);
+    // The kwarg still passes through verbatim — it just classifies nothing.
+    expect(result.messages.map((m) => m.additional_kwargs ?? null)).toEqual([
       null,
       { cancelled_turn: true },
     ]);
   });
 
-  test("the stamp survives beyond the checkpoint window", async () => {
-    // Only the tip is in the read window and no marker checkpoint is anywhere
-    // in reach — the stamp lives on the message, so an old cancelled turn
-    // keeps its status while its message is still served.
-    const plugin = new LangGraphQueryPlugin({
-      saver: tupleSaver([
-        plainTuple("2026-01-02T03:04:07.000Z", [
-          new HumanMessage({ content: "first", id: "h1" }),
-          new AIMessage({ content: "first reply", id: "a1" }),
-          new HumanMessage({
-            content: "stop this",
-            id: "h2",
-            additional_kwargs: { cancelled_turn: true },
-          }),
-          new HumanMessage({ content: "try again", id: "h3" }),
-          new AIMessage({ content: "ok this time", id: "a3" }),
-        ]),
+  test("a marker older than the message window still classifies", async () => {
+    // The lookup is decoupled from the 500-checkpoint message window, so a
+    // stopped turn keeps its status even when the marker checkpoint sits far
+    // outside it.
+    const fillers = Array.from({ length: 600 }, (_, index) =>
+      plainTuple("2026-01-02T03:01:00.000Z", [
+        new HumanMessage({ content: "f", id: `f${index}` }),
       ]),
-      client: fakeClient(),
-      dbName: "unused",
-    });
-
-    const result = await plugin.getMessagesForSession("s1");
-
-    expect(cancelledStamps(result)).toEqual([
-      null,
-      null,
-      { cancelled_turn: true },
-      null,
-      null,
+    );
+    const tip = plainTuple("2026-01-02T03:05:00.000Z", [
+      new HumanMessage({ content: "stop this", id: "h2" }),
+      new AIMessage({ content: "later reply", id: "a9" }),
     ]);
-  });
-
-  test("unmarked checkpoints carry no cancelled stamp", async () => {
+    const marker = plainTuple(
+      "2026-01-02T03:00:00.000Z",
+      [new HumanMessage({ content: "stop this", id: "h2" })],
+      {
+        [CANCELLED_TURN_METADATA_KEY]: true,
+        [CANCELLED_TURN_MESSAGE_ID_METADATA_KEY]: "h2",
+      },
+    );
+    const { saver, client } = tupleHarness([tip, ...fillers, marker]);
     const plugin = new LangGraphQueryPlugin({
-      saver: tupleSaver([
-        plainTuple("2026-01-02T03:04:05.000Z", [
-          new HumanMessage({ content: "hi", id: "h1" }),
-        ]),
-      ]),
-      client: fakeClient(),
+      saver,
+      client,
       dbName: "unused",
     });
 
     const result = await plugin.getMessagesForSession("s1");
 
-    expect(cancelledStamps(result)).toEqual([null]);
+    expect(outcomes(result)).toEqual(["cancelled", ""]);
   });
 
-  test("a subgraph-namespace stamp does not leak onto the served user role", async () => {
-    // The reader passes kwargs through verbatim; the user-role gating lives in
-    // the UI normalizer. A non-user message carrying the kwarg is served as-is.
+  test("carried cancelled openers from a fork classify every opener", async () => {
+    // A fork re-records the source thread's whole set of cancelled-opener ids
+    // on its copied tip, because replay rebuilds checkpoints and drops the
+    // per-turn marker metadata. The reader resolves every carried id.
+    const { saver, client } = tupleHarness([
+      plainTuple(
+        "2026-01-02T03:04:05.000Z",
+        [
+          new HumanMessage({ content: "stop one", id: "h2" }),
+          new HumanMessage({ content: "stop two", id: "h4" }),
+          new AIMessage({ content: "later", id: "a9" }),
+        ],
+        {
+          [CANCELLED_TURN_METADATA_KEY]: true,
+          [CANCELLED_TURN_MESSAGE_IDS_METADATA_KEY]: ["h2", "h4"],
+        },
+      ),
+    ]);
     const plugin = new LangGraphQueryPlugin({
-      saver: tupleSaver([
-        plainTuple("2026-01-02T03:04:05.000Z", [
-          new HumanMessage({ content: "first", id: "h1" }),
-          new AIMessage({
-            content: "reply",
-            id: "a1",
-            additional_kwargs: { cancelled_turn: true },
-          }),
-        ]),
-      ]),
-      client: fakeClient(),
+      saver,
+      client,
       dbName: "unused",
     });
 
     const result = await plugin.getMessagesForSession("s1");
 
-    expect(cancelledStamps(result)).toEqual([null, { cancelled_turn: true }]);
-    expect(result.messages[1]?.role).toBe("assistant");
+    expect(outcomes(result)).toEqual(["cancelled", "cancelled", ""]);
+  });
+
+  test("the cancelled-turn scan releases its cursor", async () => {
+    // The lookup bounds its work with a database-side maxTimeMS and closes the
+    // cursor on exit, so an expired read stops consuming the source rather than
+    // leaving a whole-thread traversal running.
+    const { saver, client, cursorCloses } = tupleHarness([
+      plainTuple("2026-01-02T03:04:05.000Z", [
+        new HumanMessage({ content: "hi", id: "h1" }),
+      ]),
+    ]);
+    const plugin = new LangGraphQueryPlugin({
+      saver,
+      client,
+      dbName: "unused",
+    });
+
+    await plugin.getMessagesForSession("s1");
+
+    expect(cursorCloses.count).toBeGreaterThan(0);
+  });
+
+  test("a stalled cancelled-turn cursor is aborted at the budget and released", async () => {
+    // The lookup runs under an absolute client-side deadline; aborting the
+    // signal interrupts the pending read and rejects the cursor, so expiry
+    // stops the work and releases the cursor rather than abandoning it.
+    const record = { findCalls: 0, aborted: 0, closed: 0 };
+    const { saver } = tupleHarness([
+      plainTuple("2026-01-02T03:04:05.000Z", [
+        new HumanMessage({ content: "stop this", id: "h2" }),
+        new AIMessage({ content: "later reply", id: "a9" }),
+      ]),
+    ]);
+    const plugin = new LangGraphQueryPlugin({
+      saver,
+      client: stalledMarkerClient(record),
+      dbName: "unused",
+      cancelledTurnReadBudgetMs: 50,
+    });
+
+    const result = await plugin.getMessagesForSession("s1");
+
+    // The transcript still returns; the stalled lookup degrades to unclassified.
+    expect(outcomes(result)).toEqual(["", ""]);
+    expect(record.aborted).toBeGreaterThan(0);
+    expect(record.closed).toBeGreaterThan(0);
+  });
+
+  test("the lookup receives only the remainder of the session budget", async () => {
+    // A message read that consumes the whole session budget leaves the lookup
+    // nothing, so it is skipped rather than adding a fresh upstream timeout.
+    const record = { findCalls: 0, aborted: 0, closed: 0 };
+    const { saver } = tupleHarness([
+      plainTuple("2026-01-02T03:04:05.000Z", [
+        new HumanMessage({ content: "hi", id: "h1" }),
+      ]),
+    ]);
+    const plugin = new LangGraphQueryPlugin({
+      saver,
+      client: stalledMarkerClient(record),
+      dbName: "unused",
+      sessionReadBudgetMs: 0,
+      cancelledTurnReadBudgetMs: 3_000,
+    });
+
+    const result = await plugin.getMessagesForSession("s1");
+
+    expect(outcomes(result)).toEqual([""]);
+    expect(record.findCalls).toBe(0);
   });
 });
 
@@ -312,11 +560,7 @@ describe("LangGraphQueryPlugin summary previews", () => {
     // count already loaded.
     const { saver, client } = summariesHarness({
       messages: [
-        new HumanMessage({
-          content: "rescued first prompt",
-          id: "h1",
-          additional_kwargs: { cancelled_turn: true },
-        }),
+        new HumanMessage({ content: "rescued first prompt", id: "h1" }),
       ],
     });
     const plugin = new LangGraphQueryPlugin({

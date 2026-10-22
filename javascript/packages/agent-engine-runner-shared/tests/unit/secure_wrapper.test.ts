@@ -38,6 +38,7 @@ vi.mock("../../src/tracing/setup.js", async (importOriginal) => {
 });
 
 import { trace } from "@opentelemetry/api";
+import { ZodError } from "zod";
 import {
   BasicTracerProvider,
   InMemorySpanExporter,
@@ -55,6 +56,7 @@ import {
   TerminalExecutionError,
   ToolCallTimeoutError,
   ToolExecutionError,
+  ToolPlatformError,
   ExternalAPICallError,
   SecureToolWrapper,
   SecureLLMProxy,
@@ -1858,6 +1860,278 @@ describe("SecureToolWrapper.executeTool", () => {
   });
 });
 
+describe("SecureToolWrapper platform failures", () => {
+  test.each([
+    [
+      "an unexpected route",
+      { proceed: true, route_to: "elsewhere" },
+      {},
+      /Unexpected OE tool route/,
+    ],
+    [
+      "an unexpected status",
+      { proceed: true, status: "pending" },
+      {},
+      /Unexpected OE tool status/,
+    ],
+    [
+      "a callback route for a remote tool",
+      { proceed: true, route_to: "callback" },
+      { isLocal: false },
+      /local callback route for a tool declared as remote/,
+    ],
+    [
+      "a callback route without a registered executor",
+      { proceed: true, route_to: "callback" },
+      {},
+      /missing its registered tool executor/,
+    ],
+    [
+      "a terminal execution rejection",
+      { proceed: false, reason: "execution already error" },
+      {},
+      TerminalExecutionError,
+    ],
+  ])("%s is a platform failure", async (_name, reply, options, expected) => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(jsonResponse(reply)));
+    const wrapper = new SecureToolWrapper("http://localhost:8080", "exec-123");
+
+    const error = await wrapper
+      .executeTool("demo_tool", {}, options)
+      .catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(ToolPlatformError);
+    if (expected instanceof RegExp) {
+      expect((error as Error).message).toMatch(expected);
+    } else {
+      expect(error).toBeInstanceOf(expected);
+    }
+  });
+
+  test("a retryable OE failure is a platform failure once retries run out", async () => {
+    const fetchSpy = vi.fn().mockImplementation(async () =>
+      jsonResponse({
+        proceed: true,
+        status: "error",
+        error: "session reservation lost; retry request",
+        retryable: true,
+      }),
+    );
+    vi.stubGlobal("fetch", fetchSpy);
+    const wrapper = new SecureToolWrapper("http://localhost:8080", "exec-123");
+
+    const error = await wrapper
+      .executeTool("demo_tool", {})
+      .catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(ToolPlatformError);
+    expect((error as Error).message).toMatch(/session reservation lost/);
+    expect(fetchSpy).toHaveBeenCalledTimes(OE_RETRYABLE_MAX_ATTEMPTS);
+  });
+
+  test("the tool's own failure is not a platform failure", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        jsonResponse({
+          proceed: true,
+          status: "error",
+          error: "tool failed",
+        }),
+      ),
+    );
+    const wrapper = new SecureToolWrapper("http://localhost:8080", "exec-123");
+
+    const error = await wrapper
+      .executeTool("demo_tool", {})
+      .catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(ToolExecutionError);
+    expect(error).not.toBeInstanceOf(ToolPlatformError);
+    expect(() => wrapper.throwIfPlatformFailed()).not.toThrow();
+  });
+
+  test("an unacknowledged result after the tool ran is latched for the execution", async () => {
+    vi.useFakeTimers();
+    const fetchSpy = vi.fn(async (input: string | URL | Request) =>
+      String(input).endsWith("/tool/execute")
+        ? jsonResponse({ proceed: true, route_to: "callback" })
+        : jsonResponse({ detail: "down" }, 500),
+    );
+    vi.stubGlobal("fetch", fetchSpy);
+    const wrapper = new SecureToolWrapper("http://localhost:8080", "exec-123");
+    const localExecutor = vi.fn(async () => "refund issued");
+
+    try {
+      const call = wrapper
+        .executeTool("issue_refund", {}, { localExecutor })
+        .catch((caught: unknown) => caught);
+      await vi.runAllTimersAsync();
+      const error = await call;
+
+      expect(localExecutor).toHaveBeenCalledOnce();
+      expect(error).toBeInstanceOf(ToolPlatformError);
+      expect((error as Error).message).toMatch(
+        /did not acknowledge tool result settlement/,
+      );
+      // Every later model call or step commit in this execution fails the
+      // same way, however the framework handled the tool's error.
+      expect(() => wrapper.throwIfPlatformFailed()).toThrow(error as Error);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("a lost settlement of the tool's own failure is a platform failure", async () => {
+    const toolFailure = new Error("refund service down");
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: string | URL | Request) =>
+        String(input).endsWith("/tool/execute")
+          ? jsonResponse({ proceed: true, route_to: "callback" })
+          : jsonResponse({ detail: "conflict" }, 409),
+      ),
+    );
+    const wrapper = new SecureToolWrapper("http://localhost:8080", "exec-123");
+
+    const error = await wrapper
+      .executeTool(
+        "issue_refund",
+        {},
+        {
+          localExecutor: async () => {
+            throw toolFailure;
+          },
+        },
+      )
+      .catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(ToolPlatformError);
+    const cause = (error as Error).cause;
+    expect(cause).toBeInstanceOf(AggregateError);
+    expect((cause as AggregateError).errors[0]).toBe(toolFailure);
+    expect(() => wrapper.throwIfPlatformFailed()).toThrow(error as Error);
+  });
+
+  test.each([
+    [
+      "a lost OE response",
+      async (): Promise<Response> => {
+        throw new TypeError("fetch failed");
+      },
+      /OE unreachable/,
+    ],
+    [
+      "an unreadable OE response",
+      async () =>
+        new Response("<html>bad gateway</html>", {
+          status: 200,
+          headers: { "Content-Type": "text/html" },
+        }),
+      /OE response unreadable/,
+    ],
+  ])(
+    "%s is a platform failure, since OE may have run the tool",
+    async (_name, reply, expected) => {
+      vi.stubGlobal("fetch", vi.fn(reply));
+      const wrapper = new SecureToolWrapper(
+        "http://localhost:8080",
+        "exec-123",
+      );
+
+      const error = await wrapper
+        .executeTool("demo_tool", {})
+        .catch((caught: unknown) => caught);
+
+      expect(error).toBeInstanceOf(ToolPlatformError);
+      expect((error as Error).message).toMatch(expected);
+      expect((error as Error).cause).toBeInstanceOf(PolicyDeniedException);
+      expect(() => wrapper.throwIfPlatformFailed()).toThrow(error as Error);
+    },
+  );
+
+  test("an OE response outside the tool contract is a platform failure, since OE may have run the tool", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(jsonResponse({})));
+    const wrapper = new SecureToolWrapper("http://localhost:8080", "exec-123");
+
+    const error = await wrapper
+      .executeTool("demo_tool", {}, { isLocal: false })
+      .catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(ToolPlatformError);
+    expect((error as Error).message).toMatch(
+      /OE tool response does not match its contract/,
+    );
+    expect((error as Error).cause).toBeInstanceOf(ZodError);
+    expect(() => wrapper.throwIfPlatformFailed()).toThrow(error as Error);
+  });
+
+  test("a transient credential failure is a platform failure, not a denial", async () => {
+    const reason =
+      "Credentials are temporarily unavailable. Retry the tool call.";
+    const fetchSpy = vi.fn().mockResolvedValue(
+      jsonResponse({
+        proceed: false,
+        reason,
+        error: reason,
+        retryable: true,
+      }),
+    );
+    vi.stubGlobal("fetch", fetchSpy);
+    const wrapper = new SecureToolWrapper("http://localhost:8080", "exec-123");
+
+    const error = await wrapper
+      .executeTool("demo_tool", {})
+      .catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(ToolPlatformError);
+    expect(error).not.toBeInstanceOf(PolicyDeniedException);
+    expect((error as Error).message).toContain(reason);
+    // OE recorded the step as failed, so the same step is not requested again.
+    expect(fetchSpy).toHaveBeenCalledOnce();
+    expect(() => wrapper.throwIfPlatformFailed()).toThrow(error as Error);
+  });
+
+  test("a denial OE does not mark retryable stays a policy denial", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        jsonResponse({
+          proceed: false,
+          reason:
+            'Credential provider "crm" is not configured for this project.',
+        }),
+      ),
+    );
+    const wrapper = new SecureToolWrapper("http://localhost:8080", "exec-123");
+
+    const error = await wrapper
+      .executeTool("demo_tool", {})
+      .catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(PolicyDeniedException);
+    expect(() => wrapper.throwIfPlatformFailed()).not.toThrow();
+  });
+
+  test("a later tool call in the execution is refused without reaching OE", async () => {
+    const fetchSpy = vi
+      .fn()
+      .mockResolvedValue(jsonResponse({ proceed: true, route_to: "first" }));
+    vi.stubGlobal("fetch", fetchSpy);
+    const wrapper = new SecureToolWrapper("http://localhost:8080", "exec-123");
+
+    const first = await wrapper
+      .executeTool("demo_tool", {})
+      .catch((caught: unknown) => caught);
+    const second = await wrapper
+      .executeTool("other_tool", {})
+      .catch((caught: unknown) => caught);
+
+    expect(second).toBe(first);
+    expect(fetchSpy).toHaveBeenCalledOnce();
+  });
+});
+
 describe("SecureToolWrapper.executeTool suspend provenance", () => {
   afterEach(() => {
     resetHooks();
@@ -1927,10 +2201,55 @@ describe("SecureToolWrapper.executeTool authorization_required elicitation", () 
     resetHooks();
   });
 
-  test("calls suspend handler and fails loudly if authorization interrupt does not halt", async () => {
-    vi.stubGlobal(
-      "fetch",
-      vi.fn().mockResolvedValue(
+  test("fails instead of running the tool when Continue resumes before consent", async () => {
+    // On a native resume interrupt() returns the Continue answer instead of
+    // pausing; OE still has no token, so it challenges again.
+    const fetchMock = vi.fn().mockResolvedValue(
+      jsonResponse({
+        proceed: false,
+        reason: "authorization required",
+        status: "suspend",
+        elicitation: {
+          elicitation_id: "elic-abc",
+          authorization_url:
+            "https://provider.example.com/oauth/authorize?state=elic-abc",
+          message: "Grant access to GitHub",
+          created: true,
+        },
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const mockInterrupt = vi.fn().mockReturnValue({ decision: "approve" });
+    registerSuspendHandler(mockInterrupt);
+
+    const wrapper = new SecureToolWrapper("http://localhost:8080", "exec-123");
+    const err = await wrapper
+      .executeTool("github_search", { query: "test" })
+      .catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(ToolExecutionError);
+    expect((err as ToolExecutionError).error).toBe(
+      "OAuth authorization is still required after continuation",
+    );
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(mockInterrupt).toHaveBeenCalledTimes(1);
+    expect(mockInterrupt).toHaveBeenCalledWith({
+      suspend_reason: "authorization_required",
+      suspend_context: {
+        authorization_url:
+          "https://provider.example.com/oauth/authorize?state=elic-abc",
+        elicitation_id: "elic-abc",
+        message: "Grant access to GitHub",
+        created: true,
+      },
+    });
+  });
+
+  test("returns the tool result when Continue resumes after consent", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
         jsonResponse({
           proceed: false,
           reason: "authorization required",
@@ -1943,28 +2262,27 @@ describe("SecureToolWrapper.executeTool authorization_required elicitation", () 
             created: true,
           },
         }),
-      ),
-    );
-
-    const mockInterrupt = vi.fn();
+      )
+      .mockResolvedValueOnce(
+        jsonResponse({
+          proceed: true,
+          status: "success",
+          result: '{"repos": ["qualification-repo"]}',
+          duration_ms: 1.0,
+        }),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+    const mockInterrupt = vi.fn().mockReturnValue({ decision: "approve" });
     registerSuspendHandler(mockInterrupt);
 
     const wrapper = new SecureToolWrapper("http://localhost:8080", "exec-123");
-    await expect(
-      wrapper.executeTool("github_search", { query: "test" }),
-    ).rejects.toThrow(/authorization_required interrupt must halt execution/);
-
-    expect(mockInterrupt).toHaveBeenCalledTimes(1);
-    expect(mockInterrupt).toHaveBeenCalledWith({
-      suspend_reason: "authorization_required",
-      suspend_context: {
-        authorization_url:
-          "https://provider.example.com/oauth/authorize?state=elic-abc",
-        elicitation_id: "elic-abc",
-        message: "Grant access to GitHub",
-        created: true,
-      },
+    const result = await wrapper.executeTool("github_search", {
+      query: "test",
     });
+
+    expect(result).toBe('{"repos": ["qualification-repo"]}');
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(mockInterrupt).toHaveBeenCalledTimes(1);
   });
 
   test("throws when elicitation received but no suspend handler registered", async () => {

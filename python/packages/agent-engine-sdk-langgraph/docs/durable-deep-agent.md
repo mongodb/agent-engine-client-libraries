@@ -107,17 +107,14 @@ LangGraph owns the packet lifecycle:
 4. LangGraph creates one ToolNode worker per packet.
 5. Worker scheduling may differ from the original ToolCall order.
 
-Graphs created by `app.deep_agent()` receive the private checkpointer policy in
+Graphs created by `app.deep_agent()` receive the checkpointer view in
 [`deep_agent_checkpointer.py`](../src/agent_engine_sdk_langgraph/deep_agent_checkpointer.py).
-It permits this framework-owned routing and then uses the normal inherited
-`put_writes` / `aput_writes`, scratch persistence, and checkpoint finalization
-behavior. There is no Atlas Agent Engine-specific `Send` activity, identity resolver, or
-replay protocol.
-
-The ordinary [`PlatformCheckpointer`](../src/agent_engine_sdk_langgraph/platform_checkpointer.py)
-continues to reject `Send` in application-authored durable graphs. The policy
-boundary is the opaque graph constructed by `app.deep_agent()`, not inspection
-of LangChain's private packet shape.
+It uses the normal `put_writes` / `aput_writes`, scratch persistence, and
+checkpoint finalization behavior; the runtime recognizes the view and does not
+give these ToolNode workers their own `Send` worker segment
+([Send workers](durable-subgraphs.md#send-workers)). Deep Agent's Tool and
+subagent paths therefore stay as described here. There is no Atlas Agent
+Engine-specific `Send` activity or replay protocol.
 
 ## Phase 2: allocate in the Tool step
 
@@ -205,11 +202,9 @@ during compiled-topology validation because the Deep Agent owns its own
 checkpointer. LangGraph's compiled-subgraph contract requires a child to inherit
 the root checkpointer instead.
 
-Application-authored LangGraph `Send` fan-out remains unsupported for durable
-workflows. Supporting arbitrary `Send` would require a public occurrence
-contract across producer order, checkpoint transition, PUSH-worker identity,
-and secure-effect admission. The private Deep Agent exception does not expose
-that framework mechanism as an application API.
+Application-authored LangGraph `Send` fan-out is supported through
+[Send workers](durable-subgraphs.md#send-workers). Deep Agent's internal
+ToolCall routing does not use those segments.
 
 ## Call-site map
 
@@ -217,7 +212,7 @@ that framework mechanism as an application API.
 | --- | --- |
 | Expose `app.deep_agent()` | [`runtime.py`](../src/agent_engine_sdk_langgraph/runtime.py) |
 | Build the Deep Agent and install durable middleware/checkpointer policy | [`deep_agent.py`](../src/agent_engine_sdk_langgraph/deep_agent.py) |
-| Permit Deep Agent's internal `Send` routing | [`deep_agent_checkpointer.py`](../src/agent_engine_sdk_langgraph/deep_agent_checkpointer.py) |
+| Mark Deep Agent graphs so their ToolNode workers keep existing paths | [`deep_agent_checkpointer.py`](../src/agent_engine_sdk_langgraph/deep_agent_checkpointer.py) |
 | Capture Phase 1 and scope Phase 2 | [`durable_deep_agent.py`](../src/agent_engine_sdk_langgraph/durable_deep_agent.py) |
 | Parse the public Deep Agent `task` call | [`deep_agent_task.py`](../src/agent_engine_sdk_langgraph/deep_agent_task.py) |
 | Persist checkpoint writes and advance the root step | [`platform_checkpointer.py`](../src/agent_engine_sdk_langgraph/platform_checkpointer.py) |

@@ -193,7 +193,7 @@ class TestMain:
         ):
             main()
 
-        assert exc_info.value.code == 1
+        assert exc_info.value.code == EXIT_STARTUP_CRASH
         import_module.assert_not_called()
         # caplog rather than capsys.err: logger.error() only lands on the
         # real stderr via logging.lastResort, which applies only when the
@@ -218,7 +218,7 @@ class TestMain:
         ):
             main()
 
-        assert exc_info.value.code == 1
+        assert exc_info.value.code == EXIT_STARTUP_CRASH
         import_module.assert_not_called()
         assert "Cannot materialize MCP OAuth credentials" in caplog.text
         assert "Launcher failed to start agent" not in caplog.text
@@ -838,7 +838,34 @@ class TestMainWritesTerminationMessage:
         ):
             main()
 
-        assert exc_info.value.code == 1
+        assert exc_info.value.code == EXIT_STARTUP_CRASH
         text = path.read_text()
         assert "Cannot materialize MCP OAuth credentials" in text
         assert "AGENTIC_MCP_OAUTH_B64_GITHUB" in text
+
+    def test_mcp_oauth_failure_catches_every_exception_type(
+        self, tmp_path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Every error from OAuth materialization reaches the fatal path.
+
+        The handler used to catch only RuntimeError/OSError, so an unexpected
+        type exited with no termination message and no classified code.
+        """
+        path = tmp_path / "termination-log"
+        monkeypatch.setattr("agent_engine_runner_shared.launcher._TERMINATION_LOG_PATH", str(path))
+        monkeypatch.setattr(
+            "agent_engine_runner_shared.launcher.setup_logging", lambda **_kwargs: None
+        )
+        monkeypatch.setenv("AGENT_ENTRYPOINT", "fake_module:start")
+
+        with (
+            patch(
+                "agent_engine_runner_shared.launcher.materialize_mcp_oauth_secret_cache",
+                side_effect=ValueError("embedded null byte"),
+            ),
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            main()
+
+        assert exc_info.value.code == EXIT_STARTUP_CRASH
+        assert "Cannot materialize MCP OAuth credentials" in path.read_text()

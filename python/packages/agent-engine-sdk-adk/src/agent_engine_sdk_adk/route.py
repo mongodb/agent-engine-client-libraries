@@ -34,11 +34,13 @@ No configured-topology inference or synthetic runtime identity is required.
 
 from __future__ import annotations
 
-from collections.abc import AsyncGenerator, Generator, Sequence
+import inspect
+from collections.abc import AsyncGenerator, Generator, Iterable, Sequence
 from contextlib import aclosing, contextmanager
 from contextvars import ContextVar
 from functools import wraps
 from importlib import import_module
+from types import ModuleType
 from typing import TYPE_CHECKING, Any, cast
 
 from agent_engine_runner_shared.workflow import (
@@ -46,6 +48,8 @@ from agent_engine_runner_shared.workflow import (
     operation_path_resolver_scope,
     preallocate_child_operation_ordinals,
 )
+from agent_engine_sdk_adk.adk_compat import unsupported_adk_feature
+from agent_engine_sdk_adk.adk_workarounds import install_adk_workarounds
 from agent_engine_sdk_adk.agent_route import AgentRouteAdapter
 from agent_engine_sdk_adk.errors import UnsupportedDurableADKError
 
@@ -78,7 +82,6 @@ _CURRENT_PARALLEL_WORKER_RUN_IDS: ContextVar[
 _BASE_NODE_RUN_WRAPPER_ATTRIBUTE = "_agent_engine_durable_run_wrapper_installed"
 _PARALLEL_WORKER_RUN_WRAPPER_ATTRIBUTE = "_durable_parallel_worker_wrapper_installed"
 _RUN_NODE_GUARD_ATTRIBUTE = "_agent_engine_durable_run_node_guard_installed"
-_WORKFLOW_REPLAY_WRAPPER_ATTRIBUTE = "_agent_engine_durable_replay_wrapper_installed"
 _CONFIGURED_NODE_PROVENANCE_ATTRIBUTE = "_agent_engine_durable_node_provenance"
 
 
@@ -177,6 +180,61 @@ def configured_adk_nodes(root: BaseNode) -> tuple[BaseNode, ...]:
 
     visit(root)
     return tuple(configured)
+
+
+def _is_parallel_worker(node: object) -> bool:
+    """Recognize a parallel worker without importing ADK's private module.
+
+    The public field marks a node configured with ``parallel_worker=True``;
+    ``node(..., parallel_worker=True)`` returns ADK's wrapper directly.
+    """
+    return (
+        getattr(node, "parallel_worker", False) is True
+        or type(node).__name__ == "_ParallelWorker"
+    )
+
+
+def _unsupported_parallel_workers() -> UnsupportedDurableADKError:
+    return unsupported_adk_feature(
+        "parallel_worker nodes",
+        alternative="replace parallel_worker with parallel Workflow branches",
+    )
+
+
+def _parallel_worker_module() -> ModuleType:
+    try:
+        return import_module("google.adk.workflow._parallel_worker")
+    except ImportError as error:
+        raise _unsupported_parallel_workers() from error
+
+
+def parallel_worker_templates(nodes: Iterable[BaseNode]) -> tuple[BaseNode, ...]:
+    """Return the node each configured parallel worker runs once per item.
+
+    ADK exposes a worker's template only through its private
+    ``_ParallelWorker``, so only applications that configure parallel workers
+    reach it. If ADK reshaped it, those applications are refused before they
+    run with ``UnsupportedDurableADKError``; others never import it.
+    """
+    workers = [node for node in nodes if _is_parallel_worker(node)]
+    if not workers:
+        return ()
+
+    from google.adk.workflow import BaseNode as ADKNode
+
+    worker_type = getattr(_parallel_worker_module(), "_ParallelWorker", None)
+    if not isinstance(worker_type, type):
+        raise _unsupported_parallel_workers()
+    templates: dict[int, BaseNode] = {}
+    for node in workers:
+        worker = node
+        if not isinstance(node, worker_type):
+            worker = getattr(node, "_inner_node", None)
+        template = getattr(worker, "_node", None)
+        if not isinstance(worker, worker_type) or not isinstance(template, ADKNode):
+            raise _unsupported_parallel_workers()
+        templates[id(template)] = template
+    return tuple(templates.values())
 
 
 def _set_configured_node_provenance(
@@ -281,7 +339,7 @@ def _install_context_run_node_guard() -> None:
             and (
                 adapter is None
                 or not adapter._allows_configured_run_node(
-                    getattr(context, "_node_path", ""), target_node
+                    getattr(context, "node_path", ""), target_node
                 )
             )
         ):
@@ -295,69 +353,9 @@ def _install_context_run_node_guard() -> None:
     setattr(ADKContext, _RUN_NODE_GUARD_ATTRIBUTE, True)
 
 
-def _install_workflow_replay_wrapper() -> None:
-    """Keep replayed configured transfers inside ADK's transfer loop."""
-    from google.adk.workflow.utils._replay_interceptor import InterceptionResult
-
-    adk_workflow = import_module("google.adk.workflow._workflow")
-    if not getattr(adk_workflow, _WORKFLOW_REPLAY_WRAPPER_ATTRIBUTE, False):
-        original_workflow_interception = adk_workflow.check_interception
-
-        @wraps(original_workflow_interception)
-        def check_configured_transfer(*, node: BaseNode, recovered: Any) -> Any:
-            adapter = _CURRENT_ROUTE_ADAPTER.get()
-            if (
-                adapter is not None
-                and recovered is not None
-                and recovered.transfer_to_agent is not None
-                and adapter._agent_routes.is_configured_transfer_agent(node)
-            ):
-                # ADK's static Workflow replay otherwise returns the cached
-                # transfer to the Workflow loop, which does not follow it.
-                # Context replays the same node before following its target.
-                return InterceptionResult(should_run=True)
-            return original_workflow_interception(node=node, recovered=recovered)
-
-        setattr(adk_workflow, "check_interception", check_configured_transfer)
-        setattr(adk_workflow, _WORKFLOW_REPLAY_WRAPPER_ATTRIBUTE, True)
-
-    dynamic_scheduler = import_module("google.adk.workflow._dynamic_node_scheduler")
-    if getattr(dynamic_scheduler, _WORKFLOW_REPLAY_WRAPPER_ATTRIBUTE, False):
-        return
-
-    original_dynamic_interception = dynamic_scheduler.check_interception
-
-    @wraps(original_dynamic_interception)
-    def resume_configured_transfer_target(
-        *, node: BaseNode, recovered: Any = None, current_run: Any = None
-    ) -> Any:
-        adapter = _CURRENT_ROUTE_ADAPTER.get()
-        if (
-            adapter is not None
-            and recovered is not None
-            and recovered.transfer_to_agent is None
-            and recovered.interrupt_ids
-            and not (recovered.interrupt_ids - recovered.resolved_ids)
-            and adapter._agent_routes.is_configured_transfer_agent(node)
-        ):
-            # A transferred agent defaults rerun_on_resume to false, which
-            # would expose the raw approval as output instead of finishing.
-            return InterceptionResult(
-                should_run=True,
-                resume_inputs=recovered.resolved_responses,
-            )
-        return original_dynamic_interception(
-            node=node,
-            recovered=recovered,
-            current_run=current_run,
-        )
-
-    setattr(
-        dynamic_scheduler,
-        "check_interception",
-        resume_configured_transfer_target,
-    )
-    setattr(dynamic_scheduler, _WORKFLOW_REPLAY_WRAPPER_ATTRIBUTE, True)
+def _in_durable_turn() -> bool:
+    """Whether a durable adapter turn is running in this context."""
+    return _CURRENT_ROUTE_ADAPTER.get() is not None
 
 
 def _install_base_node_run_wrapper() -> None:
@@ -368,6 +366,9 @@ def _install_base_node_run_wrapper() -> None:
         return
 
     original_run = ADKNode.run
+    if not {"ctx", "node_input"} <= set(inspect.signature(original_run).parameters):
+        # Every durable model and tool call takes its identity from this wrapper.
+        raise unsupported_adk_feature("agents and workflows")
 
     @wraps(original_run)
     async def run_with_durable_path(
@@ -399,47 +400,28 @@ def _install_base_node_run_wrapper() -> None:
     setattr(ADKNode, _BASE_NODE_RUN_WRAPPER_ATTRIBUTE, True)
 
 
-def _reserve_parallel_worker_run_ids(
-    ctx: Context, child: Any, item_count: int
-) -> list[str]:
-    """Reserve ADK run counters while supporting the 2.9 and 2.10 layouts.
-
-    ADK 2.10 moved dynamic run counters from ``Context`` to the workflow
-    scheduler state. The durable IDs remain explicit and non-numeric so they
-    continue to bypass ADK's auto-generated-ID collision checks; advancing the
-    scheduler's counter keeps later auto-generated children from colliding with
-    the preallocated parallel-worker paths.
-    """
-    legacy_counters = getattr(ctx, "_child_run_counters", None)
-    if isinstance(legacy_counters, dict):
-        legacy_counters = cast(dict[str, int], legacy_counters)
-        start = legacy_counters.get(child.name, 0)
-        legacy_counters[child.name] = start + item_count
-        return [f"durable-{start + offset}" for offset in range(1, item_count + 1)]
-
-    scheduler = getattr(ctx, "_workflow_scheduler", None)
-    state = getattr(scheduler, "_state", None)
-    next_run_id = getattr(state, "next_run_id", None)
-    if not callable(next_run_id):
-        raise UnsupportedDurableADKError(
-            "Google ADK durable parallel workers require a supported "
-            "dynamic scheduler counter API"
-        )
-
-    return [
-        f"durable-{next_run_id(child.name, parent_path=ctx.node_path)}"
-        for _ in range(item_count)
-    ]
-
-
 def _install_parallel_worker_run_wrapper() -> None:
-    """Reserve repeated configured worker paths before ADK starts tasks."""
-    parallel_worker_module = import_module("google.adk.workflow._parallel_worker")
-    parallel_worker = parallel_worker_module._ParallelWorker
+    """Reserve repeated configured worker paths before ADK starts tasks.
+
+    Installed only for applications with parallel workers; raises
+    ``UnsupportedDurableADKError`` if ADK reshaped the private worker.
+    """
+    parallel_worker_module = _parallel_worker_module()
+    parallel_worker = getattr(parallel_worker_module, "_ParallelWorker", None)
     if getattr(parallel_worker, _PARALLEL_WORKER_RUN_WRAPPER_ATTRIBUTE, False):
         return
+    from google.adk.workflow import BaseNode as ADKNode
 
-    original_run_impl = parallel_worker._run_impl
+    run_impl = getattr(parallel_worker, "_run_impl", None)
+    # An inherited BaseNode._run_impl would be the unimplemented stub, and
+    # renamed parameters would fail only once a worker runs.
+    if (
+        not callable(run_impl)
+        or run_impl is getattr(ADKNode, "_run_impl", None)
+        or not {"ctx", "node_input"} <= set(inspect.signature(run_impl).parameters)
+    ):
+        raise _unsupported_parallel_workers()
+    original_run_impl = cast(Any, run_impl)
 
     @wraps(original_run_impl)
     async def run_with_preallocated_children(
@@ -469,7 +451,10 @@ def _install_parallel_worker_run_wrapper() -> None:
                 if isinstance(normalized_input, list)
                 else [normalized_input]
             )
-            run_ids = _reserve_parallel_worker_run_ids(ctx, child, item_count)
+            # Explicit non-numeric IDs never collide with ADK's numeric
+            # automatic ones, and each worker run has its own path, so
+            # numbering its items from 1 is unique and stable across replay.
+            run_ids = [f"durable-{offset}" for offset in range(1, item_count + 1)]
             for worker_input, run_id in zip(worker_inputs, run_ids, strict=True):
                 run_ids_by_input.setdefault(id(worker_input), []).append(run_id)
                 child_path = f"{ctx.node_path}/{child.name}@{run_id}"
@@ -511,9 +496,10 @@ class DurableRouteAdapter:
         self._configured_run_node_edges = _configured_run_node_edges(root)
 
         _install_context_run_node_guard()
-        _install_workflow_replay_wrapper()
+        install_adk_workarounds(_in_durable_turn)
         _install_base_node_run_wrapper()
-        _install_parallel_worker_run_wrapper()
+        if parallel_worker_templates(configured_nodes):
+            _install_parallel_worker_run_wrapper()
 
     def _allows_configured_run_node(self, parent_path: str, node: Any) -> bool:
         """Allow only an ADK clone of a configured private node template."""

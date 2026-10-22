@@ -38,6 +38,7 @@ import {
   registerSuspendHandler,
   resetHooks,
   getCurrentWrapper,
+  ToolPlatformError,
   type ExecuteRequest,
   type InterruptResult,
   type StreamingResult,
@@ -142,13 +143,13 @@ describe("SecureToolWrapper.handleSuspend with interrupt()", () => {
     expect(JSON.parse(result as string)).toEqual(humanDecision);
   });
 
-  test("suspend without reason raises validation error", () => {
+  test("suspend without reason is a platform failure", () => {
     // test_suspend_without_reason_raises_validation_error
     const wrapper = makeWrapper();
     registerSuspendHandler(vi.fn());
     const badPayload = JSON.stringify({ __suspend__: true });
 
-    expect(() => wrapper.handleSuspend(badPayload)).toThrow();
+    expect(() => wrapper.handleSuspend(badPayload)).toThrow(ToolPlatformError);
   });
 
   test("suspend without registered handler raises runtime error", () => {
@@ -164,13 +165,16 @@ describe("SecureToolWrapper.handleSuspend with interrupt()", () => {
     );
   });
 
-  test("suspend with a non-payload result raises ToolExecutionError", () => {
+  test("suspend with a non-payload result is a platform failure", () => {
     // test_suspend_with_non_payload_result_raises
     const wrapper = makeWrapper();
     registerSuspendHandler(vi.fn());
 
     expect(() => wrapper.handleSuspend("plain text")).toThrow(
       /not a suspend payload/,
+    );
+    expect(() => wrapper.handleSuspend("plain text")).toThrow(
+      ToolPlatformError,
     );
   });
 });

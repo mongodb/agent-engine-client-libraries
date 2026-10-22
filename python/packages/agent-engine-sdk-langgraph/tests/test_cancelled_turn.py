@@ -20,7 +20,7 @@ from agent_engine_sdk_langgraph.agent import (
 )
 from agent_engine_sdk_langgraph.cancelled_turn import (
     CANCELLED_TURN_MESSAGE_ID_METADATA_KEY,
-    CANCELLED_TURN_MESSAGE_KWARG,
+    CANCELLED_TURN_MESSAGE_IDS_METADATA_KEY,
     CANCELLED_TURN_METADATA_KEY,
     commit_cancelled_turn,
 )
@@ -100,9 +100,9 @@ def _kwargs(message: Any) -> dict[str, Any]:
 async def test_identical_consecutive_prompts_cancel_before_input_persistence() -> None:
     # Turn 1 "try again" committed; turn 2 "try again" cancelled before its
     # input checkpoint landed. The captured id is absent from the stored
-    # messages, so the commit injects a NEW stamped message under that id and
+    # messages, so the commit injects a NEW opener message under that id and
     # leaves the completed first turn unmarked — a content comparison would
-    # wrongly stamp h1 here.
+    # wrongly pick h1 here.
     messages = [
         HumanMessage(content="try again", id="h1"),
         AIMessage(content="done", id="a1"),
@@ -129,7 +129,6 @@ async def test_identical_consecutive_prompts_cancel_before_input_persistence() -
     stored = checkpoint["channel_values"]["messages"]
     assert [m.id for m in stored] == ["h1", "a1", "input:turn-2"]
     assert _kwargs(stored[0]) == {}  # completed turn 1 must not be marked
-    assert _kwargs(stored[2])[CANCELLED_TURN_MESSAGE_KWARG] is True
     assert checkpoint["channel_versions"]["messages"] == 2  # bumped for the append
     assert metadata[CANCELLED_TURN_MESSAGE_ID_METADATA_KEY] == "input:turn-2"
 
@@ -166,11 +165,6 @@ async def test_identical_consecutive_prompts_after_input_persistence() -> None:
     assert checkpoint["id"] != "c9"
     stored = checkpoint["channel_values"]["messages"]
     assert [m.id for m in stored] == ["h1", "a1", "h2"]
-    assert [_kwargs(m) for m in stored] == [
-        {},
-        {},
-        {CANCELLED_TURN_MESSAGE_KWARG: True},
-    ]
     # Channel versions unchanged — nothing ran — but every node now reads as
     # caught up, so the tip presents no pending work.
     assert checkpoint["channel_versions"]["messages"] == 2
@@ -178,6 +172,7 @@ async def test_identical_consecutive_prompts_after_input_persistence() -> None:
     assert checkpoint["pending_sends"] == []
     assert metadata["step"] == 5
     assert metadata["source"] == "loop"
+    assert metadata[CANCELLED_TURN_MESSAGE_ID_METADATA_KEY] == "h2"  # h1 unmarked
     # The canned tip's own state must not be mutated through the copy.
     assert latest.checkpoint["versions_seen"]["node_a"]["messages"] == 1
 
@@ -211,16 +206,15 @@ async def test_matches_turn_by_captured_id_not_content() -> None:
     assert message_id == "h2"
     stored = saver.puts[0][1]["channel_values"]["messages"]
     assert [m.id for m in stored] == ["h1", "a1", "h2"]  # no append
-    assert _kwargs(stored[2])[CANCELLED_TURN_MESSAGE_KWARG] is True
-    assert _kwargs(stored[0]) == {}
+    assert saver.puts[0][2][CANCELLED_TURN_MESSAGE_ID_METADATA_KEY] == "h2"
 
 
 @pytest.mark.anyio
 async def test_no_captured_id_appends_a_fresh_opener_for_an_identical_prompt() -> None:
     # turn_message_id=None means the turn's input was never built (a cancel
     # during preparation). An identical earlier prompt must NOT be treated as
-    # this turn's opener: append a fresh stamped message and leave the earlier
-    # turn untouched.
+    # this turn's opener: append a fresh message and record that id, leaving
+    # the earlier turn untouched.
     messages = [
         HumanMessage(content="stop this", id="h1"),
         AIMessage(content="older reply", id="a1"),
@@ -245,14 +239,13 @@ async def test_no_captured_id_appends_a_fresh_opener_for_an_identical_prompt() -
     assert message_id is not None and message_id.startswith("msg-cancelled-")
     stored = saver.puts[0][1]["channel_values"]["messages"]
     assert [m.id for m in stored] == ["h1", "a1", message_id]
-    assert _kwargs(stored[0]) == {}  # the earlier identical prompt stays unmarked
-    assert _kwargs(stored[2])[CANCELLED_TURN_MESSAGE_KWARG] is True
+    assert saver.puts[0][2][CANCELLED_TURN_MESSAGE_ID_METADATA_KEY] == message_id
 
 
 @pytest.mark.anyio
 async def test_no_captured_id_injects_with_a_fresh_id() -> None:
     # No captured id (cancel beat the input checkpoint): inject with a fresh
-    # marker id, stamped.
+    # marker id.
     messages = [
         HumanMessage(content="older turn", id="h1"),
         AIMessage(content="older reply", id="a1"),
@@ -281,16 +274,15 @@ async def test_no_captured_id_injects_with_a_fresh_id() -> None:
     assert isinstance(stored[2], HumanMessage)
     assert stored[2].content == "never landed"
     assert stored[2].id == message_id
-    assert _kwargs(stored[2])[CANCELLED_TURN_MESSAGE_KWARG] is True
     assert checkpoint["channel_versions"]["messages"] == 2  # bumped for the append
     assert metadata[CANCELLED_TURN_MESSAGE_ID_METADATA_KEY] == message_id
 
 
 @pytest.mark.anyio
-async def test_stamp_lives_only_on_the_written_checkpoint_copy() -> None:
-    # The stamp mutates the copy inside the synthetic checkpoint; the
-    # deserialized source message object is shared read state and must stay
-    # untouched.
+async def test_commit_does_not_mutate_the_shared_source_message() -> None:
+    # The opener is recorded in the checkpoint's metadata, not on the message;
+    # the deserialized source message object is shared read state and must
+    # stay untouched.
     source_opener = HumanMessage(content="stop this", id="h2")
     latest = _tuple(
         checkpoint_id="c9",
@@ -314,9 +306,9 @@ async def test_stamp_lives_only_on_the_written_checkpoint_copy() -> None:
     )
 
     written = saver.puts[0][1]["channel_values"]["messages"][2]
-    assert _kwargs(written)[CANCELLED_TURN_MESSAGE_KWARG] is True
-    assert written is not source_opener
+    assert _kwargs(written) == {}
     assert source_opener.additional_kwargs == {}
+    assert saver.puts[0][2][CANCELLED_TURN_MESSAGE_ID_METADATA_KEY] == "h2"
 
 
 @pytest.mark.anyio
@@ -372,7 +364,6 @@ async def test_empty_thread_commits_user_message_as_first_checkpoint() -> None:
     assert isinstance(messages[0], HumanMessage)
     assert messages[0].content == "hi there"
     assert messages[0].id == "input:turn-1"
-    assert _kwargs(messages[0])[CANCELLED_TURN_MESSAGE_KWARG] is True
     assert checkpoint["channel_versions"]["messages"] == 1
     assert checkpoint["versions_seen"] == {"node_a": {"messages": 1}}
     assert checkpoint["pending_sends"] == []
@@ -382,10 +373,10 @@ async def test_empty_thread_commits_user_message_as_first_checkpoint() -> None:
 
 
 @pytest.mark.anyio
-async def test_empty_message_terminalizes_without_stamping() -> None:
+async def test_empty_message_terminalizes_without_a_turn_opener() -> None:
     # Resume-cancel shape: no fresh user message. The marker tip still lands
     # (terminalized, so the cancelled super-step never looks resumable) but
-    # nothing is stamped or injected and no turn message id is recorded.
+    # no message is injected and no turn message id is recorded.
     latest = _tuple(
         checkpoint_id="c9",
         messages=[
@@ -440,7 +431,7 @@ async def test_real_two_node_graph_tip_is_terminal_and_never_resumes() -> None:
     saver = InMemorySaver()
     graph, calls = _two_node_graph(saver)
 
-    config = {"configurable": {"thread_id": "t"}}
+    config: RunnableConfig = {"configurable": {"thread_id": "t"}}
     await graph.ainvoke(
         {"messages": [HumanMessage(content="go", id="input:1")]}, config
     )
@@ -454,6 +445,11 @@ async def test_real_two_node_graph_tip_is_terminal_and_never_resumes() -> None:
         node_names=graph.get_graph().nodes.keys(),
     )
     assert resolved == "input:1"
+
+    tip = await saver.aget_tuple(config)
+    assert tip is not None
+    marker_metadata = cast("dict[str, Any]", tip.metadata)
+    assert marker_metadata[CANCELLED_TURN_MESSAGE_ID_METADATA_KEY] == "input:1"
 
     state = await graph.aget_state(config)
     assert state.next == ()
@@ -475,8 +471,6 @@ async def test_real_two_node_graph_tip_is_terminal_and_never_resumes() -> None:
     assert calls == ["a", "a", "b"]
     final_state = await graph.aget_state(config)
     assert final_state.next == ()
-    final_messages = final_state.values["messages"]
-    assert _kwargs(final_messages[0])[CANCELLED_TURN_MESSAGE_KWARG] is True
 
 
 @pytest.mark.anyio
@@ -498,7 +492,7 @@ async def test_stop_during_a_dispatched_send_tool_never_leaves_pending_work() ->
     saver = InMemorySaver()
     graph, payloads, release = _send_graph(saver)
 
-    config = {"configurable": {"thread_id": "t"}}
+    config: RunnableConfig = {"configurable": {"thread_id": "t"}}
     run = asyncio.create_task(
         graph.ainvoke({"messages": [HumanMessage(content="go", id="input:1")]}, config)
     )
@@ -547,7 +541,16 @@ async def test_stop_during_a_dispatched_send_tool_never_leaves_pending_work() ->
     assert not copied.tasks
     copied_messages = copied.values["messages"]
     assert [m.content for m in copied_messages] == ["go", "dispatch"]
-    assert _kwargs(copied_messages[0])[CANCELLED_TURN_MESSAGE_KWARG] is True
+    copied_tip = await saver.aget_tuple({"configurable": {"thread_id": "t-fork"}})
+    assert copied_tip is not None
+    copied_tip_metadata = cast("dict[str, Any]", copied_tip.metadata)
+    assert copied_tip_metadata[CANCELLED_TURN_METADATA_KEY] is True
+    # The source opener id rides onto the copy so the reader still classifies
+    # the forked opener as stopped.
+    assert (
+        copied_tip_metadata[CANCELLED_TURN_MESSAGE_ID_METADATA_KEY]
+        == copied_messages[0].id
+    )
 
     second_source = await completed_root_checkpoint(
         graph, thread_id="t-fork", history_id=None
@@ -560,7 +563,14 @@ async def test_stop_during_a_dispatched_send_tool_never_leaves_pending_work() ->
     assert not copied2.tasks
     copied2_messages = copied2.values["messages"]
     assert [m.content for m in copied2_messages] == ["go", "dispatch"]
-    assert _kwargs(copied2_messages[0])[CANCELLED_TURN_MESSAGE_KWARG] is True
+    copied2_tip = await saver.aget_tuple({"configurable": {"thread_id": "t-fork-2"}})
+    assert copied2_tip is not None
+    copied2_tip_metadata = cast("dict[str, Any]", copied2_tip.metadata)
+    assert copied2_tip_metadata[CANCELLED_TURN_METADATA_KEY] is True
+    assert (
+        copied2_tip_metadata[CANCELLED_TURN_MESSAGE_ID_METADATA_KEY]
+        == copied2_messages[0].id
+    )
 
     await graph.ainvoke(None, {"configurable": {"thread_id": "t-fork"}})
     await graph.ainvoke(None, {"configurable": {"thread_id": "t-fork-2"}})
@@ -585,7 +595,7 @@ async def test_second_identical_prompt_cancelled_during_preparation() -> None:
 
     saver = InMemorySaver()
     graph, calls = _two_node_graph(saver)
-    config = {"configurable": {"thread_id": "t"}}
+    config: RunnableConfig = {"configurable": {"thread_id": "t"}}
     await graph.ainvoke(
         {"messages": [HumanMessage(content="go", id="input:1")]}, config
     )
@@ -606,10 +616,12 @@ async def test_second_identical_prompt_cancelled_during_preparation() -> None:
     assert state.tasks == ()
     messages = state.values["messages"]
     assert [m.content for m in messages] == ["go", "a done", "b done", "go"]
-    assert messages[0].id == "input:1"
-    assert _kwargs(messages[0]) == {}  # turn 1's opener stays unmarked
+    assert messages[0].id == "input:1"  # turn 1's opener stays unmarked
     assert messages[3].id == resolved
-    assert _kwargs(messages[3])[CANCELLED_TURN_MESSAGE_KWARG] is True
+    tip = await saver.aget_tuple(config)
+    assert tip is not None
+    tip_metadata = cast("dict[str, Any]", tip.metadata)
+    assert tip_metadata[CANCELLED_TURN_MESSAGE_ID_METADATA_KEY] == resolved
 
 
 def _two_node_graph(saver: Any) -> Any:
@@ -666,7 +678,7 @@ def _send_graph(saver: Any) -> Any:
 @pytest.mark.anyio
 async def test_fork_reproduces_a_stopped_tip_and_later_history() -> None:
     """Forking from a cancelled-turn marker tip — and from later history built
-    on one — reproduces the authoritative state, stamp included."""
+    on one — reproduces the authoritative state, marker tip included."""
     from langgraph.checkpoint.memory import InMemorySaver
 
     from agent_engine_sdk_langgraph.checkpoint_branch import (
@@ -676,7 +688,7 @@ async def test_fork_reproduces_a_stopped_tip_and_later_history() -> None:
 
     saver = InMemorySaver()
     graph, _ = _two_node_graph(saver)
-    config = {"configurable": {"thread_id": "t"}}
+    config: RunnableConfig = {"configurable": {"thread_id": "t"}}
     await graph.ainvoke(
         {"messages": [HumanMessage(content="go", id="input:1")]}, config
     )
@@ -698,10 +710,19 @@ async def test_fork_reproduces_a_stopped_tip_and_later_history() -> None:
     source_messages = (await graph.aget_state(config)).values["messages"]
     copied_messages = copied.values["messages"]
     assert [m.content for m in copied_messages] == [m.content for m in source_messages]
-    assert _kwargs(copied_messages[0])[CANCELLED_TURN_MESSAGE_KWARG] is True
+    copied_tip = await saver.aget_tuple({"configurable": {"thread_id": "t-fork"}})
+    assert copied_tip is not None
+    copied_tip_metadata = cast("dict[str, Any]", copied_tip.metadata)
+    assert copied_tip_metadata[CANCELLED_TURN_METADATA_KEY] is True
+    # The source opener id rides onto the copy so the reader still classifies
+    # the forked opener as stopped.
+    assert (
+        copied_tip_metadata[CANCELLED_TURN_MESSAGE_ID_METADATA_KEY]
+        == copied_messages[0].id
+    )
 
-    # A follow-up turn on the source, then fork again: the stamp and the full
-    # later history survive.
+    # A follow-up turn on the source, then fork again: the full later history
+    # survives.
     await graph.ainvoke(
         {"messages": [HumanMessage(content="again", id="input:2")]}, config
     )
@@ -717,8 +738,15 @@ async def test_fork_reproduces_a_stopped_tip_and_later_history() -> None:
         "a done",
         "b done",
     ]
-    assert _kwargs(copied2_messages[0])[CANCELLED_TURN_MESSAGE_KWARG] is True
-    assert _kwargs(copied2_messages[2]) == {}  # the follow-up opener unmarked
+    # Replay rebuilds checkpoints and drops the per-turn marker metadata, so the
+    # fork re-records the source's cancelled openers on the copied tip — the
+    # earlier stopped opener keeps its id and stays classified on the fork.
+    copied2_tip = await saver.aget_tuple({"configurable": {"thread_id": "t-fork-2"}})
+    assert copied2_tip is not None
+    copied2_tip_metadata = cast("dict[str, Any]", copied2_tip.metadata)
+    assert copied2_tip_metadata[CANCELLED_TURN_METADATA_KEY] is True
+    assert copied2_messages[0].id == "input:1"
+    assert copied2_tip_metadata[CANCELLED_TURN_MESSAGE_IDS_METADATA_KEY] == ["input:1"]
 
 
 @pytest.mark.anyio
@@ -748,7 +776,16 @@ async def test_fork_from_a_first_turn_cancelled_before_any_checkpoint() -> None:
     copied = await graph.aget_state({"configurable": {"thread_id": "t-fork"}})
     copied_messages = copied.values["messages"]
     assert [m.content for m in copied_messages] == ["never ran"]
-    assert _kwargs(copied_messages[0])[CANCELLED_TURN_MESSAGE_KWARG] is True
+    copied_tip = await saver.aget_tuple({"configurable": {"thread_id": "t-fork"}})
+    assert copied_tip is not None
+    copied_tip_metadata = cast("dict[str, Any]", copied_tip.metadata)
+    assert copied_tip_metadata[CANCELLED_TURN_METADATA_KEY] is True
+    # The source opener id rides onto the copy so the reader still classifies
+    # the forked opener as stopped.
+    assert (
+        copied_tip_metadata[CANCELLED_TURN_MESSAGE_ID_METADATA_KEY]
+        == copied_messages[0].id
+    )
 
 
 @pytest.mark.anyio
@@ -780,6 +817,7 @@ async def test_a_forked_stopped_tip_is_itself_forkable() -> None:
     assert tip is not None
     tip_metadata = cast("dict[str, Any]", tip.metadata)
     assert tip_metadata[CANCELLED_TURN_METADATA_KEY] is True
+    assert tip_metadata[CANCELLED_TURN_MESSAGE_ID_METADATA_KEY] == "input:1"
 
     second = await completed_root_checkpoint(graph, thread_id="t-fork", history_id=None)
     await copy_checkpoint(graph, {"configurable": {"thread_id": "t-fork-2"}}, second)
@@ -788,7 +826,16 @@ async def test_a_forked_stopped_tip_is_itself_forkable() -> None:
     assert not copied.tasks
     copied_messages = copied.values["messages"]
     assert [m.content for m in copied_messages] == ["never ran"]
-    assert _kwargs(copied_messages[0])[CANCELLED_TURN_MESSAGE_KWARG] is True
+    copied_tip = await saver.aget_tuple({"configurable": {"thread_id": "t-fork-2"}})
+    assert copied_tip is not None
+    copied_tip_metadata = cast("dict[str, Any]", copied_tip.metadata)
+    assert copied_tip_metadata[CANCELLED_TURN_METADATA_KEY] is True
+    # The source opener id rides onto the copy so the reader still classifies
+    # the forked opener as stopped.
+    assert (
+        copied_tip_metadata[CANCELLED_TURN_MESSAGE_ID_METADATA_KEY]
+        == copied_messages[0].id
+    )
 
 
 def test_stash_records_last_human_message_id() -> None:
@@ -833,7 +880,7 @@ async def test_resume_commit_recovers_the_persisted_opener_from_the_loaded_check
     None
 ):
     # A resume captures no id: the commit recovers the opener from the
-    # checkpoint it already loaded and stamps it — never appends a duplicate.
+    # checkpoint it already loaded and records it — never appends a duplicate.
     opener = HumanMessage(content="the prompt", id="input:orig-1")
     saver = _RecordingSaver(
         latest=_tuple(
@@ -857,19 +904,19 @@ async def test_resume_commit_recovers_the_persisted_opener_from_the_loaded_check
     assert resolved == "input:orig-1"
     written = saver.puts[0][1]["channel_values"]["messages"]
     assert [message.id for message in written] == ["input:orig-1", "a1"]
-    assert _kwargs(written[0])[CANCELLED_TURN_MESSAGE_KWARG] is True
+    assert saver.puts[0][2][CANCELLED_TURN_MESSAGE_ID_METADATA_KEY] == "input:orig-1"
 
 
 @pytest.mark.anyio
-async def test_native_resume_cancel_stamps_the_persisted_opener() -> None:
+async def test_native_resume_cancel_records_the_persisted_opener() -> None:
     """Real-graph: a turn parks at a HITL interrupt, resumes, then is cancelled.
     The commit recovers the opener the first execution persisted — exactly one
-    stamped opener, no duplicate prompt."""
+    opener recorded, no duplicate prompt."""
     from langgraph.checkpoint.memory import InMemorySaver
 
     saver = InMemorySaver()
     graph, calls = _two_node_graph(saver)
-    config = {"configurable": {"thread_id": "t"}}
+    config: RunnableConfig = {"configurable": {"thread_id": "t"}}
     await graph.ainvoke(
         {"messages": [HumanMessage(content="the prompt", id="input:orig-1")]}, config
     )
@@ -891,11 +938,14 @@ async def test_native_resume_cancel_stamps_the_persisted_opener() -> None:
     state = await graph.aget_state(config)
     humans = [m for m in state.values["messages"] if m.type == "human"]
     assert [m.content for m in humans] == ["the prompt"]
-    assert _kwargs(humans[0])[CANCELLED_TURN_MESSAGE_KWARG] is True
+    tip = await saver.aget_tuple(config)
+    assert tip is not None
+    tip_metadata = cast("dict[str, Any]", tip.metadata)
+    assert tip_metadata[CANCELLED_TURN_MESSAGE_ID_METADATA_KEY] == "input:orig-1"
 
 
 @pytest.mark.anyio
-async def test_native_resume_cancel_during_preparation_stamps_the_persisted_opener() -> (
+async def test_native_resume_cancel_during_preparation_records_the_persisted_opener() -> (
     None
 ):
     """A Stop that lands before the resumed step runs still recovers the
@@ -905,7 +955,7 @@ async def test_native_resume_cancel_during_preparation_stamps_the_persisted_open
 
     saver = InMemorySaver()
     graph, calls = _two_node_graph(saver)
-    config = {"configurable": {"thread_id": "t"}}
+    config: RunnableConfig = {"configurable": {"thread_id": "t"}}
     await graph.ainvoke(
         {"messages": [HumanMessage(content="the prompt", id="input:orig-1")]}, config
     )
@@ -925,7 +975,10 @@ async def test_native_resume_cancel_during_preparation_stamps_the_persisted_open
     state = await graph.aget_state(config)
     humans = [m for m in state.values["messages"] if m.type == "human"]
     assert [m.content for m in humans] == ["the prompt"]
-    assert _kwargs(humans[0])[CANCELLED_TURN_MESSAGE_KWARG] is True
+    tip = await saver.aget_tuple(config)
+    assert tip is not None
+    tip_metadata = cast("dict[str, Any]", tip.metadata)
+    assert tip_metadata[CANCELLED_TURN_MESSAGE_ID_METADATA_KEY] == "input:orig-1"
 
 
 @pytest.mark.anyio
@@ -997,7 +1050,10 @@ async def test_native_resume_cancel_while_the_continuation_is_gated() -> None:
     humans = [m for m in messages if m.type == "human"]
     assert len(humans) == 1
     assert humans[0].id == "input:orig-1"
-    assert _kwargs(humans[0])[CANCELLED_TURN_MESSAGE_KWARG] is True
+    tip = await saver.aget_tuple(config)
+    assert tip is not None
+    tip_metadata = cast("dict[str, Any]", tip.metadata)
+    assert tip_metadata[CANCELLED_TURN_MESSAGE_ID_METADATA_KEY] == "input:orig-1"
 
     # A fresh turn preserves the stopped opener and the completed step.
     release.set()
@@ -1007,19 +1063,18 @@ async def test_native_resume_cancel_while_the_continuation_is_gated() -> None:
     state = await graph.aget_state(config)
     messages = state.values["messages"]
     assert messages[0].id == "input:orig-1"
-    assert _kwargs(messages[0])[CANCELLED_TURN_MESSAGE_KWARG] is True
     assert [m.content for m in messages if m.type == "human"] == ["the prompt", "next"]
 
 
 @pytest.mark.anyio
 async def test_resume_cancel_opener_survives_a_later_fresh_turn() -> None:
     """After a resume cancel, a fresh turn appends its own opener; the stopped
-    one keeps its id and stamp."""
+    one keeps its id."""
     from langgraph.checkpoint.memory import InMemorySaver
 
     saver = InMemorySaver()
     graph, _ = _two_node_graph(saver)
-    config = {"configurable": {"thread_id": "t"}}
+    config: RunnableConfig = {"configurable": {"thread_id": "t"}}
     await graph.ainvoke(
         {"messages": [HumanMessage(content="the prompt", id="input:orig-1")]}, config
     )
@@ -1041,7 +1096,6 @@ async def test_resume_cancel_opener_survives_a_later_fresh_turn() -> None:
     state = await graph.aget_state(config)
     messages = state.values["messages"]
     assert messages[0].id == "input:orig-1"
-    assert _kwargs(messages[0])[CANCELLED_TURN_MESSAGE_KWARG] is True
     humans = [m for m in messages if m.type == "human"]
     assert [m.content for m in humans] == ["the prompt", "next"]
 
@@ -1076,7 +1130,7 @@ class TestAgentHook:
         # opener under a minted id.
         message = saver.puts[0][1]["channel_values"]["messages"][0]
         assert message.id.startswith("msg-cancelled-")
-        assert _kwargs(message)[CANCELLED_TURN_MESSAGE_KWARG] is True
+        assert saver.puts[0][2][CANCELLED_TURN_MESSAGE_ID_METADATA_KEY] == message.id
 
     @pytest.mark.anyio
     async def test_hook_consumes_the_stashed_turn_message_id(self) -> None:
@@ -1123,7 +1177,9 @@ class TestAgentHook:
 
         written = saver.puts[0][1]["channel_values"]["messages"]
         assert [message.id for message in written] == ["input:orig-1"]
-        assert _kwargs(written[0])[CANCELLED_TURN_MESSAGE_KWARG] is True
+        assert saver.puts[0][2][CANCELLED_TURN_MESSAGE_ID_METADATA_KEY] == (
+            "input:orig-1"
+        )
 
     @pytest.mark.anyio
     async def test_stateless_graph_is_a_noop(self) -> None:
@@ -1164,10 +1220,10 @@ class TestAgentHook:
         assert saver.puts == []
 
     @pytest.mark.anyio
-    async def test_prepare_input_rewrite_keeps_one_stamped_opener(self) -> None:
+    async def test_prepare_input_rewrite_keeps_one_recorded_opener(self) -> None:
         # A prepare_input hook rewrites content and drops ids. The run assigns
         # and captures the opener's id at build time, so the cancel commit
-        # stamps the hook's own persisted message — never a duplicate
+        # records the hook's own persisted message — never a duplicate
         # raw-prompt append.
         def prepare(input: AgentInput, ctx: RequestContext) -> Any:
             payload = input.payload if isinstance(input.payload, dict) else {}
@@ -1205,13 +1261,13 @@ class TestAgentHook:
         assert len(stored) == 1  # no duplicate raw-prompt message appended
         assert stored[0].id == opener.id
         assert stored[0].content == "wrapped: original"
-        assert _kwargs(stored[0])[CANCELLED_TURN_MESSAGE_KWARG] is True
+        assert saver.puts[0][2][CANCELLED_TURN_MESSAGE_ID_METADATA_KEY] == opener.id
 
 
 class TestHookMessageLikeOpeners:
     """Hooks may return supported message-likes (tuples, role dicts) instead of
     BaseMessages: the input-build boundary converts them, so the id the graph
-    persists is the id the teardown commit captured — one stamped opener
+    persists is the id the teardown commit captured — one opener recorded
     before the completed step, never a duplicate raw-prompt append."""
 
     @staticmethod
@@ -1234,8 +1290,13 @@ class TestHookMessageLikeOpeners:
         tip = await saver.aget_tuple({"configurable": {"thread_id": "sess-1:ws-1"}})
         return list(tip.checkpoint["channel_values"]["messages"])
 
+    @staticmethod
+    async def _tip_metadata(saver: Any) -> dict[str, Any]:
+        tip = await saver.aget_tuple({"configurable": {"thread_id": "sess-1:ws-1"}})
+        return cast("dict[str, Any]", tip.metadata)
+
     @pytest.mark.anyio
-    async def test_tuple_opener_is_captured_and_stamped(self) -> None:
+    async def test_tuple_opener_is_captured_and_recorded(self) -> None:
         from langgraph.checkpoint.memory import InMemorySaver
 
         saver = InMemorySaver()
@@ -1252,8 +1313,9 @@ class TestHookMessageLikeOpeners:
         messages = await self._tip_messages(saver)
         assert [m.content for m in messages] == ["stop this", "reply done"]
         assert messages[0].id.startswith("input:")
-        assert _kwargs(messages[0])[CANCELLED_TURN_MESSAGE_KWARG] is True
-        assert _kwargs(messages[1]) == {}
+        assert (await self._tip_metadata(saver))[
+            CANCELLED_TURN_MESSAGE_ID_METADATA_KEY
+        ] == messages[0].id
 
     @pytest.mark.anyio
     async def test_role_dict_opener_keeps_a_given_id(self) -> None:
@@ -1275,7 +1337,9 @@ class TestHookMessageLikeOpeners:
         messages = await self._tip_messages(saver)
         assert [m.content for m in messages] == ["stop this", "reply done"]
         assert messages[0].id == "hook-1"
-        assert _kwargs(messages[0])[CANCELLED_TURN_MESSAGE_KWARG] is True
+        assert (await self._tip_metadata(saver))[
+            CANCELLED_TURN_MESSAGE_ID_METADATA_KEY
+        ] == "hook-1"
 
     @pytest.mark.anyio
     async def test_role_dict_opener_without_id_gets_the_captured_id(self) -> None:
@@ -1297,13 +1361,15 @@ class TestHookMessageLikeOpeners:
         messages = await self._tip_messages(saver)
         assert len(messages) == 2  # no duplicate opener
         assert messages[0].id.startswith("input:")
-        assert _kwargs(messages[0])[CANCELLED_TURN_MESSAGE_KWARG] is True
+        assert (await self._tip_metadata(saver))[
+            CANCELLED_TURN_MESSAGE_ID_METADATA_KEY
+        ] == messages[0].id
 
     @pytest.mark.anyio
-    async def test_overwrite_opener_replaces_history_and_is_stamped(self) -> None:
+    async def test_overwrite_opener_replaces_history_and_is_recorded(self) -> None:
         """Overwrite survives the build-time conversion: the hook's list
         replaces prior history wholesale, and the new opener is still the one
-        the cancel commit stamps."""
+        the cancel commit records."""
         from langgraph.checkpoint.memory import InMemorySaver
         from langgraph.types import Overwrite
 
@@ -1324,13 +1390,15 @@ class TestHookMessageLikeOpeners:
         messages = await self._tip_messages(saver)
         assert [m.content for m in messages] == ["fresh slate", "reply done"]
         assert messages[0].id.startswith("input:")
-        assert _kwargs(messages[0])[CANCELLED_TURN_MESSAGE_KWARG] is True
+        assert (await self._tip_metadata(saver))[
+            CANCELLED_TURN_MESSAGE_ID_METADATA_KEY
+        ] == messages[0].id
 
     @pytest.mark.anyio
-    async def test_serialized_overwrite_opener_is_accepted_and_stamped(self) -> None:
+    async def test_serialized_overwrite_opener_is_accepted_and_recorded(self) -> None:
         """A hook may return the serialized __overwrite__ wire shape: same
         replacement semantics through the build-boundary conversion — prior
-        history replaced, one stamped opener, no rejection, no duplicate."""
+        history replaced, one recorded opener, no rejection, no duplicate."""
         from langgraph.checkpoint.memory import InMemorySaver
 
         saver = InMemorySaver()
@@ -1350,4 +1418,6 @@ class TestHookMessageLikeOpeners:
         messages = await self._tip_messages(saver)
         assert [m.content for m in messages] == ["fresh slate", "reply done"]
         assert messages[0].id.startswith("input:")
-        assert _kwargs(messages[0])[CANCELLED_TURN_MESSAGE_KWARG] is True
+        assert (await self._tip_metadata(saver))[
+            CANCELLED_TURN_MESSAGE_ID_METADATA_KEY
+        ] == messages[0].id

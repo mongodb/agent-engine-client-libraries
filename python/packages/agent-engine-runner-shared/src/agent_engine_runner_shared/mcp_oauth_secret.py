@@ -19,7 +19,33 @@ MCP_OAUTH_SECRET_ENV_PREFIX = "AGENTIC_MCP_OAUTH_B64_"
 PLATFORM_MCP_OAUTH_CACHE_DIR = Path("/tmp/agentic/mcp-oauth")
 _SAFE_ENV_CACHE_NAME_RE = re.compile(r"^[A-Z0-9_]+$")
 
-__all__ = ["materialize_mcp_oauth_secret_cache"]
+__all__ = ["materialize_mcp_oauth_secret_cache", "mcp_oauth_secret_values"]
+
+
+def mcp_oauth_secret_values() -> list[str]:
+    """Every string inside the not-yet-materialized MCP OAuth secrets.
+
+    Materialization removes the env vars, so callers that redact later must
+    capture these first. Malformed secrets are skipped; materialization reports them.
+    """
+    values: list[str] = []
+    for env_name, encoded_cache in _mcp_oauth_secret_env():
+        try:
+            raw_cache, payload = _decode_cache_secret(env_name, encoded_cache)
+        except RuntimeError:
+            continue
+        values.append(raw_cache.decode("utf-8"))
+        pending: list[Any] = [payload]
+        while pending:
+            item = pending.pop()
+            if isinstance(item, str):
+                if item:
+                    values.append(item)
+            elif isinstance(item, dict):
+                pending.extend(item.values())
+            elif isinstance(item, list):
+                pending.extend(item)
+    return values
 
 
 def materialize_mcp_oauth_secret_cache(

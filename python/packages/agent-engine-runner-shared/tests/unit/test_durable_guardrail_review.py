@@ -417,10 +417,9 @@ def test_outside_a_durable_attempt_the_call_does_not_use_the_protocol() -> None:
 class TestReviewFieldsOnTheWire:
     def _post(self, response: httpx.Response, **review: Any) -> tuple[Any, MagicMock]:
         client = MagicMock()
-        client.__enter__.return_value = client
         client.post.return_value = response
         with patch(
-            "agent_engine_runner_shared.secure_wrapper.create_httpx_client_with_tls",
+            "agent_engine_runner_shared.secure_wrapper.get_shared_client",
             return_value=client,
         ):
             result = _request_oe_approval(

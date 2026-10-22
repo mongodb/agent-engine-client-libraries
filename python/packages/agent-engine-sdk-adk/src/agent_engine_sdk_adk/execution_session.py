@@ -20,7 +20,11 @@ from agent_engine_runner_shared.workflow import current_attempt_context
 from agent_engine_sdk_adk.agent_route import configured_sub_agents
 from agent_engine_sdk_adk.errors import UnsupportedDurableADKError
 from agent_engine_sdk_adk.platform_session import PlatformSessionService
-from agent_engine_sdk_adk.route import DurableRouteAdapter, configured_adk_nodes
+from agent_engine_sdk_adk.route import (
+    DurableRouteAdapter,
+    configured_adk_nodes,
+    parallel_worker_templates,
+)
 
 if TYPE_CHECKING:
     from google.adk.agents import BaseAgent as ADKAgent
@@ -34,12 +38,9 @@ _TOOL_GUARD_ATTRIBUTE = "_agent_engine_durable_tool_guard_installed"
 
 
 def _is_node_tool(tool: object) -> bool:
-    try:
-        from google.adk.tools._node_tool import NodeTool
-    except ImportError:
-        # NodeTool was added after the minimum supported ADK 2 release.
-        return False
-    return isinstance(tool, NodeTool)
+    # ADK defines NodeTool only in a private module; matching the class name
+    # avoids importing it for every application.
+    return any(cls.__name__ == "NodeTool" for cls in type(tool).__mro__)
 
 
 def _validate_supported_tools(
@@ -108,16 +109,8 @@ def _reject_unsupported_collaboration(root: ADKAgent | ADKNode) -> None:
 
     agent_root = isinstance(root, ADKAgentType)
     nodes = (*configured_adk_nodes(root), *configured_sub_agents(root))
-    parallel_worker_module = __import__(
-        "google.adk.workflow._parallel_worker",
-        fromlist=["_ParallelWorker"],
-    )
-    parallel_worker_type = parallel_worker_module._ParallelWorker
     parallel_worker_targets: set[int] = set()
-    for node in nodes:
-        if not isinstance(node, parallel_worker_type):
-            continue
-        worker_root = getattr(node, "_node")
+    for worker_root in parallel_worker_templates(nodes):
         worker_nodes = (
             *configured_adk_nodes(worker_root),
             *configured_sub_agents(worker_root),

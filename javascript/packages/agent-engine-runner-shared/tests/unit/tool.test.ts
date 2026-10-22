@@ -20,6 +20,18 @@
  */
 
 import Fastify from "fastify";
+import { ROOT_CONTEXT, trace, type Context } from "@opentelemetry/api";
+import { W3CTraceContextPropagator } from "@opentelemetry/core";
+import { injectPlatformTraceHeaders } from "../../src/tls_client.js";
+import {
+  bindRunnerRootedTrace,
+  parentContextIsRunnerRooted,
+} from "../../src/tracing/caller_trace.js";
+import {
+  BasicTracerProvider,
+  InMemorySpanExporter,
+  SimpleSpanProcessor,
+} from "@opentelemetry/sdk-trace-base";
 import { describe, test, expect, vi, beforeEach, afterEach } from "vitest";
 import {
   ToolServer,
@@ -1416,6 +1428,214 @@ describe("ToolServer POST /guardrails/check", () => {
     await app.close();
   });
 });
+
+describe("ToolServer POST /guardrails/check trace span", () => {
+  const CALLER_TRACE_ID = "0af7651916cd43dd8448eb211c80319c";
+  const TRACEPARENT = `00-${CALLER_TRACE_ID}-b7ad6b7169203331-01`;
+  let exporter: InMemorySpanExporter;
+  let provider: BasicTracerProvider;
+
+  beforeEach(() => {
+    exporter = new InMemorySpanExporter();
+    provider = new BasicTracerProvider({
+      spanProcessors: [new SimpleSpanProcessor(exporter)],
+    });
+    trace.setGlobalTracerProvider(provider);
+  });
+
+  afterEach(async () => {
+    await provider.shutdown();
+    trace.disable();
+  });
+
+  function guardrailSpan() {
+    const span = exporter
+      .getFinishedSpans()
+      .find((candidate) => candidate.name === "tool.guardrails_check");
+    if (!span) throw new Error("no tool.guardrails_check span was exported");
+    return span;
+  }
+
+  function body(text: string) {
+    return {
+      execution_id: "exec-1",
+      stage: "llm_output",
+      input: { text, metadata: {} },
+      context: { org_id: "o1", project_id: "p1" },
+      policies: [
+        {
+          id: "policy-1",
+          type: "output_validation",
+          status: "active",
+          action: "block",
+          stage_filter: ["llm_output"],
+          config: { regex_patterns: ["Acme"] },
+        },
+      ],
+    };
+  }
+
+  async function check(text: string, headers: Record<string, string> = {}) {
+    const app = Fastify();
+    makeServer(makeMockRuntime()).registerRoutes(app);
+    const res = await app.inject({
+      method: "POST",
+      url: "/guardrails/check",
+      headers,
+      payload: body(text),
+    });
+    await app.close();
+    return res;
+  }
+
+  test("joins the inbound trace and records the check and its decision", async () => {
+    const res = await check("Acme is mentioned here.", {
+      traceparent: TRACEPARENT,
+    });
+
+    expect(res.statusCode).toBe(200);
+    const spans = exporter
+      .getFinishedSpans()
+      .filter((span) => span.name === "tool.guardrails_check");
+    expect(spans).toHaveLength(1);
+    const span = guardrailSpan();
+    expect(span.spanContext().traceId).toBe(CALLER_TRACE_ID);
+    expect(span.attributes["openinference.span.kind"]).toBe("TOOL");
+    const input = JSON.parse(String(span.attributes["input.value"]));
+    expect(input).toMatchObject({
+      stage: "llm_output",
+      text: "Acme is mentioned here.",
+      text_truncated: false,
+      policies: [
+        { id: "policy-1", type: "output_validation", action: "block" },
+      ],
+    });
+    const output = JSON.parse(String(span.attributes["output.value"]));
+    expect(output).toMatchObject({
+      decision: "block",
+      allowed: false,
+      triggered_policy_ids: ["policy-1"],
+    });
+  });
+
+  test("bounds the recorded text so one large prompt cannot reject the span", async () => {
+    await check(`Acme ${"x".repeat(10_000)}`, { traceparent: TRACEPARENT });
+
+    const span = guardrailSpan();
+    const input = JSON.parse(String(span.attributes["input.value"]));
+    expect(input.text).toHaveLength(4000);
+    expect(input.text_truncated).toBe(true);
+  });
+
+  test("records no guardrail span when no traceparent arrives", async () => {
+    const res = await check("nothing to see here.");
+
+    expect(res.statusCode).toBe(200);
+    const spans = exporter
+      .getFinishedSpans()
+      .filter((span) => span.name === "tool.guardrails_check");
+    expect(spans).toHaveLength(0);
+  });
+
+  test("records an empty rewrite instead of dropping it", async () => {
+    const app = Fastify();
+    makeServer(makeMockRuntime()).registerRoutes(app);
+    const res = await app.inject({
+      method: "POST",
+      url: "/guardrails/check",
+      headers: { traceparent: TRACEPARENT },
+      payload: {
+        ...body("Acme"),
+        policies: [
+          {
+            id: "policy-1",
+            type: "output_validation",
+            status: "active",
+            action: "modify",
+            stage_filter: ["llm_output"],
+            config: { regex_patterns: ["Acme"], replacement_text: "" },
+          },
+        ],
+      },
+    });
+    await app.close();
+
+    expect(res.statusCode).toBe(200);
+    expect(res.json().transformed_text).toBe("");
+    const output = JSON.parse(
+      String(guardrailSpan().attributes["output.value"]),
+    );
+    expect(output.transformed_text).toBe("");
+    expect(output.transformed_text_truncated).toBe(false);
+  });
+
+  test("omits guardrail payloads when a runner-rooted trace is propagated", async () => {
+    const headers = headersFromNestedSpan(ROOT_CONTEXT);
+
+    expect(headers.tracestate).toContain("agentengine=root");
+    const res = await check("Acme is mentioned here.", headers);
+
+    expect(res.statusCode).toBe(200);
+    const span = guardrailSpan();
+    expect(span.spanContext().traceId).toBe(traceIdFrom(headers.traceparent));
+    expect(span.attributes["input.value"]).toBeUndefined();
+    expect(span.attributes["output.value"]).toBeUndefined();
+  });
+
+  test("records guardrail payloads when a nested span joined an inbound caller", async () => {
+    const extracted = new W3CTraceContextPropagator().extract(
+      ROOT_CONTEXT,
+      { traceparent: TRACEPARENT },
+      {
+        get(carrier, key) {
+          return carrier[key];
+        },
+        keys(carrier) {
+          return Object.keys(carrier);
+        },
+      },
+    );
+    const parent = bindRunnerRootedTrace(
+      extracted,
+      parentContextIsRunnerRooted(extracted),
+    );
+    const headers = headersFromNestedSpan(parent);
+
+    expect(headers.tracestate ?? "").not.toContain("agentengine=root");
+    expect(headers.traceparent).toContain(CALLER_TRACE_ID);
+    const res = await check("Acme is mentioned here.", headers);
+
+    expect(res.statusCode).toBe(200);
+    const input = JSON.parse(String(guardrailSpan().attributes["input.value"]));
+    expect(input.text).toBe("Acme is mentioned here.");
+  });
+
+  // The unit context manager is a no-op, so build the active context explicitly.
+  // Production propagation reads the same context fetchPlatform passes in.
+  function headersFromNestedSpan(parent: Context): Record<string, string> {
+    const tracer = provider.getTracer("test");
+    const root = tracer.startSpan("aer.execute", {}, parent);
+    const rootContext = trace.setSpan(parent, root);
+    const child = tracer.startSpan("llm.call", {}, rootContext);
+    const childContext = trace.setSpan(rootContext, child);
+    const headers: Record<string, string> = {};
+    try {
+      injectPlatformTraceHeaders(headers, childContext);
+    } finally {
+      child.end();
+      root.end();
+    }
+    return headers;
+  }
+});
+
+function traceIdFrom(traceparent: string | undefined): string {
+  const traceId = traceparent?.split("-")[1];
+  if (!traceId) {
+    throw new Error(`missing traceparent: ${traceparent}`);
+  }
+  return traceId;
+}
 
 // ---------------------------------------------------------------------------
 // ToolServer.doHandleExecute — external API error classification
