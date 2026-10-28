@@ -16,8 +16,10 @@ run_python_tests() {
   log "Python: ruff"
   (
     cd "$PYTHON_ROOT"
-    uv run --with ruff==0.12.0 ruff check .
-    uv run --with ruff==0.12.0 ruff format --check .
+    # The workspace owns ruff as a dev dependency, so this resolves the same
+    # version from the lock that the pre-commit hook and CI use.
+    uv run ruff check .
+    uv run ruff format --check .
   )
 
   log "Python: agent-engine-sdk"

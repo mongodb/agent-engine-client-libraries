@@ -59,6 +59,13 @@ function makeServer(entrypoint: () => unknown): ServerPrivates {
     runtime as unknown as ITenantRuntime,
   ) as unknown as ServerPrivates;
 
+  // Model resolution happens under the registry lock now, so it is its own
+  // seam: these cases exercise what happens after a model is in hand.
+  (
+    server as unknown as {
+      resolveLlmForRequest: () => Promise<unknown>;
+    }
+  ).resolveLlmForRequest = async () => ({});
   server.streamLlmChunks = async function* () {
     yield { content: "ok" } as LLMStreamChunk;
   };
@@ -118,9 +125,9 @@ describe("prepared registry is independent of request metadata", () => {
 
     const events: Array<{ content?: string; done?: boolean; error?: string }> =
       [];
-    for await (const frame of server.handleInvokeLlmStream(
-      {} as unknown as LLMPodInvokeRequest,
-    )) {
+    for await (const frame of server.handleInvokeLlmStream({
+      arguments: {},
+    } as unknown as LLMPodInvokeRequest)) {
       events.push(JSON.parse(frame.slice("data: ".length)));
     }
 
@@ -181,8 +188,21 @@ describe("prepared registry is independent of request metadata", () => {
       expect(() => getNamedLlm("partial")).toThrow();
       if (importTime) expect(getNamedLlm("fallback")).toBe(fallback);
       server.streamLlmChunks = async function* () {
-        expect(getNamedLlm("primary")).toBe(primary);
         yield { content: "recovered" } as LLMStreamChunk;
+      };
+      // The retained registration has to survive until the model is captured,
+      // which is what the production path does under the lock. Re-run discovery
+      // the way the real resolver does, then check what survived.
+      (
+        server as unknown as {
+          resolveLlmForRequest: () => Promise<unknown>;
+        }
+      ).resolveLlmForRequest = async () => {
+        await (
+          server as unknown as { ensureLlmRegistryLoaded: () => Promise<void> }
+        ).ensureLlmRegistryLoaded();
+        expect(getNamedLlm("primary")).toBe(primary);
+        return primary;
       };
       recovered = true;
       const invoke = async () => {

@@ -25,10 +25,12 @@ from langgraph.prebuilt import ToolNode
 
 app = App(app_name="my-agent", app_version="1.0.0")
 
+
 @app.tool()
 def lookup(query: str) -> str:
     """Search the knowledge base."""
     return "result for " + query
+
 
 @app.entrypoint
 def build_agent():
@@ -48,6 +50,7 @@ def build_agent():
     graph.add_edge("tools", "agent")
     return graph.compile(checkpointer=app.checkpointer())
 
+
 app.run()
 ```
 
@@ -65,7 +68,10 @@ result = app.memory.save_semantic(
     text="User prefers dark mode",
     label="pref-theme",
     user_id="u1",
-    metadata={"channel": "web", "priority": "high"},  # optional caller-supplied metadata
+    metadata={
+        "channel": "web",
+        "priority": "high",
+    },  # optional caller-supplied metadata
 )
 if result.acknowledged:
     ...
@@ -79,7 +85,9 @@ for chunk in chunks:
 # Default sources are LTM (episodic + semantic); pass
 # enabled_sources={"stm", ...} to include recent turns.
 context = app.memory.build_context(query="help me", user_id="u1")
-prompt_block = context.formatted_context  # str (or structured list, depending on format)
+prompt_block = (
+    context.formatted_context
+)  # str (or structured list, depending on format)
 ```
 
 `build_context_from_sources` (per-source retrieval modes, filters, and `top_k`)
@@ -173,7 +181,10 @@ episode = app.memory.save_episode(
     title="Quote chat",
     content=summary,
     user_id="u1",
-    metadata={"channel": "web", "priority": "high"},  # optional caller-supplied metadata
+    metadata={
+        "channel": "web",
+        "priority": "high",
+    },  # optional caller-supplied metadata
     # session_id from ambient context, or pass explicitly
 )
 if episode.acknowledged:
@@ -274,6 +285,7 @@ from agent_engine_sdk_langgraph import App
 
 app = App(app_name="My Reviewer")
 
+
 @app.entrypoint
 def build_agent():
     return app.deep_agent(
@@ -281,6 +293,7 @@ def build_agent():
         system_prompt="You are a code reviewer.",
         skills=["skills"],
     )
+
 
 app.run()
 ```

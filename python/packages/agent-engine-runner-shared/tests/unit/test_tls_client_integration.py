@@ -201,7 +201,9 @@ class TestAERServerHTTPSFailClosed:
 
         # Create minimal AERServer instance (doesn't need runtime for this test)
         # AERServer.__init__ doesn't require runtime to be fully initialized
-        aer = AERServer(runtime=mock.MagicMock())
+        runtime = mock.MagicMock()
+        runtime.build_graph = mock.AsyncMock(return_value=None)
+        aer = AERServer(runtime=runtime)
 
         # Calling _get_client with HTTPS URL should raise ValueError immediately
         with pytest.raises(ValueError) as exc_info:

@@ -11,8 +11,10 @@ import fastify, { type FastifyInstance } from "fastify";
 import cors from "@fastify/cors";
 import { ZodError } from "zod";
 import type {
+  AgentInput,
   BaseAgent,
   BaseExecutionCallback,
+  RequestContext,
 } from "@mongodb-js/agent-engine-sdk";
 import { getLogger } from "../logger.js";
 import { Metrics } from "../metrics.js";
@@ -53,6 +55,14 @@ export interface GraphBuilderLike {
    * because doing so would block the Node event loop and server health.
    */
   warmUp?(): void;
+  /**
+   * Build the graph for one invocation. Present only on an App that opted into
+   * per-execution builds; its absence is how every global agent keeps the
+   * cached build path.
+   */
+  buildGraph?(agentInput?: AgentInput, ctx?: RequestContext): Promise<unknown>;
+  /** Whether this builder builds its graph per invocation. */
+  usesPerInvocationBuild?(): boolean;
 }
 
 /**
@@ -81,7 +91,23 @@ export interface ITenantRuntime {
   /** Resolved MongoDB URI: constructor option > `MONGODB_URI` env var > null. */
   getMongodbUri(): string | null;
   /** Get a `BaseAgent` instance, optionally wired with execution callbacks. */
-  getAgent(opts?: { callbacks?: BaseExecutionCallback[] }): BaseAgent;
+  getAgent(opts?: {
+    callbacks?: BaseExecutionCallback[];
+    graph?: unknown;
+  }): BaseAgent;
+  /**
+   * Ask the registered App to build a graph for this invocation. Resolves to
+   * `undefined` when the App declares no per-execution build, which is every
+   * global agent and tells the caller to use the cached path unchanged.
+   *
+   * Optional so a runtime that predates per-execution builds keeps working.
+   */
+  buildGraph?(
+    agentInput?: AgentInput,
+    ctx?: RequestContext,
+  ): Promise<unknown | undefined>;
+  /** Whether the registered App builds its graph per invocation. */
+  usesPerInvocationBuild?(): boolean;
   /** Explicit pre-build via the graph builder's `warmUp()`, if it has one. */
   warmUpAgent?(): void;
 }

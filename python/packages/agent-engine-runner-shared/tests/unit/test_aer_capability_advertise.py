@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import httpx
 import pytest
@@ -21,6 +21,7 @@ def _make_aer_server_from_workdir(workdir: Path) -> AERServer:
     runtime.project_id = "proj-from-runtime"
     runtime.agent_config = load_runtime_agent_config(workdir)
     runtime._graph_builder = MagicMock()
+    runtime.build_graph = AsyncMock(return_value=None)
     return AERServer(runtime)
 
 

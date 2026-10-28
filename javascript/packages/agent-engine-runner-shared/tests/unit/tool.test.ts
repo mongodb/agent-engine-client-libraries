@@ -947,6 +947,11 @@ describe("ToolServer execute serialization", () => {
       await release.promise;
       yield { content: "hi" };
     };
+    (
+      server as unknown as {
+        resolveLlmForRequest: () => Promise<unknown>;
+      }
+    ).resolveLlmForRequest = async () => ({});
 
     const llmCall = (server as unknown as ServerWithPrivates).doHandleInvokeLlm(
       {

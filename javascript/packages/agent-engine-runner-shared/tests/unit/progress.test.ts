@@ -54,6 +54,11 @@ function okFetch(): ReturnType<typeof vi.fn> {
   return vi.fn(async () => new Response(null, { status: 200 }));
 }
 
+// Matches the 32-character lowercase-hex delivery ids the SDK mints (a UUID4
+// without hyphens); the platform honors them as the durable delivery identity
+// of seq-less chunks, so the format is a cross-language wire contract.
+const MATCH_DELIVERY_ID = expect.stringMatching(/^[0-9a-f]{32}$/);
+
 afterEach(() => {
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
@@ -80,7 +85,30 @@ test("emitStep posts a step chunk to /stream/chunk", async () => {
     chunk_type: STEP,
     content: "Fetching page...",
     metadata: {},
+    delivery_id: MATCH_DELIVERY_ID,
   });
+});
+
+// ---------------------------------------------------------------------------
+// delivery_id — a stable per-event identity shared by both delivery attempts
+// ---------------------------------------------------------------------------
+
+test("each emit gets a distinct delivery_id, even for identical content", async () => {
+  const mock = okFetch();
+  vi.stubGlobal("fetch", mock);
+
+  await withCtx("exec-ids", "http://oe:8000", async () => {
+    await emitStep("same message");
+    await emitStep("same message");
+  });
+
+  const ids = mock.mock.calls.map(
+    ([, init]) =>
+      JSON.parse((init as RequestInit).body as string).delivery_id as string,
+  );
+  expect(ids).toHaveLength(2);
+  expect(ids[0]).not.toBe(ids[1]);
+  for (const id of ids) expect(id).toMatch(/^[0-9a-f]{32}$/);
 });
 
 test("emitStep strips a trailing slash from oeUrl", async () => {
@@ -113,6 +141,7 @@ test("emit accepts an arbitrary (non-reserved) event type", async () => {
     chunk_type: "custom_event",
     content: "payload",
     metadata: {},
+    delivery_id: MATCH_DELIVERY_ID,
   });
 });
 
@@ -153,8 +182,15 @@ describe("emit owner-callback preference", () => {
       `${OWNER}/stream/chunk`,
       "http://oe:8000/stream/chunk",
     ]);
-    // Same chunk body delivered to the fallback target.
+    // Same chunk body delivered to the fallback target — including the same
+    // delivery id, so the platform can dedup the redelivered event.
     expect(calls[0].body).toEqual(calls[1].body);
+    expect((calls[0].body as { delivery_id: string }).delivery_id).toMatch(
+      /^[0-9a-f]{32}$/,
+    );
+    expect((calls[1].body as { delivery_id: string }).delivery_id).toBe(
+      (calls[0].body as { delivery_id: string }).delivery_id,
+    );
   });
 
   test("falls back to the service URL on an owner HTTP error; owner not retried", async () => {
@@ -408,5 +444,6 @@ test("emitStep sends a correctly-formed JSON body to a real TCP server", async (
     chunk_type: STEP,
     content: "Integration check",
     metadata: {},
+    delivery_id: MATCH_DELIVERY_ID,
   });
 });

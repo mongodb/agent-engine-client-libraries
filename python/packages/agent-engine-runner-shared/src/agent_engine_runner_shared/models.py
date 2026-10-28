@@ -282,6 +282,16 @@ class ExecuteRequest(BaseModel):
             "run's partial checkpoint writes before running this turn"
         ),
     )
+    durable_ack_enabled: bool = Field(
+        default=False,
+        description=(
+            "True when the OE acknowledges a stream-chunk POST only after the "
+            "chunk is durably persisted: the runner may batch chunks per POST "
+            "and must retry unacknowledged chunks in order within the turn "
+            "budget. False/absent keeps one chunk per POST and today's "
+            "retry semantics."
+        ),
+    )
     # `message` resolution (promote payload["message"] when the top level is
     # empty; reject when both are set) lives in the AER, the only component that
     # unpacks the opaque payload — see agent_engine_runner_shared.server.aer. Keeping it out

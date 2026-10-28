@@ -3,10 +3,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
-from agent_engine_runner_shared.connectors import (
-    CONNECTOR_BUNDLE_PATH_ENV,
-    ConnectorBundleError,
-)
+from agent_engine_runner_shared.connectors import ConnectorBundleError
 from agent_engine_runner_shared.context import (
     clear_execution_context,
     set_execution_context,
@@ -24,7 +21,7 @@ from agent_engine_sdk_langgraph.memory_appbound import (
 )
 
 
-def _write_connector_bundle(
+def _write_connector_authoring(
     tmp_path: Path, *, tool_names: list[str] | None = None
 ) -> Path:
     names = tool_names or ["jiradc_getComments", "jiradc_addComment"]
@@ -47,18 +44,33 @@ def _write_connector_bundle(
             for index, name in enumerate(names)
         ],
     }
-    definitions_path = tmp_path / "jiradc.tool_defs.yaml"
     import yaml
 
-    definitions_path.write_text(
+    connectors = tmp_path / "connectors" / "jira"
+    connectors.mkdir(parents=True, exist_ok=True)
+    (connectors / "jira.tool_defs.yaml").write_text(
         yaml.safe_dump(definitions, sort_keys=False), encoding="utf-8"
     )
-    index_path = tmp_path / "bundle.yaml"
-    index_path.write_text(
-        "version: 1\nconnectors:\n  - name: jiradc\n    tool_defs: jiradc.tool_defs.yaml\n",
+    (connectors / "tool.yaml").write_text(
+        "name: jira\n"
+        "tool_defs: jira.tool_defs.yaml\n"
+        "source:\n"
+        "  base_url: https://jira.example/rest\n"
+        "expose:\n"
+        "  allow_all: true\n"
+        "auth:\n"
+        "  type: bearer\n"
+        "  env: JIRA_TOKEN\n",
         encoding="utf-8",
     )
-    return index_path
+    (tmp_path / "agent.yaml").write_text(
+        "name: connector-agent\n"
+        "entrypoint: config.agent:app\n"
+        "connectors:\n"
+        "  - source: connectors/jira/tool.yaml\n",
+        encoding="utf-8",
+    )
+    return tmp_path
 
 
 class TestApp:
@@ -104,11 +116,9 @@ class TestApp:
         assert app.agent_config.entrypoint == "config.agent:app"
         assert app.agent_config.feature_enabled("memory") is True
 
-    def test_init_registers_bundled_connector_tools_as_remote(
-        self, monkeypatch, tmp_path
-    ):
-        index_path = _write_connector_bundle(tmp_path)
-        monkeypatch.setenv(CONNECTOR_BUNDLE_PATH_ENV, str(index_path))
+    def test_init_registers_connector_tools_as_remote(self, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        _write_connector_authoring(tmp_path)
 
         app = App(app_name="Connector Agent")
 
@@ -128,16 +138,15 @@ class TestApp:
             "network": ["jira.example"],
             "timeout_seconds": 30,
             "redact_fields": [],
-            "connector": "jiradc",
+            "connector": "jira",
         }
         assert app.get_tool_definitions()[0].remote is True
 
     def test_init_materializes_connectors_from_agent_yaml_traversal(
         self, monkeypatch, tmp_path
     ):
-        """No pre-materialized bundle: agent.yaml `connectors` entries are
-        materialized at init and registered as ordinary remote tools."""
-        monkeypatch.delenv(CONNECTOR_BUNDLE_PATH_ENV, raising=False)
+        """agent.yaml `connectors` entries are materialized at init and
+        registered as ordinary remote tools."""
         monkeypatch.chdir(tmp_path)
         (tmp_path / "agent.yaml").write_text(
             "name: connector-agent\n"
@@ -192,12 +201,11 @@ class TestApp:
         assert metadata["is_local"] is False
 
     @patch("agent_engine_runner_shared.secure_wrapper.create_secure_tool_function")
-    def test_bundled_connector_tool_uses_secure_remote_wrapper(
+    def test_connector_tool_uses_secure_remote_wrapper(
         self, mock_create_secure, monkeypatch, tmp_path
     ):
-        monkeypatch.setenv(
-            CONNECTOR_BUNDLE_PATH_ENV, str(_write_connector_bundle(tmp_path))
-        )
+        monkeypatch.chdir(tmp_path)
+        _write_connector_authoring(tmp_path)
         mock_create_secure.return_value = lambda **_kwargs: "wrapped"
 
         app = App(app_name="Connector Agent")
@@ -213,6 +221,12 @@ class TestApp:
     def test_connector_collision_is_rejected_before_any_connector_registration(
         self, monkeypatch, tmp_path
     ):
+        # Tool mode prevents App init from registering connectors before the
+        # colliding tool is planted; the explicit call below is mode-independent.
+        monkeypatch.setenv("RUNNER_MODE", "tool")
+        monkeypatch.chdir(tmp_path)
+        _write_connector_authoring(tmp_path)
+
         app = App(app_name="Connector Agent")
 
         def existing_tool() -> str:
@@ -231,9 +245,6 @@ class TestApp:
             redact_fields=[],
             langchain_tool=MagicMock(),
         )
-        monkeypatch.setenv(
-            CONNECTOR_BUNDLE_PATH_ENV, str(_write_connector_bundle(tmp_path))
-        )
 
         with pytest.raises(ConnectorBundleError, match="jiradc_getComments"):
             app._register_connector_tools_from_bundle()
@@ -242,7 +253,8 @@ class TestApp:
 
     def test_tool_mode_does_not_load_connector_schemas(self, monkeypatch, tmp_path):
         monkeypatch.setenv("RUNNER_MODE", "tool")
-        monkeypatch.setenv(CONNECTOR_BUNDLE_PATH_ENV, str(tmp_path / "missing.yaml"))
+        monkeypatch.chdir(tmp_path)
+        _write_connector_authoring(tmp_path)
 
         app = App(app_name="Connector Tool Pod")
 
@@ -313,7 +325,7 @@ class TestApp:
                 SimpleNamespace(
                     name=tool_name,
                     description="",
-                    inputSchema={
+                    input_schema={
                         "type": "object",
                         "properties": {
                             "query": {"type": "string", "description": "Search query"},
@@ -390,7 +402,7 @@ class TestApp:
                 SimpleNamespace(
                     name="get-view-data",
                     description="",
-                    inputSchema={"type": "object", "properties": {}},
+                    input_schema={"type": "object", "properties": {}},
                 )
             ]
 
@@ -442,7 +454,7 @@ class TestApp:
                 SimpleNamespace(
                     name="search_issues",
                     description="Search GitHub issues",
-                    inputSchema={"type": "object", "properties": {}},
+                    input_schema={"type": "object", "properties": {}},
                     annotations=annotations,
                 )
             ]
@@ -484,7 +496,7 @@ class TestApp:
                 SimpleNamespace(
                     name="search_issues",
                     description="Search GitHub issues",
-                    inputSchema={"type": "object", "properties": {}},
+                    input_schema={"type": "object", "properties": {}},
                 )
             ]
 

@@ -144,6 +144,7 @@ describe.skipIf(TEST_MONGO_URI === "")(
           platform_api_url: "http://oe:8000",
           resume: false,
           previous_execution_cancelled: false,
+          durable_ack_enabled: false,
           thread_id: "thread-hitl-parallel",
         } as ExecuteRequest)) as { status: string };
 
@@ -199,6 +200,7 @@ describe.skipIf(TEST_MONGO_URI === "")(
           platform_api_url: "http://oe:8000",
           resume: true,
           previous_execution_cancelled: false,
+          durable_ack_enabled: false,
           resume_data: resumeMap,
           metadata: mustGet(callbackFields.metadata),
           thread_id: "thread-hitl-parallel",
@@ -246,6 +248,7 @@ describe.skipIf(TEST_MONGO_URI === "")(
           platform_api_url: "http://oe:8000",
           resume: false,
           previous_execution_cancelled: false,
+          durable_ack_enabled: false,
           thread_id: "thread-hitl-1",
         } as ExecuteRequest)) as {
           status: string;
@@ -283,6 +286,7 @@ describe.skipIf(TEST_MONGO_URI === "")(
           platform_api_url: "http://oe:8000",
           resume: true,
           previous_execution_cancelled: false,
+          durable_ack_enabled: false,
           resume_data: { decision: "approve" },
           metadata,
           thread_id: "thread-hitl-1",

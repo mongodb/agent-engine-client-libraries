@@ -1,9 +1,11 @@
 # OpenAPI acceptance corpus
 
 `manifest.json` is the executable product boundary for OpenAPI generation. It
-pins exactly 100 APIs.guru documents by URL and SHA-256 and records the declared
-operation count, accepted authentication presentation, and minimum compiled
-operation count for each document.
+pins exactly 100 APIs.guru documents by path and SHA-256 within one commit of
+the [APIs.guru GitHub repository](https://github.com/APIs-guru/openapi-directory)
+(the source of api.apis.guru), and records the declared operation count,
+accepted authentication presentation, and minimum compiled operation count for
+each document.
 
 The set was curated from the APIs.guru index retrieved on 2026-09-15. Here,
 "popular" means recognizable APIs that developers are likely to connect to agents,

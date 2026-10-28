@@ -3348,7 +3348,7 @@ def _atlas_mcp_server(
         assert server_name == "atlas"
         return [
             SimpleNamespace(
-                name="find", description="Find documents.", inputSchema=input_schema
+                name="find", description="Find documents.", input_schema=input_schema
             )
         ]
 
@@ -3551,7 +3551,7 @@ def test_mcp_tools_are_offered_in_one_order_however_the_server_lists_them(
     def offered(listed: list[str]) -> list[str]:
         async def list_tools(_server_name: str, _config: Any) -> list[Any]:
             return [
-                SimpleNamespace(name=name, description="", inputSchema=_FIND_SCHEMA)
+                SimpleNamespace(name=name, description="", input_schema=_FIND_SCHEMA)
                 for name in listed
             ]
 

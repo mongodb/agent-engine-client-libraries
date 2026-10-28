@@ -13,13 +13,14 @@ Import them directly when needed::
 Or, for the common case, use ``App.deep_agent()`` which lazy-imports both.
 """
 
+from agent_engine_runner_shared import SessionFinishStatus
+from agent_engine_sdk_memory import Memory
+
 from .agent import LangGraphBaseAgent
 from .durable_errors import UnsupportedDurableGraphError
 from .output_parser import LangGraphOutputParser, RawStreamItem
 from .platform_checkpointer import PlatformCheckpointer
-from .runtime import App
-from agent_engine_sdk_memory import Memory
-from agent_engine_runner_shared import SessionFinishStatus
+from .runtime import App, LLMRegistrationDriftError
 
 # Memory is re-exported from agent-engine-sdk-memory for a stable import path.
 # ``agent_engine_sdk_langgraph.Memory is agent_engine_sdk_memory.Memory`` (same object).
@@ -28,6 +29,7 @@ from agent_engine_runner_shared import SessionFinishStatus
 
 __all__ = [
     "App",
+    "LLMRegistrationDriftError",
     "LangGraphBaseAgent",
     "LangGraphOutputParser",
     "Memory",

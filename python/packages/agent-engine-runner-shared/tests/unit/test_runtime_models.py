@@ -244,3 +244,75 @@ class TestGetAgent:
 
         with pytest.raises(RuntimeError, match="must be a BaseApp instance"):
             rt.get_agent()
+
+    def test_forwards_a_prebuilt_graph(self):
+        """A graph built by build_graph reaches the App's get_agent()."""
+        from unittest.mock import Mock, sentinel
+
+        from agent_engine_runner_shared.runtime import TenantRuntime
+
+        rt = TenantRuntime.__new__(TenantRuntime)
+        mock_app = Mock()
+        mock_app.get_agent.return_value = sentinel.agent
+        rt._graph_builder = mock_app
+
+        rt.get_agent(callbacks=["cb1"], graph=sentinel.graph)
+
+        mock_app.get_agent.assert_called_once_with(callbacks=["cb1"], graph=sentinel.graph)
+
+    def test_omits_graph_when_absent(self):
+        """The default path keeps the existing call shape for third-party Apps."""
+        from unittest.mock import Mock, sentinel
+
+        from agent_engine_runner_shared.runtime import TenantRuntime
+
+        rt = TenantRuntime.__new__(TenantRuntime)
+        mock_app = Mock()
+        mock_app.get_agent.return_value = sentinel.agent
+        rt._graph_builder = mock_app
+
+        rt.get_agent(callbacks=["cb1"])
+
+        mock_app.get_agent.assert_called_once_with(callbacks=["cb1"])
+
+
+# =============================================================================
+# TenantRuntime.build_graph() Tests
+# =============================================================================
+
+
+class TestBuildGraph:
+    """Tests for TenantRuntime.build_graph() dispatch."""
+
+    async def test_absent_when_no_app_registered(self):
+        from agent_engine_runner_shared.runtime import TenantRuntime
+
+        rt = TenantRuntime.__new__(TenantRuntime)
+        rt._graph_builder = None
+
+        assert await rt.build_graph(object(), object()) is None
+
+    async def test_absent_when_builder_has_no_hook(self):
+        from unittest.mock import Mock
+
+        from agent_engine_runner_shared.runtime import TenantRuntime
+
+        rt = TenantRuntime.__new__(TenantRuntime)
+        rt._graph_builder = Mock(spec=["get_agent"])
+
+        assert await rt.build_graph(object(), object()) is None
+
+    async def test_delegates_to_builder_hook(self):
+        from unittest.mock import AsyncMock, Mock, sentinel
+
+        from agent_engine_runner_shared.runtime import TenantRuntime
+
+        rt = TenantRuntime.__new__(TenantRuntime)
+        mock_app = Mock()
+        mock_app.build_graph = AsyncMock(return_value={"flag": True})
+        rt._graph_builder = mock_app
+
+        result = await rt.build_graph(sentinel.input, sentinel.ctx)
+
+        assert result == {"flag": True}
+        mock_app.build_graph.assert_awaited_once_with(sentinel.input, sentinel.ctx)

@@ -79,6 +79,7 @@ def _compile_deadline(seconds: int) -> Iterator[None]:
 def test_manifest_locks_the_product_boundary() -> None:
     apis = MANIFEST["apis"]
     assert MANIFEST["source_index_retrieved_at"] == "2026-09-15"
+    assert len(MANIFEST["source_commit"]) == 40
     assert MANIFEST["declared_operations"] == 10_059
     assert MANIFEST["aggregate_minimum"] == 9_512
     assert len(apis) == 100
@@ -93,7 +94,7 @@ def test_manifest_locks_the_product_boundary() -> None:
         if api["auth"]["presentation"] == "path_api_key":
             assert "{" + api["auth"]["name"] + "}" in api["auth"]["base_url"]
         assert len(api["sha256"]) == 64
-        assert api["url"].startswith("https://api.apis.guru/v2/specs/")
+        assert api["path"].startswith("v2/specs/")
 
 
 def test_strict_fixture_set_is_exact() -> None:

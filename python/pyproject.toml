@@ -1,6 +1,13 @@
 [tool.uv.workspace]
 members = ["packages/*", "examples/*"]
 
+# The workspace owns the linter so every consumer resolves one version from the
+# lock: the test suites, the API-reference generators, the publishable SDK test
+# runner, and CI. Without it, "uv run ruff" depends on whichever member was
+# synced last.
+[dependency-groups]
+dev = ["ruff"]
+
 [tool.ruff]
 line-length = 88
 src = ["packages/agent-engine-sdk-langgraph/src", "packages/agent-engine-sdk-adk/src", "packages/agent-engine-sdk-openai-agents/src", "packages/agent-engine-runner-shared/src", "examples/test-agent/src", "examples/insurance-agent/src", "examples/mta-alerts-agent/src"]

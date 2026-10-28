@@ -1,6 +1,7 @@
 # Table of Contents
 
 * [agent\_engine\_sdk\_langgraph.runtime](#agent_engine_sdk_langgraph.runtime)
+  * [LLMRegistrationDriftError](#agent_engine_sdk_langgraph.runtime.LLMRegistrationDriftError)
   * [App](#agent_engine_sdk_langgraph.runtime.App)
     * [\_\_init\_\_](#agent_engine_sdk_langgraph.runtime.App.__init__)
     * [agent\_config](#agent_engine_sdk_langgraph.runtime.App.agent_config)
@@ -9,6 +10,7 @@
     * [tools](#agent_engine_sdk_langgraph.runtime.App.tools)
     * [tool](#agent_engine_sdk_langgraph.runtime.App.tool)
     * [entrypoint](#agent_engine_sdk_langgraph.runtime.App.entrypoint)
+    * [build\_graph](#agent_engine_sdk_langgraph.runtime.App.build_graph)
     * [prepare\_agent\_input](#agent_engine_sdk_langgraph.runtime.App.prepare_agent_input)
     * [resolve\_thread\_id](#agent_engine_sdk_langgraph.runtime.App.resolve_thread_id)
     * [output\_parser](#agent_engine_sdk_langgraph.runtime.App.output_parser)
@@ -40,6 +42,21 @@
 
 LangChain SDK Runtime
 
+<a id="agent_engine_sdk_langgraph.runtime.LLMRegistrationDriftError"></a>
+
+## LLMRegistrationDriftError
+
+```python
+class LLMRegistrationDriftError(RuntimeError)
+```
+
+A per-execution build registered a different LLM id set.
+
+Distinct from an ordinary build failure so the Tool Pod can tell a registry
+that has drifted from one that merely failed to build: a drifted registry is
+not a usable partial discovery. The marker attribute lets runner-shared
+recognise it without importing this SDK, which it is not allowed to do.
+
 <a id="agent_engine_sdk_langgraph.runtime.App"></a>
 
 ## App
@@ -53,22 +70,24 @@ LangChain SDK for MongoDB Atlas Agent Engine.
 **Example**:
 
 ```python
-    from agent_engine_sdk_langgraph import App
-    from langchain_openai import ChatOpenAI
+from agent_engine_sdk_langgraph import App
+from langchain_openai import ChatOpenAI
 
-    app = App(app_name="My Agent")
+app = App(app_name="My Agent")
 
-    @app.tool()
-    def my_tool(query: str) -> str:
-        return "result"
 
-    @app.entrypoint
-    def build_agent():
-        llm = app.llm(ChatOpenAI(model="gpt-4"))
-        checkpointer = app.checkpointer()
-        tools = app.get_tools()
-        # Build LangGraph...
-        return graph
+@app.tool()
+def my_tool(query: str) -> str:
+    return "result"
+
+
+@app.entrypoint
+def build_agent():
+    llm = app.llm(ChatOpenAI(model="gpt-4"))
+    checkpointer = app.checkpointer()
+    tools = app.get_tools()
+    # Build LangGraph...
+    return graph
 ```
 
 <a id="agent_engine_sdk_langgraph.runtime.App.__init__"></a>
@@ -217,19 +236,93 @@ for Tool Pod execution.
 #### entrypoint
 
 ```python
-def entrypoint(fn: Callable[..., Any]) -> Callable[..., Any]
+def entrypoint(
+        fn: Callable[..., Any] | None = None,
+        *,
+        load_strategy: Literal["global", "per-execution"] = "global") -> Any
 ```
 
 Mark the graph builder function.
 
+Usable bare (``@app.entrypoint``) for the default cached,
+build-once behavior, or called with a strategy:
+
+
+``load_strategy="global"`` (the default) builds the graph once and
+caches it. ``load_strategy="per-execution"`` runs the builder on every
+invocation with the invocation's ``(input, ctx)``, so it can perform
+its own request-scoped I/O (sync or async) before returning the graph.
+
+**Registering LLMs under ``per-execution``.** Register every
+``llm_id`` the agent could ever use *before* any construction that
+depends on the invocation context:
+
+
+The Tool Pod discovers an agent's registered ids by building the graph
+with no invocation context, so a builder that needs context cannot be
+built there. It keeps whatever was registered before such a build
+failed, which is why registering first and reading context afterwards
+is the shape that works. Reading context is fine; reading it before the
+registrations is what breaks discovery.
+
+The registered set must also be the same on every invocation, because
+the Tool Pod resolves a model by ``llm_id`` against a registry built
+once per pod. Vary which id the graph *binds* per caller; do not vary
+which ids are *registered*. A per-execution build that registers a
+different set fails at the build, rather than mid-execution when the
+pod cannot resolve the model.
+
+```python
+@app.entrypoint(load_strategy="per-execution")
+async def build(input: AgentInput, ctx: RequestContext) -> CompiledStateGraph:
+    flag = await fetch_flag(ctx.user_id)
+    return assemble_graph(rollout_enabled=flag)
+```
+```python
+@app.entrypoint(load_strategy="per-execution")
+async def build(input: AgentInput, ctx: RequestContext) -> CompiledStateGraph:
+    llm = app.llm(ChatOpenAI(model="gpt-5.4"), llm_id="primary")  # register first
+    tier = await fetch_tier(ctx.user_id)  # then read context
+    tools = PREMIUM if tier == "premium" else FREE
+    return compile_graph(tools, llm)
+```
+
 **Arguments**:
 
-- `fn` - Function that builds and returns a CompiledStateGraph
+- `fn` - Function that builds and returns a CompiledStateGraph.
+- `load_strategy` - ``"global"`` (default) or ``"per-execution"``.
 
 
 **Returns**:
 
-  The original function (unchanged)
+  The original function (unchanged), or a decorator when called
+  with keyword arguments.
+
+
+**Raises**:
+
+- `ValueError` - If ``load_strategy`` is not a known strategy.
+
+<a id="agent_engine_sdk_langgraph.runtime.App.build_graph"></a>
+
+#### build\_graph
+
+```python
+async def build_graph(agent_input: AgentInput | None = None,
+                      ctx: RequestContext | None = None) -> Any
+```
+
+Build the graph for this invocation.
+
+Returns ``None`` for a global agent, signalling the caller to use the
+cached build path unchanged. For a per-execution agent, runs the
+builder with ``(agent_input, ctx)`` -- awaiting it when the builder is
+async -- and returns the compiled graph.
+
+The platform also builds the graph without an invocation to discover an
+agent's registered LLM ids. That call passes ``(None, None)``; a builder
+that needs real context fails there, and the failure names the
+context-free discovery rather than looking like a bug in the builder.
 
 <a id="agent_engine_sdk_langgraph.runtime.App.prepare_agent_input"></a>
 
@@ -371,12 +464,16 @@ Never raises: a failure returns ``False`` so the AER records the
 one-shot optimization as incomplete, while the existing lazy build
 remains the fallback for the first real ``get_agent()`` call.
 
+A no-op for ``per-execution`` agents: there is no caller to build for
+yet, so building here would only be discarded by the first real
+invocation. Warm-up still pre-builds for ``global`` agents.
+
 <a id="agent_engine_sdk_langgraph.runtime.App.get_agent"></a>
 
 #### get\_agent
 
 ```python
-def get_agent(callbacks: list[Any] | None = None) -> Any
+def get_agent(callbacks: list[Any] | None = None, *, graph: Any = None) -> Any
 ```
 
 Build and return a BaseAgent instance.
@@ -389,6 +486,10 @@ then wraps it in a LangGraphBaseAgent adapter.
 - `callbacks` - Optional list of BaseExecutionCallback instances
   for observability (e.g., NodeExecutionLogger from the AER).
   Wrapped in LangGraphCallbackAdapter before passing to the graph.
+- `graph` - A graph already built by ``build_graph`` for this
+  invocation (a per-execution agent). ``None`` (the default, and
+  the only value a global agent ever sees) uses the cached build
+  path.
 
 
 **Returns**:
@@ -821,20 +922,20 @@ Resume state travels on the RequestContext, not the caller payload:
 **Example**:
 
 ```python
-    from langgraph.graph import StateGraph
-    from agent_engine_sdk_langgraph import LangGraphBaseAgent
+from langgraph.graph import StateGraph
+from agent_engine_sdk_langgraph import LangGraphBaseAgent
 
-    # Build your graph
-    graph = StateGraph(...)
-    compiled = graph.compile(checkpointer=...)
+# Build your graph
+graph = StateGraph(...)
+compiled = graph.compile(checkpointer=...)
 
-    # Wrap it with optional callbacks
-    agent = LangGraphBaseAgent(compiled, callbacks=[my_callback])
+# Wrap it with optional callbacks
+agent = LangGraphBaseAgent(compiled, callbacks=[my_callback])
 
-    # Use via BaseAgent protocol
-    output = await agent.execute(ctx, agent_input)          # non-streaming
-    async for event in agent.execute(ctx, agent_input):     # streaming
-        ...
+# Use via BaseAgent protocol
+output = await agent.execute(ctx, agent_input)  # non-streaming
+async for event in agent.execute(ctx, agent_input):  # streaming
+    ...
 ```
 
 <a id="agent_engine_sdk_langgraph.agent.LangGraphBaseAgent.__init__"></a>

@@ -327,7 +327,7 @@ export class ToolFunctionRunner {
         // Populate the named-LLM registry so a tool calling an LLM works,
         // same as ToolServer.onStartup(). Not required if no LLMs are called,
         // but matches the server-mode startup contract.
-        this._prepare();
+        await this._prepare();
 
         logger.info(
           `function mode: invoking tool=${JSON.stringify(request.tool_name)} execution_id=${request.execution_id} step=${step}`,
@@ -366,13 +366,22 @@ export class ToolFunctionRunner {
     );
   }
 
-  private _prepare(): void {
-    populateLlmRegistryFromEntrypoint(this.runtime.graphBuilder, logger, {
-      entrypointFailed:
-        "Failed to run entrypoint for LLM registration; LLM calls from this tool will fail",
-      noLlmRegistered:
-        "Entrypoint ran but did not call app.llm(); LLM calls from this tool will fail",
-    });
+  private async _prepare(): Promise<void> {
+    await populateLlmRegistryFromEntrypoint(
+      this.runtime.graphBuilder,
+      logger,
+      {
+        entrypointFailed:
+          "Failed to run entrypoint for LLM registration; LLM calls from this tool will fail",
+        noLlmRegistered:
+          "Entrypoint ran but did not call app.llm(); LLM calls from this tool will fail",
+      },
+      undefined,
+      {
+        usesPerInvocationBuild:
+          this.runtime.usesPerInvocationBuild?.() === true,
+      },
+    );
   }
 
   private async _invokeToolFn(

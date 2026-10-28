@@ -514,7 +514,12 @@ describe("streamLlmChunks retry behavior", () => {
     spyCreateLlmForPod(server, adapter);
 
     const chunks: LLMStreamChunk[] = [];
-    for await (const c of server.streamLlmChunks(makeRequest())) chunks.push(c);
+    for await (const c of server.streamLlmChunks(
+      makeRequest(),
+      undefined,
+      server.createLlmForPod("__default__"),
+    ))
+      chunks.push(c);
 
     expect(chunks.map((c) => c.content)).toEqual(["retry success"]);
     expect(callCount()).toBe(2);
@@ -529,7 +534,11 @@ describe("streamLlmChunks retry behavior", () => {
     spyCreateLlmForPod(server, adapter);
 
     await expect(async () => {
-      for await (const _ of server.streamLlmChunks(makeRequest())) {
+      for await (const _ of server.streamLlmChunks(
+        makeRequest(),
+        undefined,
+        server.createLlmForPod("__default__"),
+      )) {
         /* consume */
       }
     }).rejects.toThrow(/429 Too Many Requests/);
@@ -548,7 +557,11 @@ describe("streamLlmChunks retry behavior", () => {
 
     const chunks: LLMStreamChunk[] = [];
     await expect(async () => {
-      for await (const c of server.streamLlmChunks(makeRequest()))
+      for await (const c of server.streamLlmChunks(
+        makeRequest(),
+        undefined,
+        server.createLlmForPod("__default__"),
+      ))
         chunks.push(c);
     }).rejects.toThrow(/429 Too Many Requests/);
 

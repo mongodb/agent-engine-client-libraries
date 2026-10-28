@@ -2,14 +2,14 @@
 PolicyStore - MongoDB-backed policy and claims storage for insurance agent.
 """
 
-import logging
+import threading
+from concurrent.futures import Future
 from datetime import datetime
 from typing import List, Literal, Optional
 
 from pydantic import BaseModel, Field
 from pymongo import MongoClient
-
-logger = logging.getLogger(__name__)
+from pymongo.collection import Collection
 
 # Collection name constants
 POLICY_COLLECTION = "insurance_policies"
@@ -81,16 +81,98 @@ class Claim(BaseModel):
     resolved_at: Optional[str] = Field(default=None, description="Resolution timestamp")
 
 
+class _LazyCollection:
+    """A MongoDB collection that connects, and creates its indexes, on first use.
+
+    Building a ``MongoClient`` for a ``mongodb+srv`` URI resolves DNS, and creating
+    indexes contacts the server. Doing either at import time fails when the agent
+    starts before it can reach the database (for example before Atlas egress is
+    ready), and the store would stay broken for the life of the process. Nothing
+    is kept until the connection and its indexes succeed, so a call made while the
+    database is unreachable raises, and the next call tries again.
+    """
+
+    def __init__(self, mongodb_uri: str, database: str, name: str, indexes: list[tuple[str, bool]]):
+        """Keep the connection settings; ``indexes`` pairs each key with whether it is unique."""
+        self._mongodb_uri = mongodb_uri
+        self._database = database
+        self._name = name
+        self._indexes = indexes
+        self._collection: Optional[Collection] = None
+        # Guards the connection attempt that overlapping tool calls share.
+        self._lock = threading.Lock()
+        self._attempt: Optional[Future] = None
+
+    def get(self) -> Collection:
+        """Return the collection, connecting first if no earlier call succeeded.
+
+        Raises a ``PyMongoError`` when the database cannot be reached. Calls that
+        overlap a connection attempt share its outcome rather than starting their
+        own, so no call spans more than one attempt.
+        """
+        if self._collection is not None:
+            return self._collection
+        with self._lock:
+            # An attempt may have connected since the check above.
+            if self._collection is not None:
+                return self._collection
+            attempt, owner = self._attempt, self._attempt is None
+            if owner:
+                attempt = self._attempt = Future()
+        if not owner:
+            return attempt.result()
+        try:
+            self._collection = self._connect()
+            attempt.set_result(self._collection)
+            return self._collection
+        except BaseException as error:
+            # Calls joined to this attempt wait on it, so settle it however it ends.
+            attempt.set_exception(error)
+            raise
+        finally:
+            with self._lock:
+                self._attempt = None
+
+    def _connect(self) -> Collection:
+        """Connect and create the indexes, closing the client if either fails."""
+        # 2 s fast-fail rather than the driver defaults (20 s for the
+        # mongodb+srv DNS lookup, 30 s for server selection). The socket timeout
+        # stops a server that connects but never answers from holding a call, and
+        # every call joined to it, forever.
+        client: MongoClient = MongoClient(
+            self._mongodb_uri,
+            connectTimeoutMS=2000,
+            serverSelectionTimeoutMS=2000,
+            socketTimeoutMS=10000,
+        )
+        try:
+            collection = client[self._database][self._name]
+            for keys, unique in self._indexes:
+                collection.create_index(keys, unique=unique)
+        except BaseException:
+            client.close()
+            raise
+        return collection
+
+
 class PolicyStore:
     """MongoDB-backed policy storage."""
 
     def __init__(self, mongodb_uri: str, database: str = "tenant"):
-        # 2 s fast-fail rather than the default 30 s hang when the server is unreachable.
-        self._client = MongoClient(mongodb_uri, serverSelectionTimeoutMS=2000)
-        self._collection = self._client[database][POLICY_COLLECTION]
-        self._collection.create_index("policy_number", unique=True)
-        self._collection.create_index("holder_email")  # For listing by customer
-        self._collection.create_index("user_id")  # For listing by user_id
+        self._lazy = _LazyCollection(
+            mongodb_uri,
+            database,
+            POLICY_COLLECTION,
+            [
+                ("policy_number", True),
+                ("holder_email", False),  # For listing by customer
+                ("user_id", False),  # For listing by user_id
+            ],
+        )
+
+    @property
+    def _collection(self) -> Collection:
+        return self._lazy.get()
 
     def get_policy(self, policy_number: str) -> Optional[dict]:
         """Look up a policy by number."""
@@ -115,13 +197,21 @@ class ClaimStore:
     """MongoDB-backed claims storage."""
 
     def __init__(self, mongodb_uri: str, database: str = "tenant"):
-        # 2 s fast-fail rather than the default 30 s hang when the server is unreachable.
-        self._client = MongoClient(mongodb_uri, serverSelectionTimeoutMS=2000)
-        self._collection = self._client[database][CLAIMS_COLLECTION]
-        self._collection.create_index("claim_id", unique=True)
-        self._collection.create_index("policy_number")
-        self._collection.create_index("user_id")
-        self._collection.create_index("status")
+        self._lazy = _LazyCollection(
+            mongodb_uri,
+            database,
+            CLAIMS_COLLECTION,
+            [
+                ("claim_id", True),
+                ("policy_number", False),
+                ("user_id", False),
+                ("status", False),
+            ],
+        )
+
+    @property
+    def _collection(self) -> Collection:
+        return self._lazy.get()
 
     def create_claim(self, claim: Claim) -> dict:
         """Create a new claim. Returns the created claim."""
@@ -182,22 +272,14 @@ class ClaimStore:
 
 
 def create_policy_store(mongodb_uri: str, database: str = "tenant") -> Optional[PolicyStore]:
-    """Factory function to create PolicyStore if MongoDB is configured."""
+    """Create a PolicyStore when MongoDB is configured; it connects on first use."""
     if not mongodb_uri:
         return None
-    try:
-        return PolicyStore(mongodb_uri, database)
-    except Exception as e:
-        logger.warning(f"Failed to create PolicyStore: {e}")
-        return None
+    return PolicyStore(mongodb_uri, database)
 
 
 def create_claim_store(mongodb_uri: str, database: str = "tenant") -> Optional[ClaimStore]:
-    """Factory function to create ClaimStore if MongoDB is configured."""
+    """Create a ClaimStore when MongoDB is configured; it connects on first use."""
     if not mongodb_uri:
         return None
-    try:
-        return ClaimStore(mongodb_uri, database)
-    except Exception as e:
-        logger.warning(f"Failed to create ClaimStore: {e}")
-        return None
+    return ClaimStore(mongodb_uri, database)

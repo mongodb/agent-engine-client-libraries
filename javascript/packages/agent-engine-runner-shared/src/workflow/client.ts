@@ -39,6 +39,7 @@ import {
   type CompleteExecutionCommand,
   type FinalizeStepCommand,
 } from "../generated/workflow/v1/state_pb.js";
+import { waitForRetry } from "../server/http_retry.js";
 import { fetchPlatform, getFetchOptionsWithTLS } from "../tls_client.js";
 import {
   encodeCancelledHistoryReport,
@@ -54,6 +55,53 @@ const STEP_FINALIZE_PATH = "/executor/step/finalize";
 const EXECUTION_COMPLETE_PATH = "/executor/complete";
 
 const DEFAULT_TIMEOUT_MS = 10_000;
+
+/**
+ * Backoff before resending a request whose connection OE refused, as it does
+ * for a few seconds while its pods restart or roll out. A failed connect means
+ * the request never left this runtime, so resending it cannot repeat an OE
+ * transition; every other transport failure may have reached OE and is
+ * reported as OUTCOME_UNKNOWN at once. Lease heartbeats and history reports
+ * are not resent: the heartbeat loop retries on its next interval, which a
+ * backoff would push past the lease, and a history report has the caller's
+ * shorter deadline.
+ */
+export const CONNECT_RETRY_DELAYS_MS: readonly number[] = [
+  500, 1000, 2000, 4000, 4000, 4000,
+];
+const CONNECT_PHASE_SYSCALLS = new Set(["connect", "getaddrinfo"]);
+const NEVER_ABORTED = new AbortController().signal;
+
+/**
+ * Whether a fetch rejection happened before the request was sent. Undici
+ * reports a refused connect or failed DNS lookup as `TypeError("fetch failed")`
+ * whose cause is the socket error; when a name resolves to several addresses,
+ * the cause is an AggregateError of the per-address connect errors.
+ */
+function failedBeforeSending(error: unknown): boolean {
+  const cause = error instanceof Error ? error.cause : undefined;
+  const socketErrors: unknown[] =
+    cause instanceof AggregateError ? cause.errors : [cause];
+  return (
+    socketErrors.length > 0 &&
+    socketErrors.every((socketError) =>
+      CONNECT_PHASE_SYSCALLS.has(
+        String((socketError as { syscall?: unknown } | undefined)?.syscall),
+      ),
+    )
+  );
+}
+
+function transportFailure(
+  operation: string,
+  error: unknown,
+): WorkflowClientError {
+  return new WorkflowClientError(
+    WorkflowErrorCode.OUTCOME_UNKNOWN,
+    `${operation} transport failure: ${error instanceof Error ? error.name : typeof error}`,
+    { cause: error },
+  );
+}
 
 const STATUS_TO_CODE: Readonly<Record<number, WorkflowErrorCode>> = {
   400: WorkflowErrorCode.INVALID_ARGUMENT,
@@ -239,11 +287,7 @@ async function readResponseText(
   try {
     return await response.text();
   } catch (error) {
-    throw new WorkflowClientError(
-      WorkflowErrorCode.OUTCOME_UNKNOWN,
-      `${operation} transport failure: ${error instanceof Error ? error.name : typeof error}`,
-      { cause: error },
-    );
+    throw transportFailure(operation, error);
   }
 }
 
@@ -407,6 +451,7 @@ export class WorkflowClient {
       ATTEMPT_HEARTBEAT_PATH,
       encodeProtoJson(AttemptHeartbeatRequestSchema, request),
       "attempt heartbeat",
+      { retryConnect: false },
     );
     raiseOnError(
       response.status,
@@ -506,6 +551,7 @@ export class WorkflowClient {
       "/executor/cancelled-history",
       encodeCancelledHistoryReport(report),
       operation,
+      { retryConnect: false },
     );
     raiseOnError(
       response.status,
@@ -518,34 +564,42 @@ export class WorkflowClient {
     path: string,
     payload: string,
     operation: string,
+    { retryConnect = true }: { retryConnect?: boolean } = {},
   ): Promise<Response> {
     const url = `${this.baseUrl}${path}`;
-    try {
-      return await fetchPlatform(
-        url,
-        {
-          ...getFetchOptionsWithTLS(url),
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: payload,
-          // The execution signal (when bound) cancels an in-flight call on a
-          // Stop, so startup work cannot outlive the drain's reporting budget.
-          signal:
-            this.executionSignal === undefined
-              ? AbortSignal.timeout(this.timeoutMs)
-              : AbortSignal.any([
-                  AbortSignal.timeout(this.timeoutMs),
-                  this.executionSignal,
-                ]),
-        },
-        this.fetchFn,
-      );
-    } catch (error) {
-      throw new WorkflowClientError(
-        WorkflowErrorCode.OUTCOME_UNKNOWN,
-        `${operation} transport failure: ${error instanceof Error ? error.name : typeof error}`,
-        { cause: error },
-      );
+    const delays = retryConnect ? CONNECT_RETRY_DELAYS_MS : [];
+    for (let retry = 0; ; retry++) {
+      try {
+        return await fetchPlatform(
+          url,
+          {
+            ...getFetchOptionsWithTLS(url),
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: payload,
+            // The execution signal (when bound) cancels an in-flight call on a
+            // Stop, so startup work cannot outlive the drain's reporting budget.
+            signal:
+              this.executionSignal === undefined
+                ? AbortSignal.timeout(this.timeoutMs)
+                : AbortSignal.any([
+                    AbortSignal.timeout(this.timeoutMs),
+                    this.executionSignal,
+                  ]),
+          },
+          this.fetchFn,
+        );
+      } catch (error) {
+        const delayMs = delays[retry];
+        // A Stop during the backoff ends the call like a Stop mid-request.
+        if (
+          delayMs === undefined ||
+          !failedBeforeSending(error) ||
+          !(await waitForRetry(delayMs, this.executionSignal ?? NEVER_ABORTED))
+        ) {
+          throw transportFailure(operation, error);
+        }
+      }
     }
   }
 }

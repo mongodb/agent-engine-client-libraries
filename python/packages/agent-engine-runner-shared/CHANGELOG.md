@@ -7,7 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+- Removed the unused pre-materialized connector bundle override
+  (`AGENTIC_CONNECTOR_BUNDLE_PATH`) and the `load_connector_bundle` /
+  `CONNECTOR_BUNDLE_PATH_ENV` exports. Connectors resolve only from
+  `agent.yaml` and its local connector authoring files.
+
 ### Changed
+- Remote MCP servers now use MCP Python SDK 2.x (`mcp==2.3.0`). Each call
+  negotiates the protocol automatically: it probes `server/discover` and falls
+  back to the legacy `initialize` handshake, so servers on `2025-11-25` and
+  older keep working while `2026-07-28` servers are reached directly. Tool
+  result content keeps its wire field names (`mimeType`, `readOnlyHint`) and
+  failed HTTP calls keep reporting their status in error messages. OAuth caches
+  written by the previous SDK still load; new entries record the authorization
+  server's `issuer` when it provides one.
 - Reuse a process-wide keep-alive mTLS client for OE callbacks (tool
   execute/result, node events, progress and custom events) and drain callback
   response bodies so connections return to the pool; removes a full TLS

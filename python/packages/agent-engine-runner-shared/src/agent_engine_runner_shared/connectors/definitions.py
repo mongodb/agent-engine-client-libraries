@@ -47,7 +47,7 @@ CONNECTOR_NAME_PATTERN = r"^[A-Za-z0-9_-]{1,64}$"
 
 
 def validate_connector_name(value: str) -> str:
-    """Connector names key connector identity and appear in bundle indexes."""
+    """Connector names key connector identity in runtime registration."""
     if re.fullmatch(r"[A-Za-z0-9_-]{1,64}", value) is None:
         raise ValueError(f"connector name must match {CONNECTOR_NAME_PATTERN}")
     return value

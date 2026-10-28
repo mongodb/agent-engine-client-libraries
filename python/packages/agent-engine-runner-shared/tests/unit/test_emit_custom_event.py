@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import re
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -16,6 +17,17 @@ from agent_engine_runner_shared.custom_events import (
     set_custom_event_transport,
 )
 from agent_engine_runner_shared.server.chunk_types import CUSTOM_EVENT
+
+
+class _MatchesDeliveryID:
+    """Matcher for the 32-char lowercase-hex per-event delivery id (UUID4
+    without hyphens) the transport mints; a cross-language wire contract."""
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, str) and re.fullmatch(r"[0-9a-f]{32}", other) is not None
+
+
+MATCH_DELIVERY_ID = _MatchesDeliveryID()
 
 
 def _set_tool_ctx(
@@ -96,17 +108,17 @@ async def test_tool_transport_posts_opaque_custom_event_object() -> None:
             mock_get_client.return_value = mock_client
             await emit_custom_event({"event": "step", "data": "Fetching account information"})
 
-            mock_client.post.assert_called_once_with(
-                "http://oe:8000/stream/chunk",
-                json={
-                    "execution_id": "exec-1",
-                    "chunk_type": CUSTOM_EVENT,
-                    "custom_event": {
-                        "event": "step",
-                        "data": "Fetching account information",
-                    },
+            mock_client.post.assert_called_once()
+            payload = mock_client.post.call_args.kwargs["json"]
+            assert payload == {
+                "execution_id": "exec-1",
+                "chunk_type": CUSTOM_EVENT,
+                "custom_event": {
+                    "event": "step",
+                    "data": "Fetching account information",
                 },
-            )
+                "delivery_id": MATCH_DELIVERY_ID,
+            }
     finally:
         clear_custom_event_transport(transport_token)
         clear_execution_context(tokens)
@@ -126,6 +138,30 @@ def test_tool_transport_sync_posts_opaque_custom_event_object() -> None:
             payload = mock_client.post.call_args.kwargs["json"]
             assert payload["custom_event"] == {"event": "step", "data": "sync tool"}
             assert "metadata" not in payload
+    finally:
+        clear_custom_event_transport(transport_token)
+        clear_execution_context(tokens)
+
+
+@pytest.mark.asyncio
+async def test_tool_transport_delivery_id_distinct_between_events() -> None:
+    """Each event gets its own delivery id: two intentionally identical
+    custom events must remain distinct so the platform does not collapse
+    them, while each id is shared across that event's owner/service
+    attempts."""
+    tokens = _set_tool_ctx()
+    transport_token = install_tool_custom_event_transport()
+    try:
+        with patch("agent_engine_runner_shared.custom_events.get_shared_client") as mock_get_client:
+            mock_client = MagicMock()
+            _wire_stream_to_post(mock_client)
+            mock_get_client.return_value = mock_client
+            await emit_custom_event({"event": "step", "data": "same"})
+            await emit_custom_event({"event": "step", "data": "same"})
+
+            ids = [c.kwargs["json"]["delivery_id"] for c in mock_client.post.call_args_list]
+            assert len(ids) == 2
+            assert ids[0] != ids[1]
     finally:
         clear_custom_event_transport(transport_token)
         clear_execution_context(tokens)

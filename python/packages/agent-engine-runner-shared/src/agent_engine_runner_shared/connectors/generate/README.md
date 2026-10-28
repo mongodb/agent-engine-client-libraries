@@ -187,7 +187,7 @@ concerns.
 
 ## Acceptance corpus
 
-`tests/corpus/manifest.json` pins 100 real-world APIs.guru documents by URL and SHA-256.
+`tests/corpus/manifest.json` pins 100 real-world APIs.guru documents by path and SHA-256 within one GitHub commit.
 The set contains 10,059 declared operations and requires at least 9,512 generated tools
 overall, at least 80% for every API, and named Pinecone data-plane operations. The
 current implementation produces 9,880 tools (98.22%) for the pinned inputs.

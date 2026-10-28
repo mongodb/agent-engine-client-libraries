@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import http.server
 import json
+import re
 import threading
 from unittest.mock import MagicMock, patch
 
@@ -21,6 +22,19 @@ from agent_engine_runner_shared.server.chunk_types import (
     SUBAGENT_START,
     TEXT,
 )
+
+
+# Matches the 32-character lowercase-hex delivery ids the SDK mints (a UUID4
+# without hyphens); the platform honors them as the durable delivery identity
+# of seq-less chunks, so the format is a cross-language wire contract.
+class _Hex32:
+    """Matcher for a 32-char lowercase-hex delivery id (UUID4 without hyphens)."""
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, str) and re.fullmatch(r"[0-9a-f]{32}", other) is not None
+
+
+MATCH_HEX_32 = _Hex32()
 
 
 def _set_ctx(execution_id: str, oe_url: str):
@@ -52,6 +66,7 @@ def test_emit_step_posts_step_chunk() -> None:
                     "chunk_type": STEP,
                     "content": "Fetching page...",
                     "metadata": {},
+                    "delivery_id": MATCH_HEX_32,
                 },
             )
     finally:
@@ -95,8 +110,57 @@ def test_emit_accepts_arbitrary_event_type() -> None:
                     "chunk_type": "custom_event",
                     "content": "payload",
                     "metadata": {},
+                    "delivery_id": MATCH_HEX_32,
                 },
             )
+    finally:
+        clear_execution_context(tokens)
+
+
+# ---------------------------------------------------------------------------
+# delivery_id — a stable per-event identity shared by both delivery attempts
+# ---------------------------------------------------------------------------
+
+
+def test_emit_delivery_id_distinct_between_events() -> None:
+    """Each event gets its own delivery id: two intentionally identical emits
+    must remain distinct so the platform does not collapse them."""
+    tokens = _set_ctx("exec-ids", "http://oe:8000")
+    try:
+        with _patched_client() as mock_client:
+            emit_step("same message")
+            emit_step("same message")
+
+            ids = [c.kwargs["json"]["delivery_id"] for c in mock_client.post.call_args_list]
+            assert len(ids) == 2
+            assert ids[0] != ids[1]
+    finally:
+        clear_execution_context(tokens)
+
+
+def test_emit_delivery_id_identical_across_owner_fallback() -> None:
+    """The owner attempt and the service fallback carry the same delivery id,
+    so the platform can dedup the redelivery after a lost owner response."""
+    tokens = _set_ctx_owner("exec-id-fb", _SERVICE, _OWNER)
+    try:
+        with patch("agent_engine_runner_shared.progress.get_shared_client") as mock_get_client:
+            mock_client = MagicMock()
+            _wire_stream_to_post(mock_client)
+            mock_get_client.return_value = mock_client
+
+            def side_effect(url, json):
+                if url == f"{_OWNER}/stream/chunk":
+                    raise httpx.ConnectError("owner refused")
+                return MagicMock()
+
+            mock_client.post.side_effect = side_effect
+            emit_step("hello")
+
+            urls = [c.args[0] for c in mock_client.post.call_args_list]
+            assert urls == [f"{_OWNER}/stream/chunk", f"{_SERVICE}/stream/chunk"]
+            owner_payload = mock_client.post.call_args_list[0].kwargs["json"]
+            service_payload = mock_client.post.call_args_list[1].kwargs["json"]
+            assert owner_payload["delivery_id"] == service_payload["delivery_id"]
     finally:
         clear_execution_context(tokens)
 
@@ -255,6 +319,7 @@ def test_emit_integration_wire_format() -> None:
         "chunk_type": STEP,
         "content": "Integration check",
         "metadata": {},
+        "delivery_id": MATCH_HEX_32,
     }
 
 

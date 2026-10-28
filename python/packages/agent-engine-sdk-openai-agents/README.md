@@ -15,6 +15,10 @@ keeps no session database and never uses OpenAI Sessions, Conversations, or
 
 ## Building an agent
 
+To start from a working project, run `agentengine create` and pick the
+OpenAI Agents SDK variant of the Hello World or Human-in-the-Loop agent
+(`--template hello-world-agent-openai` or `--template insurance-agent-openai`).
+
 ```python
 from agents import Agent, ModelSettings
 from agent_engine_sdk_openai_agents import App

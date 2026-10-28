@@ -136,7 +136,10 @@ def _guidance_comment(base_url: str, auth: Auth | None) -> str:
         lines.append(f"#   secret   grant {granted} to the tool sandbox under")
         lines.append("#            sandboxes.tool.secrets (sandboxes requires an agent block)")
     elif auth is not None and auth.type == "oauth":
-        lines.append("#   auth     delegated OAuth; configure the named provider for this project")
+        lines.append(
+            "#   auth     delegated OAuth; register a credential provider with provider "
+            f"type {_quote(auth.provider_type)} in this project"
+        )
         lines.append("#   secret   none required in the tool sandbox; tokens are request-local")
     else:
         lines.append("#   secret   none required; this connector authenticates anonymously")

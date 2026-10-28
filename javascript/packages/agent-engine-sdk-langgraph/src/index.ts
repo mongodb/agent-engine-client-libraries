@@ -11,8 +11,13 @@ export { LangGraphBaseAgent } from "./agent.js";
 export type { PrepareAgentInput, ResolveThreadId } from "./agent.js";
 export { LangGraphQueryPlugin } from "./query.js";
 export type { LangGraphQueryPluginParams } from "./query.js";
-export { App } from "./runtime.js";
-export type { DeepAgentOptions, ToolDecoratorOptions } from "./runtime.js";
+export { App, LLMRegistrationDriftError } from "./runtime.js";
+export type {
+  DeepAgentOptions,
+  EntrypointOptions,
+  LoadStrategy,
+  ToolDecoratorOptions,
+} from "./runtime.js";
 export type {
   OnUnknownOutcome,
   SessionFinishStatus,

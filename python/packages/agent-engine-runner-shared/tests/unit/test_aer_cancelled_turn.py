@@ -104,6 +104,7 @@ async def _run_execute_and_drain(
     definitely fired (or definitively not).
     """
     runtime = Mock()
+    runtime.build_graph = AsyncMock(return_value=None)
     runtime.get_agent.return_value = agent
     server = AERServer(runtime)
     if configure is not None:
@@ -292,6 +293,7 @@ async def test_cancel_during_the_routing_probe_still_commits_the_turn() -> None:
         return None  # native routing
 
     runtime = Mock()
+    runtime.build_graph = AsyncMock(return_value=None)
     runtime.get_agent.return_value = agent
     server = AERServer(runtime)
     server._start_durable_attempt = slow_probe
@@ -336,6 +338,7 @@ async def test_unresolved_routing_never_writes_native_history() -> None:
         raise RuntimeError("oe unreachable")
 
     runtime = Mock()
+    runtime.build_graph = AsyncMock(return_value=None)
     runtime.get_agent.return_value = agent
     _registering_get_agent(runtime, agent)
     server = AERServer(runtime)

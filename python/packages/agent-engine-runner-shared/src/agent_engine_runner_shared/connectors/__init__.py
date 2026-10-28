@@ -1,12 +1,10 @@
-"""Compiled OpenAPI connector core, bundle loading, and authoring materialization."""
+"""Compiled OpenAPI connector core and authoring materialization."""
 
 from agent_engine_runner_shared.connectors.bundle import (
-    CONNECTOR_BUNDLE_PATH_ENV,
     BundledConnector,
     BundledTool,
     ConnectorBundle,
     ConnectorBundleError,
-    load_connector_bundle,
 )
 from agent_engine_runner_shared.connectors.definitions import (
     Auth,
@@ -33,7 +31,6 @@ from agent_engine_runner_shared.connectors.runtime import (
 )
 
 __all__ = [
-    "CONNECTOR_BUNDLE_PATH_ENV",
     "BundledConnector",
     "BundledTool",
     "CompileResult",
@@ -48,7 +45,6 @@ __all__ = [
     "Auth",
     "ToolDefinitions",
     "compile_catalog",
-    "load_connector_bundle",
     "load_tool_defs",
     "materialize_connectors",
     "regenerate_catalog",

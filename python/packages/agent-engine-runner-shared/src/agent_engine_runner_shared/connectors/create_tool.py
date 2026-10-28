@@ -51,13 +51,20 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--base-url", help="Tenant API base URL recorded in the authoring file")
     parser.add_argument(
         "--auth",
-        choices=("none", "bearer", "api_key"),
+        choices=("none", "bearer", "api_key", "oauth"),
         help="Credential presentation; the authority over the spec's own security schemes",
     )
     parser.add_argument(
         "--auth-env", help="Workspace secret environment reference for the credential"
     )
     parser.add_argument("--auth-header", help="Header name for API key credentials")
+    parser.add_argument(
+        "--provider-type",
+        help="Credential provider key registered in the project (with --auth oauth)",
+    )
+    parser.add_argument(
+        "--scopes", help="Comma-separated delegated OAuth scopes (with --auth oauth)"
+    )
     parser.add_argument("--allow", help="Comma-separated operation allow list (default: allow_all)")
     parser.add_argument(
         "--out-dir",
@@ -73,6 +80,17 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def _auth(args: argparse.Namespace) -> Auth | None:
+    """Build the credential presentation the flags select, or None to let the
+    spec's own security schemes govern. Flag-combination refusals live here;
+    the shared ``Auth`` model validates the values themselves."""
+    if args.auth != "oauth" and (args.provider_type is not None or args.scopes is not None):
+        raise GenerateError("--provider-type and --scopes require --auth oauth")
+    if args.auth == "oauth":
+        if args.auth_env or args.auth_header:
+            raise GenerateError("--auth oauth cannot take --auth-env or --auth-header")
+        if not args.provider_type:
+            raise GenerateError("--auth oauth requires --provider-type")
+        return Auth(type="oauth", provider_type=args.provider_type, scopes=_scopes(args.scopes))
     if args.auth == "none":
         if args.auth_env or args.auth_header:
             raise GenerateError("--auth none cannot take --auth-env or --auth-header")
@@ -84,6 +102,17 @@ def _auth(args: argparse.Namespace) -> Auth | None:
     if not args.auth_env:
         raise GenerateError(f"--auth {args.auth} requires --auth-env")
     return Auth(type=args.auth, env=args.auth_env, header=args.auth_header)
+
+
+def _scopes(raw: str | None) -> list[str]:
+    """Split ``--scopes``; omitted means no scopes. An empty entry is refused
+    rather than dropped, so a typo cannot silently narrow the grant."""
+    if raw is None:
+        return []
+    scopes = [scope.strip() for scope in raw.split(",")]
+    if not all(scopes):
+        raise GenerateError("--scopes must not contain empty entries")
+    return scopes
 
 
 def _allow(raw: str | None) -> list[str] | None:
@@ -127,6 +156,8 @@ def main(argv: list[str] | None = None) -> int:
                 args.auth
                 or args.auth_env
                 or args.auth_header
+                or args.provider_type is not None
+                or args.scopes is not None
                 or args.allow is not None
                 or args.base_url
                 or args.name
@@ -134,8 +165,9 @@ def main(argv: list[str] | None = None) -> int:
             ):
                 raise GenerateError(
                     "--config regeneration preserves the authored settings from "
-                    "tool.yaml and writes beside it; --auth, --auth-env, "
-                    "--auth-header, --allow, --base-url, --name and --out-dir do not apply"
+                    "tool.yaml and writes beside it; --auth, --auth-env, --auth-header, "
+                    "--provider-type, --scopes, --allow, --base-url, --name and --out-dir "
+                    "do not apply"
                 )
             result = regenerate_catalog(args.config, skip_unsupported=args.skip_unsupported)
             written = [str(result.catalog)]

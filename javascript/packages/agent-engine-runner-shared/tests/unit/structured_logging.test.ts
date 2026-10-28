@@ -357,6 +357,158 @@ test.each([
 // stdout/stderr capture
 // ---------------------------------------------------------------------------
 
+test("JSON stdout errors keep their severity", () => {
+  const fx = setupCapture();
+  fx.install();
+  const line = JSON.stringify({
+    level: "error",
+    event: "failed",
+    exception: "RuntimeError: failed\n",
+  });
+  process.stdout.write(line + "\n");
+  const rec = fx.records.find((r) => r.message === line);
+  expect(rec?.level).toBe("ERROR");
+  expect(rec?.source).toBe("stdout");
+});
+
+test("JSON stdout warnings keep their severity", () => {
+  const fx = setupCapture();
+  fx.install();
+  const line = '{"level":"warning","event":"retrying"}';
+  process.stdout.write(line + "\n");
+  expect(fx.records.find((r) => r.message === line)?.level).toBe("WARNING");
+});
+
+test.each([
+  ["debug", "DEBUG"],
+  ["INFO", "INFO"],
+  [" WaRn ", "WARNING"],
+  ["WARNING", "WARNING"],
+  [" ErR ", "ERROR"],
+  ["ERROR", "ERROR"],
+])("JSON stdout normalizes %s to %s", (level, expected) => {
+  const fx = setupCapture();
+  fx.install();
+  const line = JSON.stringify({ level });
+  process.stdout.write(line + "\n");
+  expect(fx.records.find((r) => r.message === line)?.level).toBe(expected);
+});
+
+test.each([
+  "{}",
+  '{"level":null}',
+  '{"level":50}',
+  '{"level":true}',
+  '{"level":[]}',
+  '{"level":{}}',
+  '{"level":"critical"}',
+  '{"level":""}',
+  '{"severity":"error"}',
+  '{"nested":{"level":"error"}}',
+  '{"level":"error"',
+  '[{"level":"error"}]',
+  "null",
+  '"error"',
+  "42",
+  '{"level":"error","data":' + "[".repeat(2000) + "0" + "]".repeat(2000) + "}",
+])("JSON stdout invalid levels keep INFO (%#)", (line) => {
+  const fx = setupCapture();
+  fx.install();
+  process.stdout.write(line + "\n");
+  expect(fx.records.find((r) => r.message === line)?.level).toBe("INFO");
+});
+
+test("JSON stdout preserves other logging paths", () => {
+  const fx = setupCapture();
+  fx.install({ level: "ERROR" });
+  process.stdout.write('plain stdout\n{"level":"debug"}\n');
+  process.stderr.write('{"level":"error"}\nplain stderr\n');
+  lg("native-json-test").info("filtered native info");
+  lg("native-json-test").error('{"level":"warning"}');
+  expect(fx.records.map((r) => [r.message, r.level, r.source])).toEqual([
+    ["plain stdout", "INFO", "stdout"],
+    ['{"level":"debug"}', "DEBUG", "stdout"],
+    ['{"level":"error"}', "WARNING", "stderr"],
+    ["plain stderr", "WARNING", "stderr"],
+    ['{"level":"warning"}', "ERROR", "node-logging"],
+  ]);
+});
+
+test("JSON stdout classifies buffered lines independently", () => {
+  const fx = setupCapture();
+  fx.install();
+  process.stdout.write('{"level":"er');
+  expect(fx.records).toEqual([]);
+  process.stdout.write('ror"}\n{"level":"warning"}\nplain\n{"level":"debug"}');
+  // Re-install flushes the outgoing capture, including its final partial line.
+  fx.install();
+  expect(fx.records.map((r) => [r.message, r.level])).toEqual([
+    ['{"level":"error"}', "ERROR"],
+    ['{"level":"warning"}', "WARNING"],
+    ["plain", "INFO"],
+    ['{"level":"debug"}', "DEBUG"],
+  ]);
+});
+
+test("JSON stdout cannot override platform metadata", () => {
+  const fx = setupCapture();
+  fx.install();
+  const line = JSON.stringify({
+    level: "error",
+    message: 'failed\n{"level":"info"}',
+    timestamp: "forged",
+    tenantId: "forged",
+    projectId: "forged",
+    workspaceId: "forged",
+    executionId: "forged",
+    sessionId: "forged",
+    service: "forged",
+    source: "stderr",
+    bootId: "forged",
+    podName: "forged",
+    fields: { component: "forged" },
+  });
+  runWithExecutionContext(
+    {
+      executionId: "exec-test-001",
+      oeUrl: "http://localhost:8000",
+      sessionId: "sess-test-002",
+      workspaceId: "ws-test-003",
+    },
+    () => process.stdout.write(line + "\n"),
+  );
+  expect(fx.records).toHaveLength(1);
+  const rec = fx.records[0];
+  expect(rec?.timestamp).not.toBe("forged");
+  expect(rec).toMatchObject({
+    message: line,
+    level: "ERROR",
+    tenantId: "tenant-acme",
+    projectId: "project-zeta",
+    workspaceId: "ws-test-003",
+    executionId: "exec-test-001",
+    sessionId: "sess-test-002",
+    service: "agent-execution-runtime",
+    source: "stdout",
+    bootId: "11111111-1111-4111-8111-111111111111",
+    podName: "test-pod-xyz",
+  });
+  expect(rec?.fields).toEqual({ component: "aer" });
+});
+
+test.each([
+  ['{"level":' + "9".repeat(5000) + "}", "INFO"],
+  ['{"level":"error","data":' + "9".repeat(5000) + "}", "ERROR"],
+  ['{"level":"error","data":NaN}', "INFO"],
+  ['{"level":"error","data":Infinity}', "INFO"],
+  ['{"level":"error","data":-Infinity}', "INFO"],
+])("JSON stdout numeric decoding is safe (%#)", (line, expected) => {
+  const fx = setupCapture();
+  fx.install();
+  process.stdout.write(line + "\n");
+  expect(fx.records.find((r) => r.message === line)?.level).toBe(expected);
+});
+
 test("console.log captured as source=stdout, level=INFO", () => {
   const fx = setupCapture();
   fx.install();

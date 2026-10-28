@@ -16,6 +16,8 @@
  * Python `_get_client` machinery provides.
  */
 
+import { randomUUID } from "node:crypto";
+
 import {
   getCurrentExecutionId,
   getCurrentOeOwnerUrl,
@@ -125,11 +127,17 @@ export async function emit(event: string, data: string): Promise<void> {
   if (!executionId || !oeUrl) return;
 
   try {
+    // delivery_id is minted once per event and reused verbatim by
+    // postChunkOwnerFirst across both attempts, so a fallback after a lost
+    // owner response carries the same stable identity and the platform can
+    // dedup the redelivered event. Regenerated per emit — two intentionally
+    // identical events must remain distinct. Mirrors progress.py.
     const body = JSON.stringify({
       execution_id: executionId,
       chunk_type: event,
       content: data,
       metadata: {},
+      delivery_id: randomUUID().replace(/-/g, ""),
     });
     // Owner preference: the owner URL is already validated against oeUrl by the
     // tool-pod server, so trust it as-is. Each request gets its own timeout

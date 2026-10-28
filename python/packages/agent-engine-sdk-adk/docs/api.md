@@ -1,6 +1,7 @@
 # Table of Contents
 
 * [agent\_engine\_sdk\_adk.runtime](#agent_engine_sdk_adk.runtime)
+  * [LLMRegistrationDriftError](#agent_engine_sdk_adk.runtime.LLMRegistrationDriftError)
   * [App](#agent_engine_sdk_adk.runtime.App)
     * [\_\_init\_\_](#agent_engine_sdk_adk.runtime.App.__init__)
     * [memory](#agent_engine_sdk_adk.runtime.App.memory)
@@ -9,6 +10,7 @@
     * [tool](#agent_engine_sdk_adk.runtime.App.tool)
     * [entrypoint](#agent_engine_sdk_adk.runtime.App.entrypoint)
     * [llm](#agent_engine_sdk_adk.runtime.App.llm)
+    * [build\_graph](#agent_engine_sdk_adk.runtime.App.build_graph)
     * [get\_agent](#agent_engine_sdk_adk.runtime.App.get_agent)
     * [run](#agent_engine_sdk_adk.runtime.App.run)
 * [agent\_engine\_sdk\_adk.agent](#agent_engine_sdk_adk.agent)
@@ -22,6 +24,21 @@
   * [create\_rewind\_branch](#agent_engine_sdk_adk.rewind.create_rewind_branch)
 
 Google ADK adapter runtime for Atlas Agent Engine.
+
+<a id="agent_engine_sdk_adk.runtime.LLMRegistrationDriftError"></a>
+
+## LLMRegistrationDriftError
+
+```python
+class LLMRegistrationDriftError(RuntimeError)
+```
+
+A per-execution build registered a different LLM id set.
+
+Distinct from an ordinary build failure so the Tool Pod can tell a registry
+that has drifted from one that merely failed to build: a drifted registry is
+not a usable partial discovery. The marker attribute lets runner-shared
+recognise it without importing this SDK, which it is not allowed to do.
 
 <a id="agent_engine_sdk_adk.runtime.App"></a>
 
@@ -43,10 +60,12 @@ from google.adk.models.google_llm import Gemini
 
 app = App(app_name="My Agent")
 
+
 @app.tool()
 def my_tool(query: str) -> str:
     """Search the database."""
     return "result"
+
 
 @app.entrypoint
 def build_agent():
@@ -169,10 +188,60 @@ Register a tool function with the platform.
 #### entrypoint
 
 ```python
-def entrypoint(fn: Callable[..., Any]) -> Callable[..., Any]
+def entrypoint(
+        fn: Callable[..., Any] | None = None,
+        *,
+        load_strategy: Literal["global", "per-execution"] = "global") -> Any
 ```
 
 Mark the ADK agent builder function.
+
+Usable bare (``@app.entrypoint``) for the default behavior, or called
+with a strategy:
+
+```python
+@app.entrypoint(load_strategy="per-execution")
+async def build(input: AgentInput, ctx: RequestContext) -> BaseAgent:
+    model = app.llm(Gemini(model="gemini-2.5-flash"), llm_id="primary")
+    flag = await fetch_flag(ctx.user_id)
+    return assemble_agent(model=model, rollout_enabled=flag)
+```
+
+``load_strategy="per-execution"`` runs the builder on every invocation
+with the invocation's ``(input, ctx)``, so it can perform its own
+request-scoped I/O before returning the agent. The builder's arity is
+checked here, at decoration time, against the call the runtime will
+actually make.
+
+**Registering LLMs under ``per-execution``.** Register every ``llm_id``
+the agent could ever use *before* any construction that depends on the
+invocation context. The Tool Pod discovers an agent's registered ids by
+building it with no invocation context, so a builder that needs context
+cannot be built there; it keeps whatever was registered before such a
+build failed. Reading context is fine, and reading it *before* the
+registrations is what breaks discovery.
+
+The registered set must also be the same on every invocation, because
+the Tool Pod resolves a model by ``llm_id`` against a registry built
+once per pod. Vary which id the agent *binds* per caller; do not vary
+which ids are *registered*. A per-execution build that registers a
+different set fails at the build, rather than mid-execution when the pod
+cannot resolve the model:
+
+```python
+@app.entrypoint(load_strategy="per-execution")
+async def build(input: AgentInput, ctx: RequestContext) -> BaseAgent:
+    # Register every selectable model first...
+    free = app.llm(Gemini(model="gemini-2.5-flash"), llm_id="free")
+    premium = app.llm(Gemini(model="gemini-3-flash-preview"), llm_id="premium")
+    # ...then read context, and bind one of them.
+    tier = await fetch_tier(ctx.user_id)
+    return LlmAgent(
+        model=premium if tier == "premium" else free,
+        tools=PREMIUM if tier == "premium" else FREE,
+        name="my_agent",
+    )
+```
 
 <a id="agent_engine_sdk_adk.runtime.App.llm"></a>
 
@@ -194,15 +263,40 @@ Wrap an ADK LLM for audited I/O through the Orchestration Engine.
 
   SecureLlm in AER mode; the raw *llm* in TOOL mode.
 
+<a id="agent_engine_sdk_adk.runtime.App.build_graph"></a>
+
+#### build\_graph
+
+```python
+async def build_graph(agent_input: AgentInput | None = None,
+                      ctx: RequestContext | None = None) -> Any
+```
+
+Build the agent for this invocation before ``get_agent``.
+
+Returns ``None`` for a global agent, signalling the caller to use the
+existing build path unchanged. For a per-execution agent, runs the
+builder with ``(agent_input, ctx)`` -- awaiting it when the builder is
+async -- and returns the agent.
+
+The platform also builds the agent without an invocation to discover its
+registered LLM ids. That call passes ``(None, None)``; a builder that
+needs real context fails there, and the failure names the context-free
+discovery rather than looking like a bug in the builder.
+
 <a id="agent_engine_sdk_adk.runtime.App.get_agent"></a>
 
 #### get\_agent
 
 ```python
-def get_agent(callbacks: list[Any] | None = None) -> Any
+def get_agent(callbacks: list[Any] | None = None, *, graph: Any = None) -> Any
 ```
 
 Build and return an ADKBaseAgent wrapping the registered entrypoint.
+
+``graph`` is an agent ``build_graph`` already built for this invocation.
+It is only forwarded when present, so a caller using the existing path
+keeps working.
 
 <a id="agent_engine_sdk_adk.runtime.App.run"></a>
 

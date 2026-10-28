@@ -239,7 +239,16 @@ export function writeTerminationMessage(summary: string, err?: Error): void {
  */
 let fatalPromise: Promise<never> | undefined;
 
-async function fatalWithTermination(
+/**
+ * Log, write the termination message, and exit. Idempotent.
+ *
+ * Safe to call after startup as well as during it: the startup-error report
+ * no-ops once startup completes, so a runtime fatal still gets the log line and
+ * the termination message that carries the cause to the deploy timeline. A
+ * server that finds itself unable to serve uses this rather than inventing a
+ * second exit path.
+ */
+export async function fatalWithTermination(
   summary: string,
   err?: Error,
   code = 1,

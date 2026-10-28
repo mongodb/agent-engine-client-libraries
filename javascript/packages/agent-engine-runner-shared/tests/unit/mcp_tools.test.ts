@@ -5,7 +5,7 @@
  * The transport/session-level paths (`discoverMcpTools`'s pagination and
  * caps, `withMcpSession`'s error-class selection) are covered below in
  * "discoverMcpTools / callMcpTool (mocked transport)" by mocking
- * `@modelcontextprotocol/sdk`'s `Client`, mirroring how Python's
+ * `@modelcontextprotocol/client`'s `Client`, mirroring how Python's
  * `test_mcp_tools.py` monkeypatches the `mcp` client for the same scenarios.
  */
 
@@ -25,6 +25,7 @@ import {
   resolveConfiguredMcpToolBinding,
   resolveMcpHeaders,
 } from "../../src/index.js";
+import { toolsFromPayload } from "../../src/mcp_tool_pages.js";
 
 const { mockConnect, mockListTools, mockCallTool, mockClose } = vi.hoisted(
   () => ({
@@ -35,7 +36,7 @@ const { mockConnect, mockListTools, mockCallTool, mockClose } = vi.hoisted(
   }),
 );
 
-vi.mock("@modelcontextprotocol/sdk/client/index.js", () => ({
+vi.mock("@modelcontextprotocol/client", () => ({
   // A regular `function` (not an arrow function) so `new Client(...)` in the
   // source under test can invoke this as a constructor — returning an object
   // from a constructor function replaces the `this` instance with it.
@@ -47,6 +48,11 @@ vi.mock("@modelcontextprotocol/sdk/client/index.js", () => ({
       close: mockClose,
     };
   }),
+  // The production code constructs a transport before calling `connect`;
+  // the mocked client never uses it, but the import must resolve.
+  StreamableHTTPClientTransport: vi
+    .fn()
+    .mockImplementation(function MockTransport() {}),
 }));
 
 afterEach(() => {
@@ -303,7 +309,7 @@ describe("normalizeMcpToolResult", () => {
 // discoverMcpTools / callMcpTool (mocked transport)
 // ---------------------------------------------------------------------------
 //
-// Mocks @modelcontextprotocol/sdk's `Client` so listServerTools' pagination
+// Mocks @modelcontextprotocol/client's `Client` so listServerTools' pagination
 // and caps, and withMcpSession's MCPConfigError-vs-MCPToolError selection,
 // are exercised without a real network dependency — mirroring the monkeypatch
 // coverage in Python's test_mcp_tools.py.
@@ -316,35 +322,66 @@ function makeDiscoveryConfig(overrides: Record<string, unknown> = {}) {
   });
 }
 
+describe("toolsFromPayload", () => {
+  test("counts a JSON-RPC batch tools page", () => {
+    expect(
+      toolsFromPayload([
+        {
+          jsonrpc: "2.0",
+          id: 7,
+          result: { tools: [{ name: "a" }, { name: "b" }] },
+        },
+      ]),
+    ).toEqual({ id: 7, count: 2 });
+  });
+
+  test("sums multiple tools results in one batch", () => {
+    expect(
+      toolsFromPayload([
+        { id: 1, result: { tools: [{}] } },
+        { id: 2, result: { tools: [{}, {}] } },
+      ]),
+    ).toEqual({ id: 2, count: 3 });
+  });
+
+  test("ignores payloads without a tools result", () => {
+    expect(toolsFromPayload({ id: 1, result: {} })).toBeUndefined();
+  });
+});
+
 describe("discoverMcpTools — pagination and caps", () => {
-  test("pages until nextCursor is empty, merging tools across pages", async () => {
-    mockListTools
-      .mockResolvedValueOnce({
-        tools: [{ name: "tool_a", inputSchema: { type: "object" } }],
-        nextCursor: "page-2",
-      })
-      .mockResolvedValueOnce({
-        tools: [{ name: "tool_b", inputSchema: { type: "object" } }],
-        nextCursor: undefined,
-      });
+  test("uses the SDK's aggregated page result in one listTools call", async () => {
+    mockListTools.mockResolvedValueOnce({
+      tools: [
+        { name: "tool_a", inputSchema: { type: "object" } },
+        { name: "tool_b", inputSchema: { type: "object" } },
+      ],
+    });
 
     const bindings = await discoverMcpTools(makeDiscoveryConfig());
 
-    expect(mockListTools).toHaveBeenCalledTimes(2);
+    expect(mockListTools).toHaveBeenCalledTimes(1);
+    expect(mockListTools).toHaveBeenCalledWith(undefined, {
+      timeout: 30_000,
+    });
     expect(bindings.map((b) => b.toolName).sort()).toEqual([
       "tool_a",
       "tool_b",
     ]);
   });
 
-  test("rejects when tools/list exceeds MAX_LIST_TOOL_PAGES", async () => {
-    mockListTools.mockImplementation(async () => ({
-      tools: [{ name: "tool", inputSchema: { type: "object" } }],
-      nextCursor: "always-more",
-    }));
+  test("wraps the SDK pagination-limit error as MCPConfigError", async () => {
+    mockListTools.mockRejectedValueOnce(
+      new Error(
+        "tools/list: exceeded listMaxPages (100); server pagination did not terminate",
+      ),
+    );
 
-    await expect(discoverMcpTools(makeDiscoveryConfig())).rejects.toThrow(
-      /exceeded 100 pages/,
+    await expect(discoverMcpTools(makeDiscoveryConfig())).rejects.toMatchObject(
+      {
+        name: "MCPConfigError",
+        message: expect.stringContaining("tools/list exceeded 100 pages"),
+      },
     );
   });
 
@@ -543,10 +580,13 @@ describe("callMcpTool — error classification", () => {
       structuredContent: null,
       isError: false,
     });
-    expect(mockCallTool).toHaveBeenCalledWith({
-      name: "search_issues",
-      arguments: { query: "bug" },
-    });
+    expect(mockCallTool).toHaveBeenCalledWith(
+      {
+        name: "search_issues",
+        arguments: { query: "bug" },
+      },
+      { timeout: 30_000 },
+    );
   });
 
   test("wraps a transport failure during tools/call as MCPToolError, not MCPConfigError", async () => {

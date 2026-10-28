@@ -319,7 +319,8 @@ def get_quote(
 ) -> str:
     """Generate a personalized auto insurance quote.
 
-    Uses customer memory to apply loyalty discounts and personalize pricing.
+    Applies a loyalty discount when the customer already holds a policy, and a
+    good-driver discount when memory records a clean driving record.
 
     Args:
         vehicle_year: Year of the vehicle (e.g., 2022)
@@ -349,41 +350,33 @@ def get_quote(
         elif driver_age >= 55:
             base *= 0.9  # Senior discount
 
-    # Check memory for returning customer benefits
-    loyalty_discount = 0
+    # Discounts: loyalty for policyholders, good driver from memory
+    discount = 0
     customer_notes = []
 
     # Check if customer has existing policies (true returning customer indicator)
     existing_policies = policy_store.list_by_user_id(user_id)  # type: ignore[arg-type]  # user_id is str at runtime
     has_existing_policies = len(existing_policies) > 0
 
-    # Check episodic memory for past conversations
-    past_episodes = app.memory.search_episodes(query="policy quote conversation", top_k=3)
-    has_past_interactions = len(past_episodes) > 0 if past_episodes else False
-
-    # Only apply loyalty discount if customer has existing policies OR past interactions
-    if has_existing_policies or has_past_interactions:
+    # Only an existing policy makes a returning customer. Memory is not enough:
+    # the agent saves notes during a customer's first conversation too.
+    if has_existing_policies:
         customer_notes.append("Returning customer - 10% loyalty discount applied")
-        loyalty_discount = 0.10
+        discount = 0.10
 
-        # Check semantic memory for good driving record
-        context = app.memory.build_context(
-            query="driving history record accidents",
-            user_id=user_id,
-        )
-        memory_context = (
-            context.formatted_context if isinstance(context.formatted_context, str) else ""
-        )
-        if memory_context:
-            if (
-                "clean driving" in memory_context.lower()
-                or "no accidents" in memory_context.lower()
-            ):
-                customer_notes.append("Good driver discount - additional 5% off")
-                loyalty_discount += 0.05
+    # Check semantic memory for good driving record
+    context = app.memory.build_context(
+        query="driving history record accidents",
+        user_id=user_id,
+    )
+    memory_context = context.formatted_context if isinstance(context.formatted_context, str) else ""
+    if memory_context:
+        if "clean driving" in memory_context.lower() or "no accidents" in memory_context.lower():
+            customer_notes.append("Good driver discount - additional 5% off")
+            discount += 0.05
 
-    # Apply loyalty discount
-    final_price = base * (1 - loyalty_discount)
+    # Apply discounts
+    final_price = base * (1 - discount)
 
     quote = {
         "quote_id": f"QT-{random.randint(100000, 999999)}",
@@ -398,7 +391,7 @@ def get_quote(
     if customer_notes:
         quote["applied_discounts"] = customer_notes  # type: ignore[arg-type]  # list assigned to TypedDict str field
 
-    if not has_existing_policies and not has_past_interactions:
+    if not has_existing_policies:
         quote["tip"] = (
             "Purchase a policy to become a returning customer and get loyalty discounts on future quotes!"
         )
@@ -701,12 +694,22 @@ def human_review(
     if resolution not in {"approved", "denied"}:
         return json.dumps({"error": "Human review decision must be approved or denied"})
 
+    reviewer_notes = reviewer_response.get("reviewer_notes", "")
+    if not isinstance(reviewer_notes, str):
+        return json.dumps({"error": "Human reviewer notes must be a string"})
+
+    # The reviewer response is the authoritative human input. Persist its raw
+    # notes after the interrupt returns so the model cannot paraphrase them
+    # while carrying the decision into resolve_claim.
+    if claim_store.update_claim(claim_id, {"reviewer_notes": reviewer_notes}) is None:
+        return json.dumps({"error": f"Claim not found: {claim_id}"})
+
     return json.dumps(
         {
             "status": "review_completed",
             "claim_id": claim_id,
             "resolution": resolution,
-            "reviewer_notes": reviewer_response.get("reviewer_notes", ""),
+            "reviewer_notes": reviewer_notes,
         },
         indent=2,
     )
@@ -829,6 +832,12 @@ def resolve_claim(
     claim = claim_store.get_claim(claim_id)
     if not claim:
         return json.dumps({"error": f"Claim not found: {claim_id}"})
+
+    # Human-review notes were written from the authenticated resume payload.
+    # Preserve them when the LLM supplies a paraphrase (or an empty default)
+    # while continuing to accept notes for automatic resolutions.
+    if "reviewer_notes" in claim and isinstance(claim["reviewer_notes"], str):
+        reviewer_notes = claim["reviewer_notes"]
 
     # Resolve the claim
     resolved = claim_store.resolve_claim(claim_id, resolution, reviewer_notes)
@@ -1300,7 +1309,7 @@ When a customer first says they want to buy insurance:
 1. Recall their info and past conversations
 2. Acknowledge their returning status by name if known
 3. Check existing policies with `list_customer_policies`
-4. Offer loyalty discounts on new quotes
+4. Customers with an existing policy get a loyalty discount on new quotes
 5. Help with any claims or policy questions
 
 ### For Filing Claims (follow this order exactly)
@@ -1321,7 +1330,7 @@ When a customer first says they want to buy insurance:
 6. **Decision Based on Risk Assessment**:
    - If `risk_assessment` is "low" AND claim amount < $1,000: Auto-approve with `resolve_claim`
    - If `risk_assessment` is "medium" or "high" OR claim amount >= $5,000: Call `human_review`
-7. **After Human Review Returns**: When `human_review` suspends and then resumes with approval, you MUST call `resolve_claim` with the claim_id and the reviewer's decision before doing anything else.
+7. **After Human Review Returns**: When `human_review` suspends and then resumes with approval, you MUST call `resolve_claim` with the claim_id and the reviewer's decision before doing anything else. The human review tool preserves the reviewer's notes exactly; do not invent or paraphrase them.
 8. **After Resolution**: Use `send_notification` to inform the customer of the outcome
 
 ## Risk Decision Guidelines
@@ -1378,7 +1387,7 @@ Example human_review call:
   - User: "I was in an accident"
   - You: [FIRST ACTION: Call `list_customer_policies`] → finds POL-12345
   - You: "I'm sorry to hear about your accident. I see you have an active Comprehensive policy (POL-12345) for your 2024 Toyota. Can you tell me what happened?"
-- Returning customers get automatic loyalty discounts on quotes
+- Customers with an existing policy get automatic loyalty discounts on quotes
 - When customers ask about insurance terms, use `explain_insurance_term`
 - Use `get_coverage_options` to explain Basic, Standard, and Comprehensive coverage
 - After creating a policy, provide them with their policy number

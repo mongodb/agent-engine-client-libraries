@@ -36,6 +36,7 @@ def _install_fake_clock(monkeypatch) -> _FakeClock:
 
 def _server(warm_up_agent) -> AERServer:
     runtime = MagicMock()
+    runtime.build_graph = AsyncMock(return_value=None)
     runtime._graph_builder = object()
     runtime.warm_up_agent = warm_up_agent
     server = AERServer(runtime)

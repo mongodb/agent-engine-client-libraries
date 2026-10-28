@@ -33,6 +33,7 @@ import {
   ActivityReplay,
   AttemptHeartbeat,
   attemptStartRequestFromExecute,
+  cancelledHistoryReport,
   completeExecutionCommand,
   currentAttemptContext,
   newDurabilityOwnerId,
@@ -40,6 +41,7 @@ import {
   WorkflowClient,
   WorkflowClientError,
 } from "../../src/workflow/index.js";
+import { CONNECT_RETRY_DELAYS_MS } from "../../src/workflow/client.js";
 
 afterEach(() => {
   vi.useRealTimers();
@@ -257,6 +259,189 @@ describe("WorkflowClient", () => {
         }),
       ),
     ).rejects.toMatchObject({ code: WorkflowErrorCode.STALE_FENCE });
+  });
+});
+
+describe("WorkflowClient connection failures", () => {
+  const startRequest = create(AttemptStartRequestSchema, {
+    workflowIdentity: identity,
+    ownerId: "owner",
+  });
+  const accepted = (): Response =>
+    jsonResponse({
+      attempt_context: toJson(AttemptContextSchema, attempt, {
+        useProtoFieldName: true,
+      }),
+    });
+  // Undici's rejection shapes for a refused connect (Node 22): one address, or
+  // an AggregateError when the name resolves to several.
+  const refusedSocket = (): Error =>
+    Object.assign(new Error("connect ECONNREFUSED 10.0.0.7:8080"), {
+      code: "ECONNREFUSED",
+      syscall: "connect",
+    });
+  const refused = (): TypeError =>
+    new TypeError("fetch failed", { cause: refusedSocket() });
+  const refusedEveryAddress = (): TypeError =>
+    new TypeError("fetch failed", {
+      cause: new AggregateError([refusedSocket(), refusedSocket()]),
+    });
+  const totalBackoffMs = CONNECT_RETRY_DELAYS_MS.reduce(
+    (sum, ms) => sum + ms,
+    0,
+  );
+
+  test("resends a request OE refused while restarting, until OE accepts it", async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi
+      .fn<typeof fetch>()
+      .mockRejectedValueOnce(refused())
+      .mockRejectedValueOnce(refusedEveryAddress())
+      .mockResolvedValueOnce(accepted());
+    const client = new WorkflowClient("http://oe", { fetch: fetchMock });
+
+    const result = client.startAttempt(startRequest);
+    await vi.advanceTimersByTimeAsync(totalBackoffMs);
+
+    await expect(result).resolves.toMatchObject({ attemptId: "attempt" });
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    const bodies = fetchMock.mock.calls.map(([, init]) => String(init?.body));
+    expect(new Set(bodies).size).toBe(1);
+  });
+
+  test("reports OUTCOME_UNKNOWN once OE stays unreachable past the backoff", async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi.fn<typeof fetch>().mockRejectedValue(refused());
+    const client = new WorkflowClient("http://oe", { fetch: fetchMock });
+
+    const settled = expect(
+      client.startAttempt(startRequest),
+    ).rejects.toMatchObject({
+      code: WorkflowErrorCode.OUTCOME_UNKNOWN,
+    });
+    await vi.advanceTimersByTimeAsync(totalBackoffMs);
+
+    await settled;
+    expect(fetchMock).toHaveBeenCalledTimes(CONNECT_RETRY_DELAYS_MS.length + 1);
+  });
+
+  test("resends a request whose OE name did not resolve", async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi
+      .fn<typeof fetch>()
+      .mockRejectedValueOnce(
+        new TypeError("fetch failed", {
+          cause: Object.assign(new Error("getaddrinfo ENOTFOUND oe"), {
+            code: "ENOTFOUND",
+            syscall: "getaddrinfo",
+          }),
+        }),
+      )
+      .mockResolvedValueOnce(accepted());
+    const client = new WorkflowClient("http://oe", { fetch: fetchMock });
+
+    const result = client.startAttempt(startRequest);
+    await vi.advanceTimersByTimeAsync(totalBackoffMs);
+
+    await expect(result).resolves.toMatchObject({ attemptId: "attempt" });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  // One address refusing does not prove the request never left: another may
+  // have accepted the connection and dropped it mid-request.
+  test.each([
+    {
+      name: "a request that may have reached OE",
+      cause: Object.assign(new Error("other side closed"), {
+        code: "UND_ERR_SOCKET",
+      }),
+    },
+    {
+      name: "a request only some of OE's addresses refused",
+      cause: new AggregateError([
+        refusedSocket(),
+        Object.assign(new Error("other side closed"), {
+          code: "UND_ERR_SOCKET",
+        }),
+      ]),
+    },
+  ])("does not resend $name", async ({ cause }) => {
+    vi.useFakeTimers();
+    const fetchMock = vi
+      .fn<typeof fetch>()
+      .mockRejectedValue(new TypeError("fetch failed", { cause }));
+    const client = new WorkflowClient("http://oe", { fetch: fetchMock });
+
+    const settled = expect(
+      client.startAttempt(startRequest),
+    ).rejects.toMatchObject({
+      code: WorkflowErrorCode.OUTCOME_UNKNOWN,
+    });
+    await vi.advanceTimersByTimeAsync(totalBackoffMs);
+
+    await settled;
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  // The heartbeat loop retries on its next interval, which a backoff would
+  // push past the attempt lease, and a history report must finish within its
+  // caller's deadline.
+  test.each([
+    {
+      name: "attempt heartbeat",
+      call: (client: WorkflowClient) =>
+        client.heartbeat(
+          create(AttemptHeartbeatRequestSchema, {
+            workflowIdentity: identity,
+            attemptId: "attempt",
+            fencingToken: 7n,
+            ownerId: "owner",
+          }),
+        ),
+    },
+    {
+      name: "cancelled history report",
+      call: (client: WorkflowClient) =>
+        client.reportCancelledHistory(
+          cancelledHistoryReport(attempt, {
+            openerMessageId: "opener",
+            messages: [],
+            acceptedStepOrdinal: 0n,
+          }),
+        ),
+    },
+  ])("does not resend a refused $name", async ({ call }) => {
+    const fetchMock = vi
+      .fn<typeof fetch>()
+      .mockRejectedValueOnce(refused())
+      .mockResolvedValue(new Response(null, { status: 204 }));
+    const client = new WorkflowClient("http://oe", { fetch: fetchMock });
+
+    await expect(call(client)).rejects.toMatchObject({
+      code: WorkflowErrorCode.OUTCOME_UNKNOWN,
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  test("a Stop during the backoff ends the call without resending", async () => {
+    vi.useFakeTimers();
+    const stop = new AbortController();
+    const fetchMock = vi.fn<typeof fetch>().mockRejectedValue(refused());
+    const client = new WorkflowClient("http://oe", {
+      fetch: fetchMock,
+      signal: stop.signal,
+    });
+
+    const settled = expect(
+      client.startAttempt(startRequest),
+    ).rejects.toMatchObject({
+      code: WorkflowErrorCode.OUTCOME_UNKNOWN,
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    stop.abort();
+
+    await settled;
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 });
 

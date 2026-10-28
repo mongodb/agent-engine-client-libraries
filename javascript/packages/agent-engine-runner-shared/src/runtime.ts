@@ -44,8 +44,10 @@ import {
 } from "./utils.js";
 
 import type {
+  AgentInput,
   BaseAgent,
   BaseExecutionCallback,
+  RequestContext,
 } from "@mongodb-js/agent-engine-sdk";
 
 const logger = getLogger("agent_engine_runner_shared.runtime");
@@ -252,7 +254,10 @@ export class TenantRuntime implements ITenantRuntime {
   // Agent / graph builder
   // =========================================================================
 
-  getAgent(opts?: { callbacks?: BaseExecutionCallback[] }): BaseAgent {
+  getAgent(opts?: {
+    callbacks?: BaseExecutionCallback[];
+    graph?: unknown;
+  }): BaseAgent {
     if (this.graphBuilder === null) {
       throw new Error(
         "No App registered. Call registerAndRun() with a BaseApp instance first.",
@@ -265,6 +270,27 @@ export class TenantRuntime implements ITenantRuntime {
       );
     }
     return this.graphBuilder.getAgent(opts);
+  }
+
+  /**
+   * Ask the registered App to build a graph for this invocation.
+   *
+   * Resolves to `undefined` when the App declares no per-execution build, which
+   * is every global agent and tells the caller to use the cached path
+   * unchanged. A context-free discovery call passes neither argument.
+   */
+  async buildGraph(
+    agentInput?: AgentInput,
+    ctx?: RequestContext,
+  ): Promise<unknown | undefined> {
+    const hook = this.graphBuilder?.buildGraph;
+    if (typeof hook !== "function") return undefined;
+    return hook.call(this.graphBuilder, agentInput, ctx);
+  }
+
+  /** Whether the registered App builds its graph per invocation. */
+  usesPerInvocationBuild(): boolean {
+    return this.graphBuilder?.usesPerInvocationBuild?.() === true;
   }
 
   warmUpAgent(): void {

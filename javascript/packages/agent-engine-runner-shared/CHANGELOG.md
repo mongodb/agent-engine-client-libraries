@@ -7,7 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- TypeScript connector contract and authoring materializer: validates compiled
+  connector catalogs, applies fail-closed exposure and endpoint/credential
+  bindings, and exposes the shared AER and Tool Pod runtime views. Tool
+  registration and execution land in a later change.
+
 ### Changed
+- Remote MCP servers now use the MCP TypeScript SDK 2.x
+  (`@modelcontextprotocol/client`). Each call negotiates the protocol
+  automatically: it probes `server/discover` and falls back to the legacy
+  `initialize` handshake, so servers on `2025-11-25` and older keep working
+  while `2026-07-28` servers are reached directly. Tool result and schema field
+  names are unchanged, and OAuth caches written by the previous SDK still load;
+  stored tokens and client registrations now also round-trip the authorization
+  server's `issuer` when it provides one.
 - Workflow child operation paths gained the Python parity surface for framework
   adapters that dispatch dynamic children outside the graph topology:
   `preallocateChildOperationOrdinals` assigns ordinals to a complete same-step

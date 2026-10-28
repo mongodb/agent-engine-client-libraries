@@ -3,8 +3,9 @@ from __future__ import annotations
 import asyncio
 from types import SimpleNamespace
 
-import httpx
+import httpx2
 import pytest
+from mcp import MCPError
 from mcp.types import CallToolResult, TextContent
 
 from agent_engine_runner_shared import mcp_tools
@@ -28,15 +29,20 @@ from agent_engine_runner_shared.mcp_tools import (
 from agent_engine_runner_shared.models import ToolPodExecuteResponse
 
 
-class _FakeStreamableHTTPClient:
+class _OpenMCPClient:
+    """Stand-in for the SDK's async-context client seam."""
+
+    def __init__(self, client):
+        self._client = client
+
     async def __aenter__(self):
-        return "read", "write", lambda: None
+        return self._client
 
     async def __aexit__(self, exc_type, exc, tb):
         return None
 
 
-class _FailingStreamableHTTPClient:
+class _FailingMCPClient:
     def __init__(self, exc: BaseException):
         self._exc = exc
 
@@ -47,13 +53,11 @@ class _FailingStreamableHTTPClient:
         return None
 
 
-def _http_status_exception_group(status_code: int) -> ExceptionGroup:
-    request = httpx.Request("POST", "https://api.githubcopilot.com/mcp/")
-    response = httpx.Response(status_code, request=request)
-    return ExceptionGroup(
-        "unhandled errors in a TaskGroup",
-        [httpx.HTTPStatusError("request failed", request=request, response=response)],
-    )
+def _fake_open(client):
+    def open_client(config, *, headers, auth, responses):
+        return _OpenMCPClient(client)
+
+    return open_client
 
 
 def test_make_mcp_sdk_tool_name_prefixes_server_and_sanitizes_provider_names():
@@ -209,12 +213,12 @@ def test_discover_mcp_tools_filters_allowed_tools(monkeypatch):
             SimpleNamespace(
                 name="search_issues",
                 description="Search issues",
-                inputSchema={"type": "object", "properties": {}},
+                input_schema={"type": "object", "properties": {}},
             ),
             SimpleNamespace(
                 name="create_issue",
                 description="Create issue",
-                inputSchema={"type": "object", "properties": {}},
+                input_schema={"type": "object", "properties": {}},
             ),
         ]
 
@@ -282,7 +286,7 @@ def test_discover_mcp_tools_preserves_annotations(monkeypatch):
             SimpleNamespace(
                 name="search_issues",
                 description="Search issues",
-                inputSchema={"type": "object", "properties": {}},
+                input_schema={"type": "object", "properties": {}},
                 annotations={
                     "readOnlyHint": True,
                     "destructiveHint": False,
@@ -294,24 +298,24 @@ def test_discover_mcp_tools_preserves_annotations(monkeypatch):
             SimpleNamespace(
                 name="create_issue",
                 description="Create issue",
-                inputSchema={"type": "object", "properties": {}},
+                input_schema={"type": "object", "properties": {}},
                 annotations={"readOnlyHint": False, "destructiveHint": False},
             ),
             SimpleNamespace(
                 name="delete_issue",
                 description="Delete issue",
-                inputSchema={"type": "object", "properties": {}},
+                input_schema={"type": "object", "properties": {}},
                 annotations={"readOnlyHint": False, "destructiveHint": True},
             ),
             SimpleNamespace(
                 name="unannotated",
                 description="No hints",
-                inputSchema={"type": "object", "properties": {}},
+                input_schema={"type": "object", "properties": {}},
             ),
             SimpleNamespace(
                 name="malformed",
                 description="Bad hints",
-                inputSchema={"type": "object", "properties": {}},
+                input_schema={"type": "object", "properties": {}},
                 annotations="not-an-object",
             ),
         ]
@@ -353,13 +357,13 @@ def test_discover_mcp_tools_keeps_annotations_after_allowed_tools_filter(monkeyp
             SimpleNamespace(
                 name="search_issues",
                 description="Search issues",
-                inputSchema={"type": "object", "properties": {}},
+                input_schema={"type": "object", "properties": {}},
                 annotations={"readOnlyHint": True},
             ),
             SimpleNamespace(
                 name="create_issue",
                 description="Create issue",
-                inputSchema={"type": "object", "properties": {}},
+                input_schema={"type": "object", "properties": {}},
                 annotations={"destructiveHint": False},
             ),
         ]
@@ -387,7 +391,7 @@ def test_discover_mcp_tools_rejects_active_event_loop(monkeypatch):
             SimpleNamespace(
                 name="search_issues",
                 description="Search issues",
-                inputSchema={"type": "object", "properties": {}},
+                input_schema={"type": "object", "properties": {}},
             )
         ]
 
@@ -415,7 +419,7 @@ def test_discover_mcp_tools_async_runs_from_active_event_loop(monkeypatch):
             SimpleNamespace(
                 name="search_issues",
                 description="Search issues",
-                inputSchema={"type": "object", "properties": {}},
+                input_schema={"type": "object", "properties": {}},
             )
         ]
 
@@ -439,18 +443,9 @@ def test_discover_mcp_tools_async_runs_from_active_event_loop(monkeypatch):
 
 
 def test_list_server_tools_pages_until_next_cursor_is_empty(monkeypatch):
-    class FakeClientSession:
-        def __init__(self, read_stream, write_stream):
+    class FakeClient:
+        def __init__(self):
             self.cursors: list[str | None] = []
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, exc_type, exc, tb):
-            return None
-
-        async def initialize(self):
-            return None
 
         async def list_tools(self, cursor=None):
             self.cursors.append(cursor)
@@ -460,39 +455,24 @@ def test_list_server_tools_pages_until_next_cursor_is_empty(monkeypatch):
                         SimpleNamespace(
                             name="search_issues",
                             description="Search issues",
-                            inputSchema={"type": "object", "properties": {}},
+                            input_schema={"type": "object", "properties": {}},
                         )
                     ],
-                    nextCursor="page-2",
+                    next_cursor="page-2",
                 )
             return SimpleNamespace(
                 tools=[
                     SimpleNamespace(
                         name="get_issue",
                         description="Get issue",
-                        inputSchema={"type": "object", "properties": {}},
+                        input_schema={"type": "object", "properties": {}},
                     )
                 ],
-                nextCursor=None,
+                next_cursor=None,
             )
 
-    captured_client: FakeClientSession | None = None
-    captured_stream_kwargs: dict[str, object] = {}
-
-    def fake_streamablehttp_client(url, **kwargs):
-        captured_stream_kwargs.update(kwargs)
-        return _FakeStreamableHTTPClient()
-
-    def fake_client_session(read_stream, write_stream):
-        nonlocal captured_client
-        captured_client = FakeClientSession(read_stream, write_stream)
-        return captured_client
-
-    monkeypatch.setattr(
-        "mcp.client.streamable_http.streamablehttp_client",
-        fake_streamablehttp_client,
-    )
-    monkeypatch.setattr("mcp.ClientSession", fake_client_session)
+    client = FakeClient()
+    monkeypatch.setattr(mcp_tools, "_open_mcp_client", _fake_open(client))
     config = RuntimeMCPServerConfig.model_validate(
         {
             "url": "https://api.githubcopilot.com/mcp/",
@@ -503,39 +483,79 @@ def test_list_server_tools_pages_until_next_cursor_is_empty(monkeypatch):
     tools = asyncio.run(mcp_tools._list_server_tools("github", config))
 
     assert [tool.name for tool in tools] == ["search_issues", "get_issue"]
-    assert captured_client is not None
-    assert captured_client.cursors == [None, "page-2"]
-    assert captured_stream_kwargs["timeout"] == 12
-    assert captured_stream_kwargs["sse_read_timeout"] == 12
+    assert client.cursors == [None, "page-2"]
 
 
-def test_sync_mcp_tool_callable_uses_configured_sse_timeout(monkeypatch):
-    class FakeClientSession:
-        async def __aenter__(self):
-            return self
+def test_mcp_http_client_bounds_connect_and_read_timeouts():
+    server_config = RuntimeMCPServerConfig.model_validate(
+        {
+            "url": "https://api.githubcopilot.com/mcp/",
+            "timeout_seconds": 7,
+        }
+    )
+    responses: list[mcp_tools._MCPHTTPStatus] = []
 
-        async def __aexit__(self, exc_type, exc, tb):
-            return None
+    client = mcp_tools._make_mcp_http_client(
+        server_config,
+        headers={"X-Test": "1"},
+        auth=None,
+        responses=responses,
+    )
+    try:
+        assert client.timeout.connect == 7
+        assert client.timeout.read == 7
+        assert client.timeout.write == 7
+        assert client.timeout.pool == 7
+        assert client.headers["X-Test"] == "1"
+    finally:
+        asyncio.run(client.aclose())
 
-        async def initialize(self):
-            return None
 
+def test_status_hook_attributes_only_jsonrpc_posts():
+    """Cleanup and recovered requests must not supply the operation's status."""
+
+    server_config = RuntimeMCPServerConfig.model_validate(
+        {"url": "https://api.githubcopilot.com/mcp/", "timeout_seconds": 7}
+    )
+    responses: list[mcp_tools._MCPHTTPStatus] = []
+    client = mcp_tools._make_mcp_http_client(
+        server_config,
+        headers={},
+        auth=None,
+        responses=responses,
+    )
+    hook = client.event_hooks["response"][0]
+
+    def record(method: str, status: int) -> None:
+        asyncio.run(
+            hook(
+                httpx2.Response(
+                    status,
+                    request=httpx2.Request(method, "https://api.githubcopilot.com/mcp/"),
+                )
+            )
+        )
+
+    try:
+        record("POST", 503)
+        record("DELETE", 405)
+        assert [item.status_code for item in responses] == [503]
+
+        # A later successful POST means the earlier failure recovered.
+        record("POST", 200)
+        assert responses == []
+    finally:
+        asyncio.run(client.aclose())
+
+
+def test_sync_mcp_tool_callable_returns_normalized_result(monkeypatch):
+    class FakeClient:
         async def call_tool(self, tool_name, arguments):
             assert tool_name == "search_issues"
             assert arguments == {"query": "status:open"}
             return CallToolResult(content=[TextContent(type="text", text="ok")])
 
-    captured_stream_kwargs: dict[str, object] = {}
-
-    def fake_streamablehttp_client(url, **kwargs):
-        captured_stream_kwargs.update(kwargs)
-        return _FakeStreamableHTTPClient()
-
-    monkeypatch.setattr(
-        "mcp.client.streamable_http.streamablehttp_client",
-        fake_streamablehttp_client,
-    )
-    monkeypatch.setattr("mcp.ClientSession", lambda read_stream, write_stream: FakeClientSession())
+    monkeypatch.setattr(mcp_tools, "_open_mcp_client", _fake_open(FakeClient()))
     server_config = RuntimeMCPServerConfig.model_validate(
         {
             "url": "https://api.githubcopilot.com/mcp/",
@@ -554,32 +574,14 @@ def test_sync_mcp_tool_callable_uses_configured_sse_timeout(monkeypatch):
     result = make_sync_mcp_tool_callable(binding)(query="status:open")
 
     assert result == MCPToolResult(content=[{"type": "text", "text": "ok"}])
-    assert captured_stream_kwargs["timeout"] == 7
-    assert captured_stream_kwargs["sse_read_timeout"] == 7
 
 
 def test_sync_mcp_tool_callable_rejects_active_event_loop(monkeypatch):
-    class FakeClientSession:
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, exc_type, exc, tb):
-            return None
-
-        async def initialize(self):
-            return None
-
+    class FakeClient:
         async def call_tool(self, tool_name, arguments):
             return CallToolResult(content=[TextContent(type="text", text=arguments["query"])])
 
-    def fake_streamablehttp_client(url, **kwargs):
-        return _FakeStreamableHTTPClient()
-
-    monkeypatch.setattr(
-        "mcp.client.streamable_http.streamablehttp_client",
-        fake_streamablehttp_client,
-    )
-    monkeypatch.setattr("mcp.ClientSession", lambda read_stream, write_stream: FakeClientSession())
+    monkeypatch.setattr(mcp_tools, "_open_mcp_client", _fake_open(FakeClient()))
     server_config = RuntimeMCPServerConfig.model_validate(
         {
             "url": "https://api.githubcopilot.com/mcp/",
@@ -601,14 +603,12 @@ def test_sync_mcp_tool_callable_rejects_active_event_loop(monkeypatch):
         asyncio.run(invoke_tool())
 
 
-def test_list_server_tools_unwraps_http_errors_from_mcp_exception_group(monkeypatch):
-    def fake_streamablehttp_client(url, **kwargs):
-        return _FailingStreamableHTTPClient(_http_status_exception_group(401))
+def test_list_server_tools_reports_the_recorded_http_status(monkeypatch):
+    def fake_open(config, *, headers, auth, responses):
+        responses.append(mcp_tools._MCPHTTPStatus(401, "Unauthorized"))
+        return _FailingMCPClient(MCPError(-32603, "Server returned an error response"))
 
-    monkeypatch.setattr(
-        "mcp.client.streamable_http.streamablehttp_client",
-        fake_streamablehttp_client,
-    )
+    monkeypatch.setattr(mcp_tools, "_open_mcp_client", fake_open)
     config = RuntimeMCPServerConfig.model_validate(
         {
             "url": "https://api.githubcopilot.com/mcp/",
@@ -619,14 +619,12 @@ def test_list_server_tools_unwraps_http_errors_from_mcp_exception_group(monkeypa
         asyncio.run(mcp_tools._list_server_tools("github", config))
 
 
-def test_mcp_tool_callable_unwraps_http_errors_from_mcp_exception_group(monkeypatch):
-    def fake_streamablehttp_client(url, **kwargs):
-        return _FailingStreamableHTTPClient(_http_status_exception_group(401))
+def test_mcp_tool_callable_reports_the_recorded_http_status(monkeypatch):
+    def fake_open(config, *, headers, auth, responses):
+        responses.append(mcp_tools._MCPHTTPStatus(401, "Unauthorized"))
+        return _FailingMCPClient(MCPError(-32603, "Server returned an error response"))
 
-    monkeypatch.setattr(
-        "mcp.client.streamable_http.streamablehttp_client",
-        fake_streamablehttp_client,
-    )
+    monkeypatch.setattr(mcp_tools, "_open_mcp_client", fake_open)
     server_config = RuntimeMCPServerConfig.model_validate(
         {
             "url": "https://api.githubcopilot.com/mcp/",
@@ -645,14 +643,34 @@ def test_mcp_tool_callable_unwraps_http_errors_from_mcp_exception_group(monkeypa
         make_sync_mcp_tool_callable(binding)(query="status:open")
 
 
-def test_list_server_tools_propagates_cancellation(monkeypatch):
-    def fake_streamablehttp_client(url, **kwargs):
-        return _FailingStreamableHTTPClient(asyncio.CancelledError())
+def test_mcp_tool_callable_uses_the_json_rpc_message_without_a_status(monkeypatch):
+    def fake_open(config, *, headers, auth, responses):
+        return _FailingMCPClient(MCPError(-32602, "Invalid params"))
 
-    monkeypatch.setattr(
-        "mcp.client.streamable_http.streamablehttp_client",
-        fake_streamablehttp_client,
+    monkeypatch.setattr(mcp_tools, "_open_mcp_client", fake_open)
+    server_config = RuntimeMCPServerConfig.model_validate(
+        {
+            "url": "https://api.githubcopilot.com/mcp/",
+        }
     )
+    binding = mcp_tools.MCPToolBinding(
+        server_name="github",
+        tool_name="search_issues",
+        sdk_tool_name="github__search_issues",
+        description="Search issues",
+        input_schema={"type": "object", "properties": {}},
+        server_config=server_config,
+    )
+
+    with pytest.raises(MCPToolError, match="Invalid params"):
+        make_sync_mcp_tool_callable(binding)(query="status:open")
+
+
+def test_list_server_tools_propagates_cancellation(monkeypatch):
+    def fake_open(config, *, headers, auth, responses):
+        return _FailingMCPClient(asyncio.CancelledError())
+
+    monkeypatch.setattr(mcp_tools, "_open_mcp_client", fake_open)
     config = RuntimeMCPServerConfig.model_validate(
         {
             "url": "https://api.githubcopilot.com/mcp/",
@@ -664,13 +682,10 @@ def test_list_server_tools_propagates_cancellation(monkeypatch):
 
 
 def test_mcp_tool_callable_propagates_cancellation(monkeypatch):
-    def fake_streamablehttp_client(url, **kwargs):
-        return _FailingStreamableHTTPClient(asyncio.CancelledError())
+    def fake_open(config, *, headers, auth, responses):
+        return _FailingMCPClient(asyncio.CancelledError())
 
-    monkeypatch.setattr(
-        "mcp.client.streamable_http.streamablehttp_client",
-        fake_streamablehttp_client,
-    )
+    monkeypatch.setattr(mcp_tools, "_open_mcp_client", fake_open)
     server_config = RuntimeMCPServerConfig.model_validate(
         {
             "url": "https://api.githubcopilot.com/mcp/",
@@ -695,7 +710,7 @@ def test_discover_mcp_tools_rejects_missing_allowed_tool(monkeypatch):
             SimpleNamespace(
                 name="search_issues",
                 description="Search issues",
-                inputSchema={"type": "object", "properties": {}},
+                input_schema={"type": "object", "properties": {}},
             )
         ]
 
@@ -832,28 +847,12 @@ def test_resolve_configured_mcp_tool_binding_enforces_allowed_tools_with_metadat
 
 
 def test_list_server_tools_rejects_too_many_pages(monkeypatch):
-    class FakeClientSession:
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, exc_type, exc, tb):
-            return None
-
-        async def initialize(self):
-            return None
-
+    class FakeClient:
         async def list_tools(self, cursor=None):
-            return SimpleNamespace(tools=[], nextCursor="again")
-
-    def fake_streamablehttp_client(url, **kwargs):
-        return _FakeStreamableHTTPClient()
+            return SimpleNamespace(tools=[], next_cursor="again")
 
     monkeypatch.setattr(mcp_tools, "_MAX_LIST_TOOL_PAGES", 2)
-    monkeypatch.setattr(
-        "mcp.client.streamable_http.streamablehttp_client",
-        fake_streamablehttp_client,
-    )
-    monkeypatch.setattr("mcp.ClientSession", lambda read_stream, write_stream: FakeClientSession())
+    monkeypatch.setattr(mcp_tools, "_open_mcp_client", _fake_open(FakeClient()))
     config = RuntimeMCPServerConfig.model_validate({"url": "https://api.githubcopilot.com/mcp/"})
 
     with pytest.raises(MCPConfigError, match="exceeded 2 pages"):
@@ -861,42 +860,26 @@ def test_list_server_tools_rejects_too_many_pages(monkeypatch):
 
 
 def test_list_server_tools_rejects_too_many_tools(monkeypatch):
-    class FakeClientSession:
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, exc_type, exc, tb):
-            return None
-
-        async def initialize(self):
-            return None
-
+    class FakeClient:
         async def list_tools(self, cursor=None):
             return SimpleNamespace(
                 tools=[
                     SimpleNamespace(
                         name="search_issues",
                         description="Search issues",
-                        inputSchema={"type": "object", "properties": {}},
+                        input_schema={"type": "object", "properties": {}},
                     ),
                     SimpleNamespace(
                         name="get_issue",
                         description="Get issue",
-                        inputSchema={"type": "object", "properties": {}},
+                        input_schema={"type": "object", "properties": {}},
                     ),
                 ],
-                nextCursor=None,
+                next_cursor=None,
             )
 
-    def fake_streamablehttp_client(url, **kwargs):
-        return _FakeStreamableHTTPClient()
-
     monkeypatch.setattr(mcp_tools, "_MAX_TOOLS_PER_SERVER", 1)
-    monkeypatch.setattr(
-        "mcp.client.streamable_http.streamablehttp_client",
-        fake_streamablehttp_client,
-    )
-    monkeypatch.setattr("mcp.ClientSession", lambda read_stream, write_stream: FakeClientSession())
+    monkeypatch.setattr(mcp_tools, "_open_mcp_client", _fake_open(FakeClient()))
     config = RuntimeMCPServerConfig.model_validate({"url": "https://api.githubcopilot.com/mcp/"})
 
     with pytest.raises(MCPConfigError, match="more than 1 tools"):
@@ -906,7 +889,7 @@ def test_list_server_tools_rejects_too_many_tools(monkeypatch):
 def test_normalize_mcp_tool_result_returns_json_safe_shape():
     result = CallToolResult(
         content=[TextContent(type="text", text="hello")],
-        structuredContent={"ok": True},
+        structured_content={"ok": True},
     )
 
     normalized = normalize_mcp_tool_result(result)
@@ -924,10 +907,40 @@ def test_normalize_mcp_tool_result_returns_json_safe_shape():
     }
 
 
+def test_normalize_mcp_tool_result_keeps_wire_field_names_in_content_blocks():
+    """Stored blocks keep ``mimeType`` so the contract and TS runner agree."""
+
+    from mcp.types import ImageContent, ResourceLink
+
+    result = CallToolResult(
+        content=[
+            ImageContent(type="image", data="abc", mime_type="image/png"),
+            ResourceLink(
+                type="resource_link",
+                uri="https://example.test/report",
+                name="report",
+                mime_type="text/plain",
+            ),
+        ]
+    )
+
+    normalized = normalize_mcp_tool_result(result)
+
+    assert normalized.content == [
+        {"type": "image", "data": "abc", "mimeType": "image/png"},
+        {
+            "type": "resource_link",
+            "name": "report",
+            "uri": "https://example.test/report",
+            "mimeType": "text/plain",
+        },
+    ]
+
+
 def test_normalize_mcp_tool_result_raises_for_mcp_error():
     result = CallToolResult(
         content=[TextContent(type="text", text="bad input")],
-        isError=True,
+        is_error=True,
     )
 
     with pytest.raises(MCPToolError, match="bad input"):
@@ -937,8 +950,8 @@ def test_normalize_mcp_tool_result_raises_for_mcp_error():
 def test_normalize_mcp_tool_result_rejects_non_object_structured_content():
     result = SimpleNamespace(
         content=[TextContent(type="text", text="hello")],
-        structuredContent=["not", "an", "object"],
-        isError=False,
+        structured_content=["not", "an", "object"],
+        is_error=False,
     )
 
     with pytest.raises(MCPToolError, match="not an object"):
@@ -948,9 +961,9 @@ def test_normalize_mcp_tool_result_rejects_non_object_structured_content():
 def test_normalize_mcp_tool_result_rejects_non_json_structured_content():
     result = SimpleNamespace(
         content=[TextContent(type="text", text="hello")],
-        structuredContent={"bad": object()},
-        isError=False,
+        structured_content={"bad": object()},
+        is_error=False,
     )
 
-    with pytest.raises(MCPToolError, match="non-JSON-serializable structuredContent"):
+    with pytest.raises(MCPToolError, match="non-JSON-serializable structured_content"):
         normalize_mcp_tool_result(result)

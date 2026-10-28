@@ -15,6 +15,7 @@
     - [uploadFiles()](#api-uploadfiles)
     - [write()](#api-write)
   - [App](#api-app)
+    - [buildGraph()](#api-buildgraph)
     - [checkpointer()](#api-checkpointer)
     - [close()](#api-close)
     - [deepAgent()](#api-deepagent)
@@ -34,6 +35,7 @@
     - [suspend()](#api-suspend)
     - [tool()](#api-tool)
     - [tools()](#api-tools)
+    - [usesPerInvocationBuild()](#api-usesperinvocationbuild)
     - [warmUp()](#api-warmup)
   - [LangGraphBaseAgent](#api-langgraphbaseagent)
     - [commitCancelledTurn()](#api-commitcancelledturn)
@@ -44,12 +46,15 @@
   - [LangGraphQueryPlugin](#api-langgraphqueryplugin)
     - [getMessagesForSession()](#api-getmessagesforsession)
     - [getSummariesForSessions()](#api-getsummariesforsessions)
+  - [LLMRegistrationDriftError](#api-llmregistrationdrifterror)
 - **Interfaces**
   - [CreateAgentEngineDeepAgentOptions](#api-createagentenginedeepagentoptions)
   - [DeepAgentOptions](#api-deepagentoptions)
+  - [EntrypointOptions](#api-entrypointoptions)
   - [LangGraphQueryPluginParams](#api-langgraphquerypluginparams)
   - [ToolDecoratorOptions](#api-tooldecoratoroptions)
 - **Type Aliases**
+  - [LoadStrategy](#api-loadstrategy)
   - [OnUnknownOutcome](#api-onunknownoutcome)
   - [PrepareAgentInput](#api-prepareagentinput-1)
   - [ResolveThreadId](#api-resolvethreadid-2)
@@ -475,11 +480,12 @@ BaseApp.constructor
 
 #### Properties
 
-| Property | Modifier | Type | Inherited from |
-| :------ | :------ | :------ | :------ |
-| <a id="api-property-llmwrapper"></a> `llmWrapper` | `public` | `unknown` | `BaseApp.llmWrapper` |
-| <a id="api-property-name"></a> `name` | `readonly` | `string` | `BaseApp.name` |
-| <a id="api-property-toolwrapper"></a> `toolWrapper` | `public` | `unknown` | `BaseApp.toolWrapper` |
+| Property | Modifier | Type | Default value | Description | Inherited from |
+| :------ | :------ | :------ | :------ | :------ | :------ |
+| <a id="api-property-llmwrapper"></a> `llmWrapper` | `public` | `unknown` | `undefined` | - | `BaseApp.llmWrapper` |
+| <a id="api-property-loadstrategy"></a> `loadStrategy` | `public` | [`LoadStrategy`](#api-loadstrategy) | `"global"` | How this agent builds its graph. Set by entrypoint(). | - |
+| <a id="api-property-name"></a> `name` | `readonly` | `string` | `undefined` | - | `BaseApp.name` |
+| <a id="api-property-toolwrapper"></a> `toolWrapper` | `public` | `unknown` | `undefined` | - | `BaseApp.toolWrapper` |
 
 #### Accessors
 
@@ -520,6 +526,33 @@ proxy; memory is reachable only while handling a platform request.
 `Memory`
 
 #### Methods
+
+<a id="api-buildgraph"></a>
+
+##### buildGraph()
+
+```ts
+buildGraph(agentInput?, ctx?): Promise<unknown>;
+```
+
+Build the graph for one invocation.
+
+Returns `undefined` for a global agent, which tells the caller to use the
+cached build path unchanged. Under `per-execution` the builder runs on every
+invocation with that invocation's `(input, ctx)`, so it can do its own
+request-scoped I/O before returning the graph. A context-free call passes
+neither and is the platform's discovery path.
+
+**Parameters**
+
+| Parameter | Type |
+| :------ | :------ |
+| `agentInput?` | `AgentInput` |
+| `ctx?` | `RequestContext` |
+
+**Returns**
+
+`Promise`\<`unknown`\>
 
 <a id="api-checkpointer"></a>
 
@@ -604,11 +637,17 @@ Mirrors Python `runtime.py:App.deep_agent()`.
 
 ##### entrypoint()
 
+**Call Signature**
+
 ```ts
-entrypoint<F>(fn): F;
+entrypoint<F>(fn, opts?): F;
 ```
 
 Mark the graph builder function.
+
+The builder's shape is typed off the strategy: `"global"` (the default)
+takes no arguments and is built once, while `"per-execution"` receives the
+invocation's `(input, ctx)` and is built on every invocation.
 
 **Type Parameters**
 
@@ -621,6 +660,44 @@ Mark the graph builder function.
 | Parameter | Type |
 | :------ | :------ |
 | `fn` | `F` |
+| `opts?` | \{ `loadStrategy?`: `"global"`; \} |
+| `opts.loadStrategy?` | `"global"` |
+
+**Returns**
+
+`F`
+
+**Overrides**
+
+```ts
+BaseApp.entrypoint
+```
+
+**Call Signature**
+
+```ts
+entrypoint<F>(fn, opts): F;
+```
+
+Mark the graph builder function.
+
+The builder's shape is typed off the strategy: `"global"` (the default)
+takes no arguments and is built once, while `"per-execution"` receives the
+invocation's `(input, ctx)` and is built on every invocation.
+
+**Type Parameters**
+
+| Type Parameter |
+| :------ |
+| `F` *extends* (`input`, `ctx`) => `unknown` |
+
+**Parameters**
+
+| Parameter | Type |
+| :------ | :------ |
+| `fn` | `F` |
+| `opts` | \{ `loadStrategy`: `"per-execution"`; \} |
+| `opts.loadStrategy` | `"per-execution"` |
 
 **Returns**
 
@@ -683,8 +760,9 @@ in `LangGraphCallbackAdapter` before being passed to the graph.
 
 | Parameter | Type |
 | :------ | :------ |
-| `opts?` | \{ `callbacks?`: readonly `unknown`[]; \} |
+| `opts?` | \{ `callbacks?`: readonly `unknown`[]; `graph?`: `unknown`; \} |
 | `opts.callbacks?` | readonly `unknown`[] |
+| `opts.graph?` | `unknown` |
 
 **Returns**
 
@@ -986,6 +1064,20 @@ Returns a list of wrapped, framework-specific tools.
 BaseApp.tools
 ```
 
+<a id="api-usesperinvocationbuild"></a>
+
+##### usesPerInvocationBuild()
+
+```ts
+usesPerInvocationBuild(): boolean;
+```
+
+Whether this agent builds its graph per invocation.
+
+**Returns**
+
+`boolean`
+
 <a id="api-warmup"></a>
 
 ##### warmUp()
@@ -1285,6 +1377,53 @@ getSummariesForSessions(sessionIds): Promise<{
   `sessions`: `object`[];
 \}\>
 
+***
+
+<a id="api-llmregistrationdrifterror"></a>
+
+### LLMRegistrationDriftError
+
+A per-execution build registered a different LLM id set.
+
+Distinct from an ordinary build failure so the Tool Pod can tell a registry
+that has drifted from one that merely failed to build: a drifted registry is
+not a usable partial discovery. The marker property lets runner-shared
+recognise it without importing this package, which it does not depend on.
+
+#### Extends
+
+- `Error`
+
+<a id="api-constructor-4"></a>
+
+#### Constructor
+
+```ts
+new LLMRegistrationDriftError(message): LLMRegistrationDriftError;
+```
+
+**Parameters**
+
+| Parameter | Type |
+| :------ | :------ |
+| `message` | `string` |
+
+**Returns**
+
+[`LLMRegistrationDriftError`](#api-llmregistrationdrifterror)
+
+**Overrides**
+
+```ts
+Error.constructor
+```
+
+#### Properties
+
+| Property | Modifier | Type | Default value |
+| :------ | :------ | :------ | :------ |
+| <a id="api-property-isllmregistrationdrift"></a> `isLlmRegistrationDrift` | `readonly` | `true` | `true` |
+
 ## Interfaces
 
 <a id="api-createagentenginedeepagentoptions"></a>
@@ -1331,6 +1470,20 @@ Options for [App.deepAgent](#api-deepagent).
 
 ***
 
+<a id="api-entrypointoptions"></a>
+
+### EntrypointOptions
+
+Options accepted by [App.entrypoint](#api-entrypoint).
+
+#### Properties
+
+| Property | Type | Description |
+| :------ | :------ | :------ |
+| <a id="api-property-loadstrategy-1"></a> `loadStrategy?` | [`LoadStrategy`](#api-loadstrategy) | `"global"` (default) builds once and caches the graph. `"per-execution"` runs the builder on every invocation with that invocation's `(input, ctx)`, so it can do its own request-scoped I/O first. |
+
+***
+
 <a id="api-langgraphquerypluginparams"></a>
 
 ### LangGraphQueryPluginParams
@@ -1369,6 +1522,18 @@ Options for [App.deepAgent](#api-deepagent).
 | <a id="api-property-timeout"></a> `timeout?` | `number` | - |
 
 ## Type Aliases
+
+<a id="api-loadstrategy"></a>
+
+### LoadStrategy
+
+```ts
+type LoadStrategy = "global" | "per-execution";
+```
+
+How an agent builds its graph.
+
+***
 
 <a id="api-onunknownoutcome"></a>
 

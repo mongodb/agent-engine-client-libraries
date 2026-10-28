@@ -23,18 +23,15 @@ and load-bearing:
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Sequence
 
 import yaml
 
 from agent_engine_runner_shared.connectors.bundle import (
-    CONNECTOR_BUNDLE_PATH_ENV,
     BundledConnector,
     BundledTool,
     ConnectorBundle,
-    load_connector_bundle,
 )
 from agent_engine_runner_shared.connectors.definitions import (
     Auth,
@@ -311,16 +308,10 @@ def materialize_connectors(connector_paths: Sequence[str | Path], *, root: Path)
 def resolve_runtime_bundle(agent_config: RuntimeAgentConfig) -> ConnectorBundle:
     """Resolve the connector bundle for this process.
 
-    A pre-materialized bundle published by the platform build (via
-    ``AGENTIC_CONNECTOR_BUNDLE_PATH``) wins; otherwise the ``agent.yaml``
-    ``connectors`` entries are materialized in memory from local files. With
-    neither configured this is an immediate no-op without file or network
-    I/O, matching the no-connector contract.
+    The ``agent.yaml`` ``connectors`` entries are materialized in memory from
+    local files. With none configured this is an immediate no-op without file
+    or network I/O, matching the no-connector contract.
     """
-    configured = os.environ.get(CONNECTOR_BUNDLE_PATH_ENV)
-    if configured:
-        return load_connector_bundle(configured)
-
     # Shape check, not truthiness: mocked runtime configs auto-create
     # truthy attributes, and only a real list/tuple of references counts.
     references = getattr(agent_config, "connectors", None)

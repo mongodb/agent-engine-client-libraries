@@ -39,6 +39,7 @@ def _make_server() -> Any:
     from agent_engine_runner_shared.server.aer import AERServer
 
     runtime = Mock()
+    runtime.build_graph = AsyncMock(return_value=None)
     runtime.app_name = "insurance"
     runtime.app_version = "1"
     runtime.memory_enabled = False
@@ -311,6 +312,76 @@ async def test_native_execute_cleans_up_before_callback(
 
     assert response.status == "completed"
     assert settlement_order == ["wrapper-close", "callback"]
+
+
+async def test_execute_builds_the_graph_before_building_agent() -> None:
+    """An opted-in agent's builder runs before get_agent(), and the graph it
+    returns is handed to the build."""
+    server = _make_server()
+    server.runtime._memory_writer = None
+    server._start_durable_attempt = AsyncMock(return_value=None)
+    server._execute_via_agent_stream = AsyncMock(
+        return_value=StreamingResult(content="done", messages=[])
+    )
+
+    order: list[str] = []
+    seen: dict[str, Any] = {}
+    graph = Mock()
+
+    async def _build(agent_input: Any, ctx: Any) -> Any:
+        order.append("build_graph")
+        seen["payload"] = agent_input.payload
+        return graph
+
+    server.runtime.build_graph = AsyncMock(side_effect=_build)
+
+    def _get_agent(*_args: Any, **kwargs: Any) -> Any:
+        order.append("build")
+        seen["graph"] = kwargs.get("graph")
+        return Mock()
+
+    server.runtime.get_agent = Mock(side_effect=_get_agent)
+
+    response = await server._handle_execute(
+        ExecuteRequest(
+            execution_id="execution-1",
+            message="hi",
+            platform_api_url="http://oe:8000",
+        )
+    )
+
+    assert response.status == "completed"
+    assert order == ["build_graph", "build"]
+    assert seen["payload"]["message"] == "hi"
+    assert seen["graph"] is graph
+
+
+async def test_a_stalled_async_builder_is_bounded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The builder is author I/O that runs before the whole-turn timeout, so it
+    needs its own bound: a stalled lookup must not hold /execute open."""
+    import agent_engine_runner_shared.server.aer as aer_module
+
+    monkeypatch.setattr(aer_module, "EXECUTION_TIMEOUT", 0.05)
+
+    server = _make_server()
+    server.runtime._memory_writer = None
+
+    async def _stall(*_args: Any, **_kwargs: Any) -> Any:
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    server.runtime.build_graph = AsyncMock(side_effect=_stall)
+
+    with pytest.raises(RuntimeError, match="did not complete within"):
+        await server._handle_execute(
+            ExecuteRequest(
+                execution_id="execution-1",
+                message="hi",
+                platform_api_url="http://oe:8000",
+            )
+        )
 
 
 async def test_execute_cancelled_mid_run_returns_cancelled_not_500() -> None:
@@ -1366,7 +1437,7 @@ async def test_agent_is_built_before_the_durable_routing_decision() -> None:
     server = _make_server()
     order: list[str] = []
 
-    def _get_agent(callbacks: Any = None) -> Any:
+    def _get_agent(callbacks: Any = None, *, graph: Any = None) -> Any:
         order.append("get_agent")
         raise RuntimeError("stop after agent build")
 

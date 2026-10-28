@@ -11,6 +11,7 @@ chunk emit never aborts the tool.
 from __future__ import annotations
 
 import logging
+import uuid
 from typing import Any, Callable, Optional
 
 import httpx
@@ -121,6 +122,11 @@ def emit(event: str, data: str) -> None:
 
     try:
         client = get_shared_client(oe_url)
+        # delivery_id is minted once per event and reused verbatim by the
+        # owner-first helper across both attempts, so a fallback after a lost
+        # owner response carries the same stable identity and the platform can
+        # dedup the redelivered event. Regenerated per emit — two
+        # intentionally identical events must remain distinct.
         _post_chunk_owner_first(
             client,
             service_url=f"{oe_url.rstrip('/')}/stream/chunk",
@@ -130,6 +136,7 @@ def emit(event: str, data: str) -> None:
                 "chunk_type": event,
                 "content": data,
                 "metadata": {},
+                "delivery_id": uuid.uuid4().hex,
             },
             on_owner_failure=report_oe_owner_url_failure,
             timeout=PROGRESS_TIMEOUT_SECS,

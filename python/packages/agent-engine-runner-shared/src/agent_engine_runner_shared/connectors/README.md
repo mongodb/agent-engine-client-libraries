@@ -5,20 +5,17 @@ opt-in registration. It is not exposed through the CLI. Connector tools use the 
 AER → OE → Tool Pod execution path.
 
 Runtime integration follows the platform's config → discover → register flow: each
-process derives its own view from the same manifest. Resolution order in
+process derives its own view from the same manifest. Resolution in
 `resolve_runtime_bundle`:
 
-1. A pre-materialized bundle published by the platform build, located via the
-   platform-owned `AGENTIC_CONNECTOR_BUNDLE_PATH` environment variable (the
-   deployment contract for hosted builds).
-2. Otherwise, the `connectors` entries in `agent.yaml` are materialized in memory at
+1. The `connectors` entries in `agent.yaml` are materialized in memory at
    startup: each entry names a `tool.yaml` (resolved relative to `agent.yaml`) that
    selects operations from a local catalog file (resolved relative to the
    `tool.yaml`, contained within the agent workspace) and binds the endpoint and
    credential environment reference. Catalogs are local files only — HTTPS catalog
    references fail; there is no network fetch.
-3. With neither configured, loading is an immediate no-op without filesystem or
-   network access.
+2. With no connectors configured, loading is an immediate no-op without filesystem
+   or network access.
 
 ```yaml
 version: 1
@@ -61,9 +58,8 @@ Existing static auth modes continue to use their configured environment bindings
 Catalog regeneration preserves the authored OAuth binding and records only
 secret-free Bearer presentation in the catalog.
 
-The pre-materialized index paths are relative to the index and must remain inside its
-directory. AER loads the schemas as ordinary remote tools. Tool Pod startup loads the
-same materialized view and owns one `ConnectorExecutor` per connector.
+AER loads the materialized schemas as ordinary remote tools. Tool Pod startup
+materializes the same view and owns one `ConnectorExecutor` per connector.
 
 `load_tool_defs(path)` reads a local compiled YAML artifact into `ToolDefinitions`.
 `tool_schemas()` returns detached name, description and `inputSchema` dictionaries.

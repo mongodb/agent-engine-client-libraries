@@ -17,6 +17,7 @@ import * as nodePath from "node:path";
 import * as yaml from "js-yaml";
 import { z } from "zod";
 
+import { resolveRuntimeBundle } from "./connectors/materialize.js";
 import { isPlatformEnvVar } from "./utils.js";
 
 // =============================================================================
@@ -328,6 +329,19 @@ export const RuntimeMCPConfigSchema = z
   });
 export type RuntimeMCPConfig = z.infer<typeof RuntimeMCPConfigSchema>;
 
+/**
+ * One `agent.yaml` connectors entry linking to a connector `tool.yaml`.
+ * Unknown sub-keys are ignored, matching Python's `extra="ignore"` model.
+ */
+export const RuntimeConnectorReferenceSchema = z
+  .object({
+    source: NonEmptyString,
+  })
+  .strip();
+export type RuntimeConnectorReference = z.infer<
+  typeof RuntimeConnectorReferenceSchema
+>;
+
 // =============================================================================
 // `${VAR}` interpolation
 // =============================================================================
@@ -461,6 +475,11 @@ const AgentFileConfigSchema = z
       tools: {},
     }),
     mcp: RuntimeMCPConfigSchema.default({ servers: {} }),
+    connectors: z
+      .array(RuntimeConnectorReferenceSchema)
+      .nullable()
+      .optional()
+      .transform((value) => value ?? []),
   })
   .strip();
 type AgentFileConfig = z.infer<typeof AgentFileConfigSchema>;
@@ -488,6 +507,8 @@ export class RuntimeAgentConfig {
   readonly features: AgentFeatureConfig;
   readonly requiredSecrets: SecretsConfig;
   readonly mcp: RuntimeMCPConfig;
+  /** Connector authoring files materialized at startup. */
+  readonly connectors: RuntimeConnectorReference[];
 
   constructor(
     init: {
@@ -499,6 +520,7 @@ export class RuntimeAgentConfig {
       // Input shape: callers may omit `restrict`; it is normalized below.
       requiredSecrets?: SecretsConfigInput;
       mcp?: RuntimeMCPConfig;
+      connectors?: RuntimeConnectorReference[];
     } = {},
   ) {
     this.path = init.path ?? null;
@@ -510,6 +532,7 @@ export class RuntimeAgentConfig {
       init.requiredSecrets ?? {},
     );
     this.mcp = init.mcp ?? RuntimeMCPConfigSchema.parse({});
+    this.connectors = init.connectors ?? [];
   }
 
   /** Return a feature flag value, falling back to `defaultValue` when omitted. */
@@ -648,7 +671,7 @@ export function loadRuntimeAgentConfig(
     typeof parsed.language === "string" ? parsed.language.trim() : null;
   const framework =
     typeof parsed.framework === "string" ? parsed.framework.trim() : null;
-  return new RuntimeAgentConfig({
+  const config = new RuntimeAgentConfig({
     path,
     entrypoint:
       typeof parsed.entrypoint === "string" ? parsed.entrypoint.trim() : null,
@@ -657,5 +680,19 @@ export function loadRuntimeAgentConfig(
     features: parsed.features,
     requiredSecrets: parsed.required_secrets,
     mcp: parsed.mcp,
+    connectors: parsed.connectors,
   });
+  if (config.connectors.length > 0) {
+    try {
+      // Validate the configured authoring files during startup. Registration
+      // stays in the AER and Tool Pod so this slice does not expose tools yet.
+      resolveRuntimeBundle(config);
+    } catch (error) {
+      throw new Error(
+        `Invalid connector configuration in ${path}: ${error instanceof Error ? error.message : String(error)}`,
+        { cause: error },
+      );
+    }
+  }
+  return config;
 }

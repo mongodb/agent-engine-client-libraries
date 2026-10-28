@@ -9,8 +9,8 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any
 
-from langgraph.types import Command
 from agent_engine_sdk import AgentInput, RequestContext
+from langgraph.types import Command
 
 # A value LangGraph can ingest directly as the first arg to ``ainvoke``/
 # ``astream``: a graph state dict or a ``Command``.

@@ -700,29 +700,57 @@ export class ToolServer extends BaseServer {
    */
   private async ensureLlmRegistryLoaded(): Promise<void> {
     if (this.llmRegistryLoaded) return;
-    await this.llmRegistryLock.runExclusive(async () => {
-      if (this.llmRegistryLoaded) return;
-      let loadError: unknown = NO_RECORDED_LOAD_ERROR;
-      this.llmRegistryLoaded = populateLlmRegistryFromEntrypoint(
-        this.runtime.graphBuilder,
-        logger,
-        {
-          entrypointFailed:
-            "Failed to run entrypoint for LLM registration; " +
-            "/invoke_llm will fail if no LLM was registered",
-          noLlmRegistered:
-            "Entrypoint ran but did not call app.llm(); " +
-            "/invoke_llm will fail until an LLM is registered",
-        },
-        (error) => {
-          loadError = error;
-        },
-      );
-      // A successful load clears any cause recorded by an earlier failure, so
-      // a later lookup miss is reported as a genuine registration error. The
-      // sink only fires on failure, so a success leaves the sentinel in place.
-      this.llmRegistryLoadError = loadError;
+    await this.llmRegistryLock.runExclusive(() => this.loadLlmRegistryLocked());
+  }
+
+  /**
+   * Resolve a model for one request with the registry lock held.
+   *
+   * Discovery and the lookup have to be one critical section. A context-free
+   * discovery that fails leaves the registry unlatched, so the next request
+   * re-runs discovery and begins by clearing the shared registry; resolving
+   * after the lock is released lets that clear land first, and the request
+   * loses the registration its own discovery retained. The lock is released
+   * before the model is used, so provider I/O is not serialized.
+   */
+  private async resolveLlmForRequest(
+    llmId: string,
+    tools?: unknown[],
+    toolChoice?: unknown,
+  ): Promise<AdaptedLLM> {
+    return this.llmRegistryLock.runExclusive(async () => {
+      await this.loadLlmRegistryLocked();
+      return this.createLlmForPod(llmId, tools, toolChoice);
     });
+  }
+
+  /** Registry loader body. Runs with `llmRegistryLock` held. */
+  private async loadLlmRegistryLocked(): Promise<void> {
+    if (this.llmRegistryLoaded) return;
+    let loadError: unknown = NO_RECORDED_LOAD_ERROR;
+    this.llmRegistryLoaded = await populateLlmRegistryFromEntrypoint(
+      this.runtime.graphBuilder,
+      logger,
+      {
+        entrypointFailed:
+          "Failed to run entrypoint for LLM registration; " +
+          "/invoke_llm will fail if no LLM was registered",
+        noLlmRegistered:
+          "Entrypoint ran but did not call app.llm(); " +
+          "/invoke_llm will fail until an LLM is registered",
+      },
+      (error) => {
+        loadError = error;
+      },
+      {
+        usesPerInvocationBuild:
+          this.runtime.usesPerInvocationBuild?.() === true,
+      },
+    );
+    // A successful load clears any cause recorded by an earlier failure, so
+    // a later lookup miss is reported as a genuine registration error. The
+    // sink only fires on failure, so a success leaves the sentinel in place.
+    this.llmRegistryLoadError = loadError;
   }
 
   async onShutdown(): Promise<void> {
@@ -1099,9 +1127,18 @@ export class ToolServer extends BaseServer {
         },
         () =>
           this.withCredentialIsolation(async () => {
-            await this.ensureLlmRegistryLoaded();
+            const invokeArgs = request.arguments;
+            const llm = await this.resolveLlmForRequest(
+              invokeArgs.llm_id,
+              invokeArgs.tools as unknown[],
+              invokeArgs.tool_choice,
+            );
             const collected: LLMStreamChunk[] = [];
-            for await (const chunk of this.streamLlmChunks(request, signal)) {
+            for await (const chunk of this.streamLlmChunks(
+              request,
+              signal,
+              llm,
+            )) {
               collected.push(chunk);
             }
             return collected;
@@ -1155,20 +1192,21 @@ export class ToolServer extends BaseServer {
     request: LLMPodInvokeRequest,
     signal?: AbortSignal,
   ): AsyncGenerator<LLMStreamChunk> {
-    await this.ensureLlmRegistryLoaded();
-    yield* this.streamLlmChunks(request, signal);
-  }
-
-  private async *streamLlmChunks(
-    request: LLMPodInvokeRequest,
-    signal?: AbortSignal,
-  ): AsyncGenerator<LLMStreamChunk> {
     const invokeArgs = request.arguments;
-    const llm = this.createLlmForPod(
+    const llm = await this.resolveLlmForRequest(
       invokeArgs.llm_id,
       invokeArgs.tools as unknown[],
       invokeArgs.tool_choice,
     );
+    yield* this.streamLlmChunks(request, signal, llm);
+  }
+
+  private async *streamLlmChunks(
+    request: LLMPodInvokeRequest,
+    signal: AbortSignal | undefined,
+    llm: AdaptedLLM,
+  ): AsyncGenerator<LLMStreamChunk> {
+    const invokeArgs = request.arguments;
     const messages = invokeArgs.messages;
     const extraKwargs: Record<string, unknown> =
       invokeArgs.options?.toModelKwargs() ?? {};

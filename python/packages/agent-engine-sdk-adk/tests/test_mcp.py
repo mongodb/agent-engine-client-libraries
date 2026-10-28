@@ -65,7 +65,7 @@ def _fake_list_server_tools(
             SimpleNamespace(
                 name=tool_name,
                 description="Search issues.",
-                inputSchema=dict(input_schema or _SEARCH_SCHEMA),
+                input_schema=dict(input_schema or _SEARCH_SCHEMA),
             )
         ]
 

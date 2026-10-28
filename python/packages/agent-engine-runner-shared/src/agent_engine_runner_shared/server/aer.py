@@ -960,13 +960,32 @@ class AERServer(BaseServer):
         execution_timed_out = False
         prep_complete = False
         try:
+            # Build the per-execution graph before materializing the agent. A
+            # per-execution builder does its own I/O and may be async, so the
+            # build is awaited here.
+            #
+            # Bounded by the execution timeout: this is author I/O and it runs
+            # before the whole-turn timeout starts, so a stalled builder would
+            # otherwise hold /execute open indefinitely. A global agent returns
+            # None without awaiting anything, so the bound never fires for one.
+            try:
+                graph = await asyncio.wait_for(
+                    self.runtime.build_graph(agent_input, ctx),
+                    timeout=EXECUTION_TIMEOUT,
+                )
+            except asyncio.TimeoutError as exc:
+                raise RuntimeError(
+                    "the per-execution graph build did not complete within "
+                    f"{EXECUTION_TIMEOUT} seconds"
+                ) from exc
+
             # Build the agent before the durable-routing decision: materializing
             # the graph is what registers the workflow adapter (a graph without
             # the platform checkpointer must stay native), so the eligibility
             # computed here — before the first preparation await — is correct
             # even on this worker's first request.
             with self._traced_step(AER_BUILD_AGENT):
-                agent = self.runtime.get_agent(callbacks=[node_logger])
+                agent = self.runtime.get_agent(callbacks=[node_logger], graph=graph)
             durable_start_request = attempt_start_request_from_execute(
                 request,
                 session_id,

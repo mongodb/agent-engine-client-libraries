@@ -23,6 +23,8 @@ import {
   type JsonValue,
   LLMToolSchema,
   type ToolDefinition,
+  type AgentInput,
+  type RequestContext,
 } from "@mongodb-js/agent-engine-sdk";
 import { Memory } from "@mongodb-js/agent-engine-sdk-memory";
 import {
@@ -33,6 +35,7 @@ import {
   discoverMcpTools,
   getCurrentWrapper,
   getEnvBool,
+  getEnvFloat,
   entrypointScope,
   runWithCustomerOrigin,
   getCheckpointWorkspaceId,
@@ -51,6 +54,9 @@ import {
   registerWorkflowAdapter,
   requestSessionFinish,
   resetLlmRegistry,
+  snapshotLlmRegistry,
+  entrypointScopeAsync,
+  AsyncMutex,
   runInstrumentor,
   RuntimeMode,
   type SessionFinishStatus,
@@ -125,6 +131,29 @@ function tracedGraphBuild<T>(cacheHit: boolean, fn: () => T): T {
     (span) => {
       try {
         return fn();
+      } finally {
+        span.end();
+      }
+    },
+  );
+}
+
+/** Async variant of {@link tracedGraphBuild}: the span spans the awaits. */
+async function tracedGraphBuildAsync<T>(
+  cacheHit: boolean,
+  fn: () => Promise<T>,
+): Promise<T> {
+  return getTracer("runner-shared.agent-engine-sdk-langgraph").startActiveSpan(
+    GRAPH_BUILD,
+    {
+      attributes: {
+        [OPENINFERENCE_SPAN_KIND]: OpenInferenceSpanKind.CHAIN,
+        [ATTR_CACHE_HIT]: cacheHit,
+      },
+    },
+    async (span) => {
+      try {
+        return await fn();
       } finally {
         span.end();
       }
@@ -232,6 +261,130 @@ export interface ToolDecoratorOptions {
   onUnknownOutcome?: OnUnknownOutcome;
 }
 
+/** How an agent builds its graph. */
+export type LoadStrategy = "global" | "per-execution";
+
+/** Options accepted by {@link App.entrypoint}. */
+export interface EntrypointOptions {
+  /**
+   * `"global"` (default) builds once and caches the graph. `"per-execution"`
+   * runs the builder on every invocation with that invocation's
+   * `(input, ctx)`, so it can do its own request-scoped I/O first.
+   */
+  loadStrategy?: LoadStrategy;
+}
+
+const LOAD_STRATEGIES: readonly LoadStrategy[] = ["global", "per-execution"];
+
+/** Registry id for a model registered without an explicit `llmId`. */
+const DEFAULT_LLM_ID = "__default__";
+
+/**
+ * Whether a per-execution build of `elapsedMs` is slow enough to report.
+ *
+ * A per-execution build runs inside `/execute` before the turn's first token, so
+ * its cost lands on every invocation rather than once per pod. Below the budget
+ * it is noise against model latency; above it the author is paying a visible
+ * per-turn tax. Nothing in the platform enforces the budget.
+ *
+ * Read per call so it stays a deployment knob, and so the decision is testable
+ * without capturing log output.
+ */
+export function isSlowGraphBuild(elapsedMs: number): boolean {
+  return elapsedMs > getEnvFloat("RUNNER_SLOW_GRAPH_BUILD_MS", 1000.0);
+}
+
+/**
+ * The call shapes a builder may have. Both are accepted because the strategy
+ * decides which one the runtime uses; the overloads on {@link App.entrypoint}
+ * are what tie a shape to its strategy for callers.
+ */
+type GraphBuilder = (input?: AgentInput, ctx?: RequestContext) => unknown;
+
+/**
+ * A per-execution build registered a different LLM id set.
+ *
+ * Distinct from an ordinary build failure so the Tool Pod can tell a registry
+ * that has drifted from one that merely failed to build: a drifted registry is
+ * not a usable partial discovery. The marker property lets runner-shared
+ * recognise it without importing this package, which it does not depend on.
+ */
+export class LLMRegistrationDriftError extends Error {
+  readonly isLlmRegistrationDrift = true;
+  constructor(message: string) {
+    super(message);
+    this.name = "LLMRegistrationDriftError";
+  }
+}
+
+const ABANDONED_BEFORE_START =
+  "The per-execution graph build was abandoned before it started: the " +
+  "invocation's deadline passed while it waited for the build lock.";
+
+/**
+ * The queued build's deadline passed.
+ *
+ * Deliberately not a `TimeoutError`: that name is the DOM and Undici convention
+ * for a transport deadline, and the runner already classifies by that name. The
+ * runner tells this apart from a build failure by the execution controller's
+ * state, which is aborted whenever this is thrown.
+ */
+function abandonedBeforeStart(): Error {
+  return new Error(ABANDONED_BEFORE_START);
+}
+
+/**
+ * Stop waiting for the build lock as soon as `signal` aborts.
+ *
+ * Only a caller that is still queued short-circuits. Once the build is running
+ * its promise has to stay pending, because that is what tells the runner the
+ * author's work is still live and its drain ownership must be retained; the
+ * runner reports that invocation's deadline itself. The queued callback still
+ * runs, sees the aborted signal, and releases the lock without touching the
+ * builder.
+ */
+function raceWithAbort<T>(
+  work: Promise<T>,
+  signal: AbortSignal | undefined,
+  stillQueued: () => boolean,
+): Promise<T> {
+  if (signal === undefined) return work;
+  // The queued work is observed on every path, including an already-aborted
+  // signal. It still runs, sees the same aborted signal, and rejects; an
+  // unobserved rejection is fatal to the runner process.
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = (): void => {
+      if (stillQueued()) reject(abandonedBeforeStart());
+    };
+    if (signal.aborted) onAbort();
+    else signal.addEventListener("abort", onAbort, { once: true });
+    work.then(
+      (value) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(value);
+      },
+      (error: unknown) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(error);
+      },
+    );
+  });
+}
+
+function sameIdSet(a: ReadonlySet<string>, b: ReadonlySet<string>): boolean {
+  if (a.size !== b.size) return false;
+  for (const id of a) if (!b.has(id)) return false;
+  return true;
+}
+
+function isSubset(
+  subset: ReadonlySet<string>,
+  superset: ReadonlySet<string>,
+): boolean {
+  for (const id of subset) if (!superset.has(id)) return false;
+  return true;
+}
+
 /**
  * LangChain SDK for the Atlas Agent Engine.
  *
@@ -255,12 +408,23 @@ export interface ToolDecoratorOptions {
 export class App extends BaseApp {
   // BaseApp owns `readonly name: string` — no override needed.
   private readonly runtime: TenantRuntime;
-  private builderFn: (() => unknown) | null = null;
+  private builderFn: GraphBuilder | null = null;
   // Cached graph.build result. Safe to reuse for the process lifetime: the
   // builder function is fixed once app.entrypoint() is called, and Node's
   // single-threaded event loop can't interleave two synchronous builds, so
   // no lock is needed (unlike the Python port).
   private graphCache: unknown | undefined;
+  /** How this agent builds its graph. Set by entrypoint(). */
+  loadStrategy: LoadStrategy = "global";
+  // Serializes per-execution builds. The LLM registry is process-global, and an
+  // async builder interleaves with another build's reset at its await points,
+  // which would reject an otherwise-valid app.llm() as a duplicate id.
+  private readonly perExecutionBuildLock = new AsyncMutex();
+  // Registered LLM ids from the first per-execution build in this process.
+  private llmIdBaseline: ReadonlySet<string> | null = null;
+  // Whether llmIdBaseline came from a build that failed, and so may be missing
+  // ids the builder never reached. A build that ran to the end supersedes it.
+  private llmIdBaselineProvisional = false;
   private prepareInputFn: PrepareAgentInput | null = null;
   private resolveThreadIdFn: ResolveThreadId | null = null;
   private readonly toolDefs: ToolDefinitionData[] = [];
@@ -526,8 +690,29 @@ export class App extends BaseApp {
     };
   }
 
-  /** Mark the graph builder function. */
-  entrypoint<F extends () => unknown>(fn: F): F {
+  /**
+   * Mark the graph builder function.
+   *
+   * The builder's shape is typed off the strategy: `"global"` (the default)
+   * takes no arguments and is built once, while `"per-execution"` receives the
+   * invocation's `(input, ctx)` and is built on every invocation.
+   */
+  entrypoint<F extends () => unknown>(
+    fn: F,
+    opts?: { loadStrategy?: "global" },
+  ): F;
+  entrypoint<F extends (input: AgentInput, ctx: RequestContext) => unknown>(
+    fn: F,
+    opts: { loadStrategy: "per-execution" },
+  ): F;
+  entrypoint<F extends GraphBuilder>(fn: F, opts: EntrypointOptions = {}): F {
+    const loadStrategy = opts.loadStrategy ?? "global";
+    if (!LOAD_STRATEGIES.includes(loadStrategy)) {
+      throw new TypeError(
+        `loadStrategy must be one of ${JSON.stringify(LOAD_STRATEGIES)}; got ${JSON.stringify(loadStrategy)}`,
+      );
+    }
+    this.loadStrategy = loadStrategy;
     this.builderFn = fn;
     return fn;
   }
@@ -577,14 +762,20 @@ export class App extends BaseApp {
    * Accepts an options object with an optional `callbacks` array, each wrapped
    * in `LangGraphCallbackAdapter` before being passed to the graph.
    */
-  getAgent(opts?: { callbacks?: readonly unknown[] }): LangGraphBaseAgent {
+  getAgent(opts?: {
+    callbacks?: readonly unknown[];
+    graph?: unknown;
+  }): LangGraphBaseAgent {
     const adaptedCallbacks: unknown[] = [];
     if (opts?.callbacks) {
       for (const cb of opts.callbacks) {
         adaptedCallbacks.push(new LangGraphCallbackAdapter(cb as never));
       }
     }
-    const graph = this.getOrBuildGraph();
+    // A per-execution agent passes the graph built for this invocation; every
+    // global agent takes the cached build path.
+    const graph =
+      opts?.graph !== undefined ? opts.graph : this.getOrBuildGraph();
     // Durable eligibility depends on the materialized graph: only the
     // PlatformCheckpointer provides fence-keyed scratch and release, so a
     // graph compiled with a custom saver (or none) must stay native.
@@ -607,6 +798,158 @@ export class App extends BaseApp {
     );
   }
 
+  /** Whether this agent builds its graph per invocation. */
+  usesPerInvocationBuild(): boolean {
+    return this.loadStrategy === "per-execution";
+  }
+
+  /**
+   * Build the graph for one invocation.
+   *
+   * Returns `undefined` for a global agent, which tells the caller to use the
+   * cached build path unchanged. Under `per-execution` the builder runs on every
+   * invocation with that invocation's `(input, ctx)`, so it can do its own
+   * request-scoped I/O before returning the graph. A context-free call passes
+   * neither and is the platform's discovery path.
+   */
+  async buildGraph(
+    agentInput?: AgentInput,
+    ctx?: RequestContext,
+  ): Promise<unknown | undefined> {
+    if (this.loadStrategy !== "per-execution") return undefined;
+    if (this.builderFn === null) {
+      throw new Error(
+        "No graph builder registered. Use app.entrypoint() to mark the graph builder function.",
+      );
+    }
+    const builderFn = this.builderFn;
+    // A context-free build is the platform's discovery path: how the Tool Pod
+    // populates its registry, and the only path that can complete a set an
+    // earlier failed discovery left provisional. The AER always builds with the
+    // invocation's context, so the two never share a process.
+    const discovery = agentInput === undefined && ctx === undefined;
+
+    const signal = ctx?.signal;
+    let buildStarted = false;
+    const work = this.perExecutionBuildLock.runExclusive(() => {
+      buildStarted = true;
+      // Re-check once the lock is held. A caller can wait a long time behind
+      // another build, and its own invocation deadline may already have passed;
+      // the AER aborts this signal at that deadline. Starting the builder then
+      // would run author I/O for a request that is already gone, and leave that
+      // work holding the lock with nobody waiting for it.
+      if (signal?.aborted === true) {
+        throw abandonedBeforeStart();
+      }
+      return tracedGraphBuildAsync(false, async () => {
+        const startedAt = performance.now();
+        try {
+          resetLlmRegistry();
+          try {
+            const graph = await entrypointScopeAsync(() =>
+              runWithCustomerOrigin(async () => builderFn(agentInput, ctx)),
+            );
+            this.requireInvariantLlmIds({ discovery, completed: true });
+            return graph;
+          } catch (error) {
+            if (error instanceof LLMRegistrationDriftError) throw error;
+            if (!discovery) throw error;
+            // The context-free discovery failed. Validate what it registered
+            // against the baseline if one exists, so a retry that changed its
+            // ids is rejected rather than retained.
+            this.validateOrRecordDiscoveryBaseline();
+            throw new Error(
+              "The graph builder for an agent registered with loadStrategy: " +
+                "'per-execution' failed while building without invocation context. " +
+                "A builder that needs invocation context cannot be built on the " +
+                "context-free discovery path.",
+              { cause: error },
+            );
+          }
+        } finally {
+          // Reported whether or not the build produced a graph: a build slow
+          // enough to delay the turn is worth flagging either way, and the
+          // author's fix is the same.
+          const elapsedMs = performance.now() - startedAt;
+          if (isSlowGraphBuild(elapsedMs)) {
+            logger.warn(
+              `Per-execution graph build took ${Math.round(elapsedMs)}ms, over the ` +
+                "RUNNER_SLOW_GRAPH_BUILD_MS budget. A slow build delays every " +
+                "turn; keep the builder lightweight.",
+            );
+          }
+        }
+      });
+    });
+    // Stop waiting as soon as this invocation's deadline passes, rather than
+    // holding the caller open for the whole of the build ahead of it. The
+    // queued callback still runs, sees the aborted signal, and releases the
+    // lock without touching the builder.
+    return raceWithAbort(work, signal, () => !buildStarted);
+  }
+
+  /**
+   * Validate a failed discovery's registrations, then baseline them.
+   *
+   * A failure that registered nothing is transient whether or not a baseline
+   * exists, so no baseline is frozen: the next attempt may still recover.
+   */
+  private validateOrRecordDiscoveryBaseline(): void {
+    const registered = new Set(snapshotLlmRegistry().keys());
+    if (registered.size === 0) return;
+    if (this.llmIdBaseline !== null) {
+      this.requireInvariantLlmIds({ discovery: true });
+      return;
+    }
+    this.llmIdBaseline = registered;
+    this.llmIdBaselineProvisional = true;
+  }
+
+  /**
+   * Reject a per-execution build that changes the registered LLM ids.
+   *
+   * The Tool Pod resolves a model by `llm_id` against a registry built once per
+   * pod, so every id an invocation could use must be registered there. A builder
+   * that varies ids per caller would have the platform ask for a model the pod
+   * never registered, failing mid-execution; failing here keeps it at the build.
+   *
+   * A provisional baseline may still grow from a discovery build: the motivating
+   * builder registers its models and then reads context, so it fails on every
+   * context-free discovery, and a model whose construction failed once has to be
+   * able to join the set when it succeeds. Dropping or replacing an id stays
+   * drift, since the pod would lose a model it already served. A discovery that
+   * runs to the end is authoritative and fixes the set from there on.
+   */
+  private requireInvariantLlmIds(
+    opts: { discovery?: boolean; completed?: boolean } = {},
+  ): void {
+    const discovery = opts.discovery === true;
+    const registered = new Set(snapshotLlmRegistry().keys());
+    if (this.llmIdBaseline === null) {
+      this.llmIdBaseline = registered;
+      return;
+    }
+    if (!sameIdSet(registered, this.llmIdBaseline)) {
+      const recovered =
+        discovery &&
+        this.llmIdBaselineProvisional &&
+        isSubset(this.llmIdBaseline, registered);
+      if (!recovered) {
+        throw new LLMRegistrationDriftError(
+          "An agent registered with loadStrategy: 'per-execution' must register " +
+            "the same LLM ids on every invocation, because the Tool Pod resolves " +
+            "a model by llm_id against a registry built once per pod. Got " +
+            `${JSON.stringify([...registered].sort())}, expected ` +
+            `${JSON.stringify([...this.llmIdBaseline].sort())}.`,
+        );
+      }
+      this.llmIdBaseline = registered;
+    }
+    if (discovery && opts.completed === true) {
+      this.llmIdBaselineProvisional = false;
+    }
+  }
+
   /**
    * Return the materialized graph, building it at most once.
    *
@@ -619,6 +962,17 @@ export class App extends BaseApp {
     if (this.builderFn === null) {
       throw new Error(
         "No entrypoint registered. Use app.entrypoint() to mark the graph builder function.",
+      );
+    }
+    if (this.loadStrategy === "per-execution") {
+      // This path invokes the builder synchronously and caches the result. A
+      // per-execution builder is async, so it would cache a pending Promise and
+      // run the builder's I/O outside the caller's control. Callers must build
+      // through buildGraph() and pass the result to getAgent({ graph }).
+      throw new Error(
+        "A per-execution agent builds its graph per invocation. Call " +
+          "buildGraph(input, ctx) and pass the result to getAgent({ graph }) " +
+          "instead of materializing the agent directly.",
       );
     }
     const builderFn = this.builderFn;
@@ -643,6 +997,10 @@ export class App extends BaseApp {
    */
   warmUp(): void {
     if (this.builderFn === null) return;
+    // A per-execution agent has no caller to build for yet, so a build here
+    // would be discarded by the first real invocation and would run
+    // caller-specific I/O with no caller.
+    if (this.loadStrategy === "per-execution") return;
     this.getOrBuildGraph();
   }
 
@@ -826,7 +1184,7 @@ export class App extends BaseApp {
    * named call with the same id.
    */
   llm(llm: BaseChatModel, llmId?: string): BaseChatModel {
-    const resolvedId = llmId ?? "__default__";
+    const resolvedId = llmId ?? DEFAULT_LLM_ID;
     // Register in the named-LLM registry regardless of mode — mirrors Python's
     // App.llm() which calls register_llm() before the mode branch. The Tool Pod
     // needs it for /invoke_llm resolution; the AER side needs it for tests and
@@ -912,6 +1270,42 @@ export class App extends BaseApp {
   // ----- Deep agents -----
 
   /**
+   * Resolve the orchestrator model, registering it unless the author already
+   * did.
+   *
+   * An agent that opts into per-execution builds must register every `llm_id`
+   * before it reads invocation context, because the Tool Pod's context-free
+   * discovery build only retains what was registered before the builder
+   * stopped. `deepAgent` registers the orchestrator itself, under
+   * `__default__`, which would be a duplicate id once the author has already
+   * registered it.
+   *
+   * Registration and wrapping are separate decisions; see the body.
+   *
+   * The model passed here is not compared against the registered one: in AER
+   * mode `app.llm()` registers the unwrapped model and returns a
+   * `SecureWrappedLLM`, so the two are never the same object and an identity
+   * check would reject correct code. The registry proves the id is taken, not
+   * that this argument is the wrapped form of it.
+   */
+  private orchestratorLlm(llm: BaseChatModel): BaseChatModel {
+    if (!snapshotLlmRegistry().has(DEFAULT_LLM_ID)) return this.llm(llm);
+    // Registration and wrapping are separate decisions. The id is taken, so
+    // registering again would raise, but the model still has to be wrapped:
+    // `llm()` registers the model it is given and returns a different object,
+    // so a caller that kept its own raw instance and passed that on would
+    // otherwise hand the provider an unwrapped model and bypass OE approvals,
+    // auditing, and guardrails.
+    if (this.runtime.mode === RuntimeMode.TOOL) return llm;
+    if (llm instanceof SecureWrappedLLM) return llm;
+    return new SecureWrappedLLM(
+      llm,
+      () => getCurrentWrapper() as SecureLLMWrapper | null,
+      DEFAULT_LLM_ID,
+    ) as unknown as BaseChatModel;
+  }
+
+  /**
    * Build a deepagents graph pre-wired for Atlas Agent Engine AER.
    *
    * Wraps `llm` in `SecureWrappedLLM`, resolves relative skill paths, validates
@@ -960,7 +1354,7 @@ export class App extends BaseApp {
     // when the subagent's model is resolved. Registering the orchestrator's
     // __default__ below via `this.llm()` leaves prior subagent entries intact;
     // a genuine duplicate id surfaces through `registerLlm`'s own guard.
-    const secureLlm = this.llm(llm);
+    const secureLlm = this.orchestratorLlm(llm);
 
     // Checkpointer resolution:
     //   undefined (omitted) -> app.checkpointer() (returns null outside AER)

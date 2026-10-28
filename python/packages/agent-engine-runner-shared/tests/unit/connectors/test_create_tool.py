@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 
+import pytest
 import yaml
 
 from agent_engine_runner_shared.connectors.create_tool import RESULT_PREFIX, main
@@ -481,3 +482,176 @@ servers:""",
         assert code == 2
         assert "disk on fire line two" in err
         assert "Traceback" not in err
+
+
+_COMPILE = ["--spec", "connectors/jira/spec.yaml", "--name", "jira", "--out-dir", "connectors/jira"]
+
+
+class TestDelegatedOAuth:
+    def test_oauth_compile_writes_the_delegated_binding(self, tmp_path, capsys, monkeypatch):
+        out = _connector_dir(tmp_path)
+        monkeypatch.chdir(tmp_path)
+
+        code, _, err = _run(
+            capsys,
+            [
+                *_COMPILE,
+                "--auth",
+                "oauth",
+                "--provider-type",
+                "github",
+                "--scopes",
+                "repo, read:org",
+            ],
+        )
+
+        assert code == 0, err
+        authoring = (out / "tool.yaml").read_text(encoding="utf-8")
+        assert yaml.safe_load(authoring)["auth"] == {
+            "type": "oauth",
+            "provider_type": "github",
+            "scopes": ["repo", "read:org"],
+        }
+        # The guidance names the key the project's credential provider must use.
+        assert (
+            "#   auth     delegated OAuth; register a credential provider with provider "
+            "type github in this project\n"
+        ) in authoring
+        catalog = yaml.safe_load((out / "tool_defs.yaml").read_text(encoding="utf-8"))
+        assert catalog["externalize"] == {"auth": {"type": "bearer"}}
+
+    def test_oauth_without_scopes_binds_no_scopes(self, tmp_path, capsys, monkeypatch):
+        out = _connector_dir(tmp_path)
+        monkeypatch.chdir(tmp_path)
+
+        code, _, err = _run(capsys, [*_COMPILE, "--auth", "oauth", "--provider-type", "github"])
+
+        assert code == 0, err
+        authoring = yaml.safe_load((out / "tool.yaml").read_text(encoding="utf-8"))
+        assert authoring["auth"] == {"type": "oauth", "provider_type": "github"}
+
+    @pytest.mark.parametrize(
+        ("flags", "expected"),
+        [
+            (["--auth", "oauth"], "--auth oauth requires --provider-type"),
+            (["--auth", "oauth", "--provider-type", "github", "--scopes", ""], "empty"),
+            (["--auth", "oauth", "--provider-type", "github", "--scopes", "repo,,admin"], "empty"),
+            (["--auth", "oauth", "--provider-type", "github", "--scopes", "repo,repo"], "unique"),
+            (["--auth", "oauth", "--provider-type", "github", "--scopes", "re po"], "unique"),
+            (["--auth", "oauth", "--provider-type", "git hub"], "provider key"),
+            (
+                ["--auth", "oauth", "--provider-type", "github", "--auth-env", "GH_TOKEN"],
+                "--auth oauth cannot take --auth-env or --auth-header",
+            ),
+            (
+                ["--auth", "bearer", "--auth-env", "GH_TOKEN", "--provider-type", "github"],
+                "require --auth oauth",
+            ),
+            (["--scopes", "repo"], "require --auth oauth"),
+        ],
+    )
+    def test_invalid_oauth_input_is_refused_before_writing(
+        self, tmp_path, capsys, monkeypatch, flags, expected
+    ):
+        out = _connector_dir(tmp_path)
+        monkeypatch.chdir(tmp_path)
+
+        code, _, err = _run(capsys, [*_COMPILE, *flags])
+
+        assert code == 1
+        assert expected in err
+        assert not (out / "tool.yaml").exists()
+        assert not (out / "tool_defs.yaml").exists()
+
+    def test_regeneration_refuses_oauth_flags(self, tmp_path, capsys, monkeypatch):
+        _connector_dir(tmp_path)
+        monkeypatch.chdir(tmp_path)
+
+        code, _, err = _run(
+            capsys,
+            [
+                "--config",
+                "connectors/jira/tool.yaml",
+                "--auth",
+                "oauth",
+                "--provider-type",
+                "github",
+            ],
+        )
+
+        assert code == 1
+        assert "preserves the authored settings" in err
+
+    @pytest.mark.parametrize(
+        ("flags", "expected"),
+        [
+            (
+                ["--auth", "bearer", "--auth-env", "JIRA_TOKEN"],
+                {"type": "bearer", "env": "JIRA_TOKEN"},
+            ),
+            (
+                ["--auth", "api_key", "--auth-env", "JIRA_KEY", "--auth-header", "X-Key"],
+                {"type": "api_key", "env": "JIRA_KEY", "header": "X-Key"},
+            ),
+        ],
+    )
+    def test_static_credentials_are_unchanged(self, tmp_path, capsys, monkeypatch, flags, expected):
+        out = _connector_dir(tmp_path)
+        monkeypatch.chdir(tmp_path)
+
+        code, _, err = _run(capsys, [*_COMPILE, *flags])
+
+        assert code == 0, err
+        assert yaml.safe_load((out / "tool.yaml").read_text(encoding="utf-8"))["auth"] == expected
+
+
+def _many_operations_spec(count: int) -> str:
+    """A minimal JSON document with ``count`` GET operations."""
+    return json.dumps(
+        {
+            "openapi": "3.0.3",
+            "info": {"title": "Items", "version": "1"},
+            "servers": [{"url": "https://api.example.com"}],
+            "paths": {
+                f"/items{index}": {
+                    "get": {
+                        "operationId": f"getItem{index}",
+                        "responses": {"200": {"description": "ok"}},
+                    }
+                }
+                for index in range(count)
+            },
+        }
+    )
+
+
+class TestUnmatchedAllowOnLargeCatalogs:
+    def test_names_the_closest_operations_instead_of_every_one(self, tmp_path, capsys, monkeypatch):
+        """A large catalog can have thousands of operations; a typo in
+        --allow must point at the intended name, not print them all."""
+        out = tmp_path / "connectors" / "items"
+        out.mkdir(parents=True)
+        (out / "items.json").write_text(_many_operations_spec(40), encoding="utf-8")
+        monkeypatch.chdir(tmp_path)
+
+        code, _, err = _run(
+            capsys,
+            [
+                "--spec",
+                "connectors/items/items.json",
+                "--name",
+                "items",
+                "--out-dir",
+                "connectors/items",
+                "--allow",
+                "items_getItem7x",
+            ],
+        )
+
+        assert code == 1
+        assert "items_getItem7x" in err
+        assert "40 operations available" in err
+        closest = err.split("closest: ", 1)[1]
+        assert "'items_getItem7'" in closest
+        assert "items_getItem23" not in err
+        assert not (out / "tool.yaml").exists()

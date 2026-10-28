@@ -18,7 +18,13 @@
  */
 
 import { describe, test, expect, beforeEach, afterEach, vi } from "vitest";
-import { mkdtempSync, writeFileSync, rmSync, realpathSync } from "node:fs";
+import {
+  mkdirSync,
+  mkdtempSync,
+  writeFileSync,
+  rmSync,
+  realpathSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -625,5 +631,103 @@ describe("isPlatformEnvVar membership", () => {
     expect(isPlatformEnvVar("SHUTDOWN_GRACE_PERIOD_MS")).toBe(true);
     expect(isPlatformEnvVar("AGENT_ENGINE_ENVIRONMENT")).toBe(true);
     expect(isPlatformEnvVar("MY_API_TOKEN")).toBe(false);
+  });
+});
+
+function writeConnectorFixture(): void {
+  const connectorDir = join(tmpDir, "connectors", "jira");
+  mkdirSync(connectorDir, { recursive: true });
+  writeFileSync(
+    join(connectorDir, "jira.tool_defs.yaml"),
+    [
+      "source:",
+      "  name: jiradc",
+      "  base_url: https://jira.example/rest",
+      "tools:",
+      "  - name: jiradc_getComments",
+      "    description: Returns comments.",
+      "    method: GET",
+      "    path: /api/2/issue",
+      "    params: {}",
+      "    inputSchema:",
+      "      type: object",
+      "      properties: {}",
+    ].join("\n"),
+    "utf-8",
+  );
+  writeFileSync(
+    join(connectorDir, "tool.yaml"),
+    [
+      "name: jira",
+      "tool_defs: jira.tool_defs.yaml",
+      "source:",
+      "  base_url: https://jira.example/rest",
+      "expose:",
+      "  allow_all: true",
+      "auth:",
+      "  type: none",
+    ].join("\n"),
+    "utf-8",
+  );
+}
+
+describe("agent.yaml connectors", () => {
+  test("parses connector references and defaults null to empty", () => {
+    writeConnectorFixture();
+    writeAgentYaml(
+      [
+        "entrypoint: connector.agent:app",
+        "connectors:",
+        "  - source: connectors/jira/tool.yaml",
+      ].join("\n"),
+    );
+    expect(loadRuntimeAgentConfig().connectors).toEqual([
+      { source: "connectors/jira/tool.yaml" },
+    ]);
+
+    writeAgentYaml("entrypoint: connector.agent:app\nconnectors: null\n");
+    expect(loadRuntimeAgentConfig().connectors).toEqual([]);
+
+    writeAgentYaml("entrypoint: connector.agent:app\n");
+    expect(loadRuntimeAgentConfig().connectors).toEqual([]);
+  });
+
+  test("ignores unknown connector sub-keys", () => {
+    writeConnectorFixture();
+    writeAgentYaml(
+      [
+        "entrypoint: connector.agent:app",
+        "connectors:",
+        "  - source: connectors/jira/tool.yaml",
+        "    note: ignored",
+      ].join("\n"),
+    );
+    expect(loadRuntimeAgentConfig().connectors).toEqual([
+      { source: "connectors/jira/tool.yaml" },
+    ]);
+  });
+
+  test("rejects an empty connector source", () => {
+    writeAgentYaml(
+      [
+        "entrypoint: connector.agent:app",
+        "connectors:",
+        "  - source: '   '",
+      ].join("\n"),
+    );
+    expect(() => loadRuntimeAgentConfig()).toThrow(/Invalid agent.yaml/);
+  });
+
+  test("fails startup when a configured connector cannot be materialized", () => {
+    writeAgentYaml(
+      [
+        "entrypoint: connector.agent:app",
+        "connectors:",
+        "  - source: connectors/missing/tool.yaml",
+      ].join("\n"),
+    );
+    expect(() => loadRuntimeAgentConfig()).toThrow(
+      /Invalid connector configuration/,
+    );
   });
 });

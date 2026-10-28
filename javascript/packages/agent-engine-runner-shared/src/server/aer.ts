@@ -21,7 +21,9 @@ import {
   type StreamEvent,
 } from "@mongodb-js/agent-engine-sdk";
 import { explicitFeatures, RuntimeAgentConfig } from "../agent_config.js";
+import { fatalWithTermination } from "../launcher.js";
 import { getLogger } from "../logger.js";
+import { TimeoutError, withTimeout } from "../timeout.js";
 import { withMetrics } from "../metrics.js";
 import {
   AERExecuteResponseSchema,
@@ -120,6 +122,24 @@ const logger = getLogger("agent_engine_runner_shared.server.aer");
 // is not cut off short of the limit the caller was promised.
 const EXECUTION_TIMEOUT_MS =
   getEnvFloat("RUNNER_EXECUTION_TIMEOUT", 600.0) * 1000;
+
+/** A per-execution build whose caller gave up while it was still running. */
+interface AbandonedBuild {
+  build: Promise<unknown>;
+  graceTimer: NodeJS.Timeout;
+}
+
+/**
+ * How long an abandoned per-execution build may keep running past its deadline
+ * before the pod gives up on it and exits for replacement.
+ *
+ * Read per call so it stays a deployment knob. The build already ran for the
+ * whole execution timeout before being abandoned, and the spec asks builders to
+ * stay lightweight, so anything past this is not going to settle.
+ */
+function abandonedBuildGraceMs(): number {
+  return getEnvFloat("RUNNER_ABANDONED_BUILD_GRACE", 60.0) * 1000;
+}
 
 // Per-request OE callback timeout.
 const REQUEST_TIMEOUT_MS = getRequestTimeout() * 1000;
@@ -443,11 +463,171 @@ export class AERServer extends BaseServer {
   // drained by the /execute route once the response has been flushed.
   pendingSessionFinish: Map<string, ExecutorCallbackRequest> = new Map();
   private readonly durabilityOwnerId = newDurabilityOwnerId();
+  // Per-execution builds whose caller gave up while the build was still running,
+  // keyed by execution_id. The execution stays registered as drain work until
+  // the build settles, so a drain cannot report this pod idle while author code
+  // is still running against shared state, and a build that never settles takes
+  // the pod out of service rather than leaving it wedged and healthy-looking.
+  private readonly abandonedBuilds = new Map<string, AbandonedBuild>();
   // One-shot capability advertise, mirrors Python's `_capabilities_advertised`.
   // Set only after OE accepts the declaration.
   private capabilitiesAdvertised = false;
   get modeName(): string {
     return "aer";
+  }
+
+  /**
+   * Build the graph for this invocation, bounded by the execution timeout.
+   *
+   * The builder does its own I/O and may be async, so it is awaited here: this
+   * is author I/O running before the whole-turn timeout starts, and a stalled
+   * builder would otherwise hold /execute open indefinitely. A global agent
+   * resolves to `undefined` without awaiting anything.
+   */
+  private async buildGraphForInvocation(
+    executionId: string,
+    agentInput: AgentInput,
+    ctx: RequestContext,
+    timeoutMs: number = EXECUTION_TIMEOUT_MS,
+  ): Promise<unknown> {
+    const pendingGraph =
+      this.runtime.buildGraph?.(agentInput, ctx) ?? Promise.resolve(undefined);
+    let buildSettled = false;
+    const markSettled = (): void => {
+      buildSettled = true;
+    };
+    void pendingGraph.then(markSettled, markSettled);
+
+    try {
+      return await withTimeout(
+        pendingGraph,
+        timeoutMs,
+        () =>
+          `the per-execution graph build did not complete within ${timeoutMs / 1000} seconds`,
+      );
+    } catch (error) {
+      if (error instanceof TimeoutError && !buildSettled) {
+        // The caller is gone but the build is still running. Keep its execution
+        // registered as work until it settles, so a drain cannot report this
+        // pod idle while author code is live. The build itself is not
+        // cancelled: it holds the registry lock, and the next invocation
+        // serializes behind it.
+        this.trackAbandonedBuild(executionId, pendingGraph);
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * Record a per-execution build whose caller gave up while it was still
+   * running, so the /execute route keeps its execution registered as drain work
+   * until the build settles.
+   *
+   * The entry clears on settlement, which is also what returns the pod to
+   * normal service: the next invocation waits on the build lock and proceeds
+   * once the abandoned build releases it.
+   */
+  private trackAbandonedBuild(
+    executionId: string,
+    build: Promise<unknown>,
+  ): void {
+    const entry: AbandonedBuild = {
+      build,
+      graceTimer: setTimeout(() => {
+        this.exitForUnsettledBuild(executionId);
+      }, abandonedBuildGraceMs()),
+    };
+    // Never hold the process open just to fire this.
+    entry.graceTimer.unref();
+    this.abandonedBuilds.set(executionId, entry);
+
+    const settle = (): void => {
+      if (this.abandonedBuilds.get(executionId) !== entry) return;
+      clearTimeout(entry.graceTimer);
+      this.abandonedBuilds.delete(executionId);
+    };
+    void build.then(settle, settle);
+  }
+
+  /**
+   * Report a deadline breach the way the platform expects: a terminal ERROR
+   * chunk and callback carrying the timeout error code, then a 504 that the
+   * outer handler re-raises without reporting a second time.
+   *
+   * Shared by the whole-turn deadline and the graph-build deadline, which are
+   * the same bound and reach the caller the same way.
+   */
+  private async reportDeadlineBreach(
+    request: ExecuteRequest,
+    stageCallback: (
+      status: string,
+      fields?: ExecutorCallbackFields,
+    ) => ExecutorCallbackRequest,
+  ): Promise<never> {
+    const errorMsg = `Execution timed out after ${EXECUTION_TIMEOUT_MS / 1000} seconds`;
+    try {
+      await this.sendStreamChunk(
+        request.platform_api_url,
+        request.execution_id,
+        ERROR,
+        "",
+        errorMsg,
+        { error_code: TIMEOUT_ERROR_CODE },
+      );
+    } catch (chunkErr) {
+      logger.error(
+        { err: chunkErr },
+        `Failed to deliver ERROR chunk for execution ${request.execution_id} after retries`,
+      );
+    }
+    stageCallback("ERROR", {
+      error: errorMsg,
+      metadata: { error_code: TIMEOUT_ERROR_CODE },
+    });
+    const httpError = new Error(errorMsg) as Error & {
+      statusCode: number;
+      alreadyReported?: boolean;
+    };
+    httpError.statusCode = 504;
+    // Terminal ERROR chunk + callback are already sent above. Mark the error so
+    // the outer catch re-raises without reporting a second time — mirrors
+    // Python's `except HTTPException: raise`.
+    httpError.alreadyReported = true;
+    throw httpError;
+  }
+
+  /**
+   * Take the pod out of service after a build that never settled.
+   *
+   * The build still holds the registry lock, so nothing this process does can
+   * make it serve the agent again. Exiting hands the replacement to the
+   * orchestrator, and the termination message carries the cause to the deploy
+   * timeline, which is what the runner's fatal path exists for.
+   */
+  private exitForUnsettledBuild(executionId: string): void {
+    void fatalWithTermination(
+      `A per-execution graph build for execution ${executionId} did not ` +
+        `settle within ${abandonedBuildGraceMs() / 1000}s of its invocation ` +
+        "deadline, so this pod can no longer serve the agent.",
+    );
+  }
+
+  /**
+   * End an execution's drain work, or defer it to an abandoned build's
+   * settlement.
+   *
+   * Ending it now would let a drain report this pod idle while author code from
+   * that build is still running against shared state, so the execution stays
+   * registered as work until the build settles.
+   */
+  private endWorkForExecution(executionId: string): void {
+    const abandoned = this.abandonedBuilds.get(executionId);
+    if (abandoned === undefined) {
+      this.drainRegistry.endWork(executionId);
+      return;
+    }
+    const endWork = (): void => this.drainRegistry.endWork(executionId);
+    void abandoned.build.then(endWork, endWork);
   }
 
   async onStartup(): Promise<void> {
@@ -598,7 +778,7 @@ export class AERServer extends BaseServer {
         }
         return reply.send(responseBody);
       } finally {
-        this.drainRegistry.endWork(body.execution_id);
+        this.endWorkForExecution(body.execution_id);
       }
     });
 
@@ -1019,6 +1199,43 @@ export class AERServer extends BaseServer {
             sessionId.slice(0, 8),
           );
 
+          let graph: unknown;
+          try {
+            graph = await this.buildGraphForInvocation(
+              request.execution_id,
+              agentInput,
+              ctx,
+            );
+            // A build that settles normally can still belong to an invocation
+            // that was cancelled while it ran. Re-check before materializing,
+            // or the author's input-preparation hook starts after the Stop:
+            // the stream's abort race cannot prevent it, because the iterator's
+            // first next() is evaluated before the race.
+            if (abortController.signal.aborted) {
+              throw new Error(
+                "Execution stopped: cancelled while the graph was building",
+              );
+            }
+          } catch (error) {
+            // The build deadline is the execution deadline, so a breach is
+            // reported as a timeout rather than falling through to the generic
+            // error path as a 500. Classify against the controller as well as
+            // the error: a builder that honors ctx.signal reports the deadline
+            // as an ordinary abort, and the deadline is what aborted the
+            // controller. A drain is a cancellation, not a breach, so it keeps
+            // the existing cancelled handling in the outer catch.
+            const drained =
+              abortController.signal.aborted &&
+              abortController.signal.reason === DRAIN_ABORT_REASON;
+            if (
+              !drained &&
+              (error instanceof TimeoutError || abortController.signal.aborted)
+            ) {
+              await this.reportDeadlineBreach(request, stageCallback);
+            }
+            throw error;
+          }
+
           agent = getTracer("runner-shared.aer").startActiveSpan(
             AER_BUILD_AGENT,
             {
@@ -1028,7 +1245,10 @@ export class AERServer extends BaseServer {
             },
             (span) => {
               try {
-                return this.runtime.getAgent({ callbacks: [nodeLogger] });
+                return this.runtime.getAgent({
+                  callbacks: [nodeLogger],
+                  graph,
+                });
               } finally {
                 span.end();
               }
@@ -1150,36 +1370,7 @@ export class AERServer extends BaseServer {
                   { cause: err },
                 );
               }
-              const errorMsg = `Execution timed out after ${EXECUTION_TIMEOUT_MS / 1000} seconds`;
-              try {
-                await this.sendStreamChunk(
-                  request.platform_api_url,
-                  request.execution_id,
-                  ERROR,
-                  "",
-                  errorMsg,
-                  { error_code: TIMEOUT_ERROR_CODE },
-                );
-              } catch (chunkErr) {
-                logger.error(
-                  { err: chunkErr },
-                  `Failed to deliver ERROR chunk for execution ${request.execution_id} after retries`,
-                );
-              }
-              stageCallback("ERROR", {
-                error: errorMsg,
-                metadata: { error_code: TIMEOUT_ERROR_CODE },
-              });
-              const httpError = new Error(errorMsg) as Error & {
-                statusCode: number;
-                alreadyReported?: boolean;
-              };
-              httpError.statusCode = 504;
-              // Terminal ERROR chunk + callback are already sent above. Mark the
-              // error so the outer catch re-raises without reporting a second time
-              // — mirrors Python's `except HTTPException: raise`.
-              httpError.alreadyReported = true;
-              throw httpError;
+              await this.reportDeadlineBreach(request, stageCallback);
             }
             throw err;
           }

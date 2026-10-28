@@ -31,6 +31,7 @@ export {
   type AERQueryPlugin,
 } from "./server/index.js";
 export { chunkTypes } from "./server/index.js";
+export { AsyncMutex } from "./server/tool.js";
 
 export * from "./models.js";
 
@@ -92,6 +93,7 @@ export {
   resolveImportTarget,
   runLauncher,
   boundText,
+  fatalWithTermination,
   writeTerminationMessage,
   setTerminationLogPathForTest,
   EXIT_IMPORT_ERROR,
@@ -157,3 +159,5 @@ export * from "./tracing/index.js";
 export * from "./span_names.js";
 export { AppBoundRuntime, AppBoundCrudClient } from "./memory_appbound.js";
 export { ToolAPIErrorSchema, type ToolAPIError } from "./tool_api_error.js";
+
+export * from "./connectors/index.js";

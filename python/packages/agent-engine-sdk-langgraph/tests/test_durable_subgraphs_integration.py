@@ -1143,7 +1143,7 @@ def test_send_rounds_inside_a_compiled_coordinator_replay_per_worker(
     coordinator.add_edge("work", "gather")
     coordinator.add_conditional_edges(
         "gather",
-        lambda state: (_send_rounds(state["cases"], 2) if state["rounds"] < 2 else END),
+        lambda state: _send_rounds(state["cases"], 2) if state["rounds"] < 2 else END,
         ["work", END],
     )
     root = StateGraph(_RoundState)

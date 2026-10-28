@@ -26,7 +26,9 @@ pytestmark = pytest.mark.asyncio
 def _make_server() -> Any:
     from agent_engine_runner_shared.server.aer import AERServer
 
-    server = AERServer(Mock())
+    runtime = Mock()
+    runtime.build_graph = AsyncMock(return_value=None)
+    server = AERServer(runtime)
     server._send_stream_chunk = AsyncMock()
     server._send_callback_body = AsyncMock()
     return server

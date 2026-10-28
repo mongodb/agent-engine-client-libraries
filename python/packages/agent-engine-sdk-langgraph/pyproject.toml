@@ -4,13 +4,13 @@ build-backend = "hatchling.build"
 
 [project]
 name = "agent-engine-sdk-langgraph"
-version = "0.11.10"
+version = "0.11.11"
 description = "Atlas Agent Engine LangGraph SDK for building secure, observable agents."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "agent-engine-sdk==0.11.10",
-    "agent-engine-sdk-memory==0.11.10",
+    "agent-engine-sdk==0.11.11",
+    "agent-engine-sdk-memory==0.11.11",
     "langgraph>=1.2.11,<2",
     # Floor required: 4.1.0 dispatches stored method names on checkpoint load
     # (GHSA-fjqc-hq36-qh5p).
@@ -18,7 +18,7 @@ dependencies = [
     "langgraph-checkpoint-mongodb>=0.3.1",
     # Floor required: this package imports agent_engine_runner_shared.memory_appbound at
     # import time.
-    "agent-engine-runner-shared[mongodb,tracing]==0.11.10",
+    "agent-engine-runner-shared[mongodb,tracing]==0.11.11",
     # Tracing instrumentation (moved from agent-engine-runner-shared[tracing])
     "openinference-instrumentation-langchain>=0.1.4",
 ]
@@ -67,6 +67,12 @@ typeCheckingMode = "strict"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.ruff.lint]
+# Pin the rule set explicitly: with no ``select``, ruff applies its built-in
+# default, which grew from 59 to 413 rules in ruff 0.16 and turned this
+# package's lint suite red.
+select = ["E4", "E7", "E9", "F"]
 
 [tool.ruff.lint.isort]
 known-first-party = ["tests"]

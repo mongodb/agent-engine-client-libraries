@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -93,6 +94,15 @@ EXECUTION_COMPLETE_PATH = "/executor/complete"
 CANCELLED_HISTORY_PATH = "/executor/cancelled-history"
 
 _DEFAULT_TIMEOUT_SECONDS = 10.0
+
+# OE refuses connections for a few seconds while its pods restart or roll out.
+# A failed connect means the request never left this runtime, so resending it
+# cannot repeat an OE transition. Every other transport failure may have reached
+# OE and is reported as OUTCOME_UNKNOWN at once. Lease heartbeats and history
+# reports are not resent: a heartbeat loop retries on its next interval, which
+# a backoff would push past the lease, and a history report has the caller's
+# shorter deadline.
+_CONNECT_RETRY_DELAYS_SECONDS = (0.5, 1.0, 2.0, 4.0, 4.0, 4.0)
 
 _STATUS_TO_CODE = {
     400: WORKFLOW_ERROR_CODE_INVALID_ARGUMENT,
@@ -397,6 +407,8 @@ def _interpret_finalize_step_response(status_code: int, body: bytes) -> Finalize
 
 def _transport_error(operation: str, error: httpx.TransportError) -> WorkflowClientError:
     # The request may have reached OE, so the outcome is unknown rather than failed.
+    # A connect failure that outlasts its retries keeps the same code, so callers
+    # handle a single kind of transport failure.
     return WorkflowClientError(
         WORKFLOW_ERROR_CODE_OUTCOME_UNKNOWN,
         f"{operation} transport failure: {type(error).__name__}",
@@ -432,7 +444,10 @@ class WorkflowClient:
     def heartbeat(self, request: AttemptHeartbeatRequest) -> None:
         """Renew the attempt lease under its current fence."""
         response = self._post(
-            ATTEMPT_HEARTBEAT_PATH, encode_protojson(request), "attempt heartbeat"
+            ATTEMPT_HEARTBEAT_PATH,
+            encode_protojson(request),
+            "attempt heartbeat",
+            retry_connect=False,
         )
         _raise_on_error_response(response.status_code, response.content, "attempt heartbeat")
 
@@ -466,7 +481,10 @@ class WorkflowClient:
     def heartbeat_activity(self, request: ActivityHeartbeatRequest) -> None:
         """Renew one activity lease under its current fencing token."""
         response = self._post(
-            ACTIVITY_HEARTBEAT_PATH, encode_protojson(request), "activity heartbeat"
+            ACTIVITY_HEARTBEAT_PATH,
+            encode_protojson(request),
+            "activity heartbeat",
+            retry_connect=False,
         )
         _raise_on_error_response(response.status_code, response.content, "activity heartbeat")
 
@@ -476,6 +494,7 @@ class WorkflowClient:
             CANCELLED_HISTORY_PATH,
             payload,
             "cancelled history",
+            retry_connect=False,
         )
         _raise_on_error_response(response.status_code, response.content, "cancelled history")
 
@@ -511,17 +530,26 @@ class WorkflowClient:
     def __exit__(self, *exc_info: object) -> None:
         self.close()
 
-    def _post(self, path: str, payload: str, operation: str) -> httpx.Response:
+    def _post(
+        self, path: str, payload: str, operation: str, *, retry_connect: bool = True
+    ) -> httpx.Response:
         headers = {"Content-Type": "application/json"}
-        try:
-            with _propagate_without_http_span(headers):
-                return self._client.post(
-                    f"{self._base_url}{path}",
-                    content=payload,
-                    headers=headers,
-                )
-        except httpx.TransportError as error:
-            raise _transport_error(operation, error) from error
+        delays = iter(_CONNECT_RETRY_DELAYS_SECONDS if retry_connect else ())
+        while True:
+            try:
+                with _propagate_without_http_span(headers):
+                    return self._client.post(
+                        f"{self._base_url}{path}",
+                        content=payload,
+                        headers=headers,
+                    )
+            except httpx.ConnectError as error:
+                delay = next(delays, None)
+                if delay is None:
+                    raise _transport_error(operation, error) from error
+                time.sleep(delay)
+            except httpx.TransportError as error:
+                raise _transport_error(operation, error) from error
 
 
 class AsyncWorkflowClient:
@@ -554,7 +582,10 @@ class AsyncWorkflowClient:
     async def heartbeat(self, request: AttemptHeartbeatRequest) -> None:
         """Renew the attempt lease under its current fence."""
         response = await self._post(
-            ATTEMPT_HEARTBEAT_PATH, encode_protojson(request), "attempt heartbeat"
+            ATTEMPT_HEARTBEAT_PATH,
+            encode_protojson(request),
+            "attempt heartbeat",
+            retry_connect=False,
         )
         _raise_on_error_response(response.status_code, response.content, "attempt heartbeat")
 
@@ -592,7 +623,10 @@ class AsyncWorkflowClient:
     async def heartbeat_activity(self, request: ActivityHeartbeatRequest) -> None:
         """Renew one activity lease under its current fencing token."""
         response = await self._post(
-            ACTIVITY_HEARTBEAT_PATH, encode_protojson(request), "activity heartbeat"
+            ACTIVITY_HEARTBEAT_PATH,
+            encode_protojson(request),
+            "activity heartbeat",
+            retry_connect=False,
         )
         _raise_on_error_response(response.status_code, response.content, "activity heartbeat")
 
@@ -611,6 +645,7 @@ class AsyncWorkflowClient:
             CANCELLED_HISTORY_PATH,
             payload,
             "cancelled history",
+            retry_connect=False,
         )
         _raise_on_error_response(response.status_code, response.content, "cancelled history")
 
@@ -654,15 +689,24 @@ class AsyncWorkflowClient:
                 )
             return self._client
 
-    async def _post(self, path: str, payload: str, operation: str) -> httpx.Response:
+    async def _post(
+        self, path: str, payload: str, operation: str, *, retry_connect: bool = True
+    ) -> httpx.Response:
         client = await self._ensure_client()
         headers = {"Content-Type": "application/json"}
-        try:
-            with _propagate_without_http_span(headers):
-                return await client.post(
-                    f"{self._base_url}{path}",
-                    content=payload,
-                    headers=headers,
-                )
-        except httpx.TransportError as error:
-            raise _transport_error(operation, error) from error
+        delays = iter(_CONNECT_RETRY_DELAYS_SECONDS if retry_connect else ())
+        while True:
+            try:
+                with _propagate_without_http_span(headers):
+                    return await client.post(
+                        f"{self._base_url}{path}",
+                        content=payload,
+                        headers=headers,
+                    )
+            except httpx.ConnectError as error:
+                delay = next(delays, None)
+                if delay is None:
+                    raise _transport_error(operation, error) from error
+                await asyncio.sleep(delay)
+            except httpx.TransportError as error:
+                raise _transport_error(operation, error) from error

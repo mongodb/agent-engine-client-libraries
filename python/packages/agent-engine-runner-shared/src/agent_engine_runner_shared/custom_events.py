@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import uuid
 from collections.abc import Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar, Token
@@ -157,6 +158,11 @@ class OEHTTPCustomEventTransport:
             return
         try:
             client = get_shared_client(oe_url)
+            # delivery_id is minted once per event and reused verbatim by the
+            # owner-first helper across both attempts, so a fallback after a
+            # lost owner response carries the same stable identity and the
+            # platform can dedup the redelivered event. Regenerated per emit —
+            # two intentionally identical events must remain distinct.
             _post_chunk_owner_first(
                 client,
                 service_url=f"{oe_url.rstrip('/')}/stream/chunk",
@@ -165,6 +171,7 @@ class OEHTTPCustomEventTransport:
                     "execution_id": execution_id,
                     "chunk_type": CUSTOM_EVENT,
                     "custom_event": dict(payload),
+                    "delivery_id": uuid.uuid4().hex,
                 },
                 on_owner_failure=report_oe_owner_url_failure,
                 timeout=PROGRESS_TIMEOUT_SECS,

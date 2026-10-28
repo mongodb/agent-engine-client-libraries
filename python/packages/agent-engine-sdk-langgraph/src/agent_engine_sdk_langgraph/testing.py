@@ -32,7 +32,8 @@ cheaply and more honestly.
 
 from __future__ import annotations
 
-from collections.abc import Iterator, Mapping, Sequence
+import inspect
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
@@ -379,6 +380,8 @@ def build_test_graph(
     llm: BaseChatModel | None = None,
     *,
     llms: dict[str, BaseChatModel] | None = None,
+    agent_input: Any = None,
+    ctx: Any = None,
 ) -> Any:
     """Build the raw compiled graph behind ``app``, substituting test models
     for the real LLMs the tenant's entrypoint constructs.
@@ -421,6 +424,11 @@ def build_test_graph(
             Mutually exclusive with ``llms``.
         llms: Per-``llm_id`` test models for multi-model agents. Mutually
             exclusive with ``llm``.
+        agent_input: The invocation input to build with, for an agent
+            registered with ``load_strategy="per-execution"``. Omitted, the
+            builder receives ``(None, None)`` — the same context-free build the
+            platform uses for discovery.
+        ctx: The invocation request context, paired with ``agent_input``.
 
     Returns:
         The raw compiled graph (``app._builder_fn()``'s return value), not
@@ -433,27 +441,85 @@ def build_test_graph(
             registers an ``llm_id`` with no matching entry.
     """
     with _test_llm_substitution(app, llm, llms, helper="build_test_graph"):
-        builder_fn = app._builder_fn
-        if builder_fn is None:
-            raise RuntimeError(
-                "app has no entrypoint registered — call @app.entrypoint before "
-                "build_test_graph."
-            )
-        # Mirrors get_agent()'s own fail-fast: the parser is inert unless
-        # features.use_custom_parser is true, but opting in without a registered
-        # parser is a misconfiguration that should surface here too — otherwise a
-        # Layer 1 test would build and run the raw graph silently (the parser is
-        # never consulted for the raw graph regardless), masking a config error
-        # that fails immediately under real AER execution.
-        use_custom_parser = app.agent_config.feature_enabled("use_custom_parser")
-        if use_custom_parser and app._output_parser_cls is None:
-            raise RuntimeError(
-                "agent.yaml features.use_custom_parser is true but no output "
-                "parser is registered; decorate one with @app.output_parser."
-            )
-        reset_llm_registry()  # mirrors get_agent(): a fresh registry per build
+        builder_fn = _helper_fail_fasts(app, "build_test_graph")
         with entrypoint_scope():
-            return builder_fn()
+            if app._load_strategy != "per-execution":
+                return builder_fn()
+            graph = builder_fn(agent_input, ctx)
+            if inspect.isawaitable(graph):
+                if inspect.iscoroutine(graph):
+                    graph.close()
+                raise TypeError(
+                    "The entrypoint for this load_strategy='per-execution' agent "
+                    "is async. Use abuild_test_graph, which awaits it while the "
+                    "entrypoint scope and model substitution are still active."
+                )
+            # Enforce the same id invariant production does, so a caller-dependent
+            # registration mistake fails here rather than only in production.
+            app._require_invariant_llm_ids(
+                discovery=agent_input is None and ctx is None, completed=True
+            )
+            return graph
+
+
+async def abuild_test_graph(
+    app: App,
+    llm: BaseChatModel | None = None,
+    *,
+    llms: dict[str, BaseChatModel] | None = None,
+    agent_input: Any = None,
+    ctx: Any = None,
+) -> Any:
+    """Async counterpart to ``build_test_graph``.
+
+    Needed for a ``load_strategy="per-execution"`` agent whose entrypoint is
+    async: the builder has to be awaited while ``entrypoint_scope`` and the model
+    substitution are still active, which the synchronous helper cannot do.
+
+    Takes the same arguments and applies the same substitution and fail-fasts as
+    ``build_test_graph``.
+    """
+    with _test_llm_substitution(app, llm, llms, helper="abuild_test_graph"):
+        builder_fn = _helper_fail_fasts(app, "abuild_test_graph")
+        with entrypoint_scope():
+            if app._load_strategy != "per-execution":
+                return builder_fn()
+            graph = builder_fn(agent_input, ctx)
+            if inspect.isawaitable(graph):
+                graph = await graph
+            # Enforce the same id invariant production does, so a caller-dependent
+            # registration mistake fails here rather than only in production.
+            app._require_invariant_llm_ids(
+                discovery=agent_input is None and ctx is None, completed=True
+            )
+            return graph
+
+
+def _helper_fail_fasts(app: App, helper: str) -> Callable[..., Any]:
+    """The fail-fasts every testing helper shares, then a fresh registry.
+
+    Returns the registered builder, narrowed to non-None.
+
+    Mirrors ``get_agent()``'s own fail-fast: the parser is inert unless
+    ``features.use_custom_parser`` is true, but opting in without a registered
+    parser is a misconfiguration that should surface here too. Otherwise a
+    Layer 1 test would build and run the raw graph silently (the parser is never
+    consulted for the raw graph regardless), masking a config error that fails
+    immediately under real AER execution.
+    """
+    builder_fn = app._builder_fn
+    if builder_fn is None:
+        raise RuntimeError(
+            f"app has no entrypoint registered — call @app.entrypoint before {helper}."
+        )
+    use_custom_parser = app.agent_config.feature_enabled("use_custom_parser")
+    if use_custom_parser and app._output_parser_cls is None:
+        raise RuntimeError(
+            "agent.yaml features.use_custom_parser is true but no output "
+            "parser is registered; decorate one with @app.output_parser."
+        )
+    reset_llm_registry()  # mirrors get_agent(): a fresh registry per build
+    return builder_fn
 
 
 def build_test_agent(
@@ -461,6 +527,8 @@ def build_test_agent(
     llm: BaseChatModel | None = None,
     *,
     llms: dict[str, BaseChatModel] | None = None,
+    agent_input: Any = None,
+    ctx: Any = None,
 ) -> LangGraphBaseAgent:
     """Build the framework-wrapped agent behind ``app`` — what
     ``app.get_agent()`` returns — with test models substituted, so tests can
@@ -509,6 +577,11 @@ def build_test_agent(
             has an entry; it does not verify a node received its intended
             model — assert on each model's scripted responses to confirm
             the wiring.
+        agent_input: The invocation input to build with, for an agent
+            registered with ``load_strategy="per-execution"``. Omitted, the
+            builder receives ``(None, None)`` — the same context-free build the
+            platform uses for discovery.
+        ctx: The invocation request context, paired with ``agent_input``.
 
     Returns:
         The ``LangGraphBaseAgent`` produced by ``app.get_agent()``.
@@ -521,14 +594,59 @@ def build_test_agent(
     """
     with _test_llm_substitution(app, llm, llms, helper="build_test_agent"):
         original_checkpointer = app.checkpointer
+        # One saver for the whole invocation: an opted-in builder is validated
+        # against the App's own checkpointer, so handing out a fresh instance
+        # per call would fail that check for a reason that has nothing to do
+        # with the graph under test.
+        memory_checkpointer = InMemorySaver(serde=app._checkpoint_serializer())
 
         def _memory_checkpointer() -> Any:
-            return InMemorySaver(serde=app._checkpoint_serializer())
+            return memory_checkpointer
 
         app.checkpointer = _memory_checkpointer
         try:
             # get_agent() does its own entrypoint/use_custom_parser fail-fasts
             # plus reset_llm_registry() + entrypoint_scope() around the build.
+            # A per-execution builder runs here, with the substituted
+            # checkpointer in place, and its graph is handed to get_agent.
+            if app._load_strategy == "per-execution":
+                graph = build_test_graph(
+                    app, llm, llms=llms, agent_input=agent_input, ctx=ctx
+                )
+                return app.get_agent(graph=graph)
+            return app.get_agent()
+        finally:
+            app.checkpointer = original_checkpointer
+
+
+async def abuild_test_agent(
+    app: App,
+    llm: BaseChatModel | None = None,
+    *,
+    llms: dict[str, BaseChatModel] | None = None,
+    agent_input: Any = None,
+    ctx: Any = None,
+) -> LangGraphBaseAgent:
+    """Async counterpart to ``build_test_agent``.
+
+    Needed for a ``load_strategy="per-execution"`` agent whose entrypoint is
+    async. Takes the same arguments and applies the same substitution and
+    fail-fasts as ``build_test_agent``.
+    """
+    with _test_llm_substitution(app, llm, llms, helper="abuild_test_agent"):
+        original_checkpointer = app.checkpointer
+        memory_checkpointer = InMemorySaver(serde=app._checkpoint_serializer())
+
+        def _memory_checkpointer() -> Any:
+            return memory_checkpointer
+
+        app.checkpointer = _memory_checkpointer
+        try:
+            if app._load_strategy == "per-execution":
+                graph = await abuild_test_graph(
+                    app, llm, llms=llms, agent_input=agent_input, ctx=ctx
+                )
+                return app.get_agent(graph=graph)
             return app.get_agent()
         finally:
             app.checkpointer = original_checkpointer

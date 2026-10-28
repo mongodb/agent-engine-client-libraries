@@ -8,6 +8,7 @@ coordinates the focused parser, compiler, and writer modules.
 
 from __future__ import annotations
 
+import difflib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
@@ -38,6 +39,28 @@ from agent_engine_runner_shared.connectors.generate.spec import (
     _load_spec,
     _quote,
 )
+
+# Catalogs up to this size list every operation when an allow rule misses.
+_LISTED_OPERATIONS = 20
+
+
+def _unmatched_allow_error(unmatched: list[str], available: set[str]) -> GenerateError:
+    """Name the allow rules that match no operation and point at the fix.
+
+    Small catalogs list every operation. Large ones, which can run to
+    thousands of operations, report the count and the closest names, so a
+    typo does not flood the terminal.
+    """
+    if len(available) <= _LISTED_OPERATIONS:
+        hint = f"available: {sorted(available)}"
+    else:
+        closest = sorted(
+            {match for name in unmatched for match in difflib.get_close_matches(name, available)}
+        )
+        hint = f"{len(available)} operations available"
+        if closest:
+            hint += f"; closest: {closest}"
+    return GenerateError(f"allow rules match no catalog operation: {unmatched}; {hint}")
 
 
 @dataclass(frozen=True)
@@ -89,10 +112,7 @@ def compile_catalog(
         available = {operation.name for operation in catalog.tools}
         unmatched = sorted(set(allow) - available)
         if unmatched:
-            raise GenerateError(
-                f"allow rules match no catalog operation: {unmatched}; "
-                f"available: {sorted(available)}"
-            )
+            raise _unmatched_allow_error(unmatched, available)
 
     catalog_path = _ensure_output(out, _CATALOG_NAME)
     catalog.write(catalog_path)
@@ -146,10 +166,7 @@ def scaffold_tool_yaml(
     if allow is not None:
         unmatched = sorted(set(allow) - available)
         if unmatched:
-            raise GenerateError(
-                f"allow rules match no catalog operation: {unmatched}; "
-                f"available: {sorted(available)}"
-            )
+            raise _unmatched_allow_error(unmatched, available)
     return _write_tool_yaml(
         out,
         name=catalog.source.name,

@@ -7,10 +7,8 @@ import yaml
 
 from agent_engine_runner_shared.agent_config import RuntimeAgentConfig, RuntimeConnectorReference
 from agent_engine_runner_shared.connectors import (
-    CONNECTOR_BUNDLE_PATH_ENV,
     ConnectorBundle,
     MaterializeError,
-    load_connector_bundle,
     materialize_connectors,
     resolve_runtime_bundle,
 )
@@ -350,64 +348,14 @@ class TestMaterializeConnectors:
         with pytest.raises(MaterializeError, match="invalid connector authoring file"):
             materialize_connectors([tool_yaml_path], root=tmp_path)
 
-    def test_bundle_round_trips_through_the_runtime_loader(self, tmp_path, tmp_path_factory):
-        """The in-memory bundle and the on-disk loader must agree on the same
-        authoring inputs — this is the contract a platform-build bundle (which
-        IS materialized to files) will have to satisfy."""
-        work = tmp_path_factory.mktemp("ondisk")
-        definitions = _bundle_for(tmp_path).connectors[0].definitions
-        (work / "jira.tool_defs.yaml").write_text(
-            yaml.safe_dump(definitions.model_dump(exclude_none=True), sort_keys=False),
-            encoding="utf-8",
-        )
-        index_path = work / "index.yaml"
-        index_path.write_text(
-            "version: 1\nconnectors:\n  - name: jira\n    tool_defs: jira.tool_defs.yaml\n",
-            encoding="utf-8",
-        )
-
-        loaded = load_connector_bundle(index_path)
-
-        assert [t.operation.name for t in loaded.tools] == [
-            t.operation.name for t in _bundle_for(tmp_path).tools
-        ]
-
 
 class TestResolveRuntimeBundle:
-    def test_no_env_and_no_connectors_is_an_empty_noop(self, monkeypatch):
-        monkeypatch.delenv(CONNECTOR_BUNDLE_PATH_ENV, raising=False)
-
+    def test_no_connectors_is_an_empty_noop(self):
         bundle = resolve_runtime_bundle(RuntimeAgentConfig())
 
         assert bundle == ConnectorBundle()
 
-    def test_pre_materialized_bundle_wins_over_agent_yaml(self, tmp_path, monkeypatch):
-        tool_yaml_path = _write_authoring(tmp_path)
-        env_bundle_root = tmp_path / "env-bundle"
-        env_bundle_root.mkdir()
-        (env_bundle_root / "other.tool_defs.yaml").write_text(
-            FIXTURE.read_text(encoding="utf-8").replace("name: jiradc", "name: envconn"),
-            encoding="utf-8",
-        )
-        index_path = env_bundle_root / "index.yaml"
-        index_path.write_text(
-            "version: 1\nconnectors:\n  - name: envconn\n    tool_defs: other.tool_defs.yaml\n",
-            encoding="utf-8",
-        )
-        monkeypatch.setenv(CONNECTOR_BUNDLE_PATH_ENV, str(index_path))
-
-        agent_config = RuntimeAgentConfig(
-            path=tmp_path / "agent.yaml",
-            connectors=[
-                RuntimeConnectorReference(source=str(tool_yaml_path.relative_to(tmp_path)))
-            ],
-        )
-        bundle = resolve_runtime_bundle(agent_config)
-
-        assert [connector.name for connector in bundle.connectors] == ["envconn"]
-
-    def test_traverses_agent_yaml_connectors(self, tmp_path, monkeypatch):
-        monkeypatch.delenv(CONNECTOR_BUNDLE_PATH_ENV, raising=False)
+    def test_traverses_agent_yaml_connectors(self, tmp_path):
         _write_authoring(tmp_path)
         (tmp_path / "agent.yaml").write_text("name: agent\n", encoding="utf-8")
 
@@ -423,8 +371,7 @@ class TestResolveRuntimeBundle:
             "jiradc_addComment",
         ]
 
-    def test_traversal_source_escaping_agent_root_is_rejected(self, tmp_path, monkeypatch):
-        monkeypatch.delenv(CONNECTOR_BUNDLE_PATH_ENV, raising=False)
+    def test_traversal_source_escaping_agent_root_is_rejected(self, tmp_path):
         outside = tmp_path.parent / f"{tmp_path.name}-outside"
         outside.mkdir(exist_ok=True)
         (outside / "tool.yaml").write_text(TOOL_YAML, encoding="utf-8")
@@ -437,8 +384,7 @@ class TestResolveRuntimeBundle:
         with pytest.raises(MaterializeError, match="inside the agent.yaml directory"):
             resolve_runtime_bundle(agent_config)
 
-    def test_traversal_without_located_agent_yaml_fails(self, monkeypatch):
-        monkeypatch.delenv(CONNECTOR_BUNDLE_PATH_ENV, raising=False)
+    def test_traversal_without_located_agent_yaml_fails(self):
         agent_config = RuntimeAgentConfig(
             connectors=[RuntimeConnectorReference(source="connectors/jira/tool.yaml")]
         )

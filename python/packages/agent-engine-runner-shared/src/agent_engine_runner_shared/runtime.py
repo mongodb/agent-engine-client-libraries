@@ -309,7 +309,12 @@ class TenantRuntime:
         warnings.warn(message, DeprecationWarning, stacklevel=3)
         logger.warning(message)
 
-    def get_agent(self, callbacks: List[Any] | None = None) -> BaseAgent:
+    def get_agent(
+        self,
+        callbacks: List[Any] | None = None,
+        *,
+        graph: Any = None,
+    ) -> BaseAgent:
         """Get a BaseAgent instance from the registered App.
 
         Delegates to the App's get_agent() method, which handles
@@ -318,6 +323,9 @@ class TenantRuntime:
         Args:
             callbacks: Framework-neutral callbacks for observability
                 (e.g., NodeExecutionLogger)
+            graph: A graph already built by ``build_graph`` for this
+                invocation (a per-execution agent). Only forwarded when
+                present, so an App that does not accept it keeps working.
 
         Returns:
             BaseAgent instance
@@ -336,7 +344,39 @@ class TenantRuntime:
                 "Plain callables are not supported."
             )
 
-        return self._graph_builder.get_agent(callbacks=callbacks)  # type: ignore[union-attr]
+        if graph is None:
+            return self._graph_builder.get_agent(callbacks=callbacks)  # type: ignore[union-attr]
+        return self._graph_builder.get_agent(  # type: ignore[union-attr]
+            callbacks=callbacks, graph=graph
+        )
+
+    async def build_graph(self, agent_input: Any = None, ctx: Any = None) -> Any:
+        """Build the graph for this invocation before ``get_agent``.
+
+        The AER awaits this so a per-execution agent's builder -- which may do
+        its own async I/O -- runs off the build path. Returns ``None`` when the
+        registered App declares no per-execution build (every global agent),
+        which tells the caller to use the cached build path unchanged. A
+        context-free discovery call passes ``(None, None)``.
+        """
+        if self._graph_builder is None:
+            return None
+        hook = getattr(self._graph_builder, "build_graph", None)
+        if hook is None:
+            return None
+        return await hook(agent_input, ctx)
+
+    def uses_per_invocation_build(self) -> bool:
+        """Whether the registered App builds its graph per invocation.
+
+        True only for an App that opted into ``load_strategy="per-execution"``.
+        The Tool Pod reads this to decide whether a failed context-free
+        discovery build should keep the registrations the builder made before
+        it raised, rather than discarding them.
+        """
+        if self._graph_builder is None:
+            return False
+        return getattr(self._graph_builder, "_load_strategy", "global") == "per-execution"
 
     def warm_up_agent(self) -> bool:
         """Best-effort pre-build of the agent graph before the first /execute.

@@ -7,9 +7,10 @@ import http.server
 import json
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 
+import httpx
 import pytest
 from opentelemetry import baggage
 from opentelemetry.baggage.propagation import W3CBaggagePropagator
@@ -60,6 +61,7 @@ from agent_engine_runner_shared.workflow import (
     WorkflowClient,
     WorkflowClientError,
 )
+from agent_engine_runner_shared.workflow import client as workflow_client
 from agent_engine_runner_shared.workflow.client import ActivityDispatch, ActivityReplay
 from agent_engine_runner_shared.workflow.protojson import encode_protojson
 
@@ -503,14 +505,125 @@ def test_start_attempt_timeout_maps_to_outcome_unknown(
             client.start_attempt(_start_request())
 
     assert raised.value.code == WORKFLOW_ERROR_CODE_OUTCOME_UNKNOWN
+    # OE received the request, so resending it could repeat the transition.
+    assert len(script.requests) == 1
 
 
-def test_start_attempt_connection_failure_maps_to_outcome_unknown() -> None:
+@pytest.fixture()
+def short_connect_backoff(monkeypatch: pytest.MonkeyPatch) -> tuple[float, ...]:
+    delays = (0.0, 0.0, 0.0)
+    monkeypatch.setattr(workflow_client, "_CONNECT_RETRY_DELAYS_SECONDS", delays)
+    return delays
+
+
+def test_start_attempt_connection_failure_maps_to_outcome_unknown(
+    short_connect_backoff: tuple[float, ...],
+) -> None:
     with WorkflowClient("http://127.0.0.1:9", timeout=0.2) as client:
         with pytest.raises(WorkflowClientError) as raised:
             client.start_attempt(_start_request())
 
     assert raised.value.code == WORKFLOW_ERROR_CODE_OUTCOME_UNKNOWN
+
+
+def _unreachable_then_accepting(failures: int) -> tuple[list[bytes], httpx.MockTransport]:
+    """An OE that refuses `failures` connections (as while its pods restart), then accepts."""
+    bodies: list[bytes] = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        bodies.append(request.content)
+        if len(bodies) <= failures:
+            raise httpx.ConnectError("All connection attempts failed", request=request)
+        return httpx.Response(200, text=_accepted_attempt_body())
+
+    return bodies, httpx.MockTransport(handle)
+
+
+def test_start_attempt_rides_out_oe_refusing_connections(
+    short_connect_backoff: tuple[float, ...],
+) -> None:
+    bodies, transport = _unreachable_then_accepting(failures=len(short_connect_backoff))
+
+    with WorkflowClient("http://oe", client=httpx.Client(transport=transport)) as client:
+        context = client.start_attempt(_start_request())
+
+    assert context is not None and context.attempt_id == "attempt-1"
+    assert len(bodies) == len(short_connect_backoff) + 1
+    assert len(set(bodies)) == 1
+
+
+def test_start_attempt_gives_up_when_oe_stays_unreachable(
+    short_connect_backoff: tuple[float, ...],
+) -> None:
+    bodies, transport = _unreachable_then_accepting(failures=len(short_connect_backoff) + 1)
+
+    with WorkflowClient("http://oe", client=httpx.Client(transport=transport)) as client:
+        with pytest.raises(WorkflowClientError) as raised:
+            client.start_attempt(_start_request())
+
+    assert raised.value.code == WORKFLOW_ERROR_CODE_OUTCOME_UNKNOWN
+    assert len(bodies) == len(short_connect_backoff) + 1
+
+
+async def test_async_start_attempt_rides_out_oe_refusing_connections(
+    short_connect_backoff: tuple[float, ...],
+) -> None:
+    bodies, transport = _unreachable_then_accepting(failures=len(short_connect_backoff))
+
+    async with AsyncWorkflowClient(
+        "http://oe", client=httpx.AsyncClient(transport=transport)
+    ) as client:
+        context = await client.start_attempt(_start_request())
+
+    assert context is not None and context.attempt_id == "attempt-1"
+    assert len(bodies) == len(short_connect_backoff) + 1
+
+
+# A heartbeat loop retries on its next interval, which a backoff would push past
+# the attempt lease, and a history report must finish within its caller's deadline.
+_NOT_RESENT_CALLS = [
+    pytest.param("heartbeat", _heartbeat_request, id="attempt heartbeat"),
+    pytest.param(
+        "heartbeat_activity",
+        lambda: ActivityHeartbeatRequestPb(activity_id="activity-1", fencing_token=7),
+        id="activity heartbeat",
+    ),
+    pytest.param("report_cancelled_history", lambda: "{}", id="cancelled history"),
+]
+
+
+@pytest.mark.parametrize(("method", "argument"), _NOT_RESENT_CALLS)
+def test_refused_heartbeats_and_history_reports_are_not_resent(
+    method: str,
+    argument: Callable[[], object],
+    short_connect_backoff: tuple[float, ...],
+) -> None:
+    bodies, transport = _unreachable_then_accepting(failures=1)
+
+    with WorkflowClient("http://oe", client=httpx.Client(transport=transport)) as client:
+        with pytest.raises(WorkflowClientError) as raised:
+            getattr(client, method)(argument())
+
+    assert raised.value.code == WORKFLOW_ERROR_CODE_OUTCOME_UNKNOWN
+    assert len(bodies) == 1
+
+
+@pytest.mark.parametrize(("method", "argument"), _NOT_RESENT_CALLS)
+async def test_async_refused_heartbeats_and_history_reports_are_not_resent(
+    method: str,
+    argument: Callable[[], object],
+    short_connect_backoff: tuple[float, ...],
+) -> None:
+    bodies, transport = _unreachable_then_accepting(failures=1)
+
+    async with AsyncWorkflowClient(
+        "http://oe", client=httpx.AsyncClient(transport=transport)
+    ) as client:
+        with pytest.raises(WorkflowClientError) as raised:
+            await getattr(client, method)(argument())
+
+    assert raised.value.code == WORKFLOW_ERROR_CODE_OUTCOME_UNKNOWN
+    assert len(bodies) == 1
 
 
 def test_heartbeat_posts_to_exact_path_and_returns_none(

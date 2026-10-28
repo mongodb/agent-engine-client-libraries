@@ -2,7 +2,7 @@
 
 import json
 from typing import Any
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import httpx
 import pytest
@@ -15,6 +15,16 @@ from agent_engine_runner_shared.context import (
 )
 from agent_engine_runner_shared.server import LLMRegistryLoadError, ToolServer
 from agent_engine_runner_shared.utils import format_llm_error
+
+
+class _DriftError(RuntimeError):
+    """A stand-in for a framework SDK's LLM-registration drift error.
+
+    Local to the test: runner-shared must not import a framework SDK, so this
+    exercises the marker boundary the runner actually reads.
+    """
+
+    is_llm_registration_drift = True
 
 
 class TestToolServerOnStartup:
@@ -32,13 +42,16 @@ class TestToolServerOnStartup:
         mock_runtime._tool_definitions = {"get_weather": {}}
         mock_runtime._graph_builder = None
         mock_runtime.agent_config.feature_enabled = Mock(return_value=False)
+        # Stated explicitly: the partial-registry retention is opt-in only, and a
+        # bare Mock would answer truthy.
+        mock_runtime.uses_per_invocation_build = Mock(return_value=False)
         return ToolServer(mock_runtime)
 
     @pytest.mark.asyncio
     async def test_on_startup_calls_entrypoint(self):
         """Warm-up populates the registry without executing a business turn."""
         server = self._make_server()
-        mock_app = Mock()
+        mock_app = Mock(build_graph=AsyncMock(return_value=None))
         llm = Mock()
 
         def build():
@@ -83,6 +96,9 @@ class TestEnsureLLMRegistryLoaded:
         mock_runtime._tool_definitions = {"get_weather": {}}
         mock_runtime._graph_builder = None
         mock_runtime.agent_config.feature_enabled = Mock(return_value=False)
+        # Stated explicitly: the partial-registry retention is opt-in only, and a
+        # bare Mock would answer truthy.
+        mock_runtime.uses_per_invocation_build = Mock(return_value=False)
         return ToolServer(mock_runtime)
 
     @pytest.mark.asyncio
@@ -95,7 +111,7 @@ class TestEnsureLLMRegistryLoaded:
                 hooks.register_llm("primary", Mock())
             return Mock()
 
-        mock_app = Mock()
+        mock_app = Mock(build_graph=AsyncMock(return_value=None))
         mock_app.get_agent = Mock(side_effect=fake_entrypoint)
         server.runtime._graph_builder = mock_app
 
@@ -108,7 +124,7 @@ class TestEnsureLLMRegistryLoaded:
     async def test_subsequent_calls_do_not_reload_entrypoint(self):
         """Only the first call for a pod's lifetime runs the entrypoint."""
         server = self._make_server()
-        mock_app = Mock()
+        mock_app = Mock(build_graph=AsyncMock(return_value=None))
         mock_app.get_agent = Mock(return_value=Mock())
         server.runtime._graph_builder = mock_app
 
@@ -122,7 +138,7 @@ class TestEnsureLLMRegistryLoaded:
     async def test_warns_when_no_llm_registered(self):
         """Warns if entrypoint runs but doesn't register an LLM."""
         server = self._make_server()
-        mock_app = Mock()
+        mock_app = Mock(build_graph=AsyncMock(return_value=None))
         mock_app.get_agent = Mock(return_value=Mock())
         server.runtime._graph_builder = mock_app
 
@@ -160,6 +176,8 @@ class TestEnsureLLMRegistryLoaded:
         builder = Mock(side_effect=build)
         server.runtime._graph_builder = Mock(get_agent=builder)
         await server.on_startup()  # Failed warming must not prevent startup.
+        # A global agent keeps the previous contract: partial registrations are
+        # discarded, and only the prior snapshot survives.
         with pytest.raises(KeyError):
             hooks.get_named_llm("partial")
         if import_time:
@@ -213,7 +231,7 @@ class TestEnsureLLMRegistryLoaded:
                 hooks.register_llm("entrypoint-only", Mock())
             return Mock()
 
-        mock_app = Mock()
+        mock_app = Mock(build_graph=AsyncMock(return_value=None))
         mock_app.get_agent = Mock(side_effect=fake_entrypoint)
         server.runtime._graph_builder = mock_app
 
@@ -232,7 +250,7 @@ class TestEnsureLLMRegistryLoaded:
         with hooks.entrypoint_scope():
             hooks.register_llm("import-time", mock_llm)
         server = self._make_server()
-        mock_app = Mock()
+        mock_app = Mock(build_graph=AsyncMock(return_value=None))
         mock_app.get_agent = Mock(return_value=Mock())  # never calls app.llm()
         server.runtime._graph_builder = mock_app
 
@@ -248,13 +266,105 @@ class TestEnsureLLMRegistryLoaded:
         with hooks.entrypoint_scope():
             hooks.register_llm("import-time", mock_llm)
         server = self._make_server()
-        mock_app = Mock()
+        mock_app = Mock(build_graph=AsyncMock(return_value=None))
         mock_app.get_agent = Mock(side_effect=Exception("MongoDB unavailable"))
         server.runtime._graph_builder = mock_app
 
         await server.on_startup()
 
         assert hooks.get_named_llm("import-time") is mock_llm
+
+    @pytest.mark.asyncio
+    async def test_keeps_llms_registered_before_the_entrypoint_raised(self):
+        """An opted-in builder that registers its LLMs and then needs invocation
+        context keeps what it registered, so the pod still has models.
+
+        This is the shape an opted-in agent has: register the models up front,
+        then choose tools or models from the invocation context. The context-free
+        discovery path cannot get past the context access, but the registrations
+        that preceded it are exactly what the pod needs.
+        """
+        import_time_llm = Mock()
+        partial_llm = Mock()
+        with hooks.entrypoint_scope():
+            hooks.register_llm("import-time", import_time_llm)
+        server = self._make_server()
+        server.runtime.uses_per_invocation_build = Mock(return_value=True)
+        mock_app = Mock()
+
+        def fake_entrypoint():
+            with hooks.entrypoint_scope():
+                hooks.register_llm("primary", partial_llm)
+            raise KeyError("rollout_enabled")
+
+        mock_app.get_agent = Mock(side_effect=fake_entrypoint)
+        server.runtime._graph_builder = mock_app
+
+        await server._ensure_llm_registry_loaded()
+
+        assert hooks.get_named_llm("primary") is partial_llm
+        assert hooks.get_named_llm("import-time") is import_time_llm
+        assert server._llm_registry_load_error is not None
+
+    @pytest.mark.asyncio
+    async def test_a_drift_error_discards_the_partials(self):
+        """A build that changed the registered ids is not a usable discovery.
+
+        The registry has drifted from the pod's baseline, so the partials are
+        discarded rather than served as a mismatched discovery.
+        """
+        import_time_llm = Mock()
+        with hooks.entrypoint_scope():
+            hooks.register_llm("import-time", import_time_llm)
+        server = self._make_server()
+        server.runtime.uses_per_invocation_build = Mock(return_value=True)
+        mock_app = Mock()
+
+        def fake_entrypoint():
+            with hooks.entrypoint_scope():
+                hooks.register_llm("drifted", Mock())
+            raise _DriftError("registered a different id set")
+
+        mock_app.get_agent = Mock(side_effect=fake_entrypoint)
+        server.runtime._graph_builder = mock_app
+
+        await server._ensure_llm_registry_loaded()
+
+        with pytest.raises(KeyError):
+            hooks.get_named_llm("drifted")
+        assert hooks.get_named_llm("import-time") is import_time_llm
+        assert server._llm_registry_load_error is not None
+
+    @pytest.mark.asyncio
+    async def test_a_global_agent_discards_partials_and_restores_the_snapshot(self):
+        """Every other agent keeps the previous contract: a failed build leaves
+        no half-populated registry behind, only the prior snapshot.
+
+        The TypeScript runner behaves this way too, so keeping Python in step
+        until that framework gains the opt-in is what avoids a cross-language
+        divergence.
+        """
+        import_time_llm = Mock()
+        partial_llm = Mock()
+        with hooks.entrypoint_scope():
+            hooks.register_llm("import-time", import_time_llm)
+        server = self._make_server()  # not opted in
+        mock_app = Mock()
+
+        def fake_entrypoint():
+            with hooks.entrypoint_scope():
+                hooks.register_llm("primary", partial_llm)
+            raise KeyError("boom")
+
+        mock_app.get_agent = Mock(side_effect=fake_entrypoint)
+        server.runtime._graph_builder = mock_app
+
+        await server._ensure_llm_registry_loaded()
+
+        with pytest.raises(KeyError):
+            hooks.get_named_llm("primary")
+        assert hooks.get_named_llm("import-time") is import_time_llm
+        assert server._llm_registry_load_error is not None
 
     @pytest.mark.asyncio
     async def test_failed_load_reports_underlying_cause_not_registration_error(self):
@@ -665,6 +775,7 @@ class TestToolServerHandleExecute:
         mock_runtime = Mock()
         mock_runtime._tools = {"announce": announce}
         mock_runtime.agent_config.feature_enabled = Mock(return_value=False)
+        mock_runtime.uses_per_invocation_build = Mock(return_value=False)
         server = ToolServer(mock_runtime)
 
         request = ToolPodExecuteRequest(
@@ -862,6 +973,9 @@ class TestInvokeLlmMetadataEnvOrdering:
         mock_runtime._tool_definitions = {}
         mock_runtime._graph_builder = None
         mock_runtime.agent_config.feature_enabled = Mock(return_value=False)
+        # Stated explicitly: the partial-registry retention is opt-in only, and a
+        # bare Mock would answer truthy.
+        mock_runtime.uses_per_invocation_build = Mock(return_value=False)
         return ToolServer(mock_runtime)
 
     @pytest.mark.asyncio
@@ -896,7 +1010,7 @@ class TestInvokeLlmMetadataEnvOrdering:
                 hooks.register_llm("primary", Mock())
             return Mock()
 
-        mock_app = Mock()
+        mock_app = Mock(build_graph=AsyncMock(return_value=None))
         mock_app.get_agent = Mock(side_effect=fake_entrypoint)
         server.runtime._graph_builder = mock_app
 
@@ -934,6 +1048,9 @@ class TestToolAPIErrorClassification:
         mock_runtime._tools = {"call_api": Mock()}
         mock_runtime._tool_definitions = {"call_api": tool_def or {}}
         mock_runtime.agent_config.feature_enabled = Mock(return_value=False)
+        # Stated explicitly: the partial-registry retention is opt-in only, and a
+        # bare Mock would answer truthy.
+        mock_runtime.uses_per_invocation_build = Mock(return_value=False)
         return ToolServer(mock_runtime)
 
     def _request(self):

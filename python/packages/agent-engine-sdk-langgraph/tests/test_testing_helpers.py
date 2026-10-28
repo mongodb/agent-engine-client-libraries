@@ -11,11 +11,13 @@ import pytest
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
-from agent_engine_sdk_langgraph.runtime import App
+from agent_engine_sdk_langgraph.runtime import App, LLMRegistrationDriftError
 from agent_engine_sdk_langgraph.testing import (
     ExpectedToolCall,
     FakeChatModel,
     assert_tool_calls,
+    abuild_test_agent,
+    abuild_test_graph,
     build_test_agent,
     build_test_graph,
     execution_context,
@@ -822,3 +824,139 @@ class TestExecutionContext:
             execution_id = get_current_execution_id()
             assert execution_id is not None
             assert execution_id.startswith("test-")
+
+
+class TestPerExecutionBuildHelpers:
+    """The maintained helpers must be able to build an opted-in graph."""
+
+    @staticmethod
+    def _opted_in_app(*, is_async: bool = False) -> tuple[App, dict[str, Any]]:
+        app = App(app_name="Per-execution Agent")
+        seen: dict[str, Any] = {}
+
+        def _compile() -> Any:
+            from typing import TypedDict
+
+            from langgraph.graph import END, StateGraph
+
+            class State(TypedDict):
+                messages: list
+
+            def respond(state: State) -> State:
+                return {"messages": state["messages"]}
+
+            graph = StateGraph(State)
+            graph.add_node("respond", respond)
+            graph.set_entry_point("respond")
+            graph.add_edge("respond", END)
+            return graph.compile(checkpointer=app.checkpointer())
+
+        if is_async:
+
+            @app.entrypoint(load_strategy="per-execution")
+            async def build(input, ctx):
+                seen["input"] = input
+                seen["ctx"] = ctx
+                return _compile()
+
+        else:
+
+            @app.entrypoint(load_strategy="per-execution")
+            def build(input, ctx):
+                seen["input"] = input
+                seen["ctx"] = ctx
+                return _compile()
+
+        return app, seen
+
+    def test_build_test_graph_passes_the_supplied_invocation(self, monkeypatch):
+        monkeypatch.setenv("RUNNER_MODE", "tool")
+        app, seen = self._opted_in_app()
+        agent_input, ctx = object(), object()
+
+        build_test_graph(app, FakeChatModel(), agent_input=agent_input, ctx=ctx)
+
+        assert seen["input"] is agent_input
+        assert seen["ctx"] is ctx
+
+    def test_build_test_agent_builds_an_opted_in_graph(self, monkeypatch):
+        monkeypatch.setenv("RUNNER_MODE", "tool")
+        app, seen = self._opted_in_app()
+        agent_input, ctx = object(), object()
+
+        agent = build_test_agent(app, FakeChatModel(), agent_input=agent_input, ctx=ctx)
+
+        assert agent is not None
+        assert seen["input"] is agent_input
+        assert seen["ctx"] is ctx
+
+    def test_sync_helper_rejects_an_async_builder(self, monkeypatch):
+        """The synchronous helper cannot await; it directs to the async one."""
+        monkeypatch.setenv("RUNNER_MODE", "tool")
+        app, _ = self._opted_in_app(is_async=True)
+
+        with pytest.raises(TypeError, match="abuild_test_graph"):
+            build_test_graph(app, FakeChatModel(), agent_input=object(), ctx=object())
+
+    @pytest.mark.anyio
+    async def test_async_helper_builds_an_async_builder(self, monkeypatch):
+        monkeypatch.setenv("RUNNER_MODE", "tool")
+        app, seen = self._opted_in_app(is_async=True)
+        agent_input, ctx = object(), object()
+
+        graph = await abuild_test_graph(
+            app, FakeChatModel(), agent_input=agent_input, ctx=ctx
+        )
+
+        assert graph is not None
+        assert seen["input"] is agent_input
+
+    @pytest.mark.anyio
+    async def test_async_helper_builds_a_usable_agent(self, monkeypatch):
+        monkeypatch.setenv("RUNNER_MODE", "tool")
+        app, seen = self._opted_in_app(is_async=True)
+        agent_input, ctx = object(), object()
+
+        agent = await abuild_test_agent(
+            app, FakeChatModel(), agent_input=agent_input, ctx=ctx
+        )
+
+        assert agent is not None
+        assert seen["ctx"] is ctx
+
+    def test_helpers_enforce_the_id_invariant(self, monkeypatch):
+        """The helpers reject a caller-dependent registration like production."""
+        monkeypatch.setenv("RUNNER_MODE", "tool")
+        app = App(app_name="Per-execution Agent")
+        builds = [0]
+
+        def _compile() -> Any:
+            from typing import TypedDict
+
+            from langgraph.graph import END, StateGraph
+
+            class State(TypedDict):
+                messages: list
+
+            def respond(state: State) -> State:
+                return {"messages": state["messages"]}
+
+            graph = StateGraph(State)
+            graph.add_node("respond", respond)
+            graph.set_entry_point("respond")
+            graph.add_edge("respond", END)
+            return graph.compile(checkpointer=app.checkpointer())
+
+        @app.entrypoint(load_strategy="per-execution")
+        def build(input, ctx):
+            index = min(builds[0], 1)
+            builds[0] += 1
+            app.llm(FakeChatModel(), llm_id="primary")
+            if index == 1:
+                app.llm(FakeChatModel(), llm_id="extra")
+            return _compile()
+
+        build_test_graph(app, FakeChatModel(), agent_input=object(), ctx=object())
+
+        with pytest.raises(LLMRegistrationDriftError, match="same LLM ids"):
+            build_test_graph(app, FakeChatModel(), agent_input=object(), ctx=object())

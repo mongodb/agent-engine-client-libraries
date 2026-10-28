@@ -59,6 +59,7 @@ from agent_engine_runner_shared.server.chunk_types import (
 def _make_server() -> AERServer:
     """Construct an AERServer with mocks, bypassing FastAPI / httpx wiring."""
     runtime = MagicMock()
+    runtime.build_graph = AsyncMock(return_value=None)
     server = AERServer.__new__(AERServer)
     server.runtime = runtime  # type: ignore[attr-defined]
     server._client = None  # type: ignore[attr-defined]

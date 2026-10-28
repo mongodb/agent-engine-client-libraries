@@ -14,10 +14,11 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import TracebackType
-from typing import Any, TextIO
+from typing import Any, TextIO, cast
 from urllib.parse import ParseResult, parse_qs, urlparse
 
-import httpx
+from mcp import MCPError
+from mcp.shared.auth import AuthorizationCodeResult
 
 from agent_engine_runner_shared.agent_config import (
     RuntimeMCPServerConfig,
@@ -195,28 +196,46 @@ async def list_oauth_tools(
     *,
     auth: Any,
 ) -> list[str]:
-    """Initialize the MCP session and return tool names."""
+    """Open an MCP session and return the server's tool names.
 
-    from mcp import ClientSession
-    from mcp.client.streamable_http import streamablehttp_client
+    Reuses the runner's session helper so the one-shot login helper negotiates
+    the protocol era the same way the runtime does.
+    """
+
+    from agent_engine_runner_shared.mcp_tools import (
+        _last_http_status,
+        _mcp_transport_error_message,
+        _MCPHTTPStatus,
+        _open_mcp_client,
+    )
 
     headers = resolve_mcp_headers(server_name, config)
-    timeout = config.timeout_seconds
-    async with streamablehttp_client(
-        config.url,
-        headers=headers,
-        timeout=timeout,
-        sse_read_timeout=timeout,
-        auth=auth,
-    ) as (
-        read_stream,
-        write_stream,
-        _,
-    ):
-        async with ClientSession(read_stream, write_stream) as session:
-            await session.initialize()
-            result = await session.list_tools()
+    responses: list[_MCPHTTPStatus] = []
+    captured: tuple[BaseException, _MCPHTTPStatus | None] | None = None
+    try:
+        async with _open_mcp_client(
+            config,
+            headers=headers,
+            auth=auth,
+            responses=responses,
+        ) as client:
+            try:
+                result = await client.list_tools()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                # Capture before the context exits: a cleanup token refresh or
+                # session DELETE can otherwise replace this status.
+                captured = (exc, _last_http_status(responses))
+                raise
             return [tool.name for tool in result.tools]
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        cause, status = captured if captured is not None else (exc, _last_http_status(responses))
+        raise RuntimeError(
+            _mcp_transport_error_message(server_name, "tools/list", cause, status)
+        ) from exc
 
 
 class LoopbackCallbackServer:
@@ -238,7 +257,7 @@ class LoopbackCallbackServer:
         self._server = ThreadingHTTPServer(("0.0.0.0", redirect.port), self._handler_class())
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
         self._loop: asyncio.AbstractEventLoop | None = None
-        self._future: asyncio.Future[tuple[str, str | None]] | None = None
+        self._future: asyncio.Future[AuthorizationCodeResult] | None = None
 
     async def __aenter__(self) -> "LoopbackCallbackServer":
         self._loop = asyncio.get_running_loop()
@@ -256,7 +275,7 @@ class LoopbackCallbackServer:
         self._server.server_close()
         self._thread.join(timeout=2)
 
-    async def wait(self) -> tuple[str, str | None]:
+    async def wait(self) -> AuthorizationCodeResult:
         if self._future is None:
             raise RuntimeError("OAuth callback server is not running")
         return await self._future
@@ -306,7 +325,13 @@ class LoopbackCallbackServer:
             return
 
         state = _first_query_value(query, "state")
-        self._loop.call_soon_threadsafe(self._future.set_result, (code, state))
+        # RFC 9207: pass the issuer through so the SDK can reject a response
+        # minted by a different authorization server.
+        iss = _first_query_value(query, "iss")
+        self._loop.call_soon_threadsafe(
+            self._future.set_result,
+            AuthorizationCodeResult(code=code, state=state, iss=iss),
+        )
         _send_callback_response(handler, HTTPStatus.OK, "OAuth complete. You can close this tab.")
 
 
@@ -411,16 +436,10 @@ def main(argv: list[str] | None = None) -> int:
                 pending = children + pending
                 continue
 
-            if isinstance(current, httpx.HTTPStatusError):
-                response = current.response
-                status_detail = f"HTTP {response.status_code} {response.reason_phrase}"
-                try:
-                    response_body = " ".join(response.text.split())
-                except httpx.ResponseNotRead:
-                    response_body = ""
-                if response_body:
-                    status_detail = f"{status_detail}: {response_body}"
-                leaf_errors.append(status_detail)
+            if isinstance(current, MCPError):
+                mcp_error = cast(MCPError, current)
+                detail = f"MCPError {mcp_error.code}: {mcp_error.message}".strip()
+                leaf_errors.append(" ".join(detail.split()))
                 continue
 
             detail = str(current).strip() or type(current).__name__

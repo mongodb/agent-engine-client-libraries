@@ -11,9 +11,9 @@ The Tool Executor is responsible for:
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
-import os
 import time
 from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Dict, List, Optional
@@ -87,6 +87,16 @@ if TYPE_CHECKING:
 
     from agent_engine_runner_shared.context import OwnerUrlFailureState
     from agent_engine_runner_shared.runtime import TenantRuntime
+
+
+def _is_llm_registration_drift(exc: BaseException) -> bool:
+    """Whether ``exc`` is a framework SDK's LLM-registration drift error.
+
+    Detected by marker attribute rather than ``isinstance``: runner-shared must
+    not import a framework SDK (``test_no_lc_imports`` enforces that), so the
+    SDK's ``LLMRegistrationDriftError`` carries the marker instead.
+    """
+    return getattr(exc, "is_llm_registration_drift", False) is True
 
 
 def _deserialize_messages(messages: list[Message]) -> list[Message]:
@@ -261,17 +271,13 @@ class ToolExecution:
     async def prepare(self) -> None:
         """Register built-in tool handlers."""
         from agent_engine_runner_shared import toolpod_handlers
-        from agent_engine_runner_shared.connectors import CONNECTOR_BUNDLE_PATH_ENV
 
-        # A pre-materialized bundle (env var) wins; otherwise the agent.yaml
-        # `connectors` entries are materialized in-process (local files only).
-        # Shape check: mocked configs auto-create truthy attributes.
+        # The agent.yaml `connectors` entries are materialized in-process from
+        # local files. Shape check: mocked configs auto-create truthy attributes.
         agent_connectors = getattr(self.runtime.agent_config, "connectors", None)
         has_connectors = isinstance(agent_connectors, (list, tuple)) and bool(agent_connectors)
         bundle = None
-        if (os.environ.get(CONNECTOR_BUNDLE_PATH_ENV) or has_connectors) and getattr(
-            self, "_connector_runtime", None
-        ) is None:
+        if has_connectors and getattr(self, "_connector_runtime", None) is None:
             from agent_engine_runner_shared.connectors import resolve_runtime_bundle
             from agent_engine_runner_shared.mcp_tools import make_mcp_sdk_tool_name
 
@@ -354,6 +360,13 @@ class ToolExecution:
             get_agent = (
                 getattr(graph_builder, "get_agent", None) if graph_builder is not None else None
             )
+            build_graph = (
+                getattr(graph_builder, "build_graph", None) if graph_builder is not None else None
+            )
+            # A framework adapter with no per-execution build exposes no async
+            # ``build_graph``; fall back to the cached get_agent() path.
+            if not inspect.iscoroutinefunction(build_graph):
+                build_graph = None
             if get_agent is not None:
                 pre_snapshot = snapshot_llm_registry()
                 reset_llm_registry()
@@ -361,25 +374,76 @@ class ToolExecution:
                     from agent_engine_runner_shared.context import customer_origin_scope
 
                     with customer_origin_scope():
-                        get_agent()
+                        # A per-execution agent registers its LLMs by running
+                        # the builder, with no invocation context. A builder that
+                        # needs context fails here naming the context-free
+                        # discovery. A global agent returns None and falls back
+                        # to the cached get_agent() path.
+                        graph = await build_graph(None, None) if build_graph is not None else None
+                        if graph is None:
+                            get_agent()
                 except Exception as exc:
                     logger.warning(
                         "Failed to run entrypoint for LLM registration; "
                         "/invoke_llm will fail if no LLM was registered",
                         exc_info=True,
                     )
-                    # Discard partial registrations before restoring the last snapshot.
-                    reset_llm_registry()
-                    if pre_snapshot:
-                        # Runtime-owned restoration, not a user app.llm() call --
-                        # exempt from the entrypoint-scope requirement.
-                        with entrypoint_scope():
-                            for llm_id, llm in pre_snapshot.items():
-                                register_llm(llm_id, llm)
-                        logger.info(
-                            "Entrypoint failed; restored %d import-time registration(s)",
-                            len(pre_snapshot),
+                    if _is_llm_registration_drift(exc):
+                        # The build registered a different id set than the
+                        # baseline. That registry has drifted, so it is not a
+                        # usable partial discovery: discard it and surface the
+                        # drift, rather than serving ids the pod was not built
+                        # for.
+                        reset_llm_registry()
+                        if pre_snapshot:
+                            with entrypoint_scope():
+                                for llm_id, llm in pre_snapshot.items():
+                                    register_llm(llm_id, llm)
+                        logger.error(
+                            "Per-execution build changed the registered LLM ids; "
+                            "discarding the mismatched registry"
                         )
+                        self._llm_registry_load_error = exc
+                        return
+                    if self.runtime.uses_per_invocation_build():
+                        # An opted-in builder registers its LLMs and only then
+                        # reads invocation context, which this context-free
+                        # discovery path cannot supply. Keep what it registered
+                        # before raising, and fill in anything the previous
+                        # snapshot holds that the partial build did not.
+                        partial = snapshot_llm_registry()
+                        missing = {
+                            llm_id: llm
+                            for llm_id, llm in pre_snapshot.items()
+                            if llm_id not in partial
+                        }
+                        if missing:
+                            # Runtime-owned restoration, not a user app.llm() call --
+                            # exempt from the entrypoint-scope requirement.
+                            with entrypoint_scope():
+                                for llm_id, llm in missing.items():
+                                    register_llm(llm_id, llm)
+                        if partial or missing:
+                            logger.info(
+                                "Entrypoint failed; kept %d partial registration(s) and "
+                                "restored %d import-time registration(s)",
+                                len(partial),
+                                len(missing),
+                            )
+                    else:
+                        # Every other agent keeps the previous contract: a failed
+                        # build leaves no half-populated registry behind. The
+                        # TypeScript runner behaves the same way, so this stays
+                        # in step until that framework gains the opt-in.
+                        reset_llm_registry()
+                        if pre_snapshot:
+                            with entrypoint_scope():
+                                for llm_id, llm in pre_snapshot.items():
+                                    register_llm(llm_id, llm)
+                            logger.info(
+                                "Entrypoint failed; restored %d import-time registration(s)",
+                                len(pre_snapshot),
+                            )
 
                     # Remember the cause so the caller's failed lookup can report
                     # it instead of a bare "not registered" KeyError.

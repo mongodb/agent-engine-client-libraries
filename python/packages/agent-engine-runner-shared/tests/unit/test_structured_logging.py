@@ -230,6 +230,178 @@ async def test_context_vars_populate_when_inside_execution(install_to_buffer):
     assert "traceId" not in _records(buf)[-1]
 
 
+def test_json_stdout_error_keeps_its_severity(install_to_buffer):
+    buf = install_to_buffer()
+    line = json.dumps({"level": "error", "event": "failed", "exception": "RuntimeError: failed\n"})
+    print(line)
+    rec = next(r for r in _records(buf) if r["message"] == line)
+    assert rec["level"] == "ERROR"
+    assert rec["source"] == "stdout"
+
+
+def test_json_stdout_warning_keeps_its_severity(install_to_buffer):
+    buf = install_to_buffer()
+    line = '{"level":"warning","event":"retrying"}'
+    print(line)
+    rec = next(r for r in _records(buf) if r["message"] == line)
+    assert rec["level"] == "WARNING"
+
+
+@pytest.mark.parametrize(
+    ("level", "expected"),
+    [
+        ("debug", "DEBUG"),
+        ("INFO", "INFO"),
+        (" WaRn ", "WARNING"),
+        ("WARNING", "WARNING"),
+        (" ErR ", "ERROR"),
+        ("ERROR", "ERROR"),
+    ],
+)
+def test_json_stdout_normalizes_supported_levels(install_to_buffer, level, expected):
+    buf = install_to_buffer()
+    line = json.dumps({"level": level})
+    print(line)
+    assert next(r for r in _records(buf) if r["message"] == line)["level"] == expected
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "{}",
+        '{"level":null}',
+        '{"level":50}',
+        '{"level":true}',
+        '{"level":[]}',
+        '{"level":{}}',
+        '{"level":"critical"}',
+        '{"level":""}',
+        '{"severity":"error"}',
+        '{"nested":{"level":"error"}}',
+        '{"level":"error"',
+        '[{"level":"error"}]',
+        "null",
+        '"error"',
+        "42",
+        '{"level":"error","data":' + "[" * 2000 + "0" + "]" * 2000 + "}",
+    ],
+)
+def test_json_stdout_invalid_levels_keep_info(install_to_buffer, line):
+    buf = install_to_buffer()
+    print(line)
+    assert next(r for r in _records(buf) if r["message"] == line)["level"] == "INFO"
+
+
+def test_json_stdout_preserves_other_logging_paths(install_to_buffer):
+    buf = install_to_buffer()
+    logging.getLogger().setLevel(logging.ERROR)
+    print("plain stdout")
+    print('{"level":"debug"}')
+    sys.stderr.write('{"level":"error"}\nplain stderr\n')
+    logger = logging.getLogger("native-json-test")
+    logger.info("filtered native info")
+    logger.error('{"level":"warning"}')
+    records = _records(buf)
+    assert [(r["message"], r["level"], r["source"]) for r in records] == [
+        ("plain stdout", "INFO", "stdout"),
+        ('{"level":"debug"}', "DEBUG", "stdout"),
+        ('{"level":"error"}', "WARNING", "stderr"),
+        ("plain stderr", "WARNING", "stderr"),
+        ('{"level":"warning"}', "ERROR", "python-logging"),
+    ]
+
+
+def test_json_stdout_classifies_buffered_lines_independently(install_to_buffer):
+    buf = install_to_buffer()
+    sys.stdout.write('{"level":"er')
+    assert _records(buf) == []
+    sys.stdout.write('ror"}\n{"level":"warning"}\nplain\n{"level":"debug"}')
+    sys.stdout.flush()
+    assert [(r["message"], r["level"]) for r in _records(buf)] == [
+        ('{"level":"error"}', "ERROR"),
+        ('{"level":"warning"}', "WARNING"),
+        ("plain", "INFO"),
+        ('{"level":"debug"}', "DEBUG"),
+    ]
+
+
+def test_json_stdout_cannot_override_platform_metadata(install_to_buffer):
+    buf = install_to_buffer()
+    tokens = set_execution_context(
+        _EXEC_ID, None, _OE_URL, session_id=_SESSION_ID, workspace_id=_WORKSPACE_ID
+    )
+    line = json.dumps(
+        {
+            "level": "error",
+            "message": 'failed\n{"level":"info"}',
+            "timestamp": "forged",
+            "tenantId": "forged",
+            "projectId": "forged",
+            "workspaceId": "forged",
+            "executionId": "forged",
+            "sessionId": "forged",
+            "service": "forged",
+            "source": "stderr",
+            "bootId": "forged",
+            "podName": "forged",
+            "fields": {"component": "forged"},
+        }
+    )
+    try:
+        print(line)
+    finally:
+        clear_execution_context(tokens)
+    records = _records(buf)
+    assert len(records) == 1
+    rec = records[0]
+    assert rec["message"] == line
+    assert rec["level"] == "ERROR"
+    assert rec["timestamp"] != "forged"
+    assert {
+        key: rec[key]
+        for key in (
+            "tenantId",
+            "projectId",
+            "workspaceId",
+            "executionId",
+            "sessionId",
+            "service",
+            "source",
+            "bootId",
+            "podName",
+            "fields",
+        )
+    } == {
+        "tenantId": "tenant-acme",
+        "projectId": "project-zeta",
+        "workspaceId": _WORKSPACE_ID,
+        "executionId": _EXEC_ID,
+        "sessionId": _SESSION_ID,
+        "service": "agent-execution-runtime",
+        "source": "stdout",
+        "bootId": "11111111-1111-4111-8111-111111111111",
+        "podName": "test-pod-xyz",
+        "fields": {"component": "aer"},
+    }
+
+
+@pytest.mark.parametrize(
+    ("line", "expected"),
+    [
+        ('{"level":' + "9" * 5000 + "}", "INFO"),
+        ('{"level":"error","data":' + "9" * 5000 + "}", "ERROR"),
+        ('{"level":"error","data":NaN}', "INFO"),
+        ('{"level":"error","data":Infinity}', "INFO"),
+        ('{"level":"error","data":-Infinity}', "INFO"),
+    ],
+    ids=["numeric-level", "unrelated-integer", "nan", "infinity", "negative-infinity"],
+)
+def test_json_stdout_numeric_decoding_is_safe(install_to_buffer, line, expected):
+    buf = install_to_buffer()
+    print(line)
+    assert next(r for r in _records(buf) if r["message"] == line)["level"] == expected
+
+
 def test_print_captured_as_stdout_source(install_to_buffer):
     """sys.stdout writes go through LoggingStream and emerge with source=stdout."""
     buf = install_to_buffer()

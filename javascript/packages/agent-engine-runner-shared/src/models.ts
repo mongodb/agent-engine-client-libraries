@@ -264,6 +264,13 @@ export const ExecuteRequestSchema = z.object({
    * checkpoint writes before running this turn.
    */
   previous_execution_cancelled: z.boolean().default(false),
+  /**
+   * True when the OE acknowledges a stream-chunk POST only after the chunk is
+   * durably persisted: the runner may batch chunks per POST and must retry
+   * unacknowledged chunks in order within the turn budget. False keeps one
+   * chunk per POST and today's retry semantics.
+   */
+  durable_ack_enabled: z.boolean().default(false),
 });
 export type ExecuteRequest = z.infer<typeof ExecuteRequestSchema>;
 

@@ -28,6 +28,7 @@ from agent_engine_runner_shared.tracing.setup import get_current_trace_context
 
 def _make_server() -> AERServer:
     runtime = Mock()
+    runtime.build_graph = AsyncMock(return_value=None)
     return AERServer(runtime)
 
 

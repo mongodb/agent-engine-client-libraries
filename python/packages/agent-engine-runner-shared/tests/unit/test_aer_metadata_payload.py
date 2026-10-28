@@ -191,6 +191,7 @@ def _make_aer_server():
     from agent_engine_runner_shared.server.aer import AERServer
 
     runtime = Mock()
+    runtime.build_graph = AsyncMock(return_value=None)
     server = AERServer(runtime)
     server._send_callback_body = AsyncMock()
     return server

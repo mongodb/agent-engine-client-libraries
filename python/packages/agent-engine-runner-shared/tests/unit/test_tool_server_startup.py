@@ -17,7 +17,7 @@ from pydantic import ValidationError
 
 import agent_engine_runner_shared.hooks as hooks
 from agent_engine_runner_shared.agent_config import RuntimeMCPConfig
-from agent_engine_runner_shared.connectors import CONNECTOR_BUNDLE_PATH_ENV, ConnectorBundleError
+from agent_engine_runner_shared.connectors import ConnectorBundleError
 from agent_engine_runner_shared.context import (
     get_current_authorization,
     get_current_session_id,
@@ -44,50 +44,46 @@ auth:
   env: JIRA_TOKEN
 """
 
-
-def _write_connector_bundle(tmp_path):
-    definitions_path = tmp_path / "jiradc.tool_defs.yaml"
-    definitions_path.write_text(
-        """source:
-  name: jiradc
+OAUTH_TOOL_YAML_TEXT = """\
+name: jira
+tool_defs: jira.tool_defs.yaml
+source:
   base_url: https://jira.example/rest
+expose:
+  allow_all: true
 auth:
-  type: bearer
-  env: JIRA_TOKEN
-tools:
-  - name: jiradc_getComments
-    description: Returns comments for an issue.
-    method: GET
-    path: /api/2/issue/{issueIdOrKey}/comment
-    params:
-      path: [issueIdOrKey]
-    inputSchema:
-      type: object
-      properties:
-        issueIdOrKey: {type: string}
-      required: [issueIdOrKey]
-  - name: jiradc_addComment
-    description: Adds a comment to an issue.
-    method: POST
-    path: /api/2/issue/{issueIdOrKey}/comment
-    params:
-      path: [issueIdOrKey]
-      body: [body]
-    inputSchema:
-      type: object
-      properties:
-        issueIdOrKey: {type: string}
-        body: {type: string}
-      required: [issueIdOrKey, body]
-""",
-        encoding="utf-8",
+  type: oauth
+  provider_type: github
+  scopes: [repo]
+"""
+
+
+def _write_connector_authoring(tmp_path, tool_yaml: str = TOOL_YAML_TEXT):
+    connectors = tmp_path / "connectors" / "jira"
+    connectors.mkdir(parents=True)
+    (connectors / "jira.tool_defs.yaml").write_text(
+        FIXTURE.read_text(encoding="utf-8"), encoding="utf-8"
     )
-    index_path = tmp_path / "bundle.yaml"
-    index_path.write_text(
-        "version: 1\nconnectors:\n  - name: jiradc\n    tool_defs: jiradc.tool_defs.yaml\n",
-        encoding="utf-8",
+    (connectors / "tool.yaml").write_text(tool_yaml, encoding="utf-8")
+    return tmp_path / "agent.yaml"
+
+
+def _connector_agent_config(tmp_path, tool_yaml: str = TOOL_YAML_TEXT):
+    return SimpleNamespace(
+        feature_enabled=lambda name, default=False: default,
+        mcp=RuntimeMCPConfig(),
+        path=_write_connector_authoring(tmp_path, tool_yaml),
+        connectors=[SimpleNamespace(source="connectors/jira/tool.yaml")],
     )
-    return index_path
+
+
+def _make_connector_runtime(tmp_path, tool_yaml: str = TOOL_YAML_TEXT) -> SimpleNamespace:
+    return SimpleNamespace(
+        _tools={},
+        _tool_definitions={},
+        _graph_builder=None,
+        agent_config=_connector_agent_config(tmp_path, tool_yaml),
+    )
 
 
 def _make_runtime(
@@ -152,15 +148,14 @@ class TestToolServerStartup:
             assert defn.get("name") == name
 
     @pytest.mark.asyncio
-    async def test_registers_and_executes_bundled_connectors(self, monkeypatch, tmp_path):
-        monkeypatch.setenv(CONNECTOR_BUNDLE_PATH_ENV, str(_write_connector_bundle(tmp_path)))
-        runtime = _make_runtime(deep_agent_enabled=False)
+    async def test_registers_and_executes_connectors(self, monkeypatch, tmp_path):
+        runtime = _make_connector_runtime(tmp_path)
         calls = []
         closed = []
 
         class FakeExecutor:
             def __init__(self, definitions):
-                assert definitions.source.name == "jiradc"
+                assert definitions.source.name == "jira"
 
             def execute(self, name, arguments, *, env, authorization):
                 """Observe the runtime boundary without replacing credential selection."""
@@ -197,7 +192,7 @@ class TestToolServerStartup:
             "network": ["jira.example"],
             "timeout_seconds": 30,
             "redact_fields": [],
-            "connector": "jiradc",
+            "connector": "jira",
         }
         assert response.status == "success"
         assert response.result == "connector result"
@@ -205,11 +200,8 @@ class TestToolServerStartup:
         assert closed == [True]
 
     @pytest.mark.asyncio
-    async def test_connector_collision_does_not_partially_register_bundle(
-        self, monkeypatch, tmp_path
-    ):
-        monkeypatch.setenv(CONNECTOR_BUNDLE_PATH_ENV, str(_write_connector_bundle(tmp_path)))
-        runtime = _make_runtime(deep_agent_enabled=False)
+    async def test_connector_collision_does_not_partially_register_bundle(self, tmp_path):
+        runtime = _make_connector_runtime(tmp_path)
         runtime._tools["jiradc_getComments"] = lambda: "existing"
         runtime._tool_definitions["jiradc_getComments"] = {"name": "jiradc_getComments"}
         server = ToolServer(runtime)
@@ -220,26 +212,8 @@ class TestToolServerStartup:
         assert set(runtime._tools) == {"jiradc_getComments"}
 
     @pytest.mark.asyncio
-    async def test_materializes_connectors_from_agent_yaml_traversal(self, monkeypatch, tmp_path):
-        monkeypatch.delenv(CONNECTOR_BUNDLE_PATH_ENV, raising=False)
-        connectors = tmp_path / "connectors" / "jira"
-        connectors.mkdir(parents=True)
-        (connectors / "jira.tool_defs.yaml").write_text(
-            FIXTURE.read_text(encoding="utf-8"), encoding="utf-8"
-        )
-        (connectors / "tool.yaml").write_text(TOOL_YAML_TEXT, encoding="utf-8")
-        agent_config = SimpleNamespace(
-            feature_enabled=lambda name, default=False: default,
-            mcp=RuntimeMCPConfig(),
-            path=tmp_path / "agent.yaml",
-            connectors=[SimpleNamespace(source="connectors/jira/tool.yaml")],
-        )
-        runtime = SimpleNamespace(
-            _tools={},
-            _tool_definitions={},
-            _graph_builder=None,
-            agent_config=agent_config,
-        )
+    async def test_materializes_connectors_from_agent_yaml_traversal(self, tmp_path):
+        runtime = _make_connector_runtime(tmp_path)
         server = ToolServer(runtime)
 
         await server.on_startup()
@@ -247,25 +221,6 @@ class TestToolServerStartup:
 
         assert set(runtime._tools) == {"jiradc_getComments", "jiradc_addComment"}
         assert runtime._tool_definitions["jiradc_getComments"]["connector"] == "jira"
-
-    @pytest.mark.asyncio
-    async def test_pre_materialized_bundle_wins_over_agent_yaml_traversal(
-        self, monkeypatch, tmp_path
-    ):
-        monkeypatch.setenv(CONNECTOR_BUNDLE_PATH_ENV, str(_write_connector_bundle(tmp_path)))
-        runtime = _make_runtime(deep_agent_enabled=False)
-        runtime.agent_config = SimpleNamespace(
-            feature_enabled=lambda name, default=False: default,
-            mcp=RuntimeMCPConfig(),
-            path=tmp_path / "agent.yaml",
-            connectors=[SimpleNamespace(source="connectors/jira/tool.yaml")],
-        )
-        server = ToolServer(runtime)
-
-        await server.on_startup()
-        await server.close_connector_runtime()
-
-        assert runtime._tool_definitions["jiradc_getComments"]["connector"] == "jiradc"
 
     @pytest.mark.asyncio
     async def test_execute_returns_memory_metadata_without_reclassifying_tool(self):
@@ -508,8 +463,7 @@ class TestToolServerStartup:
         from agent_engine_runner_shared.connectors import ConnectorExecutor
         from agent_engine_runner_shared.utils import tenant_env_vars
 
-        bundle_path = _write_connector_bundle(tmp_path)
-        monkeypatch.setenv(CONNECTOR_BUNDLE_PATH_ENV, str(bundle_path))
+        runtime = _make_connector_runtime(tmp_path)
 
         merged_secrets = iter(("token-a", "token-b"))
 
@@ -540,7 +494,6 @@ class TestToolServerStartup:
 
         monkeypatch.setattr(ConnectorExecutor, "execute", execute)
 
-        runtime = _make_runtime(deep_agent_enabled=False)
         server = ToolServer(runtime)
         await server.on_startup()
         try:
@@ -582,16 +535,9 @@ class TestToolServerStartup:
         import asyncio
         import threading
 
-        import yaml
-
         from agent_engine_runner_shared.connectors import ConnectorExecutor
 
-        index = _write_connector_bundle(tmp_path)
-        path = tmp_path / "jiradc.tool_defs.yaml"
-        document = yaml.safe_load(path.read_text())
-        document["auth"] = {"type": "oauth", "provider_type": "github", "scopes": ["repo"]}
-        path.write_text(yaml.safe_dump(document))
-        monkeypatch.setenv(CONNECTOR_BUNDLE_PATH_ENV, str(index))
+        runtime = _make_connector_runtime(tmp_path, OAUTH_TOOL_YAML_TEXT)
         monkeypatch.setenv("JIRA_TOKEN", "shared-fallback")
         started = threading.Event()
         release = threading.Event()
@@ -616,7 +562,7 @@ class TestToolServerStartup:
                 definitions, transport=httpx.MockTransport(resource)
             ),
         )
-        server = ToolServer(_make_runtime(deep_agent_enabled=False))
+        server = ToolServer(runtime)
         await server.on_startup()
 
         async def invoke(issue, token=None):
@@ -974,10 +920,8 @@ class TestToolServerStartup:
         assert set(runtime._tools.keys()) == EXPECTED_TOOLS
 
     @pytest.mark.asyncio
-    async def test_connector_startup_is_idempotent(self, monkeypatch, tmp_path):
-        bundle_path = _write_connector_bundle(tmp_path)
-        monkeypatch.setenv(CONNECTOR_BUNDLE_PATH_ENV, str(bundle_path))
-        runtime = _make_runtime(deep_agent_enabled=False)
+    async def test_connector_startup_is_idempotent(self, tmp_path):
+        runtime = _make_connector_runtime(tmp_path)
         server = ToolServer(runtime)
 
         await server.on_startup()

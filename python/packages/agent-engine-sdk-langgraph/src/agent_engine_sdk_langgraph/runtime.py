@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
+import inspect
 import json
 import logging
 import os
@@ -13,10 +14,13 @@ import warnings
 from collections.abc import Callable, Iterable, Sequence
 from functools import wraps
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated, Any, Literal, cast
+from typing import TYPE_CHECKING, Annotated, Any, Literal, cast, overload
 
 if TYPE_CHECKING:
-    from agent_engine_sdk_langgraph.hooks import PrepareAgentInput, ResolveThreadId
+    from agent_engine_sdk_langgraph.hooks import (
+        PrepareAgentInput,
+        ResolveThreadId,
+    )
 
 from agent_engine_runner_shared import (
     RuntimeAgentConfig,
@@ -57,7 +61,13 @@ from agent_engine_runner_shared.workflow.context import (
     in_spawned_task,
     operation_path_scope,
 )
-from agent_engine_sdk import BaseApp, OutputParser, ToolDefinition
+from agent_engine_sdk import (
+    AgentInput,
+    BaseApp,
+    OutputParser,
+    RequestContext,
+    ToolDefinition,
+)
 from agent_engine_sdk_memory import Memory
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import ToolMessage
@@ -381,6 +391,58 @@ def _suspend_durable_activity(payload: dict[str, Any]) -> None:
     )
 
 
+_LOAD_STRATEGIES = ("global", "per-execution")
+
+# Registry id for a model registered without an explicit ``llm_id``.
+_DEFAULT_LLM_ID = "__default__"
+
+
+class LLMRegistrationDriftError(RuntimeError):
+    """A per-execution build registered a different LLM id set.
+
+    Distinct from an ordinary build failure so the Tool Pod can tell a registry
+    that has drifted from one that merely failed to build: a drifted registry is
+    not a usable partial discovery. The marker attribute lets runner-shared
+    recognise it without importing this SDK, which it is not allowed to do.
+    """
+
+    is_llm_registration_drift = True
+
+
+def _require_builder_arity(builder: Callable[..., Any], load_strategy: str) -> None:
+    """Fail fast when the builder cannot accept the strategy's call shape.
+
+    Binds the call the runtime will actually make rather than counting
+    parameters, so a builder with optional parameters stays valid (the
+    maintained example agents take an optional model override) and one that
+    cannot accept the call is rejected. Runs at decoration time, where a
+    mismatch is a coding error the author can see rather than a confusing
+    call-site error.
+    """
+    try:
+        signature = inspect.signature(builder)
+    except (TypeError, ValueError):
+        # An unreadable signature (a builtin, a C callable) is not evidence of
+        # a mistake; leave it to the call itself.
+        return
+    if load_strategy == "per-execution":
+        call_args: tuple[Any, ...] = (object(), object())
+        requirement = "accept the (input, context) arguments"
+    else:
+        call_args = ()
+        requirement = (
+            "take no arguments (the input and context are only passed under "
+            "load_strategy='per-execution')"
+        )
+    try:
+        signature.bind(*call_args)
+    except TypeError as exc:
+        raise TypeError(
+            f"@app.entrypoint(load_strategy={load_strategy!r}) builder must "
+            f"{requirement}."
+        ) from exc
+
+
 class App(BaseApp):
     """LangChain SDK for MongoDB Atlas Agent Engine.
 
@@ -466,12 +528,30 @@ class App(BaseApp):
         self._builder_fn: Callable[..., Any] | None = None
         self._prepare_input_fn: PrepareAgentInput | None = None
         self._resolve_thread_id_fn: ResolveThreadId | None = None
+        # "global" (default) caches the graph process-wide; "per-execution"
+        # rebuilds it on every invocation by running the builder with the
+        # invocation's (input, ctx). Set via ``@app.entrypoint(load_strategy=...)``.
+        self._load_strategy: Literal["global", "per-execution"] = "global"
+        # Registered LLM ids from the first per-execution build in this process.
+        # Every later build must match it, since the Tool Pod resolves models
+        # against a registry populated once per pod. See
+        # _require_invariant_llm_ids.
+        self._llm_id_baseline: frozenset[str] | None = None
+        # Whether _llm_id_baseline was recorded by a build that *failed*, and so
+        # may be missing ids the builder never reached. A completed build
+        # supersedes such a set. See _require_invariant_llm_ids.
+        self._llm_id_baseline_provisional = False
         # Cached graph.build result, keyed by _adapter_version() so a
         # runtime upgrade invalidates it. Lock dedupes concurrent first
         # invocations to a single build rather than racing the entrypoint
         # function (which has user-visible side effects via app.llm()).
         self._graph_cache: tuple[str, Any] | None = None
         self._graph_cache_lock = threading.Lock()
+        # Serializes per-execution builds so their process-global LLM registry
+        # reset/register lifetime does not interleave across concurrent
+        # invocations. Created lazily on first use, since an asyncio.Lock binds
+        # to the running loop.
+        self._per_execution_build_lock: asyncio.Lock | None = None
         self._output_parser_cls: type[OutputParser] | None = None
         self._tool_defs: list[ToolDefinition] = []
         self._lc_tools: dict[str, Any] = {}
@@ -569,8 +649,8 @@ class App(BaseApp):
         )
 
     def _register_connector_tools_from_bundle(self) -> None:
-        # A pre-materialized bundle wins; otherwise materialize the
-        # agent.yaml `connectors` authoring files in-process (no network).
+        # Materialize the agent.yaml `connectors` authoring files in-process
+        # (local files only, no network).
         from agent_engine_runner_shared.connectors import resolve_runtime_bundle
 
         bundle = resolve_runtime_bundle(self._runtime.agent_config)
@@ -751,17 +831,265 @@ class App(BaseApp):
 
         return wrapper
 
-    def entrypoint(self, fn: Callable[..., Any]) -> Callable[..., Any]:
+    @overload
+    def entrypoint(self, fn: Callable[[], Any], /) -> Callable[[], Any]: ...
+
+    @overload
+    def entrypoint(
+        self,
+        fn: None = None,
+        /,
+        *,
+        load_strategy: Literal["global"] = ...,
+    ) -> Callable[[Callable[[], Any]], Callable[[], Any]]: ...
+
+    @overload
+    def entrypoint(
+        self,
+        fn: None = None,
+        /,
+        *,
+        load_strategy: Literal["per-execution"],
+    ) -> Callable[
+        [Callable[[AgentInput, RequestContext], Any]],
+        Callable[[AgentInput, RequestContext], Any],
+    ]: ...
+
+    def entrypoint(
+        self,
+        fn: Callable[..., Any] | None = None,
+        /,
+        *,
+        load_strategy: Literal["global", "per-execution"] = "global",
+    ) -> Any:
         """Mark the graph builder function.
 
+        Usable bare (``@app.entrypoint``) for the default cached,
+        build-once behavior, or called with a strategy:
+
+        ```python
+        @app.entrypoint(load_strategy="per-execution")
+        async def build(input: AgentInput, ctx: RequestContext) -> CompiledStateGraph:
+            flag = await fetch_flag(ctx.user_id)
+            return assemble_graph(rollout_enabled=flag)
+        ```
+
+        ``load_strategy="global"`` (the default) builds the graph once and
+        caches it. ``load_strategy="per-execution"`` runs the builder on every
+        invocation with the invocation's ``(input, ctx)``, so it can perform
+        its own request-scoped I/O (sync or async) before returning the graph.
+
+        **Registering LLMs under ``per-execution``.** Register every
+        ``llm_id`` the agent could ever use *before* any construction that
+        depends on the invocation context:
+
+        ```python
+        @app.entrypoint(load_strategy="per-execution")
+        async def build(input: AgentInput, ctx: RequestContext) -> CompiledStateGraph:
+            llm = app.llm(ChatOpenAI(model="gpt-5.4"), llm_id="primary")  # register first
+            tier = await fetch_tier(ctx.user_id)                          # then read context
+            tools = PREMIUM if tier == "premium" else FREE
+            return compile_graph(tools, llm)
+        ```
+
+        The Tool Pod discovers an agent's registered ids by building the graph
+        with no invocation context, so a builder that needs context cannot be
+        built there. It keeps whatever was registered before such a build
+        failed, which is why registering first and reading context afterwards
+        is the shape that works. Reading context is fine; reading it before the
+        registrations is what breaks discovery.
+
+        The registered set must also be the same on every invocation, because
+        the Tool Pod resolves a model by ``llm_id`` against a registry built
+        once per pod. Vary which id the graph *binds* per caller; do not vary
+        which ids are *registered*. A per-execution build that registers a
+        different set fails at the build, rather than mid-execution when the
+        pod cannot resolve the model.
+
         Args:
-            fn: Function that builds and returns a CompiledStateGraph
+            fn: Function that builds and returns a CompiledStateGraph.
+            load_strategy: ``"global"`` (default) or ``"per-execution"``.
 
         Returns:
-            The original function (unchanged)
+            The original function (unchanged), or a decorator when called
+            with keyword arguments.
+
+        Raises:
+            ValueError: If ``load_strategy`` is not a known strategy.
         """
-        self._builder_fn = fn
-        return fn
+        if load_strategy not in _LOAD_STRATEGIES:
+            raise ValueError(
+                "load_strategy must be one of "
+                f"{_LOAD_STRATEGIES}; got {load_strategy!r}"
+            )
+
+        def register(builder: Callable[..., Any]) -> Callable[..., Any]:
+            # Fail at import, not at the first invocation: the decorator types
+            # the builder off load_strategy, so a mismatch is a coding error.
+            _require_builder_arity(builder, load_strategy)
+            self._load_strategy = load_strategy
+            self._builder_fn = builder
+            return builder
+
+        if fn is not None:
+            return register(fn)
+        return register
+
+    async def build_graph(
+        self,
+        agent_input: AgentInput | None = None,
+        ctx: RequestContext | None = None,
+    ) -> Any:
+        """Build the graph for this invocation.
+
+        Returns ``None`` for a global agent, signalling the caller to use the
+        cached build path unchanged. For a per-execution agent, runs the
+        builder with ``(agent_input, ctx)`` -- awaiting it when the builder is
+        async -- and returns the compiled graph.
+
+        The platform also builds the graph without an invocation to discover an
+        agent's registered LLM ids. That call passes ``(None, None)``; a builder
+        that needs real context fails there, and the failure names the
+        context-free discovery rather than looking like a bug in the builder.
+        """
+        if self._load_strategy != "per-execution":
+            return None
+        if self._builder_fn is None:
+            raise RuntimeError(
+                "No graph builder registered. Decorate a function with @app.entrypoint."
+            )
+        builder_fn = self._builder_fn
+        # A context-free build is the platform's discovery path: how the Tool Pod
+        # populates its registry, and the only path that can complete a set an
+        # earlier failed discovery left provisional. The AER always builds with
+        # the invocation's context, so the two never share a process.
+        discovery = agent_input is None and ctx is None
+
+        from agent_engine_runner_shared.context import customer_origin_scope
+        from agent_engine_runner_shared.hooks import (
+            entrypoint_scope,
+            reset_llm_registry,
+        )
+
+        # Serialize the reset/build/register lifetime. The LLM registry is
+        # process-global, so two overlapping builds could otherwise interleave
+        # their resets and one would reject the other's otherwise-valid
+        # app.llm() as a duplicate id. Held across the builder's own I/O.
+        if self._per_execution_build_lock is None:
+            self._per_execution_build_lock = asyncio.Lock()
+        async with self._per_execution_build_lock:
+            reset_llm_registry()
+            with (
+                entrypoint_scope(),
+                customer_origin_scope(),
+                _traced_graph_build(cache_hit=False),
+            ):
+                try:
+                    graph = builder_fn(agent_input, ctx)
+                    if inspect.isawaitable(graph):
+                        graph = await graph
+                except LLMRegistrationDriftError:
+                    raise
+                except Exception as exc:
+                    if discovery:
+                        # The context-free discovery failed. Validate what it
+                        # registered against the baseline if one exists, so a
+                        # retry that changed its ids is rejected rather than
+                        # retained. A failure that registered nothing is
+                        # transient, so no baseline is frozen: the next attempt
+                        # may still recover.
+                        self._validate_or_record_discovery_baseline()
+                        raise RuntimeError(
+                            "The graph builder for an agent registered with "
+                            "load_strategy='per-execution' failed while building "
+                            "without invocation context. A builder that needs "
+                            "invocation context cannot be built on the "
+                            "context-free discovery path."
+                        ) from exc
+                    raise
+            self._require_invariant_llm_ids(discovery=discovery, completed=True)
+            return graph
+
+    def _validate_or_record_discovery_baseline(self) -> None:
+        """Validate a failed discovery's registrations, then baseline them.
+
+        A retry that registered a different set is rejected against an existing
+        baseline. When no baseline exists yet, one is recorded from the
+        registrations the failed discovery did produce, but only if it produced
+        any: freezing an empty baseline would block a later successful retry.
+        That recorded set is provisional, since the build it came from may have
+        been cut short before registering everything.
+
+        A failure that registered nothing is transient whether or not a baseline
+        exists: the Tool Pod keeps the registry it already held, so there is no
+        set to reject, and reporting one as drift would misdiagnose a transient
+        failure as a caller-dependent builder.
+        """
+        from agent_engine_runner_shared.hooks import snapshot_llm_registry
+
+        registered = frozenset(snapshot_llm_registry())
+        if not registered:
+            return
+        if self._llm_id_baseline is not None:
+            self._require_invariant_llm_ids(discovery=True)
+            return
+        self._llm_id_baseline = registered
+        self._llm_id_baseline_provisional = True
+
+    def _require_invariant_llm_ids(
+        self, *, discovery: bool = False, completed: bool = False
+    ) -> None:
+        """Reject a per-execution build that changes the registered LLM ids.
+
+        The Tool Pod resolves a model by ``llm_id`` against a registry built once
+        per pod from a context-free build, so every id an invocation could use
+        has to be registered there. A builder that registers different ids per
+        caller would have the platform ask for a model the pod never registered,
+        which fails mid-execution; failing here keeps the failure at the build.
+
+        The first build in this process establishes the baseline. In a Tool Pod
+        that is its discovery build; in an AER it is the first invocation. A
+        discovery build that fails still records the ids it registered before
+        raising, since those are what the Tool Pod retains -- but that set is
+        provisional, because the failure may have cut the build short before it
+        registered the rest.
+
+        ``discovery`` marks a build on the context-free discovery path, and
+        ``completed`` one that ran to the end. A provisional set may still grow,
+        but only from a discovery build: the motivating builder registers its
+        models and then reads invocation context, so it fails on every
+        context-free discovery and never runs to the end, and a model whose
+        construction failed once has to be able to join the set when it succeeds.
+        Registering *more* is a recovery -- every id a build registered is one an
+        invocation may ask the pod for, so the pod only gains by keeping it --
+        while dropping or replacing an id stays drift, since the pod would lose a
+        model it already served. A discovery that runs to the end is
+        authoritative evidence of what the builder registers, so it fixes the set
+        from there on.
+        """
+        from agent_engine_runner_shared.hooks import snapshot_llm_registry
+
+        registered = frozenset(snapshot_llm_registry())
+        if self._llm_id_baseline is None:
+            self._llm_id_baseline = registered
+            return
+        if registered != self._llm_id_baseline:
+            recovered = (
+                self._llm_id_baseline < registered
+                and discovery
+                and self._llm_id_baseline_provisional
+            )
+            if not recovered:
+                raise LLMRegistrationDriftError(
+                    "An agent registered with load_strategy='per-execution' must "
+                    "register the same LLM ids on every invocation, because the Tool "
+                    "Pod resolves a model by llm_id against a registry built once per "
+                    f"pod. Got {sorted(registered)}, expected "
+                    f"{sorted(self._llm_id_baseline)}."
+                )
+            self._llm_id_baseline = registered
+        if discovery and completed:
+            self._llm_id_baseline_provisional = False
 
     def prepare_agent_input(self, fn: PrepareAgentInput) -> PrepareAgentInput:
         """Register a hook that builds graph input from the invocation.
@@ -867,10 +1195,11 @@ class App(BaseApp):
         return cls
 
     def _get_or_build_graph(self) -> Any:
-        """Return the materialized graph, building it at most once.
+        """Return the graph to run this invocation with.
 
-        The graph carries no per-request state -- ``adapted_callbacks`` and
-        the ``LangGraphBaseAgent`` wrapper are rebuilt fresh by every
+        ``global`` (the default) builds at most once and caches it. The graph
+        carries no per-request state -- ``adapted_callbacks`` and the
+        ``LangGraphBaseAgent`` wrapper are rebuilt fresh by every
         ``get_agent()`` call regardless of cache state -- so only the
         expensive part, running ``@app.entrypoint`` and compiling the graph,
         is skipped on a hit. ``reset_llm_registry()`` only runs on a miss:
@@ -881,6 +1210,7 @@ class App(BaseApp):
         concurrent first invocations build exactly once rather than racing
         the entrypoint function, which has user-visible side effects
         (``app.llm()`` raises on a duplicate id).
+
         """
         if self._builder_fn is None:
             raise RuntimeError(
@@ -889,6 +1219,7 @@ class App(BaseApp):
             )
         builder_fn = self._builder_fn
 
+        from agent_engine_runner_shared.context import customer_origin_scope
         from agent_engine_runner_shared.hooks import (
             entrypoint_scope,
             reset_llm_registry,
@@ -911,7 +1242,6 @@ class App(BaseApp):
                 return cached[1]
 
             reset_llm_registry()
-            from agent_engine_runner_shared.context import customer_origin_scope
 
             with (
                 entrypoint_scope(),
@@ -929,8 +1259,14 @@ class App(BaseApp):
         Never raises: a failure returns ``False`` so the AER records the
         one-shot optimization as incomplete, while the existing lazy build
         remains the fallback for the first real ``get_agent()`` call.
+
+        A no-op for ``per-execution`` agents: there is no caller to build for
+        yet, so building here would only be discarded by the first real
+        invocation. Warm-up still pre-builds for ``global`` agents.
         """
         if self._builder_fn is None:
+            return True
+        if self._load_strategy == "per-execution":
             return True
         try:
             self._get_or_build_graph()
@@ -943,7 +1279,12 @@ class App(BaseApp):
             return False
         return True
 
-    def get_agent(self, callbacks: list[Any] | None = None) -> Any:
+    def get_agent(
+        self,
+        callbacks: list[Any] | None = None,
+        *,
+        graph: Any = None,
+    ) -> Any:
         """Build and return a BaseAgent instance.
 
         Calls the registered entrypoint function to build the graph,
@@ -953,6 +1294,10 @@ class App(BaseApp):
             callbacks: Optional list of BaseExecutionCallback instances
                 for observability (e.g., NodeExecutionLogger from the AER).
                 Wrapped in LangGraphCallbackAdapter before passing to the graph.
+            graph: A graph already built by ``build_graph`` for this
+                invocation (a per-execution agent). ``None`` (the default, and
+                the only value a global agent ever sees) uses the cached build
+                path.
 
         Returns:
             LangGraphBaseAgent instance implementing BaseAgent protocol
@@ -986,7 +1331,7 @@ class App(BaseApp):
                 "parser is registered; decorate one with @app.output_parser."
             )
 
-        graph = self._get_or_build_graph()
+        graph = self._get_or_build_graph() if graph is None else graph
 
         # Durable eligibility depends on the materialized graph: only the
         # PlatformCheckpointer provides fence-keyed scratch and release, so a
@@ -1153,7 +1498,7 @@ class App(BaseApp):
         """
         from agent_engine_runner_shared.hooks import register_llm
 
-        resolved_id = llm_id if llm_id is not None else "__default__"
+        resolved_id = llm_id if llm_id is not None else _DEFAULT_LLM_ID
         register_llm(resolved_id, llm)
 
         if self._runtime.mode == RuntimeMode.TOOL:
@@ -1165,6 +1510,41 @@ class App(BaseApp):
     # =========================================================================
     # Deep Agent API
     # =========================================================================
+
+    def _orchestrator_llm(self, llm: BaseChatModel) -> BaseChatModel:
+        """Resolve the orchestrator model, registering it unless already registered.
+
+        An agent that opts into per-execution builds must register every
+        ``llm_id`` before it reads invocation context, because the Tool Pod's
+        context-free discovery build only retains what was registered before
+        the builder stopped. ``deep_agent()`` registers the orchestrator itself
+        under ``__default__``, which would be a duplicate id once the author has
+        already registered it.
+
+        Registration and wrapping are separate decisions. Once the id is
+        present, registering again would raise, but the model still has to be
+        wrapped: ``app.llm()`` registers the model it is given and returns a
+        *different* object, so a caller that kept its own raw instance and
+        passed that on would otherwise hand the provider an unwrapped model and
+        bypass OE approvals, auditing, and guardrails.
+
+        The model is not compared against the registered one. In AER mode the
+        two are never the same object, so an identity check would reject
+        correct code; the registry proves the id is taken, not that this
+        argument is the wrapped form of it.
+        """
+        from agent_engine_runner_shared.hooks import snapshot_llm_registry
+
+        if _DEFAULT_LLM_ID not in snapshot_llm_registry():
+            return self.llm(llm)
+        if self._runtime.mode == RuntimeMode.TOOL:
+            # Mirrors App.llm(): TOOL mode hands back the raw model.
+            return llm
+        if isinstance(llm, SecureWrappedLLM):
+            return llm
+        return SecureWrappedLLM(
+            llm=llm, get_wrapper=get_current_wrapper, llm_id=_DEFAULT_LLM_ID
+        )
 
     def deep_agent(
         self,
@@ -1298,7 +1678,7 @@ class App(BaseApp):
         # registers *before* this method body executes. Resetting here would
         # wipe that registration, and the Tool Pod's /invoke_llm could no longer
         # resolve the subagent LLM by id.
-        secure_llm = self.llm(llm)
+        secure_llm = self._orchestrator_llm(llm)
 
         # Checkpointer sentinel resolution:
         # _UNSET -> delegate to app.checkpointer() (returns None outside AER)

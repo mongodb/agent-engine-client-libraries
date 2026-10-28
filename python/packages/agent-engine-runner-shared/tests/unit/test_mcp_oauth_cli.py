@@ -5,10 +5,12 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from urllib.parse import urlparse
 
-import httpx
 import pytest
+from mcp import MCPError
+from mcp.client.auth import OAuthTokenError
 
-from agent_engine_runner_shared import mcp_oauth_cli
+from agent_engine_runner_shared import mcp_oauth_cli, mcp_tools
+from agent_engine_runner_shared.agent_config import RuntimeMCPServerConfig
 from agent_engine_runner_shared.mcp_oauth import mcp_oauth_cache_name
 
 _SENTRY_MCP_URL = "https://mcp.sentry.dev/mcp"
@@ -191,7 +193,86 @@ def test_main_status_check_delegates_after_status(
     assert "sentry check ok (1 tool(s))" in output
 
 
-def test_main_unwraps_oauth_exception_group_with_response_detail(
+@pytest.mark.asyncio
+async def test_list_oauth_tools_keeps_provider_detail_alongside_status(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """The login helper must not trade the provider's explanation for a status."""
+
+    config = RuntimeMCPServerConfig.model_validate(
+        {
+            "url": _SENTRY_MCP_URL,
+            "auth": {"type": "oauth", "scope": "SEARCH"},
+        }
+    )
+
+    class FailingClient:
+        def __init__(self, exc: BaseException) -> None:
+            self._exc = exc
+
+        async def __aenter__(self):
+            raise self._exc
+
+        async def __aexit__(self, *_args):
+            return None
+
+    def fake_open(config, *, headers, auth, responses):
+        _ = (config, headers, auth)
+        responses.append(mcp_tools._MCPHTTPStatus(400, "Bad Request"))
+        return FailingClient(
+            OAuthTokenError(
+                'Token exchange failed (400): {"error": "invalid_scope", '
+                '"error_description": "Unsupported scope: SEARCH"}'
+            )
+        )
+
+    monkeypatch.setattr(mcp_tools, "_open_mcp_client", fake_open)
+
+    with pytest.raises(RuntimeError) as exc_info:
+        await mcp_oauth_cli.list_oauth_tools("sentry", config, auth=None)
+
+    message = str(exc_info.value)
+    assert "HTTP 400 Bad Request" in message
+    assert "invalid_scope" in message
+    assert "Unsupported scope: SEARCH" in message
+
+
+@pytest.mark.asyncio
+async def test_list_oauth_tools_captures_status_before_teardown(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A cleanup refresh after the failure must not erase the listing status."""
+
+    config = RuntimeMCPServerConfig.model_validate(
+        {
+            "url": _SENTRY_MCP_URL,
+            "auth": {"type": "oauth", "scope": "SEARCH"},
+        }
+    )
+
+    class FailingClient:
+        async def list_tools(self):
+            raise MCPError(-32603, "Server returned an error response")
+
+    from contextlib import asynccontextmanager
+
+    @asynccontextmanager
+    async def fake_open(config, *, headers, auth, responses):
+        _ = (config, headers, auth)
+        responses.append(mcp_tools._MCPHTTPStatus(503, "Service Unavailable"))
+        try:
+            yield FailingClient()
+        finally:
+            # Simulate a cleanup token refresh succeeding after the failure.
+            responses.clear()
+
+    monkeypatch.setattr(mcp_tools, "_open_mcp_client", fake_open)
+
+    with pytest.raises(RuntimeError, match="HTTP 503 Service Unavailable"):
+        await mcp_oauth_cli.list_oauth_tools("sentry", config, auth=None)
+
+
+def test_main_unwraps_oauth_exception_group_with_token_error_detail(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
@@ -217,22 +298,13 @@ def test_main_unwraps_oauth_exception_group_with_response_detail(
     )
 
     async def fake_login(*_args, **_kwargs):
-        request = httpx.Request("POST", "https://mongodb-be.glean.com/oauth/token")
-        response = httpx.Response(
-            400,
-            json={
-                "error": "invalid_scope",
-                "error_description": "Unsupported scope: SEARCH",
-            },
-            request=request,
-        )
+        # The 2.x token handler keeps the server's body in the error message.
         raise ExceptionGroup(
             "unhandled errors in a TaskGroup",
             [
-                httpx.HTTPStatusError(
-                    "request failed",
-                    request=request,
-                    response=response,
+                OAuthTokenError(
+                    'Token exchange failed (400): {"error": "invalid_scope", '
+                    '"error_description": "Unsupported scope: SEARCH"}'
                 )
             ],
         )
@@ -255,14 +327,14 @@ def test_main_unwraps_oauth_exception_group_with_response_detail(
 
     stderr = capsys.readouterr().err
     assert exit_code == 1
-    assert "MCP OAuth login for 'glean' failed: HTTP 400 Bad Request" in stderr
+    assert "MCP OAuth login for 'glean' failed" in stderr
+    assert "Token exchange failed (400)" in stderr
     assert "invalid_scope" in stderr
     assert "Unsupported scope: SEARCH" in stderr
-    assert "Glean advertises lowercase OAuth scopes" not in stderr
     assert "unhandled errors in a TaskGroup" not in stderr
 
 
-def test_main_handles_unread_http_response_body(
+def test_main_reports_mcp_error_code_and_message(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
@@ -288,22 +360,7 @@ def test_main_handles_unread_http_response_body(
     )
 
     async def fake_login(*_args, **_kwargs):
-        request = httpx.Request("POST", "https://mongodb-be.glean.com/oauth/token")
-        response = httpx.Response(
-            400,
-            stream=httpx.ByteStream(b'{"error":"invalid_scope"}'),
-            request=request,
-        )
-        raise ExceptionGroup(
-            "unhandled errors in a TaskGroup",
-            [
-                httpx.HTTPStatusError(
-                    "request failed",
-                    request=request,
-                    response=response,
-                )
-            ],
-        )
+        raise MCPError(-32603, "Server returned an error response")
 
     monkeypatch.setattr(mcp_oauth_cli, "login_oauth_server", fake_login)
 
@@ -323,9 +380,7 @@ def test_main_handles_unread_http_response_body(
 
     stderr = capsys.readouterr().err
     assert exit_code == 1
-    assert "MCP OAuth login for 'glean' failed: HTTP 400 Bad Request" in stderr
-    assert "ResponseNotRead" not in stderr
-    assert "Attempted to access streaming response content" not in stderr
+    assert "MCPError -32603: Server returned an error response" in stderr
 
 
 def test_main_caps_oauth_error_detail_length(

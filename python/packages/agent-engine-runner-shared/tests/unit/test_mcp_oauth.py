@@ -10,9 +10,9 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
-import httpx
+import httpx2
 import pytest
-from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
+from mcp.shared.auth import AuthorizationCodeResult, OAuthClientInformationFull, OAuthToken
 
 import agent_engine_runner_shared.mcp_oauth as mcp_oauth
 import agent_engine_runner_shared.mcp_oauth_cache_lock as mcp_oauth_cache_lock
@@ -488,15 +488,14 @@ async def test_client_credentials_provider_uses_standard_sdk_discovery_flow(
         ),
         cache_dir=tmp_path,
     )
-    assert provider.context.timeout == 5.0
 
-    request = httpx.Request("POST", "https://mcp.example.com/mcp")
+    request = httpx2.Request("POST", "https://mcp.example.com/mcp")
     flow = provider.async_auth_flow(request)
     initial_request = await anext(flow)
     assert "Authorization" not in initial_request.headers
 
     protected_resource_request = await flow.asend(
-        httpx.Response(
+        httpx2.Response(
             401,
             headers={
                 "WWW-Authenticate": (
@@ -513,7 +512,7 @@ async def test_client_credentials_provider_uses_standard_sdk_discovery_flow(
     )
 
     oauth_metadata_request = await flow.asend(
-        httpx.Response(
+        httpx2.Response(
             200,
             json={
                 "resource": "https://mcp.example.com/mcp",
@@ -527,7 +526,7 @@ async def test_client_credentials_provider_uses_standard_sdk_discovery_flow(
     )
 
     token_request = await flow.asend(
-        httpx.Response(
+        httpx2.Response(
             200,
             json={
                 "issuer": "https://auth.example.com",
@@ -550,7 +549,7 @@ async def test_client_credentials_provider_uses_standard_sdk_discovery_flow(
     assert decoded_basic_header == "client-id:client-secret"
 
     authed_request = await flow.asend(
-        httpx.Response(
+        httpx2.Response(
             200,
             json={
                 "access_token": "standard-access-token",
@@ -578,7 +577,7 @@ async def test_client_credentials_provider_uses_sdk_flow_with_configured_token_u
         cache_dir=tmp_path,
     )
 
-    request = httpx.Request("POST", "https://cloud-dev.mongodb.com/api/private/mcp")
+    request = httpx2.Request("POST", "https://cloud-dev.mongodb.com/api/private/mcp")
     flow = provider.async_auth_flow(request)
     token_request = await anext(flow)
 
@@ -593,7 +592,7 @@ async def test_client_credentials_provider_uses_sdk_flow_with_configured_token_u
     assert decoded_basic_header == "client-id:client-secret"
 
     authed_request = await flow.asend(
-        httpx.Response(
+        httpx2.Response(
             200,
             json={
                 "access_token": "ingress-access-token",
@@ -626,7 +625,7 @@ async def test_client_credentials_provider_retries_direct_flow_on_insufficient_s
         cache_dir=tmp_path,
     )
 
-    request = httpx.Request("POST", "https://cloud-dev.mongodb.com/api/private/mcp")
+    request = httpx2.Request("POST", "https://cloud-dev.mongodb.com/api/private/mcp")
     flow = provider.async_auth_flow(request)
     token_request = await anext(flow)
     assert parse_qs(token_request.content.decode("utf-8")) == {
@@ -634,7 +633,7 @@ async def test_client_credentials_provider_retries_direct_flow_on_insufficient_s
     }
 
     authed_request = await flow.asend(
-        httpx.Response(
+        httpx2.Response(
             200,
             json={
                 "access_token": "initial-token",
@@ -647,7 +646,7 @@ async def test_client_credentials_provider_retries_direct_flow_on_insufficient_s
     assert authed_request.headers["Authorization"] == "Bearer initial-token"
 
     scoped_token_request = await flow.asend(
-        httpx.Response(
+        httpx2.Response(
             403,
             headers={
                 "WWW-Authenticate": 'Bearer error="insufficient_scope", scope="GROUP_MCP_ACCESS"'
@@ -661,7 +660,7 @@ async def test_client_credentials_provider_retries_direct_flow_on_insufficient_s
     }
 
     retried_request = await flow.asend(
-        httpx.Response(
+        httpx2.Response(
             200,
             json={
                 "access_token": "scoped-token",
@@ -707,7 +706,7 @@ async def test_client_credentials_provider_ignores_cached_token_for_different_cl
         cache_dir=tmp_path,
     )
 
-    request = httpx.Request("POST", "https://cloud-dev.mongodb.com/api/private/mcp")
+    request = httpx2.Request("POST", "https://cloud-dev.mongodb.com/api/private/mcp")
     flow = provider.async_auth_flow(request)
     token_request = await anext(flow)
     await flow.aclose()
@@ -748,7 +747,7 @@ async def test_client_credentials_provider_ignores_cached_token_for_different_sc
         cache_dir=tmp_path,
     )
 
-    request = httpx.Request("POST", "https://cloud-dev.mongodb.com/api/private/mcp")
+    request = httpx2.Request("POST", "https://cloud-dev.mongodb.com/api/private/mcp")
     flow = provider.async_auth_flow(request)
     token_request = await anext(flow)
     await flow.aclose()
@@ -772,8 +771,8 @@ async def test_interactive_provider_preserves_configured_scope_during_login(
         authorization_urls.append(url)
         captured_state = parse_qs(urlparse(url).query)["state"][0]
 
-    async def callback_handler() -> tuple[str, str | None]:
-        return "auth-code", captured_state
+    async def callback_handler() -> AuthorizationCodeResult:
+        return AuthorizationCodeResult(code="auth-code", state=captured_state)
 
     provider = make_interactive_mcp_oauth_auth(
         "sentry",
@@ -784,12 +783,12 @@ async def test_interactive_provider_preserves_configured_scope_during_login(
         callback_handler=callback_handler,
     )
 
-    request = httpx.Request("POST", "https://mcp.sentry.dev/mcp")
+    request = httpx2.Request("POST", "https://mcp.sentry.dev/mcp")
     flow = provider.async_auth_flow(request)
     initial_request = await anext(flow)
 
     protected_resource_request = await flow.asend(
-        httpx.Response(
+        httpx2.Response(
             401,
             headers={
                 "WWW-Authenticate": (
@@ -806,7 +805,7 @@ async def test_interactive_provider_preserves_configured_scope_during_login(
     )
 
     oauth_metadata_request = await flow.asend(
-        httpx.Response(
+        httpx2.Response(
             200,
             json={
                 "resource": "https://mcp.sentry.dev/mcp",
@@ -822,7 +821,7 @@ async def test_interactive_provider_preserves_configured_scope_during_login(
     )
 
     registration_request = await flow.asend(
-        httpx.Response(
+        httpx2.Response(
             200,
             json={
                 "issuer": "https://mcp.sentry.dev",
@@ -838,7 +837,7 @@ async def test_interactive_provider_preserves_configured_scope_during_login(
     assert registration_payload["token_endpoint_auth_method"] == "none"
 
     token_request = await flow.asend(
-        httpx.Response(
+        httpx2.Response(
             201,
             json={
                 "client_id": "client-id",
@@ -857,7 +856,7 @@ async def test_interactive_provider_preserves_configured_scope_during_login(
     assert "grant_type=authorization_code" in token_payload
 
     authed_request = await flow.asend(
-        httpx.Response(
+        httpx2.Response(
             200,
             json={
                 "access_token": "access-token",
@@ -905,7 +904,7 @@ async def test_cached_oauth_provider_discovers_token_endpoint_before_refresh(
     monkeypatch.delenv("AGENTIC_MCP_OAUTH_DIR", raising=False)
     monkeypatch.setattr(mcp_oauth, "MCP_OAUTH_CACHE_DIR", tmp_path)
     monkeypatch.setattr(
-        mcp_oauth.httpx, "AsyncClient", _metadata_client(requested_urls=requested_urls)
+        mcp_oauth.httpx2, "AsyncClient", _metadata_client(requested_urls=requested_urls)
     )
 
     provider = make_mcp_oauth_auth("sentry", _sentry_config())
@@ -934,7 +933,7 @@ async def test_cached_oauth_provider_tries_second_metadata_url_after_404(
         lambda *_args: metadata_urls,
     )
     monkeypatch.setattr(
-        mcp_oauth.httpx,
+        mcp_oauth.httpx2,
         "AsyncClient",
         _metadata_client(requested_urls=requested_urls, not_found_url=metadata_urls[0]),
     )
@@ -953,16 +952,16 @@ async def test_cached_oauth_provider_refreshes_expired_cached_token(
     tmp_path: Path,
 ):
     cache_file = _write_sentry_cache(tmp_path)
-    monkeypatch.setattr(mcp_oauth.httpx, "AsyncClient", _metadata_client())
+    monkeypatch.setattr(mcp_oauth.httpx2, "AsyncClient", _metadata_client())
     provider = make_mcp_oauth_auth("sentry", _sentry_config(), cache_dir=tmp_path)
 
-    request = httpx.Request("GET", "https://mcp.sentry.dev/mcp")
+    request = httpx2.Request("GET", "https://mcp.sentry.dev/mcp")
     flow = provider.async_auth_flow(request)
     refresh_request = await anext(flow)
     assert str(refresh_request.url) == "https://mcp.sentry.dev/oauth/token"
 
     authed_request = await flow.asend(
-        httpx.Response(
+        httpx2.Response(
             200,
             json={
                 "access_token": "refreshed-access-token",
@@ -997,10 +996,10 @@ async def test_cached_oauth_provider_refreshes_public_client_without_secret(
             "token_endpoint_auth_method": "none",
         },
     )
-    monkeypatch.setattr(mcp_oauth.httpx, "AsyncClient", _metadata_client())
+    monkeypatch.setattr(mcp_oauth.httpx2, "AsyncClient", _metadata_client())
     provider = make_mcp_oauth_auth("sentry", _sentry_config(), cache_dir=tmp_path)
 
-    request = httpx.Request("GET", "https://mcp.sentry.dev/mcp")
+    request = httpx2.Request("GET", "https://mcp.sentry.dev/mcp")
     flow = provider.async_auth_flow(request)
     refresh_request = await anext(flow)
     assert str(refresh_request.url) == "https://mcp.sentry.dev/oauth/token"
@@ -1015,7 +1014,7 @@ async def test_cached_oauth_provider_refreshes_public_client_without_secret(
     assert "client_secret" not in refresh_payload
 
     authed_request = await flow.asend(
-        httpx.Response(
+        httpx2.Response(
             200,
             json={
                 "access_token": "refreshed-access-token",
@@ -1074,6 +1073,60 @@ def _atlas_cache_path(cache_dir: Path) -> Path:
     return cache_dir / f"{cache_name}.json"
 
 
+@pytest.mark.asyncio
+async def test_file_oauth_token_storage_reads_v1_cache_without_issuer(
+    tmp_path: Path,
+):
+    """A cache written by SDK 1.x has no issuer binding and must still load."""
+
+    _write_sentry_cache(tmp_path)
+    storage = FileOAuthTokenStorage(
+        "sentry",
+        "https://mcp.sentry.dev/mcp",
+        cache_dir=tmp_path,
+    )
+
+    client_info = await storage.get_client_info()
+    tokens = await storage.get_tokens()
+
+    assert client_info is not None
+    assert client_info.client_id == "client-id"
+    assert client_info.issuer is None
+    assert client_info.application_type is None
+    assert tokens is not None
+    assert tokens.refresh_token == "refresh-token"
+
+
+@pytest.mark.asyncio
+async def test_file_oauth_token_storage_round_trips_issuer_binding(
+    tmp_path: Path,
+):
+    """SEP-2352 binding survives a write/read cycle."""
+
+    storage = FileOAuthTokenStorage(
+        "sentry",
+        "https://mcp.sentry.dev/mcp",
+        cache_dir=tmp_path,
+    )
+    storage._update_payload(
+        client={
+            "client_id": "client-id",
+            "redirect_uris": ["http://127.0.0.1:1234/callback"],
+            "token_endpoint_auth_method": "none",
+            "grant_types": ["authorization_code", "refresh_token"],
+            "response_types": ["code"],
+            "issuer": "https://mcp.sentry.dev",
+            "application_type": "native",
+        }
+    )
+
+    client_info = await storage.get_client_info()
+
+    assert client_info is not None
+    assert client_info.issuer == "https://mcp.sentry.dev"
+    assert client_info.application_type == "native"
+
+
 def _write_sentry_cache(cache_dir: Path, *, client: dict[str, Any] | None = None) -> Path:
     server_url = _sentry_config().url
     cache_name = mcp_oauth.mcp_oauth_cache_name("sentry", server_url)
@@ -1122,18 +1175,18 @@ def _metadata_client(
         async def __aexit__(self, *_args: Any):
             return None
 
-        async def send(self, request: httpx.Request) -> httpx.Response:
+        async def send(self, request: httpx2.Request) -> httpx2.Response:
             if requested_urls is not None:
                 requested_urls.append(str(request.url))
             if str(request.url) == not_found_url:
-                return httpx.Response(404, request=request)
+                return httpx2.Response(404, request=request)
             return _metadata_response(request)
 
     return MetadataClient
 
 
-def _metadata_response(request: httpx.Request) -> httpx.Response:
-    return httpx.Response(
+def _metadata_response(request: httpx2.Request) -> httpx2.Response:
+    return httpx2.Response(
         200,
         json={
             "issuer": "https://mcp.sentry.dev",

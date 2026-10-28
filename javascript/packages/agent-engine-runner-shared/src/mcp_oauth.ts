@@ -1,7 +1,7 @@
 /**
  * OAuth provider and file-backed token storage for remote MCP servers.
  *
- * Port of `agent_engine_runner_shared/mcp_oauth.py`, adapted to `@modelcontextprotocol/sdk`'s
+ * Port of `agent_engine_runner_shared/mcp_oauth.py`, adapted to `@modelcontextprotocol/client`'s
  * `OAuthClientProvider` interface — a lower-level, method-based contract
  * (`tokens()`/`saveTokens()`/`clientInformation()`/...) rather than Python's
  * httpx-`Auth`-flow-based `OAuthClientProvider`. The cache file format/path
@@ -17,13 +17,15 @@ import * as path from "node:path";
 
 import { lock } from "proper-lockfile";
 
-import { ClientCredentialsProvider } from "@modelcontextprotocol/sdk/client/auth-extensions.js";
-import type { OAuthClientProvider } from "@modelcontextprotocol/sdk/client/auth.js";
-import type {
-  OAuthClientInformationFull,
-  OAuthClientMetadata,
-  OAuthTokens,
-} from "@modelcontextprotocol/sdk/shared/auth.js";
+import {
+  ClientCredentialsProvider,
+  type ClientCredentialsProviderOptions,
+  type OAuthClientMetadata,
+  type OAuthClientProvider,
+  type OAuthDiscoveryState,
+  type StoredOAuthClientInformation,
+  type StoredOAuthTokens,
+} from "@modelcontextprotocol/client";
 
 import type { RuntimeMCPServerConfig } from "./agent_config.js";
 
@@ -165,7 +167,7 @@ class FileOAuthTokenStorage {
     }
   }
 
-  getTokens(): OAuthTokens | undefined {
+  getTokens(): StoredOAuthTokens | undefined {
     const payload = this.readPayload();
     if (!this.payloadMatches(payload)) return undefined;
     const tokenData = payload.tokens;
@@ -189,10 +191,13 @@ class FileOAuthTokenStorage {
       refresh_token: tokenData["refresh_token"] as string | undefined,
       expires_in: expiresIn,
       scope: tokenData["scope"] as string | undefined,
-    } as OAuthTokens;
+      // The SDK stamps the authorization-server issuer on stored tokens so a
+      // credential cannot be replayed against a different server.
+      issuer: tokenData["issuer"] as string | undefined,
+    } as StoredOAuthTokens;
   }
 
-  async saveTokens(tokens: OAuthTokens): Promise<void> {
+  async saveTokens(tokens: StoredOAuthTokens): Promise<void> {
     const tokenData: Record<string, unknown> = { ...tokens };
     if (typeof tokenData["expires_in"] === "number") {
       const expiry = new Date(
@@ -204,7 +209,7 @@ class FileOAuthTokenStorage {
     await this.writePayload({ tokens: tokenData });
   }
 
-  getClientInfo(): OAuthClientInformationFull | undefined {
+  getClientInfo(): StoredOAuthClientInformation | undefined {
     const payload = this.readPayload();
     if (!this.payloadMatches(payload)) return undefined;
     const clientData = payload.client;
@@ -215,7 +220,10 @@ class FileOAuthTokenStorage {
     ) {
       return undefined;
     }
+    // Preserve every stored field (notably the SDK-stamped issuer) while
+    // filling the registration defaults older caches may omit.
     return {
+      ...(clientData as StoredOAuthClientInformation),
       redirect_uris: (clientData["redirect_uris"] as string[] | undefined) ?? [
         DEFAULT_MCP_OAUTH_REDIRECT_URI,
       ],
@@ -239,10 +247,12 @@ class FileOAuthTokenStorage {
       client_secret_expires_at: clientData["client_secret_expires_at"] as
         | number
         | undefined,
-    } as OAuthClientInformationFull;
+    } as StoredOAuthClientInformation;
   }
 
-  async saveClientInfo(clientInfo: OAuthClientInformationFull): Promise<void> {
+  async saveClientInfo(
+    clientInfo: StoredOAuthClientInformation,
+  ): Promise<void> {
     await this.writePayload({
       client: clientInfo as unknown as Record<string, unknown>,
     });
@@ -337,19 +347,21 @@ class FileBackedOAuthProvider implements OAuthClientProvider {
     return this._clientMetadata;
   }
 
-  clientInformation(): OAuthClientInformationFull | undefined {
+  clientInformation(): StoredOAuthClientInformation | undefined {
     return this.storage.getClientInfo();
   }
 
-  async saveClientInformation(info: OAuthClientInformationFull): Promise<void> {
+  async saveClientInformation(
+    info: StoredOAuthClientInformation,
+  ): Promise<void> {
     await this.storage.saveClientInfo(info);
   }
 
-  tokens(): OAuthTokens | undefined {
+  tokens(): StoredOAuthTokens | undefined {
     return this.storage.getTokens();
   }
 
-  async saveTokens(tokens: OAuthTokens): Promise<void> {
+  async saveTokens(tokens: StoredOAuthTokens): Promise<void> {
     await this.storage.saveTokens(tokens);
   }
 
@@ -384,6 +396,45 @@ export function makeMcpOauthAuth(
 }
 
 /**
+ * Construct the SDK client-credentials provider without leaking its
+ * deprecation warning into customer logs.
+ *
+ * A configured token URL is also the authorization-server issuer this adapter
+ * pre-seeds in `discoveryState()`, so bind the credentials to it. For
+ * discovery-only configurations the issuer is unknown until the SDK fetches
+ * metadata; no stable value exists at construction time, so suppress that one
+ * diagnostic (as the Python adapter does) while leaving issuer-mismatch
+ * enforcement intact.
+ */
+function makeInnerClientCredentialsProvider(
+  options: ClientCredentialsProviderOptions,
+  expectedIssuer: string | undefined,
+): ClientCredentialsProvider {
+  if (expectedIssuer !== undefined) {
+    return new ClientCredentialsProvider({ ...options, expectedIssuer });
+  }
+
+  // 2.3.1 emits this warning synchronously from the provider constructor
+  // (`checkedExpectedIssuer`), so the swap cannot miss a deferred emission.
+  const originalWarn = console.warn;
+  console.warn = (...args: unknown[]) => {
+    if (
+      args.length === 1 &&
+      typeof args[0] === "string" &&
+      args[0].includes("Omitting `expectedIssuer` is deprecated")
+    ) {
+      return;
+    }
+    originalWarn(...args);
+  };
+  try {
+    return new ClientCredentialsProvider(options);
+  } finally {
+    console.warn = originalWarn;
+  }
+}
+
+/**
  * `client_credentials` OAuth provider with file-backed token caching.
  *
  * Wraps the SDK's `ClientCredentialsProvider` (which only caches tokens
@@ -398,6 +449,7 @@ class FileBackedClientCredentialsProvider implements OAuthClientProvider {
   private readonly inner: ClientCredentialsProvider;
   private readonly storage: FileOAuthTokenStorage;
   private readonly tokenUrl: string | null;
+  private readonly configuredScope: string | undefined;
 
   constructor(
     serverName: string,
@@ -406,19 +458,23 @@ class FileBackedClientCredentialsProvider implements OAuthClientProvider {
     clientSecret: string,
     cacheDir?: string,
   ) {
-    this.inner = new ClientCredentialsProvider({
-      clientId,
-      clientSecret,
-      scope: config.auth.scope ?? undefined,
-    });
+    this.tokenUrl = config.auth.token_url;
+    this.configuredScope = config.auth.scope ?? undefined;
+    this.inner = makeInnerClientCredentialsProvider(
+      {
+        clientId,
+        clientSecret,
+        scope: this.configuredScope,
+      },
+      this.tokenUrl ?? undefined,
+    );
     this.storage = new FileOAuthTokenStorage(
       serverName,
       config.url,
       cacheDir,
       clientId,
-      config.auth.scope ?? undefined,
+      this.configuredScope,
     );
-    this.tokenUrl = config.auth.token_url;
   }
 
   get redirectUrl(): undefined {
@@ -429,19 +485,15 @@ class FileBackedClientCredentialsProvider implements OAuthClientProvider {
     return this.inner.clientMetadata;
   }
 
-  clientInformation() {
+  clientInformation(): StoredOAuthClientInformation {
     return this.inner.clientInformation();
   }
 
-  saveClientInformation(info: OAuthClientInformationFull): void {
-    this.inner.saveClientInformation(info);
-  }
-
-  tokens(): OAuthTokens | undefined {
+  tokens(): StoredOAuthTokens | undefined {
     return this.storage.getTokens();
   }
 
-  async saveTokens(tokens: OAuthTokens): Promise<void> {
+  async saveTokens(tokens: StoredOAuthTokens): Promise<void> {
     await this.storage.saveTokens(tokens);
     this.inner.saveTokens(tokens);
   }
@@ -459,10 +511,12 @@ class FileBackedClientCredentialsProvider implements OAuthClientProvider {
   }
 
   prepareTokenRequest(scope?: string) {
-    return this.inner.prepareTokenRequest(scope);
+    // The SDK prefers resource-metadata scopes over client metadata; an
+    // explicit agent.yaml scope must stay authoritative.
+    return this.inner.prepareTokenRequest(this.configuredScope ?? scope);
   }
 
-  discoveryState() {
+  discoveryState(): OAuthDiscoveryState | undefined {
     if (this.tokenUrl === null) return undefined;
     return {
       authorizationServerUrl: this.tokenUrl,

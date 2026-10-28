@@ -52,6 +52,7 @@ from agent_engine_runner_shared.server.callback_delivery import (
 def _make_server() -> AERServer:
     """Construct an AERServer with mocks, bypassing FastAPI / httpx wiring."""
     runtime = MagicMock()
+    runtime.build_graph = AsyncMock(return_value=None)
     runtime._memory_writer = None
     runtime.org_id = "org-1"
     runtime.get_agent = MagicMock(return_value=MagicMock())

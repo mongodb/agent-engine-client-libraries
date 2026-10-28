@@ -6,6 +6,12 @@
 from agent_engine_sdk_adk.agent import ADKBaseAgent
 from agent_engine_sdk_adk.rewind import RewindBranchError
 from agent_engine_sdk_adk.runner import DurableADKRunner
-from agent_engine_sdk_adk.runtime import App
+from agent_engine_sdk_adk.runtime import App, LLMRegistrationDriftError
 
-__all__ = ["App", "ADKBaseAgent", "DurableADKRunner", "RewindBranchError"]
+__all__ = [
+    "App",
+    "ADKBaseAgent",
+    "DurableADKRunner",
+    "LLMRegistrationDriftError",
+    "RewindBranchError",
+]

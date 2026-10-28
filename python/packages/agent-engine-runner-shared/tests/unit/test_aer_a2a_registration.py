@@ -7,7 +7,7 @@ import hashlib
 import hmac
 import json
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import httpx
 import pytest
@@ -42,6 +42,7 @@ def _make_aer_server(a2a_config: A2AConfig | None = None) -> AERServer:
         allowed_callers=["ws-allowed"],
     )
     runtime._graph_builder = MagicMock()
+    runtime.build_graph = AsyncMock(return_value=None)
     server = AERServer(runtime)
     return server
 

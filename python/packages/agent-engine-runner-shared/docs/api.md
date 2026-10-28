@@ -6,6 +6,8 @@
     * [agent\_config](#agent_engine_runner_shared.runtime.TenantRuntime.agent_config)
     * [memory\_enabled](#agent_engine_runner_shared.runtime.TenantRuntime.memory_enabled)
     * [get\_agent](#agent_engine_runner_shared.runtime.TenantRuntime.get_agent)
+    * [build\_graph](#agent_engine_runner_shared.runtime.TenantRuntime.build_graph)
+    * [uses\_per\_invocation\_build](#agent_engine_runner_shared.runtime.TenantRuntime.uses_per_invocation_build)
     * [warm\_up\_agent](#agent_engine_runner_shared.runtime.TenantRuntime.warm_up_agent)
     * [memory\_engine](#agent_engine_runner_shared.runtime.TenantRuntime.memory_engine)
     * [memory\_writer](#agent_engine_runner_shared.runtime.TenantRuntime.memory_writer)
@@ -347,7 +349,9 @@ Return the resolved agent.yaml Memory feature setting.
 #### get\_agent
 
 ```python
-def get_agent(callbacks: List[Any] | None = None) -> BaseAgent
+def get_agent(callbacks: List[Any] | None = None,
+              *,
+              graph: Any = None) -> BaseAgent
 ```
 
 Get a BaseAgent instance from the registered App.
@@ -359,6 +363,9 @@ framework-specific graph building and callback adaptation.
 
 - `callbacks` - Framework-neutral callbacks for observability
   (e.g., NodeExecutionLogger)
+- `graph` - A graph already built by ``build_graph`` for this
+  invocation (a per-execution agent). Only forwarded when
+  present, so an App that does not accept it keeps working.
 
 
 **Returns**:
@@ -369,6 +376,37 @@ framework-specific graph building and callback adaptation.
 **Raises**:
 
 - `RuntimeError` - If no App has been registered via register_and_run()
+
+<a id="agent_engine_runner_shared.runtime.TenantRuntime.build_graph"></a>
+
+#### build\_graph
+
+```python
+async def build_graph(agent_input: Any = None, ctx: Any = None) -> Any
+```
+
+Build the graph for this invocation before ``get_agent``.
+
+The AER awaits this so a per-execution agent's builder -- which may do
+its own async I/O -- runs off the build path. Returns ``None`` when the
+registered App declares no per-execution build (every global agent),
+which tells the caller to use the cached build path unchanged. A
+context-free discovery call passes ``(None, None)``.
+
+<a id="agent_engine_runner_shared.runtime.TenantRuntime.uses_per_invocation_build"></a>
+
+#### uses\_per\_invocation\_build
+
+```python
+def uses_per_invocation_build() -> bool
+```
+
+Whether the registered App builds its graph per invocation.
+
+True only for an App that opted into ``load_strategy="per-execution"``.
+The Tool Pod reads this to decide whether a failed context-free
+discovery build should keep the registrations the builder made before
+it raised, rather than discarding them.
 
 <a id="agent_engine_runner_shared.runtime.TenantRuntime.warm_up_agent"></a>
 

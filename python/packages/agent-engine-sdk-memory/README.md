@@ -317,7 +317,9 @@ ACCESS_TOKEN=$(curl --fail-with-body --silent --show-error \
 ```
 
 ```python
-memory = Memory(service_account_token="<your-access-token>", project_id="<your-project-id>")
+memory = Memory(
+    service_account_token="<your-access-token>", project_id="<your-project-id>"
+)
 ```
 
 | Input | Falls back to | Notes |
@@ -436,7 +438,9 @@ turn, and retrieve context.
 ```python
 from agent_engine_sdk_memory import Memory, MemoryRequestContext
 
-memory = Memory(service_account_token="<your-access-token>", project_id="<your-project-id>")
+memory = Memory(
+    service_account_token="<your-access-token>", project_id="<your-project-id>"
+)
 
 # Scope every call to a user and conversation.
 session = memory.bind(MemoryRequestContext(user_id="user_1", session_id="thread_123"))
@@ -763,7 +767,7 @@ so this reads only the org-visible records user_1 owns:
 
 ```python
 session = memory.bind(MemoryRequestContext(user_id="user_1", session_id="thread_123"))
-session.search_semantic("refund policy", visibility="org")   # user_1 AND org
+session.search_semantic("refund policy", visibility="org")  # user_1 AND org
 ```
 
 Passing `user_id=None` does **not** widen it. A `None` or blank argument counts
@@ -783,8 +787,8 @@ So an assistant that needs both the user's own history and the team's shared
 knowledge issues two reads and merges them:
 
 ```python
-personal = session.search_semantic(query, top_k=5)                       # user_1, any visibility
-shared = memory.search_semantic(query, visibility="org", top_k=5)        # org-wide, any owner
+personal = session.search_semantic(query, top_k=5)  # user_1, any visibility
+shared = memory.search_semantic(query, visibility="org", top_k=5)  # org-wide, any owner
 ```
 
 ## Errors

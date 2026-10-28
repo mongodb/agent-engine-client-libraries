@@ -6,12 +6,12 @@ import asyncio
 import json
 import os
 import re
-from collections.abc import Callable, Coroutine
+from collections.abc import AsyncIterator, Callable, Coroutine
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any, TypeVar, cast
 from urllib.parse import urlparse
 
-import httpx
 from pydantic import BaseModel, ConfigDict, Field
 
 from agent_engine_runner_shared.agent_config import (
@@ -22,6 +22,8 @@ from agent_engine_runner_shared.agent_config import (
 _UNSAFE_TOOL_NAME_CHARS_RE = re.compile(r"[^a-zA-Z0-9_]")
 _MAX_LIST_TOOL_PAGES = 100
 _MAX_TOOLS_PER_SERVER = 10_000
+# Transport messages that add nothing beyond an HTTP status we already report.
+_GENERIC_MCP_ERRORS = frozenset({"Server returned an error response"})
 _T = TypeVar("_T")
 
 
@@ -63,6 +65,95 @@ class MCPToolResult(BaseModel):
         default=False,
         description="Whether the MCP tool returned an error result.",
     )
+
+
+@dataclass(frozen=True)
+class _MCPHTTPStatus:
+    """The HTTP status of a failed response, kept for the caller's error text.
+
+    The 2.x transport reports a non-2xx response as a JSON-RPC error and drops
+    the status, so the response hook is the only remaining source for messages
+    such as ``HTTP 401 Unauthorized``.
+    """
+
+    status_code: int
+    reason_phrase: str
+
+
+def _make_mcp_http_client(
+    config: RuntimeMCPServerConfig,
+    *,
+    headers: dict[str, str],
+    auth: Any | None,
+    responses: list[_MCPHTTPStatus],
+) -> Any:
+    """Build the httpx2 client the MCP transport uses for one operation.
+
+    Redirect following stays off so the transport keeps owning same-origin
+    redirects, and the response hook records failed statuses for error text.
+    """
+
+    import httpx2
+
+    timeout = float(config.timeout_seconds)
+
+    async def record_status(response: httpx2.Response) -> None:
+        # httpx2 awaits response hooks, so this must be a coroutine.
+        #
+        # Only JSON-RPC POSTs describe the operation. The SDK also sends a
+        # session DELETE while the client closes and tolerates its 405; taking
+        # that status would report the cleanup instead of the failed call.
+        if response.request.method != "POST":
+            return
+        if response.status_code >= 400:
+            responses.append(_MCPHTTPStatus(response.status_code, response.reason_phrase))
+        else:
+            # A later successful POST means an earlier probe or authentication
+            # failure recovered, so it must not be reused as this call's status.
+            responses.clear()
+
+    return httpx2.AsyncClient(
+        headers=headers,
+        timeout=httpx2.Timeout(timeout, read=timeout),
+        auth=auth,
+        event_hooks={"response": [record_status]},
+    )
+
+
+@asynccontextmanager
+async def _open_mcp_client(
+    config: RuntimeMCPServerConfig,
+    *,
+    headers: dict[str, str],
+    auth: Any | None,
+    responses: list[_MCPHTTPStatus],
+) -> AsyncIterator[Any]:
+    """Open one MCP client session with the SDK's automatic era negotiation.
+
+    ``mode="auto"`` probes ``server/discover`` and falls back to the legacy
+    ``initialize`` handshake, so servers on ``2025-11-25`` and older keep
+    working while ``2026-07-28`` servers are reached directly.
+    """
+
+    from mcp import Client
+    from mcp.client.streamable_http import streamable_http_client
+
+    timeout = float(config.timeout_seconds)
+    http_client = _make_mcp_http_client(
+        config,
+        headers=headers,
+        auth=auth,
+        responses=responses,
+    )
+    # The transport never closes a caller-owned client, so the session owns it.
+    async with http_client:
+        client = Client(
+            streamable_http_client(config.url, http_client=http_client),
+            read_timeout_seconds=timeout,
+            mode="auto",
+        )
+        async with client as connected:
+            yield connected
 
 
 def make_mcp_sdk_tool_name(server_name: str, tool_name: str) -> str:
@@ -176,7 +267,7 @@ async def discover_mcp_tools_async(config: RuntimeMCPConfig) -> list[MCPToolBind
                     tool_name=tool.name,
                     sdk_tool_name=sdk_tool_name,
                     description=tool.description or "",
-                    input_schema=dict(tool.inputSchema),
+                    input_schema=dict(tool.input_schema),
                     server_config=server_config,
                     annotations=normalize_mcp_tool_annotations(getattr(tool, "annotations", None)),
                 )
@@ -238,30 +329,31 @@ def is_configured_mcp_sdk_tool_name(config: RuntimeMCPConfig, sdk_tool_name: str
 async def _call_mcp_tool(binding: MCPToolBinding, arguments: dict[str, Any]) -> MCPToolResult:
     """Execute a remote MCP tool and normalize its result for Go OE persistence."""
 
-    from mcp import ClientSession
-    from mcp.client.streamable_http import streamablehttp_client
-
     headers = resolve_mcp_headers(binding.server_name, binding.server_config)
     auth = resolve_mcp_auth(binding.server_name, binding.server_config)
-    timeout = binding.server_config.timeout_seconds
+    responses: list[_MCPHTTPStatus] = []
 
+    failure: tuple[BaseException, _MCPHTTPStatus | None] | None = None
+    operation = f"tool {binding.tool_name!r}"
     try:
         # TODO: Reuse MCP sessions once OAuth token lifecycle support can
         # safely own long-lived remote clients across calls.
-        async with streamablehttp_client(
-            binding.server_config.url,
+        async with _open_mcp_client(
+            binding.server_config,
             headers=headers,
-            timeout=timeout,
-            sse_read_timeout=timeout,
             auth=auth,
-        ) as (
-            read_stream,
-            write_stream,
-            _,
-        ):
-            async with ClientSession(read_stream, write_stream) as session:
-                await session.initialize()
-                result = await session.call_tool(binding.tool_name, arguments)
+            responses=responses,
+        ) as client:
+            try:
+                result = await client.call_tool(binding.tool_name, arguments)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                # Read the status here, before the client's context exits: a
+                # cleanup token refresh or session DELETE can otherwise replace
+                # the failed operation's status.
+                failure = (exc, _last_http_status(responses))
+            else:
                 return normalize_mcp_tool_result(result)
     except MCPToolError:
         raise
@@ -270,9 +362,20 @@ async def _call_mcp_tool(binding: MCPToolBinding, arguments: dict[str, Any]) -> 
     except asyncio.CancelledError:
         raise
     except Exception as exc:
-        operation = f"tool {binding.tool_name!r}"
-        message = _mcp_transport_error_message(binding.server_name, operation, exc)
-        raise MCPToolError(message) from exc
+        # The client's task group can regroup the captured failure with a
+        # teardown error; prefer the operation's own failure when we have one.
+        cause, status = failure if failure is not None else (exc, _last_http_status(responses))
+        raise MCPToolError(
+            _mcp_transport_error_message(binding.server_name, operation, cause, status)
+        ) from cause
+
+    # Raise outside the client context so the SDK cannot regroup the error.
+    if failure is not None:
+        cause, status = failure
+        raise MCPToolError(
+            _mcp_transport_error_message(binding.server_name, operation, cause, status)
+        ) from cause
+    raise MCPToolError(f"mcp server {binding.server_name!r} {operation} failed")
 
 
 def make_mcp_tool_pod_callable(binding: MCPToolBinding) -> Callable[..., Any]:
@@ -307,26 +410,28 @@ def normalize_mcp_tool_result(result: Any) -> MCPToolResult:
     """Convert an MCP ``CallToolResult`` into a JSON/BSON-safe model."""
 
     content = [
-        block.model_dump(mode="json", by_alias=False, exclude_none=True)
+        # by_alias keeps the wire field names (``mimeType``, not ``mime_type``)
+        # that the stored contract and the TypeScript runner use.
+        block.model_dump(mode="json", by_alias=True, exclude_none=True)
         if hasattr(block, "model_dump")
         else block
         for block in result.content
     ]
     _ensure_json_safe("content", content)
 
-    structured_content = getattr(result, "structuredContent", None)
+    structured_content = getattr(result, "structured_content", None)
     if structured_content is not None:
         if not isinstance(structured_content, dict):
-            raise MCPToolError("MCP tool returned structuredContent that is not an object")
-        _ensure_json_safe("structuredContent", structured_content)
+            raise MCPToolError("MCP tool returned structured_content that is not an object")
+        _ensure_json_safe("structured_content", structured_content)
 
     normalized = MCPToolResult(
         content=content,
         structured_content=structured_content,
-        is_error=bool(result.isError),
+        is_error=bool(result.is_error),
     )
 
-    if result.isError:
+    if result.is_error:
         text_parts: list[str] = []
         for block in content:
             if isinstance(block, dict) and block.get("type") == "text":
@@ -341,40 +446,39 @@ def normalize_mcp_tool_result(result: Any) -> MCPToolResult:
 
 
 async def _list_server_tools(server_name: str, config: RuntimeMCPServerConfig) -> list[Any]:
-    from mcp import ClientSession
-    from mcp.client.streamable_http import streamablehttp_client
-
     headers = resolve_mcp_headers(server_name, config)
     auth = resolve_mcp_auth(server_name, config)
-    timeout = config.timeout_seconds
+    responses: list[_MCPHTTPStatus] = []
 
+    failure: tuple[BaseException, _MCPHTTPStatus | None] | None = None
     try:
-        async with streamablehttp_client(
-            config.url,
+        async with _open_mcp_client(
+            config,
             headers=headers,
-            timeout=timeout,
-            sse_read_timeout=timeout,
             auth=auth,
-        ) as (
-            read_stream,
-            write_stream,
-            _,
-        ):
-            async with ClientSession(read_stream, write_stream) as session:
-                await session.initialize()
-                tools: list[Any] = []
-                cursor: str | None = None
-                for _ in range(_MAX_LIST_TOOL_PAGES):
-                    result = await session.list_tools(cursor=cursor)
-                    tools.extend(result.tools)
-                    if len(tools) > _MAX_TOOLS_PER_SERVER:
-                        raise MCPConfigError(
-                            f"mcp server {server_name!r} returned more than "
-                            f"{_MAX_TOOLS_PER_SERVER} tools"
-                        )
-                    cursor = result.nextCursor
-                    if cursor is None:
-                        return tools
+            responses=responses,
+        ) as client:
+            tools: list[Any] = []
+            cursor: str | None = None
+            for _ in range(_MAX_LIST_TOOL_PAGES):
+                try:
+                    result = await client.list_tools(cursor=cursor)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    # Capture before context exit; see _call_mcp_tool.
+                    failure = (exc, _last_http_status(responses))
+                    break
+                tools.extend(result.tools)
+                if len(tools) > _MAX_TOOLS_PER_SERVER:
+                    raise MCPConfigError(
+                        f"mcp server {server_name!r} returned more than "
+                        f"{_MAX_TOOLS_PER_SERVER} tools"
+                    )
+                cursor = result.next_cursor
+                if cursor is None:
+                    return tools
+            if failure is None:
                 raise MCPConfigError(
                     f"mcp server {server_name!r} tools/list exceeded {_MAX_LIST_TOOL_PAGES} pages"
                 )
@@ -383,8 +487,18 @@ async def _list_server_tools(server_name: str, config: RuntimeMCPServerConfig) -
     except asyncio.CancelledError:
         raise
     except Exception as exc:
-        message = _mcp_transport_error_message(server_name, "tools/list", exc)
-        raise MCPConfigError(message) from exc
+        cause, status = failure if failure is not None else (exc, _last_http_status(responses))
+        raise MCPConfigError(
+            _mcp_transport_error_message(server_name, "tools/list", cause, status)
+        ) from cause
+
+    # Raise outside the client context so the SDK cannot regroup the error.
+    if failure is not None:
+        cause, status = failure
+        raise MCPConfigError(
+            _mcp_transport_error_message(server_name, "tools/list", cause, status)
+        ) from cause
+    raise MCPConfigError(f"mcp server {server_name!r} tools/list failed")
 
 
 def _run_coroutine_sync(
@@ -414,7 +528,7 @@ def normalize_mcp_tool_annotations(value: Any) -> dict[str, Any] | None:
     model_dump = getattr(value, "model_dump", None)
     if callable(model_dump):
         try:
-            dumped = model_dump(mode="json", exclude_unset=True)
+            dumped = model_dump(mode="json", by_alias=True, exclude_unset=True)
         except Exception:
             return None
     if not isinstance(dumped, dict):
@@ -448,29 +562,35 @@ def _sanitize_tool_name_part(value: str) -> str:
     return sanitized
 
 
-def _mcp_transport_error_message(server_name: str, operation: str, exc: BaseException) -> str:
-    http_error = _find_http_status_error(exc)
-    if http_error is not None:
-        response = http_error.response
-        status = response.status_code
-        reason = response.reason_phrase or "HTTP error"
-        return f"mcp server {server_name!r} {operation} failed: HTTP {status} {reason}"
-
+def _mcp_transport_error_message(
+    server_name: str,
+    operation: str,
+    exc: BaseException,
+    http_status: _MCPHTTPStatus | None = None,
+) -> str:
+    prefix = f"mcp server {server_name!r} {operation} failed"
     leaf_messages = _leaf_exception_messages(exc)
+
+    if http_status is not None:
+        reason = http_status.reason_phrase or "HTTP error"
+        message = f"{prefix}: HTTP {http_status.status_code} {reason}"
+        # Keep provider detail such as an OAuth token error's scope explanation.
+        # The transport's own "Server returned an error response" says nothing
+        # beyond the status we already report.
+        actionable = [item for item in leaf_messages if item not in _GENERIC_MCP_ERRORS]
+        if actionable:
+            message = f"{message}: {'; '.join(actionable)}"
+        return message
+
     if leaf_messages:
-        return f"mcp server {server_name!r} {operation} failed: {'; '.join(leaf_messages)}"
-    return f"mcp server {server_name!r} {operation} failed"
+        return f"{prefix}: {'; '.join(leaf_messages)}"
+    return prefix
 
 
-def _find_http_status_error(exc: BaseException) -> httpx.HTTPStatusError | None:
-    if isinstance(exc, httpx.HTTPStatusError):
-        return exc
-    if isinstance(exc, BaseExceptionGroup):
-        for child in exc.exceptions:
-            found = _find_http_status_error(child)
-            if found is not None:
-                return found
-    return None
+def _last_http_status(responses: list[_MCPHTTPStatus]) -> _MCPHTTPStatus | None:
+    """Return the last failed HTTP status seen during one MCP operation."""
+
+    return responses[-1] if responses else None
 
 
 def _leaf_exception_messages(exc: BaseException) -> list[str]:

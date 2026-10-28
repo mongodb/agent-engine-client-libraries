@@ -160,6 +160,13 @@ function makeToolServer(failure: unknown): {
     throw failure;
     yield undefined as unknown as LLMStreamChunk; // marks this an async generator
   };
+  // Model resolution is its own seam now; this case is about the stream's
+  // failure classification.
+  (
+    server as unknown as {
+      resolveLlmForRequest: () => Promise<unknown>;
+    }
+  ).resolveLlmForRequest = async () => ({});
   return server as unknown as {
     doHandleInvokeLlm: (
       request: unknown,

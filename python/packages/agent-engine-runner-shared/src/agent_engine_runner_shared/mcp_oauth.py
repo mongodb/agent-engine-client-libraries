@@ -6,13 +6,14 @@ import asyncio
 import json
 import os
 import tempfile
+import warnings
 from collections.abc import AsyncGenerator
 from contextvars import ContextVar
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Awaitable, Callable, cast
 
-import httpx
+import httpx2
 from mcp.client.auth import OAuthClientProvider, TokenStorage
 from mcp.client.auth import oauth2 as mcp_oauth2
 from mcp.client.auth.extensions.client_credentials import ClientCredentialsOAuthProvider
@@ -27,12 +28,14 @@ from mcp.client.auth.utils import (
     get_client_metadata_scopes as _sdk_get_client_metadata_scopes,
 )
 from mcp.shared.auth import (
+    AuthorizationCodeResult,
     OAuthClientInformationFull,
     OAuthClientMetadata,
     OAuthMetadata,
     OAuthToken,
     ProtectedResourceMetadata,
 )
+from mcp.shared.exceptions import MCPDeprecationWarning
 
 from agent_engine_runner_shared.agent_config import RuntimeMCPServerConfig
 from agent_engine_runner_shared.mcp_oauth_cache_lock import mcp_oauth_cache_file_lock
@@ -60,6 +63,7 @@ def _agentic_get_client_metadata_scopes(
     www_authenticate_scope: str | None,
     protected_resource_metadata: ProtectedResourceMetadata | None,
     authorization_server_metadata: OAuthMetadata | None = None,
+    client_grant_types: list[str] | None = None,
 ) -> str | None:
     configured_scope = _CONFIGURED_OAUTH_SCOPE.get()
     if configured_scope:
@@ -68,6 +72,7 @@ def _agentic_get_client_metadata_scopes(
         www_authenticate_scope,
         protected_resource_metadata,
         authorization_server_metadata,
+        client_grant_types,
     )
 
 
@@ -126,22 +131,17 @@ class FileOAuthTokenStorage(TokenStorage):
         client_data = payload.get("client")
         if not isinstance(client_data, dict) or not client_data.get("client_id"):
             return None
-        return OAuthClientInformationFull.model_validate(
-            {
-                "redirect_uris": client_data.get("redirect_uris")
-                or [DEFAULT_MCP_OAUTH_REDIRECT_URI],
-                "token_endpoint_auth_method": client_data.get("token_endpoint_auth_method"),
-                "grant_types": client_data.get("grant_types")
-                or ["authorization_code", "refresh_token"],
-                "response_types": client_data.get("response_types") or ["code"],
-                "scope": client_data.get("scope"),
-                "client_name": client_data.get("client_name"),
-                "client_id": client_data.get("client_id"),
-                "client_secret": client_data.get("client_secret"),
-                "client_id_issued_at": client_data.get("client_id_issued_at"),
-                "client_secret_expires_at": client_data.get("client_secret_expires_at"),
-            }
-        )
+        # Keep every field the SDK stored so a server-substituted registration
+        # round-trips; fill the minimums older cache files may omit.
+        stored = {
+            key: value
+            for key, value in client_data.items()
+            if key in OAuthClientInformationFull.model_fields
+        }
+        stored.setdefault("redirect_uris", [DEFAULT_MCP_OAUTH_REDIRECT_URI])
+        stored.setdefault("grant_types", ["authorization_code", "refresh_token"])
+        stored.setdefault("response_types", ["code"])
+        return OAuthClientInformationFull.model_validate(stored)
 
     async def set_client_info(self, client_info: OAuthClientInformationFull) -> None:
         await asyncio.to_thread(
@@ -225,21 +225,25 @@ class CachedOAuthClientProvider(OAuthClientProvider):
         self,
         *args: Any,
         configured_scope: str | None = None,
+        timeout: float = 300.0,
         **kwargs: Any,
     ) -> None:
         super().__init__(*args, **kwargs)
         self._configured_scope = configured_scope
+        # The SDK moved timeouts onto the httpx2 client, so the provider keeps
+        # its own copy for the metadata request it issues outside the SDK flow.
+        self._timeout = timeout
 
-    async def async_auth_flow(
+    async def _auth_flow(
         self,
-        request: httpx.Request,
-    ) -> AsyncGenerator[httpx.Request, httpx.Response]:
+        request: httpx2.Request,
+    ) -> AsyncGenerator[httpx2.Request, httpx2.Response]:
         token = None
         if self._configured_scope:
             token = _CONFIGURED_OAUTH_SCOPE.set(self._configured_scope)
-        upstream = super().async_auth_flow(request)
+        upstream = super()._auth_flow(request)
         send_response = False
-        response: httpx.Response | None = None
+        response: httpx2.Response | None = None
         try:
             while True:
                 if send_response:
@@ -262,7 +266,7 @@ class CachedOAuthClientProvider(OAuthClientProvider):
         if self.context.current_tokens is not None:
             self.context.update_token_expiry(self.context.current_tokens)
 
-    async def _refresh_token(self) -> httpx.Request:
+    async def _refresh_token(self) -> httpx2.Request:
         await self._load_oauth_metadata()
         return await super()._refresh_token()
 
@@ -274,7 +278,9 @@ class CachedOAuthClientProvider(OAuthClientProvider):
             self.context.auth_server_url,
             self.context.server_url,
         )
-        async with httpx.AsyncClient(timeout=self.context.timeout) as client:
+        async with httpx2.AsyncClient(
+            timeout=httpx2.Timeout(self._timeout, read=self._timeout)
+        ) as client:
             for metadata_url in urls:
                 response = await client.send(create_oauth_metadata_request(metadata_url))
                 ok, metadata = await handle_auth_metadata_response(response)
@@ -293,14 +299,24 @@ class CachedClientCredentialsOAuthProvider(ClientCredentialsOAuthProvider):
         self,
         *args: Any,
         scopes: str | None = None,
-        timeout: float = 300.0,
         **kwargs: Any,
     ) -> None:
-        super().__init__(*args, scopes=scopes, **kwargs)
+        # The 2.x provider names the parameter `scope`; keep the `scopes`
+        # keyword at our call sites so the agent.yaml surface does not change.
+        kwargs.setdefault("scope", scopes)
+        # No issuer is configured here, so the SDK's forward-looking warning
+        # (required in 3.0) would fire on every agent start. The value is only
+        # meaningful for the direct-token-url flow, which cannot supply one.
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                category=MCPDeprecationWarning,
+                message=r"Omitting `issuer`.*",
+            )
+            super().__init__(*args, **kwargs)
         self._configured_scope = scopes
-        self.context.timeout = timeout
 
-    async def _perform_authorization(self) -> httpx.Request:
+    async def _perform_authorization(self) -> httpx2.Request:
         if self._configured_scope:
             # MCP SDK discovery can replace constructor scopes before the token
             # request. Keep explicit agent.yaml scopes authoritative.
@@ -331,27 +347,34 @@ class DirectClientCredentialsOAuthProvider(CachedClientCredentialsOAuthProvider)
         client_id: str,
         client_secret: str,
         scopes: str | None,
-        timeout: float,
     ) -> None:
-        super().__init__(
-            server_url=server_url,
-            storage=storage,
-            client_id=client_id,
-            client_secret=client_secret,
-            token_endpoint_auth_method="client_secret_basic",
-            scopes=scopes,
-            timeout=timeout,
-        )
+        # The direct flow has no discovery step, so there is no authorization
+        # server metadata to bind these credentials to. SDK 3.0 will require an
+        # issuer; deriving one here would fail the metadata check it enables.
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                category=MCPDeprecationWarning,
+                message=r"Omitting `issuer`.*",
+            )
+            super().__init__(
+                server_url=server_url,
+                storage=storage,
+                client_id=client_id,
+                client_secret=client_secret,
+                token_endpoint_auth_method="client_secret_basic",
+                scopes=scopes,
+            )
         self._token_url = token_url
 
     def _get_token_endpoint(self) -> str:
         return self._token_url
 
-    async def async_auth_flow(
+    async def _auth_flow(
         self,
-        request: httpx.Request,
-    ) -> AsyncGenerator[httpx.Request, httpx.Response]:
-        token_request: httpx.Request | None = None
+        request: httpx2.Request,
+    ) -> AsyncGenerator[httpx2.Request, httpx2.Response]:
+        token_request: httpx2.Request | None = None
         async with self.context.lock:
             if not self._initialized:
                 await self._initialize()
@@ -447,7 +470,6 @@ def make_mcp_client_credentials_auth(
             client_secret=client_secret,
             token_endpoint_auth_method="client_secret_basic",
             scopes=auth.scope,
-            timeout=float(config.timeout_seconds),
         )
 
     return DirectClientCredentialsOAuthProvider(
@@ -457,7 +479,6 @@ def make_mcp_client_credentials_auth(
         client_id=client_id,
         client_secret=client_secret,
         scopes=auth.scope,
-        timeout=float(config.timeout_seconds),
     )
 
 
@@ -468,7 +489,7 @@ def make_interactive_mcp_oauth_auth(
     cache_dir: Path,
     redirect_uri: str,
     redirect_handler: Callable[[str], Awaitable[None]],
-    callback_handler: Callable[[], Awaitable[tuple[str, str | None]]],
+    callback_handler: Callable[[], Awaitable[AuthorizationCodeResult]],
 ) -> OAuthClientProvider:
     """Return an interactive OAuth provider used by the one-shot auth helper."""
 

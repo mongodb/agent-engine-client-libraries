@@ -15,6 +15,15 @@ import {
 } from "./constants.js";
 import { truncateUtf8 } from "./serialize.js";
 
+function withinJsonDepth(value: unknown, depth = 0): boolean {
+  if (!value || typeof value !== "object") return true;
+  // Keep hostile payloads from exhausting the stack, with the same bound in Python.
+  if (depth >= 64) return false;
+  return Object.values(value).every((child: unknown) =>
+    withinJsonDepth(child, depth + 1),
+  );
+}
+
 type WriteFn = NodeJS.WriteStream["write"];
 type PatchableStream = NodeJS.WriteStream & { [ORIGINAL_WRITE_SLOT]?: WriteFn };
 
@@ -119,11 +128,41 @@ export class LoggingStream {
   }
 
   private emit(line: string): void {
-    if (this.level === "warn") {
-      this.logger.warn({ source: this.source }, line);
-    } else {
-      this.logger.info({ source: this.source }, line);
+    let level: "debug" | "info" | "warn" | "error" = this.level;
+    if (this.source === "stdout") {
+      try {
+        const payload: unknown = JSON.parse(line);
+        if (
+          payload &&
+          typeof payload === "object" &&
+          !Array.isArray(payload) &&
+          withinJsonDepth(payload)
+        ) {
+          const value = (payload as Record<string, unknown>)["level"];
+          if (typeof value === "string") {
+            switch (value.trim().toLowerCase()) {
+              case "debug":
+                level = "debug";
+                break;
+              case "info":
+                level = "info";
+                break;
+              case "warning":
+              case "warn":
+                level = "warn";
+                break;
+              case "error":
+              case "err":
+                level = "error";
+                break;
+            }
+          }
+        }
+      } catch {
+        // Non-JSON output retains the stream's default severity.
+      }
     }
+    this.logger[level]({ source: this.source }, line);
   }
 }
 

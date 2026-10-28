@@ -2,22 +2,25 @@
  * Tests for MCP OAuth providers and file-backed token caching.
  *
  * Mirrors the file-cache-format coverage in Python's tests/unit/test_mcp_oauth.py.
- * Adapted to `@modelcontextprotocol/sdk`'s `OAuthClientProvider` interface —
+ * Adapted to `@modelcontextprotocol/client`'s `OAuthClientProvider` interface —
  * see the `mcp_oauth.ts` module comment for why this isn't a literal port.
  */
 
 import { describe, test, expect, beforeEach, afterEach, vi } from "vitest";
 import {
+  mkdirSync,
   mkdtempSync,
   readFileSync,
   readdirSync,
   rmSync,
   statSync,
+  writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import {
+  DEFAULT_MCP_OAUTH_REDIRECT_URI,
   RuntimeMCPServerConfigSchema,
   makeMcpClientCredentialsAuth,
   makeMcpOauthAuth,
@@ -40,6 +43,11 @@ function makeServerConfig(overrides: Record<string, unknown> = {}) {
     url: "https://mcp.example.com/github",
     ...overrides,
   });
+}
+
+interface ClientCredentialsInternals {
+  prepareTokenRequest(scope?: string): URLSearchParams;
+  clientInformation(): { issuer?: string };
 }
 
 describe("mcpOauthCacheName", () => {
@@ -140,6 +148,57 @@ describe("makeMcpOauthAuth", () => {
     expect(onDisk.tokens.access_token).toBe("abc123");
     expect(onDisk.tokens.expiry).toBeDefined();
     expect(onDisk.tokens.expires_in).toBeUndefined();
+  });
+
+  test("round-trips the authorization-server issuer on tokens and client info", async () => {
+    const config = makeServerConfig({ auth: { type: "oauth" } });
+    const provider = makeMcpOauthAuth("github", config, cacheDir);
+    const issuer = "https://auth.example.com";
+
+    await provider.saveTokens({
+      access_token: "abc123",
+      token_type: "Bearer",
+      issuer,
+    });
+    await provider.saveClientInformation?.({
+      client_id: "client-xyz",
+      redirect_uris: ["http://127.0.0.1:8765/callback"],
+      issuer,
+    });
+
+    expect((await provider.tokens())?.issuer).toBe(issuer);
+    expect(provider.clientInformation()?.issuer).toBe(issuer);
+  });
+
+  test("loads a cache written before issuers were stored", async () => {
+    const config = makeServerConfig({ auth: { type: "oauth" } });
+    const cachePath = join(
+      cacheDir,
+      `${mcpOauthCacheName("github", config.url)}.json`,
+    );
+    mkdirSync(cacheDir, { recursive: true });
+    writeFileSync(
+      cachePath,
+      JSON.stringify({
+        schema_version: 1,
+        server_name: "github",
+        server_url: config.url,
+        tokens: {
+          access_token: "legacy-token",
+          token_type: "Bearer",
+          expiry: new Date(Date.now() + 3_600_000).toISOString(),
+        },
+        client: { client_id: "legacy-client" },
+      }),
+    );
+
+    const provider = makeMcpOauthAuth("github", config, cacheDir);
+
+    expect((await provider.tokens())?.access_token).toBe("legacy-token");
+    expect(provider.clientInformation()).toMatchObject({
+      client_id: "legacy-client",
+      redirect_uris: [DEFAULT_MCP_OAUTH_REDIRECT_URI],
+    });
   });
 
   test("concurrent saveTokens + saveClientInformation don't clobber each other (lock covers the read-modify-write)", async () => {
@@ -246,6 +305,92 @@ describe("makeMcpClientCredentialsAuth", () => {
     const provider = makeMcpClientCredentialsAuth("github", config, cacheDir);
     expect(provider.clientMetadata.scope).toBe("repo");
     expect(provider.redirectUrl).toBeUndefined();
+  });
+
+  test("keeps the configured scope authoritative over discovery-selected scopes", () => {
+    vi.stubEnv("GH_CLIENT_ID", "client-abc");
+    vi.stubEnv("GH_SECRET", "shh");
+    const config = makeServerConfig({
+      auth: {
+        type: "client_credentials",
+        client_id_env: "GH_CLIENT_ID",
+        client_secret_env: "GH_SECRET",
+        scope: "read",
+      },
+    });
+    const provider = makeMcpClientCredentialsAuth(
+      "github",
+      config,
+      cacheDir,
+    ) as unknown as ClientCredentialsInternals;
+
+    expect(provider.prepareTokenRequest("read write").get("scope")).toBe(
+      "read",
+    );
+  });
+
+  test("uses the discovery-selected scope when configuration omits one", () => {
+    vi.stubEnv("GH_CLIENT_ID", "client-abc");
+    vi.stubEnv("GH_SECRET", "shh");
+    const config = makeServerConfig({
+      auth: {
+        type: "client_credentials",
+        client_id_env: "GH_CLIENT_ID",
+        client_secret_env: "GH_SECRET",
+      },
+    });
+    const provider = makeMcpClientCredentialsAuth(
+      "github",
+      config,
+      cacheDir,
+    ) as unknown as ClientCredentialsInternals;
+
+    expect(provider.prepareTokenRequest("read write").get("scope")).toBe(
+      "read write",
+    );
+  });
+
+  test("does not emit the SDK's expectedIssuer deprecation warning", () => {
+    vi.stubEnv("GH_CLIENT_ID", "client-abc");
+    vi.stubEnv("GH_SECRET", "shh");
+    const config = makeServerConfig({
+      auth: {
+        type: "client_credentials",
+        client_id_env: "GH_CLIENT_ID",
+        client_secret_env: "GH_SECRET",
+      },
+    });
+
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      makeMcpClientCredentialsAuth("github", config, cacheDir);
+      const messages = warn.mock.calls.flat().map((value) => String(value));
+      expect(messages.join("\n")).not.toContain("expectedIssuer");
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  test("binds direct token-url credentials to that issuer", () => {
+    vi.stubEnv("GH_CLIENT_ID", "client-abc");
+    vi.stubEnv("GH_SECRET", "shh");
+    const config = makeServerConfig({
+      auth: {
+        type: "client_credentials",
+        client_id_env: "GH_CLIENT_ID",
+        client_secret_env: "GH_SECRET",
+        token_url: "https://auth.example.com/token",
+      },
+    });
+    const provider = makeMcpClientCredentialsAuth(
+      "github",
+      config,
+      cacheDir,
+    ) as unknown as ClientCredentialsInternals;
+
+    expect(provider.clientInformation().issuer).toBe(
+      "https://auth.example.com/token",
+    );
   });
 
   test("caches tokens to a client-id-scoped file distinct from the oauth cache", async () => {

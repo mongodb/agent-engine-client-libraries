@@ -26,7 +26,7 @@ import asyncio
 import json
 import threading
 from typing import Optional
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock
 
 import httpx
 import pytest
@@ -492,6 +492,7 @@ class _HangingAgent:
 
 async def test_aer_turn_blocked_mid_execution_is_stopped_by_drain() -> None:
     runtime = Mock()
+    runtime.build_graph = AsyncMock(return_value=None)
     runtime.get_agent.return_value = _HangingAgent()
     server = AERServer(runtime)
     app = server.create_app()

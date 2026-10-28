@@ -182,6 +182,20 @@ class StructuredJSONFormatter(logging.Formatter):
         return json.dumps(entry, default=str, separators=(",", ":"))
 
 
+def _reject_json_constant(value: str) -> None:
+    raise ValueError(f"Invalid JSON constant: {value}")
+
+
+def _within_json_depth(value: Any, depth: int = 0) -> bool:
+    if not isinstance(value, (dict, list)):
+        return True
+    # Keep hostile payloads from exhausting the stack, with the same bound in Node.
+    if depth >= 64:
+        return False
+    children = value.values() if isinstance(value, dict) else value
+    return all(_within_json_depth(child, depth + 1) for child in children)
+
+
 class LoggingStream(IOBase):
     """Replacement for ``sys.stdout``/``sys.stderr`` that routes writes through logging.
 
@@ -282,9 +296,27 @@ class LoggingStream(IOBase):
             self._buffer = ""
 
     def _emit(self, line: str) -> None:
+        level = self._level
+        if self._source == "stdout":
+            try:
+                # Only string severity is consumed; avoid integer conversion limits.
+                payload = json.loads(line, parse_int=str, parse_constant=_reject_json_constant)
+            except (ValueError, RecursionError):
+                payload = None
+            if isinstance(payload, dict) and _within_json_depth(payload):
+                value = payload.get("level")
+                if isinstance(value, str):
+                    level = {
+                        "debug": logging.DEBUG,
+                        "info": logging.INFO,
+                        "warning": logging.WARNING,
+                        "warn": logging.WARNING,
+                        "error": logging.ERROR,
+                        "err": logging.ERROR,
+                    }.get(value.strip().lower(), level)
         record = self._logger.makeRecord(
             self._logger.name,
-            self._level,
+            level,
             "(stdout-capture)",
             0,
             line,

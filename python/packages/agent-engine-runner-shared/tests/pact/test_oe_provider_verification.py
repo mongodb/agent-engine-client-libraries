@@ -164,11 +164,19 @@ class _FakeAERRuntime:
             return None
         return _FakeQueryPlugin()
 
-    def get_agent(self, callbacks: Any = None):
+    def get_agent(self, callbacks: Any = None, *, graph: Any = None):
         return _FakeAgent(_aer_state["mode"])
 
     def warm_up_agent(self) -> bool:
         return True
+
+    def uses_per_invocation_build(self) -> bool:
+        # This fake stands in for a global agent, which is the default and the
+        # only shape the OE contract covers.
+        return False
+
+    async def build_graph(self, agent_input: Any = None, ctx: Any = None) -> Any:
+        return None
 
 
 def _build_aer_app() -> FastAPI:
