@@ -635,7 +635,7 @@ class App(BaseApp):
             description=description,
             args_schema=binding.input_schema,
             is_local=False,
-            provider_type=None,
+            provider=None,
             scopes=[],
             network=mcp_server_network_hosts(binding.server_config),
             timeout_seconds=binding.server_config.timeout_seconds,
@@ -683,7 +683,7 @@ class App(BaseApp):
                 description=description,
                 args_schema=operation.inputSchema,
                 is_local=metadata["is_local"],
-                provider_type=metadata["provider_type"],
+                provider=metadata["provider"],
                 scopes=metadata["scopes"],
                 network=metadata["network"],
                 timeout_seconds=metadata["timeout_seconds"],
@@ -701,7 +701,7 @@ class App(BaseApp):
         description: str,
         args_schema: dict[str, Any],
         is_local: bool,
-        provider_type: str | None,
+        provider: str | None,
         scopes: list[str],
         network: list[str],
         timeout_seconds: int,
@@ -726,7 +726,7 @@ class App(BaseApp):
             "name": name,
             "description": description,
             "is_local": is_local,
-            "provider_type": provider_type,
+            "provider": provider,
             "scopes": scopes,
             "network": network,
             "timeout_seconds": timeout_seconds,
@@ -753,7 +753,7 @@ class App(BaseApp):
                 args_schema=args_schema,
                 callable=func,
                 remote=not is_local,
-                provider_type=provider_type,
+                provider=provider,
                 scopes=scopes,
                 network=network,
                 timeout_seconds=timeout_seconds,
@@ -765,7 +765,7 @@ class App(BaseApp):
         self,
         is_local: bool = True,
         *,
-        provider_type: str | None = None,
+        provider: str | None = None,
         scopes: list[str] | None = None,
         network: list[str] | None = None,
         timeout: int = 30,
@@ -780,7 +780,7 @@ class App(BaseApp):
 
         Args:
             is_local: If True, runs in AER; if False, runs in Tool Pod (default: True)
-            provider_type: Credential provider type for delegated auth (e.g. "github")
+            provider: Credential provider key for delegated auth (e.g. "github")
             scopes: OAuth scopes requested for delegated auth
             network: Allowed network hosts (for tool pod)
             timeout: Execution timeout in seconds
@@ -818,7 +818,7 @@ class App(BaseApp):
                 description=fn.__doc__ or "",
                 args_schema=_derive_args_schema(langchain_tool),
                 is_local=is_local,
-                provider_type=provider_type,
+                provider=provider,
                 scopes=effective_scopes,
                 network=effective_network,
                 timeout_seconds=timeout,
@@ -1911,7 +1911,7 @@ class App(BaseApp):
                     "mcp_server": mcp_server_name,
                     "mcp_tool": mcp_tool_name,
                 }
-            provider_type = normalize_optional_str(tool_metadata.get("provider_type"))
+            provider = normalize_optional_str(tool_metadata.get("provider"))
             raw_scopes = tool_metadata.get("scopes")
             if isinstance(raw_scopes, list):
                 scopes = [
@@ -1947,7 +1947,7 @@ class App(BaseApp):
                 tool_name=tool_name,
                 allow_direct=allow_direct,
                 is_local=bool(tool_metadata.get("is_local", True)),
-                provider_type=provider_type,
+                provider=provider,
                 scopes=scopes,
                 metadata=tool_call_metadata,
                 response_format=response_format,
@@ -1964,7 +1964,7 @@ class App(BaseApp):
             )
 
             oauth_coroutine = None
-            if provider_type:
+            if provider:
                 wrapper_func, oauth_coroutine = _with_durable_oauth_task(
                     wrapper_func, tool_name=tool_name
                 )

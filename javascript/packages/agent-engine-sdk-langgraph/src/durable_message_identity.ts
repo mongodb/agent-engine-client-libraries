@@ -8,7 +8,11 @@ import {
   type BaseMessage,
   type BaseMessageLike,
 } from "@langchain/core/messages";
-import { RunnableLambda, type Runnable } from "@langchain/core/runnables";
+import {
+  RunnableLambda,
+  type Runnable,
+  type RunnableConfig,
+} from "@langchain/core/runnables";
 import {
   Overwrite,
   isCommand,
@@ -21,6 +25,8 @@ import {
   currentOperationPath,
   currentStepOrdinal,
 } from "@mongodb-js/agent-engine-runner-shared";
+
+import { sendTaskIndex } from "./durable_subgraphs.js";
 
 const installedNodes = new WeakSet<object>();
 
@@ -153,13 +159,16 @@ type GraphWithNodes = {
 export function installDurableMessageIdentity(
   graph: CompiledStateGraph<unknown, unknown>,
 ): void {
-  const source = graph as unknown as GraphWithNodes;
-  const discovered = source.getSubgraphs?.call(graph, undefined, true);
+  // `createAgent` and `createDeepAgent` return a wrapper around the compiled
+  // graph, which holds the nodes and channels.
+  const wrapped = (graph as unknown as { graph?: GraphWithNodes }).graph;
+  const source = wrapped ?? (graph as unknown as GraphWithNodes);
+  const discovered = source.getSubgraphs?.call(source, undefined, true);
   const graphs: unknown[] = [
     ...(discovered === undefined
       ? []
       : [...discovered].map(([, subgraph]) => subgraph)),
-    graph,
+    source,
   ];
   for (const compiled of graphs) {
     const { channels, nodes } = compiled as GraphWithNodes;
@@ -177,8 +186,18 @@ export function installDurableMessageIdentity(
       if (nodeName.startsWith("__") || installedNodes.has(node)) continue;
       node.bound = node.bound.pipe(
         new RunnableLambda({
-          func: (output: unknown) =>
-            withDurableMessageIdentity(output, nodeName, messageChannels),
+          func: (output: unknown, config?: RunnableConfig) => {
+            // Send tasks of one node can share its name, operation path and
+            // step, and the reducer keeps one message per ID. Only a later task
+            // adds its index, so a lone or first task keeps the ID a recorded
+            // turn already has.
+            const index = sendTaskIndex(config?.metadata);
+            return withDurableMessageIdentity(
+              output,
+              index ? `${nodeName}#send${index}` : nodeName,
+              messageChannels,
+            );
+          },
         }),
       );
       installedNodes.add(node);

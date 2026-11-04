@@ -521,6 +521,12 @@ class TestShellExecute:
         assert "EARLY" in result["output"]
         assert "LATE" not in result["output"]
 
+    def test_a_zero_timeout_runs_the_command_under_the_default(self, handlers):
+        """deepagents tells the model to pass 0 for "no timeout"; it must not kill the command."""
+        result = handlers.shell_execute("sleep 0.2; echo ran", timeout=0)
+        assert result["exit_code"] == 0
+        assert "ran" in result["output"]
+
     def test_unbounded_output_does_not_oom_pod(self, handlers, monkeypatch):
         """Drain threads must keep the child unblocked while discarding bytes past the cap."""
         monkeypatch.setattr(handlers, "SHELL_OUTPUT_MAX_BYTES", 1024)

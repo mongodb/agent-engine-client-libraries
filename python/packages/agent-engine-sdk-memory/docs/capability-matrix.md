@@ -132,3 +132,12 @@ selected. Both options work on the Gateway and OE HTTP modes. App-bound mode rai
 `MemoryNotSupportedError` when either is set: app-bound `build_context` flattens the
 response to a formatted string, and the per-source path does not thread the options
 through `TenantRuntime` yet.
+
+`Memory.build_context_from_sources` also accepts `collapse_duplicate_content`
+(default `True`). Set it to `False` to skip the content-based duplicate collapse —
+exact text matches and near-duplicates — both within a hybrid source and across
+sources, so each source contributes every candidate up to its `top_k` (a document
+surfacing from both the vector and text legs is still returned once either way;
+`max_tokens` still applies after merging). Like the response-shaping options above,
+app-bound mode raises `MemoryNotSupportedError` when the flag is set to `False`,
+because `TenantRuntime`'s per-source path does not carry it.

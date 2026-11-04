@@ -1385,6 +1385,46 @@ describe("SecureToolWrapper.executeTool", () => {
     }
   });
 
+  test("redacts credentials in an unclassified local callback failure", async () => {
+    const fetchSpy = vi
+      .fn()
+      .mockResolvedValueOnce(
+        jsonResponse({
+          proceed: true,
+          route_to: "callback",
+          latest_step_number: 1,
+        }),
+      )
+      .mockResolvedValueOnce(jsonResponse({ ok: true }));
+    vi.stubGlobal("fetch", fetchSpy);
+    const thrown = new Error(
+      "Authentication failed for mongodb+srv://ada:s3cr3t-pass@cluster0.example.net/admin",
+    );
+
+    const wrapper = new SecureToolWrapper("http://localhost:8080", "exec-123");
+    const rejection = await wrapper
+      .executeTool(
+        "native_command",
+        {},
+        {
+          isLocal: true,
+          localExecutor: async () => {
+            throw thrown;
+          },
+        },
+      )
+      .catch((error: unknown) => error);
+
+    // The framework turns the propagated message into the model's tool result.
+    expect(rejection).toBe(thrown);
+    expect(thrown.message).toContain("cluster0.example.net/admin");
+    expect(thrown.message).not.toContain("s3cr3t-pass");
+    const resultBody = JSON.parse(fetchSpy.mock.calls[1]?.[1].body as string);
+    expect(resultBody.status).toBe("error");
+    expect(String(resultBody.error)).toContain("Authentication failed for");
+    expect(String(resultBody.error)).not.toContain("s3cr3t-pass");
+  });
+
   test("latches a failed owner across local tool settlements", async () => {
     const oe = "http://oe.ns.svc.cluster.local:8000";
     const owner = "http://10-1-2-3.oe-headless.ns.svc.cluster.local:8000";
@@ -1437,7 +1477,7 @@ describe("SecureToolWrapper.executeTool", () => {
         "github_tool",
         {},
         {
-          providerType: "github",
+          provider: "github",
           scopes: ["repo:read"],
           isLocal: true,
           localExecutor,
@@ -2382,7 +2422,7 @@ describe("createSecureToolFunction", () => {
       { city: "Tokyo" },
       {
         metadata: undefined,
-        providerType: undefined,
+        provider: undefined,
         scopes: undefined,
         toolCallId: "call_abc123",
         rawOnInterrupt: true,
@@ -2417,7 +2457,7 @@ describe("createSecureToolFunction", () => {
       { city: "Tokyo" },
       {
         metadata: undefined,
-        providerType: undefined,
+        provider: undefined,
         scopes: undefined,
         toolCallId: "call_fallback",
         rawOnInterrupt: true,
@@ -2449,7 +2489,7 @@ describe("createSecureToolFunction", () => {
       { city: "Tokyo" },
       {
         metadata: undefined,
-        providerType: undefined,
+        provider: undefined,
         scopes: undefined,
         toolCallId: undefined,
         rawOnInterrupt: true,
@@ -2595,7 +2635,7 @@ describe("createSecureToolFunction", () => {
       { amount: 100 },
       {
         metadata: undefined,
-        providerType: undefined,
+        provider: undefined,
         scopes: undefined,
         toolCallId: undefined,
         rawOnInterrupt: true,

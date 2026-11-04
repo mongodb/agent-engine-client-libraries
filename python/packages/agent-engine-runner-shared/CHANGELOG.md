@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **Breaking:** the connector `tool.yaml` `auth` block no longer takes `type`.
+  It names exactly one credential: `bearer: <secret>`, `basic: {username,
+  password}`, `api_keys: [{env, location, name, prefix}]`, or
+  `provider: <OAuth app>` with optional `scopes`, plus optional `headers`; omit
+  the block for no credential. A block that still uses `type` or its fields
+  fails validation and names the key to use instead. `compile_catalog` and
+  `scaffold_tool_yaml` propose the block from the document's security schemes
+  and derive secret names from the connector name; `auth` now takes `none`,
+  `bearer`, `basic` or `api_keys`, and an OAuth document needs `provider`.
+  Generated catalogs record the credential kind without `type`.
+  `Auth.header_name()` and `Auth.credential_bindings()` are removed; read
+  `Auth.api_keys`. Regenerating a connector with no `auth` block compiles every
+  operation anonymously instead of from the OpenAPI document's security, so
+  operations the first compile skipped can appear as tools; they send no
+  credential.
+
 ### Removed
 - Removed the unused pre-materialized connector bundle override
   (`AGENTIC_CONNECTOR_BUNDLE_PATH`) and the `load_connector_bundle` /

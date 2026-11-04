@@ -334,7 +334,7 @@ async def test_oauth_tool_resumed_by_continue_never_returns_none(
                 wrapper.execute_tool(
                     "list_repos",
                     {},
-                    provider_type="keycloak",
+                    provider="keycloak",
                     scopes=["repo"],
                     is_local=False,
                 )

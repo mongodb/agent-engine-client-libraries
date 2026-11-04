@@ -90,6 +90,7 @@ class MemoryRuntime(Protocol):
         max_tokens: int | None = None,
         format_style: FormatStyle | str | None = None,
         include_memories: bool = False,
+        collapse_duplicate_content: bool = True,
     ) -> ContextResponse: ...
 
     def search_semantic(

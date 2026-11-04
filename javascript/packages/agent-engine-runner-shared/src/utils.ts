@@ -15,19 +15,11 @@ const logger = getLogger("agent_engine_runner_shared.utils");
 export enum RuntimeMode {
   AER = "aer",
   TOOL = "tool",
-  // Tool role, per-call (function) lifecycle: the process boots, runs a
-  // single named tool from the registry, reports the result, and exits.
-  // TOOL is the same role as a long-running server handling many /execute
-  // calls. The value carries the role because the function lifecycle is
-  // orthogonal to it (a future per-call AER would be e.g. "aer_function").
-  // The invocation is read once from the guest metadata channel, not env.
-  TOOL_FUNCTION = "tool_function",
 }
 
 const MODE_MAP: Record<string, RuntimeMode> = {
   [RuntimeMode.AER]: RuntimeMode.AER,
   [RuntimeMode.TOOL]: RuntimeMode.TOOL,
-  [RuntimeMode.TOOL_FUNCTION]: RuntimeMode.TOOL_FUNCTION,
 };
 
 /**

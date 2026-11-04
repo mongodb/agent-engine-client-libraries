@@ -130,13 +130,6 @@ class RuntimeMode(str, Enum):
 
     AER = "aer"
     TOOL = "tool"
-    # Tool role, per-call (function) lifecycle: the process boots, runs a
-    # single named tool from the registry, reports the result, and exits.
-    # TOOL is the same role as a long-running server handling many /execute
-    # calls. The value carries the role because the function lifecycle is
-    # orthogonal to it (a future per-call AER would be e.g. "aer_function").
-    # The invocation is read once from the guest metadata channel, not env.
-    TOOL_FUNCTION = "tool_function"
 
 
 _MODE_MAP: dict[str, RuntimeMode] = {m.value: m for m in RuntimeMode}
@@ -689,7 +682,7 @@ def setup_logging(
 
     Args:
         app_name: Application name for log file naming
-        mode: Runtime mode (aer, tool, tool_function)
+        mode: Runtime mode (aer, tool)
         log_dir: Directory for log files (default: ./logs)
         log_level: Log level (default: from LOG_LEVEL env or INFO)
         backup_count: Number of rotated backup files to keep

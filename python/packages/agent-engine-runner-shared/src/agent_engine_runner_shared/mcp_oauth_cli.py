@@ -113,6 +113,7 @@ async def status_oauth_server(
     """Print cache status, optionally validating cached credentials with ``tools/list``."""
 
     output = out or sys.stdout
+    assert config.url is not None  # The oauth auth type requires a URL.
     status = read_cache_status(server_name, config.url, cache_dir, now=datetime.now(UTC))
     print(
         format_cache_status(server_name, status, display_cache_dir=display_cache_dir), file=output
@@ -401,6 +402,7 @@ def main(argv: list[str] | None = None) -> int:
                     redirect_uri=redirect_uri,
                 )
             )
+            assert server.url is not None  # The oauth auth type requires a URL.
             cache_path = FileOAuthTokenStorage(args.server, server.url, args.cache_dir).path
             display_cache_path = cache_path
             if args.display_cache_dir is not None:

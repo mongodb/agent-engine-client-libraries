@@ -7,7 +7,6 @@ export const SERVICE_BY_MODE: Record<string, string> = {
   orchestrator: "orchestration-engine",
   aer: "agent-execution-runtime",
   tool: "tool-executor",
-  tool_function: "tool-executor",
   "memory-server": "memory-server",
 };
 

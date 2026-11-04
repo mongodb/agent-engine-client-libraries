@@ -1,8 +1,10 @@
 # Compiled connector core
 
-This Python-only package implements definition loading, synchronous HTTP execution and
-opt-in registration. It is not exposed through the CLI. Connector tools use the existing
-AER → OE → Tool Pod execution path.
+The Python and TypeScript Runner SDKs share this connector contract. The Python
+implementation covers definition loading, synchronous HTTP execution, and opt-in
+registration; the TypeScript implementation mirrors the same materialization,
+registration, and execution contract. It is not exposed through the CLI. Connector
+tools use the existing AER → OE → Tool Pod execution path.
 
 Runtime integration follows the platform's config → discover → register flow: each
 process derives its own view from the same manifest. Resolution in
@@ -35,24 +37,26 @@ source:
 expose:
   allow: [jiradc_getComments]
 auth:
-  type: bearer
-  env: JIRA_TOKEN
+  bearer: JIRA_TOKEN
 ```
 
-For delegated OAuth, replace that auth block with an explicit provider binding:
+The block names exactly one of `bearer`, `basic`, `api_keys` or `provider`, by
+workspace secret name or OAuth app; no block means no credential. For OAuth,
+bind the project's OAuth app instead:
 
 ```yaml
 auth:
-  type: oauth
-  provider_type: github
+  provider: github
   scopes: [repo]
 ```
 
-`provider_type` is the key of a provider configured for the project, independent
+`provider` names an OAuth app configured for the project, independent
 of the resource API's base URL. The scopes apply to every exposed operation in
 this connector. Registration carries this policy outside the model's argument
-schema. The Orchestration Engine resolves a credential for the saved application
-user and passes it to the Tool Pod for that invocation. A missing or invalid token
+schema. The Orchestration Engine resolves a credential and passes it to the Tool
+Pod for that invocation. The app's grant decides whose: an authorization code app
+gives the saved application user's token, and a client credentials app gives the
+project's shared token with no user and no consent. A missing or invalid token
 stops the HTTP call; OAuth never falls back to a tenant environment secret.
 Existing static auth modes continue to use their configured environment bindings.
 Catalog regeneration preserves the authored OAuth binding and records only

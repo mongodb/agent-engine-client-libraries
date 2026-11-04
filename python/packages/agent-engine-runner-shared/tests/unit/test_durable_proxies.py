@@ -153,7 +153,7 @@ class TestDurableToolWrapper:
                 "lookup",
                 {"q": 1},
                 metadata={"trace": "platform-value"},
-                provider_type="github",
+                provider="github",
                 scopes=["repo", "issues"],
                 tool_call_id="call-1",
                 is_local=True,

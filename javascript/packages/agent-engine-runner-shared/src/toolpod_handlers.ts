@@ -824,7 +824,9 @@ function buildShellEnv(): Record<string, string> {
 /**
  * Run a shell command and capture its output. Per
  * `SandboxBackendProtocol.execute`, *timeout* is `null` = "use the backend
- * default" (SHELL_DEFAULT_TIMEOUT_SECONDS), not "no timeout".
+ * default" (SHELL_DEFAULT_TIMEOUT_SECONDS), not "no timeout". So is `0`, which
+ * a sandbox protocol may read as "no timeout": this backend never runs a
+ * command unbounded.
  *
  * Threat model: `shell: true` is intentional — agents need pipes, redirects,
  * globs. The sandbox is the Tool Pod itself.
@@ -851,8 +853,7 @@ export async function shellExecute(
 ): Promise<Record<string, unknown>> {
   const command = String(args["command"] ?? "");
   const rawTimeout = args["timeout"];
-  const effectiveTimeout =
-    rawTimeout == null ? SHELL_DEFAULT_TIMEOUT_SECONDS : Number(rawTimeout);
+  const effectiveTimeout = Number(rawTimeout) || SHELL_DEFAULT_TIMEOUT_SECONDS;
 
   let cwd: string;
   try {

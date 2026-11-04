@@ -75,6 +75,10 @@ function llmTokenUsageToDict(usage: LLMTokenUsage): Record<string, JsonValue> {
     completion_tokens: usage.completionTokens,
     total_tokens: usage.totalTokens,
     model: usage.model,
+    // The provider already folds cache reads into input_tokens; the mapping
+    // reports them alongside so a cached prompt is distinguishable.
+    input_token_details: usage.inputTokenDetails,
+    output_token_details: usage.outputTokenDetails,
   });
 }
 

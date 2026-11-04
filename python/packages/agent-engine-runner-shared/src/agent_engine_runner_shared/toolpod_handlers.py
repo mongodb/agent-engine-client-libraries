@@ -748,7 +748,9 @@ def shell_execute(command: str, *, timeout: int | None = None) -> dict[str, Any]
 
     Per ``deepagents.SandboxBackendProtocol.execute``, *timeout* is
     keyword-only. ``None`` means "use the backend default"
-    (:data:`SHELL_DEFAULT_TIMEOUT_SECONDS`), not "no timeout".
+    (:data:`SHELL_DEFAULT_TIMEOUT_SECONDS`), not "no timeout". So does ``0``,
+    which the protocol lets a backend read as "no timeout": deepagents tells the
+    model it can pass it, and this backend never runs a command unbounded.
 
     Threat model
     ------------
@@ -786,7 +788,7 @@ def shell_execute(command: str, *, timeout: int | None = None) -> dict[str, Any]
     with the error message in ``"error"`` — distinct from the timeout
     sentinel so callers can tell the two apart.
     """
-    effective_timeout = timeout if timeout is not None else SHELL_DEFAULT_TIMEOUT_SECONDS
+    effective_timeout = timeout or SHELL_DEFAULT_TIMEOUT_SECONDS
 
     try:
         cwd = _effective_workspace_dir()

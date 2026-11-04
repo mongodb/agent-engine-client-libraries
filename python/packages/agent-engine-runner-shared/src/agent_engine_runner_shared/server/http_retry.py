@@ -1,9 +1,8 @@
-"""Bounded-retry JSON POST shared by the AER chunk stream and function mode.
+"""Bounded-retry JSON POST for the AER's OE callback delivery.
 
-Both the AER's streaming-chunk delivery and function mode need to POST a JSON
-body to the Orchestration Engine and tolerate transient transport failures.
-This module holds the single retry policy both paths use so the behaviour
-stays identical.
+The AER's streaming-chunk and terminal-callback POSTs to the Orchestration
+Engine must tolerate transient transport failures. This module holds the
+single retry policy they share.
 """
 
 from __future__ import annotations

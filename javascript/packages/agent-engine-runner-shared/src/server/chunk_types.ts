@@ -36,12 +36,14 @@ export const POLICY_DENIED_ERROR_CODE = "policy_denied";
 
 /**
  * Machine-readable discriminator set on `metadata.error_code` of an ERROR
- * chunk/callback when a deadline expired rather than the work failing. Covers
- * both flavours — one tool/LLM call overrunning, and the whole turn overrunning —
- * because a consumer's response to either is the same: offer more time or a
- * retry, not a bug report. Forwarded verbatim like the values above.
+ * chunk/callback when a tool or LLM call exceeds its deadline. Older runners
+ * also use this code for whole-turn expiry, so consumers cannot assume which
+ * deadline a bare timeout describes.
  */
 export const TIMEOUT_ERROR_CODE = "timeout";
+
+/** Only a positively identified whole-turn deadline gets run-limit copy. */
+export const RUN_TIMEOUT_ERROR_CODE = "run_timeout";
 
 /**
  * Machine-readable discriminator set on `metadata.error_code` of an ERROR

@@ -7,14 +7,13 @@
 
 export {
   AuthSchema,
+  BasicAuthSchema,
   ConnectorDefinitionError,
   CredentialSchema,
   OperationSchema,
   ParametersSchema,
   SourceSchema,
   ToolDefinitionsSchema,
-  authCredentialBindings,
-  authHeaderName,
   authHeaderNames,
   isRecord,
   loadToolDefs,
@@ -23,7 +22,7 @@ export {
   validateSegment,
   validateUrl,
   type Auth,
-  type AuthType,
+  type BasicAuth,
   type Credential,
   type Operation,
   type Parameters,
@@ -44,3 +43,24 @@ export {
   materializeConnectors,
   resolveRuntimeBundle,
 } from "./materialize.js";
+export {
+  ConnectorExecutor,
+  ConnectorHTTPError,
+  DEFAULT_EXECUTION_TIMEOUT_SECONDS,
+  MAX_ERROR_ENVELOPE_BYTES,
+  MAX_REDIRECTS,
+  MAX_RESPONSE_BYTES,
+  MAX_RETRIES,
+  USER_AGENT,
+  type ConnectorExecutorOptions,
+  type ConnectorTransport,
+  type ConnectorTransportRequest,
+  type ConnectorTransportResponse,
+} from "./executor.js";
+export {
+  ConnectorToolRegistration,
+  ConnectorToolRuntime,
+  registerConnectorTools,
+  withConnectorEnvironment,
+  type ConnectorRuntimeTarget,
+} from "./runtime.js";

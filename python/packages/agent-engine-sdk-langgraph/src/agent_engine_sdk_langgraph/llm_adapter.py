@@ -15,7 +15,6 @@ from collections.abc import AsyncIterator
 from typing import Any, cast
 
 from langchain_core.messages import BaseMessage, BaseMessageChunk
-from langchain_core.runnables import RunnableBinding
 from agent_engine_sdk.interfaces import BaseLLM
 from agent_engine_sdk.models import (
     LLMResponse,
@@ -27,7 +26,8 @@ from agent_engine_sdk.models import (
 )
 from pydantic import JsonValue
 
-from agent_engine_sdk_langgraph.messages import platform_messages_to_lc
+from agent_engine_sdk_langgraph.chat_model import unwrap_chat_model
+from agent_engine_sdk_langgraph.provider_call import prepare_provider_call
 from agent_engine_runner_shared.async_utils import iterate_in_thread
 from agent_engine_runner_shared.models import (
     LLMResult,
@@ -67,15 +67,26 @@ class LangChainLLMAdapter(BaseLLM):
         else:
             self._llm = llm
 
+    def _prepare_call(
+        self, messages: list[Message], kwargs: dict[str, Any]
+    ) -> tuple[list[BaseMessage], dict[str, Any]]:
+        """Convert platform messages and apply the provider's request shape.
+
+        See ``provider_call`` for why provider rules run here rather than in the
+        agent or the framework.
+        """
+        prepared = prepare_provider_call(self._llm, messages, kwargs)
+        return prepared.messages, prepared.options
+
     def invoke(self, messages: list[Message], **kwargs: object) -> LLMResponse:
         """Synchronous LLM invocation."""
-        lc_messages = platform_messages_to_lc(messages)
+        lc_messages, kwargs = self._prepare_call(messages, kwargs)
         response = self._llm.invoke(lc_messages, **kwargs)
         return _response_to_llm_response(response)
 
     async def ainvoke(self, messages: list[Message], **kwargs: object) -> LLMResponse:
         """Async LLM invocation."""
-        lc_messages = platform_messages_to_lc(messages)
+        lc_messages, kwargs = self._prepare_call(messages, kwargs)
         if asyncio.iscoroutinefunction(getattr(self._llm, "ainvoke", None)):
             response = await self._llm.ainvoke(lc_messages, **kwargs)
         else:
@@ -88,7 +99,7 @@ class LangChainLLMAdapter(BaseLLM):
         """Async streaming LLM invocation."""
         import inspect
 
-        lc_messages = platform_messages_to_lc(messages)
+        lc_messages, kwargs = self._prepare_call(messages, kwargs)
 
         if hasattr(self._llm, "astream"):
             # Chat Completions omits usage unless asked. Responses.create
@@ -122,13 +133,9 @@ class LangChainLLMAdapter(BaseLLM):
             yield stream_chunk
 
 
-def _unwrap_chat_model(llm: Any) -> Any:
-    return llm.bound if isinstance(llm, RunnableBinding) else llm
-
-
 def _uses_responses_api(llm: Any) -> bool:
     """True when LangChain will call ``Responses.create``, which rejects ``stream_usage``."""
-    model = _unwrap_chat_model(llm)
+    model = unwrap_chat_model(llm)
     if getattr(model, "use_responses_api", None) is True:
         return True
     probe = getattr(model, "_use_responses_api", None)
@@ -143,7 +150,7 @@ def _uses_responses_api(llm: Any) -> bool:
 
 def _supports_stream_usage(llm: Any) -> bool:
     """True when the model declares ``stream_usage`` and is not on the Responses API."""
-    model = _unwrap_chat_model(llm)
+    model = unwrap_chat_model(llm)
     fields = getattr(type(model), "model_fields", None)
     return (
         isinstance(fields, dict)

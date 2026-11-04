@@ -39,6 +39,54 @@ test("redactText scrubs common secret patterns", () => {
   expect(redacted).not.toContain(home);
 });
 
+test("redactText scrubs private keys, Atlas service-account secrets and API keys", () => {
+  const pem = [
+    "-----BEGIN RSA PRIVATE KEY-----",
+    "MIIEowIBAAKCAQEA7exampleprivatekeymaterial",
+    "-----END RSA PRIVATE KEY-----",
+  ].join("\n");
+  const redacted = redactText(
+    `upstream failed: key=sk-proj-abcdefghijklmnopqrstuvwxyz012345 sa=mdb_sa_sk_fake-not-a-real-secret\n${pem}\ndone`,
+  );
+
+  expect(redacted).not.toContain("abcdefghijklmnopqrstuvwxyz012345");
+  expect(redacted).not.toContain("fake-not-a-real-secret");
+  expect(redacted).not.toContain("exampleprivatekeymaterial");
+  expect(redacted).toContain("sa=mdb_sa_sk_<redacted>");
+  expect(redacted).toContain("upstream failed:");
+  expect(redacted).toContain("<redacted>\ndone");
+});
+
+test("redactText scrubs a private key given as a key=value secret", () => {
+  const redacted = redactText(
+    "secret=-----BEGIN RSA PRIVATE KEY-----\nMIIEexamplekeybody\n-----END RSA PRIVATE KEY----- done",
+  );
+
+  expect(redacted).not.toContain("MIIEexamplekeybody");
+  expect(redacted).toContain("done");
+});
+
+test("redactText scrubs a quoted JSON secret value and keeps it quoted", () => {
+  expect(redactText('provider failed: {"password":"opaque-value"}')).toBe(
+    'provider failed: {"password":"<redacted>"}',
+  );
+});
+
+test("redactText leaves short sk- words and unterminated PEM headers alone", () => {
+  expect(redactText("task-runner failed: sk-short")).toBe(
+    "task-runner failed: sk-short",
+  );
+  const unterminated = "-----BEGIN PRIVATE KEY----- truncated";
+  expect(redactText(unterminated)).toBe(unterminated);
+});
+
+test("redactText stays linear on repeated unterminated PEM headers", () => {
+  const text = "-----BEGIN PRIVATE KEY-----".repeat(50_000);
+  const started = performance.now();
+  expect(redactText(text)).toBe(text);
+  expect(performance.now() - started).toBeLessThan(1_000);
+});
+
 test("redactText scrubs a bare-token URL credential (no user:pass pair)", () => {
   const redacted = redactText(
     "clone failed: https://ghp_abcdef123456@github.com/org/repo",

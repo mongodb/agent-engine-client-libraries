@@ -259,33 +259,58 @@ export type RuntimeMCPAuthConfig = z.infer<typeof RuntimeMCPAuthConfigSchema>;
 export const RuntimeMCPServerConfigSchema = z
   .object({
     transport: z.literal("streamable_http").default("streamable_http"),
-    url: NonEmptyString,
+    // An entry with no url names a project OAuth app with its key, and the
+    // app's resource is the endpoint.
+    url: NonEmptyString.nullable().default(null),
+    // No defaults on scopes and auth, so the rules below can tell a written
+    // value from an omitted one; the transform at the end applies them.
+    scopes: z.array(NonEmptyString).optional(),
     headers: z.record(z.string(), z.string()).default({}),
-    auth: RuntimeMCPAuthConfigSchema.default(
-      RuntimeMCPAuthConfigSchema.parse({}),
-    ),
+    auth: RuntimeMCPAuthConfigSchema.optional(),
     allowed_tools: z.array(NonEmptyString).nullable().default(null),
     timeout_seconds: z.number().int().gt(0).default(30),
   })
   .strip()
   .superRefine((value, ctx) => {
-    const parsedUrl = tryParseUrl(value.url);
-    const validScheme =
-      parsedUrl !== null &&
-      (parsedUrl.protocol === "http:" || parsedUrl.protocol === "https:") &&
-      !!parsedUrl.hostname;
-    if (!validScheme) {
-      ctx.addIssue({
-        code: "custom",
-        message: "mcp server url must be an absolute http(s) URL",
-        path: ["url"],
-      });
-    } else if (parsedUrl?.protocol === "http:" && value.auth.type !== "none") {
-      ctx.addIssue({
-        code: "custom",
-        message: "mcp server url must be https when auth.type is set",
-        path: ["url"],
-      });
+    const authType = value.auth?.type ?? "none";
+    if (value.url === null) {
+      // The app supplies the credential, so an auth block here could only
+      // disagree with it.
+      if (value.auth !== undefined) {
+        ctx.addIssue({
+          code: "custom",
+          message:
+            "mcp server auth is not allowed without url; an entry with no url names an OAuth app",
+          path: ["auth"],
+        });
+      }
+    } else {
+      if (value.scopes !== undefined) {
+        ctx.addIssue({
+          code: "custom",
+          message:
+            "mcp server scopes is not allowed with url; scopes apply to an entry that names an OAuth app",
+          path: ["scopes"],
+        });
+      }
+      const parsedUrl = tryParseUrl(value.url);
+      const validScheme =
+        parsedUrl !== null &&
+        (parsedUrl.protocol === "http:" || parsedUrl.protocol === "https:") &&
+        !!parsedUrl.hostname;
+      if (!validScheme) {
+        ctx.addIssue({
+          code: "custom",
+          message: "mcp server url must be an absolute http(s) URL",
+          path: ["url"],
+        });
+      } else if (parsedUrl?.protocol === "http:" && authType !== "none") {
+        ctx.addIssue({
+          code: "custom",
+          message: "mcp server url must be https when auth.type is set",
+          path: ["url"],
+        });
+      }
     }
 
     const forbiddenHeaders = Object.keys(value.headers)
@@ -300,7 +325,12 @@ export const RuntimeMCPServerConfigSchema = z
         path: ["headers"],
       });
     }
-  });
+  })
+  .transform(({ scopes, auth, ...server }) => ({
+    ...server,
+    scopes: scopes ?? [],
+    auth: auth ?? RuntimeMCPAuthConfigSchema.parse({}),
+  }));
 export type RuntimeMCPServerConfig = z.infer<
   typeof RuntimeMCPServerConfigSchema
 >;

@@ -10,7 +10,6 @@ import {
   CredentialSchema,
   SourceSchema,
   ToolDefinitionsSchema,
-  authCredentialBindings,
   authHeaderNames,
   loadToolDefs,
   toolSchemas,
@@ -68,30 +67,17 @@ describe("connector definitions", () => {
     expect(definitions.tools[0]?.inputSchema).not.toHaveProperty("name");
   });
 
-  it("derives auth headers and credential bindings", () => {
+  it("derives auth headers", () => {
     const definitions = loadToolDefs(FIXTURE);
     expect(authHeaderNames(definitions.auth)).toEqual(
       new Set(["authorization"]),
     );
-    expect(authCredentialBindings(definitions.auth)).toEqual([]);
 
-    const oauth = ToolDefinitionsSchema.parse({
+    const delegated = ToolDefinitionsSchema.parse({
       ...fixtureDocument(),
-      auth: { type: "oauth", provider_type: "custom-github", scopes: ["repo"] },
+      auth: { provider: "custom-github", scopes: ["repo"] },
     });
-    expect(authHeaderNames(oauth.auth)).toEqual(new Set(["authorization"]));
-    expect(authCredentialBindings(oauth.auth)).toEqual([]);
-  });
-
-  it("rejects auth fields that belong to another auth type", () => {
-    const result = ToolDefinitionsSchema.safeParse({
-      ...fixtureDocument(),
-      auth: { type: "bearer", env: "JIRA_TOKEN", provider_type: "github" },
-    });
-    expect(result.success).toBe(false);
-    expect(messages(result)).toContain(
-      "bearer auth contains fields for another auth type",
-    );
+    expect(authHeaderNames(delegated.auth)).toEqual(new Set(["authorization"]));
   });
 
   it("rejects auth headers used as model arguments", () => {
@@ -192,26 +178,20 @@ describe("connector definitions", () => {
 
   it("normalizes static auth bindings", () => {
     const apiKey = AuthSchema.parse({
-      type: "api_key",
-      env: "API_KEY",
-      location: "query",
-      name: "api_key",
+      api_keys: [{ env: "API_KEY", location: "query", name: "api_key" }],
     });
     expect(authHeaderNames(apiKey)).toEqual(new Set());
-    expect(authCredentialBindings(apiKey)).toEqual([
+    expect(apiKey.api_keys).toEqual([
       { env: "API_KEY", location: "query", name: "api_key", prefix: "" },
     ]);
 
     const basic = AuthSchema.parse({
-      type: "basic",
-      username_env: "JIRA_USER",
-      password_env: "JIRA_PASSWORD",
+      basic: { username: "JIRA_USER", password: "JIRA_PASSWORD" },
     });
     expect(authHeaderNames(basic)).toEqual(new Set(["authorization"]));
 
     const multi = AuthSchema.parse({
-      type: "api_keys",
-      credentials: [
+      api_keys: [
         {
           env: "FIRST_KEY",
           location: "header",
@@ -376,16 +356,15 @@ describe("connector definitions", () => {
     const parsed = loadAuthoringYaml(
       [
         "shared_auth: &shared_auth",
-        "  type: bearer",
-        "  env: JIRA_TOKEN",
+        "  bearer: JIRA_TOKEN",
         "auth:",
         "  <<: *shared_auth",
         "allow_all: yes",
       ].join("\n"),
     ) as Record<string, unknown>;
     expect(parsed).toEqual({
-      shared_auth: { type: "bearer", env: "JIRA_TOKEN" },
-      auth: { type: "bearer", env: "JIRA_TOKEN" },
+      shared_auth: { bearer: "JIRA_TOKEN" },
+      auth: { bearer: "JIRA_TOKEN" },
       allow_all: true,
     });
   });

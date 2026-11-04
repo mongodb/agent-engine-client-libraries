@@ -119,8 +119,8 @@ on failure `content` is null and `error` carries a classified message.
 
 Native-mode batches fan out on a bounded worker pool so skills loading
 pays one round-trip of latency instead of a sum. Durable attempts stay
-sequential: unkeyed activities are exclusive under the attempt gate, and
-overlapping them raises CONFLICT.
+sequential: a worker pool picks up the next file as one finishes, so
+positions would depend on completion order.
 
 **Parameters**
 
@@ -914,9 +914,9 @@ decorator. Equivalent to the Python SDK's `@app.prepare_agent_input`.
 ready(): Promise<void>;
 ```
 
-Resolved once configured MCP servers have been discovered and registered
-as tools. `TenantRuntime.runAsync()` awaits this (via `GraphBuilderLike.ready()`)
-before starting the server.
+Resolved once configured MCP servers have been discovered and connector
+tools registered. `TenantRuntime.runAsync()` awaits this (via
+`GraphBuilderLike.ready()`) before starting the server.
 
 **Returns**
 
@@ -1515,7 +1515,7 @@ Options accepted by [App.entrypoint](#api-entrypoint).
 | <a id="api-property-name-1"></a> `name?` | `string` | Override the registered tool name. Defaults to the wrapped function's `name`. |
 | <a id="api-property-network"></a> `network?` | readonly `string`[] | - |
 | <a id="api-property-onunknownoutcome"></a> `onUnknownOutcome?` | [`OnUnknownOutcome`](#api-onunknownoutcome) | What a retry does when the platform lost the runner while this tool was running in a durable workflow, so nobody knows whether it ran. `"rerun"` runs the tool again (at-least-once execution; declare it only for a tool that is safe to run twice). `"fail"` refuses the retry, so the tool never runs twice. Leave unset for the platform default. |
-| <a id="api-property-providertype"></a> `providerType?` | `string` | - |
+| <a id="api-property-provider"></a> `provider?` | `string` | - |
 | <a id="api-property-redactfields"></a> `redactFields?` | readonly `string`[] | - |
 | <a id="api-property-schema"></a> `schema?` | `ZodType`\<`unknown`, `unknown`, `$ZodTypeInternals`\<`unknown`, `unknown`\>\> | Zod schema describing the tool's arguments. Without it, the LLM has no structured view of the parameters and tool calling will fail. Mirrors the type hints + Pydantic-style auto-schema that Python's `@app.tool()` derives from the function signature. |
 | <a id="api-property-scopes"></a> `scopes?` | readonly `string`[] | - |

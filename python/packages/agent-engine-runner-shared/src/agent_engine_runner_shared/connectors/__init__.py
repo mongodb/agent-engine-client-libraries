@@ -8,6 +8,7 @@ from agent_engine_runner_shared.connectors.bundle import (
 )
 from agent_engine_runner_shared.connectors.definitions import (
     Auth,
+    BasicAuth,
     Credential,
     ToolDefinitions,
     load_tool_defs,
@@ -43,6 +44,7 @@ __all__ = [
     "GenerateError",
     "MaterializeError",
     "Auth",
+    "BasicAuth",
     "ToolDefinitions",
     "compile_catalog",
     "load_tool_defs",

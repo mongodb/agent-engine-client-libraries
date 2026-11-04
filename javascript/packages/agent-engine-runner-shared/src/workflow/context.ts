@@ -39,6 +39,8 @@ interface AttemptContextHolder {
 
 const storage = new AsyncLocalStorage<AttemptContextHolder>();
 
+const TOOL_EFFECTS_SEGMENT = "tool:effects";
+
 /**
  * Framework-neutral identity for one nested operation.
  *
@@ -241,6 +243,8 @@ class ActivityOrdinalAllocator {
   private readonly nextByPath = new Map<PathKey, number>();
   private readonly byPathAndKey = new Map<string, number>();
   private readonly preallocatedPathsByKey = new Map<string, PathKey[]>();
+  // Path-and-key pairs preallocated beside at least one other key.
+  private readonly batchedKeys = new Set<string>();
   // Key -> spawning scope -> owner, for keys a spawned task took, so a later
   // preallocation of the same key in that scope fails instead of having lost a
   // race it would win on another attempt. Kept per scope so a take in one
@@ -274,8 +278,17 @@ class ActivityOrdinalAllocator {
         paths.push(path);
         this.preallocatedPathsByKey.set(key, paths);
       }
+      if (keys.length > 1) this.batchedKeys.add(JSON.stringify([path, key]));
       return this.allocate(path, key);
     });
+  }
+
+  /** The ordinal of `key` if it was preallocated at `path` beside other keys. */
+  batchedOrdinal(path: PathKey, key: string): number | undefined {
+    const pathKey = JSON.stringify([path, key]);
+    return this.batchedKeys.has(pathKey)
+      ? this.byPathAndKey.get(pathKey)
+      : undefined;
   }
 
   /**
@@ -724,6 +737,49 @@ export function allocateActivityPosition(key?: string): {
       ),
     }),
     activityOrdinal,
+  };
+}
+
+/**
+ * Return the position of one operation a tool call performs on its own behalf,
+ * such as a file operation inside a filesystem tool.
+ *
+ * Operations of tool calls the same model turn requested may reach OE in any
+ * order, so a shared ordinal sequence would give them different positions on
+ * another attempt. Each therefore takes its ordinals under a path derived from
+ * its call's preallocated ordinal, which the model's list order fixes. An
+ * operation of a lone call stays in the current path: nothing overlaps it, and
+ * a turn recorded before derived paths existed still replays.
+ *
+ * Operations within one call number by first arrival. A call whose concurrent
+ * branches each perform several operations can arrive differently on another
+ * attempt, which OE refuses as nondeterministic rather than repeating an effect.
+ */
+export function allocateToolEffectPosition(toolCallId: string): {
+  operationPath: OperationPath;
+  activityOrdinal: number;
+} {
+  const holder = requireHolder("activity_ordinal");
+  const current = currentOperationPath().segments;
+  const callOrdinal = holder.activityOrdinals.batchedOrdinal(
+    pathKeyFromSegments(current),
+    toolActivityKey(toolCallId),
+  );
+  const segments =
+    callOrdinal === undefined
+      ? current
+      : [
+          ...current,
+          create(OperationPathSegmentSchema, {
+            name: TOOL_EFFECTS_SEGMENT,
+            ordinal: BigInt(callOrdinal),
+          }),
+        ];
+  return {
+    operationPath: create(OperationPathSchema, { segments }),
+    activityOrdinal: holder.activityOrdinals.allocate(
+      pathKeyFromSegments(segments),
+    ),
   };
 }
 

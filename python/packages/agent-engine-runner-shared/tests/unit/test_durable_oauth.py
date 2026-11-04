@@ -119,7 +119,7 @@ def _run(
         result = wrapper.execute_tool(
             "github",
             {},
-            provider_type="configured-github",
+            provider="configured-github",
             scopes=["repo"],
             tool_call_id=call_id,
             is_local=False,
@@ -275,7 +275,7 @@ def test_coalesced_consent_waits_keep_individual_provenance_after_one_answer():
                 wrapper.execute_tool(
                     "github",
                     {},
-                    provider_type="configured-github",
+                    provider="configured-github",
                     is_local=False,
                     tool_call_id=call_id,
                 )
@@ -286,7 +286,7 @@ def test_coalesced_consent_waits_keep_individual_provenance_after_one_answer():
             proceed=True, status="success", result={"repo": "alice-a"}
         )
         wrapper.execute_tool(
-            "github", {}, provider_type="configured-github", is_local=False, tool_call_id="call-a"
+            "github", {}, provider="configured-github", is_local=False, tool_call_id="call-a"
         )
         assert oauth_authorization_wait_id(pending[1]) == "flow-alice"
         assert (

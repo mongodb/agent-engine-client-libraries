@@ -83,11 +83,16 @@ jobs:
 
   publish-python-memory:
     name: publish-python / agent-engine-sdk-memory
+    # This job checks out the triggering ref, which a manual run can set to
+    # any branch. Release writes and the canary dispatch token stay in
+    # record-memory-sdk-release.yml. That workflow only follows a default-branch
+    # publish and runs the recorder from that commit.
     needs: [resolve-mode, publish-python-core]
     runs-on: ubuntu-latest
     permissions:
       contents: read
       id-token: write
+      actions: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: astral-sh/setup-uv@ae62891fec2bb8e7d6c99fc78c9fec3a63790f8d # v10.0.0
@@ -106,6 +111,31 @@ jobs:
         with:
           packages-dir: dist
           skip-existing: true
+      - name: Record memory SDK manifest
+        if: needs.resolve-mode.outputs.dry-run != 'true'
+        run: bash ./scripts/record-memory-sdk-manifest.sh --dist-dir dist
+      - name: Stage memory SDK record
+        if: needs.resolve-mode.outputs.dry-run != 'true'
+        run: |
+          set -euo pipefail
+          stage="${GITHUB_WORKSPACE}/sdk-memory-record"
+          mkdir -p "$stage"
+          if [ -f "${GITHUB_WORKSPACE}/sdk-memory-manifest.json" ]; then
+            cp "${GITHUB_WORKSPACE}/sdk-memory-manifest.json" "$stage/"
+          elif [ -f "${GITHUB_WORKSPACE}/sdk-memory-manifest.json.skipped" ]; then
+            cp "${GITHUB_WORKSPACE}/sdk-memory-manifest.json.skipped" "$stage/"
+          else
+            echo "ERROR: real memory SDK publish produced no manifest" >&2
+            exit 1
+          fi
+      - name: Upload memory SDK record
+        if: needs.resolve-mode.outputs.dry-run != 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: sdk-memory-manifest
+          path: sdk-memory-record/*
+          if-no-files-found: error
+          retention-days: 5
 
   publish-python-runner-shared:
     name: publish-python / agent-engine-runner-shared

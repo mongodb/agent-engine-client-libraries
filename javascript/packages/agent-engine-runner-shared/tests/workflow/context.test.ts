@@ -13,6 +13,7 @@ import {
   AmbiguousActivityKeyError,
   allocateActivityOrdinal,
   allocateActivityPosition,
+  allocateToolEffectPosition,
   activityRequiresReconstruction,
   currentOperationPath,
   currentPendingChildOperationBatch,
@@ -643,6 +644,65 @@ describe("pending child operation batch", () => {
     await expect(detached).resolves.toEqual([]);
     runWithAttemptContext(attempt(), () => {
       expect(currentPendingChildOperationBatch()).toEqual([]);
+    });
+  });
+});
+
+describe("tool effect positions", () => {
+  const effect = (toolCallId: string): [string, number] => {
+    const { operationPath, activityOrdinal } =
+      allocateToolEffectPosition(toolCallId);
+    const path = operationPath.segments
+      .map((segment) => `${segment.name}/${segment.ordinal}`)
+      .join("/");
+    return [path, activityOrdinal];
+  };
+  const preallocate = (...keys: string[]): void => {
+    preallocateActivityOrdinals(keys.map(toolActivityKey));
+  };
+
+  test("batched calls keep their positions whichever arrives first", () => {
+    const run = (first: string, second: string) =>
+      runWithAttemptContext(attempt(), () => {
+        preallocate("call-a", "call-b");
+        return Object.fromEntries([
+          [first, effect(first)],
+          [second, effect(second)],
+        ]);
+      });
+
+    expect(run("call-a", "call-b")).toEqual({
+      "call-a": ["agent/1/tool:effects/1", 1],
+      "call-b": ["agent/1/tool:effects/2", 1],
+    });
+    expect(run("call-b", "call-a")).toEqual(run("call-a", "call-b"));
+  });
+
+  test("one batched call numbers its own operations", () => {
+    runWithAttemptContext(attempt(), () => {
+      preallocate("call-a", "call-b");
+      expect(effect("call-a")).toEqual(["agent/1/tool:effects/1", 1]);
+      expect(effect("call-a")).toEqual(["agent/1/tool:effects/1", 2]);
+    });
+  });
+
+  test("a lone call's operation takes the next ordinal in the current path", () => {
+    runWithAttemptContext(attempt(), () => {
+      preallocate("call-a");
+      expect(effect("call-a")).toEqual(["agent/1", 2]);
+      expect(effect("call-a")).toEqual(["agent/1", 3]);
+    });
+  });
+
+  test("a call preallocated elsewhere stays in the current path", () => {
+    runWithAttemptContext(attempt(), () => {
+      preallocate("call-a", "call-b");
+      runWithOperationPathResolver(
+        () => [{ name: "worker", occurrenceKey: "worker" }],
+        () => {
+          expect(effect("call-a")[0]).toBe("agent/1/worker/1");
+        },
+      );
     });
   });
 });

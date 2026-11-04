@@ -1287,7 +1287,6 @@ def test_runner_mode_maps_to_service_and_component(monkeypatch):
         "orchestrator": "orchestration-engine",
         "aer": "agent-execution-runtime",
         "tool": "tool-executor",
-        "tool_function": "tool-executor",
     }
     for mode, expected_service in cases.items():
         monkeypatch.setenv("RUNNER_MODE", mode)

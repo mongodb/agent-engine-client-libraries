@@ -3449,6 +3449,53 @@ class TestLangGraphBaseAgentOutputParser:
         assert set(on_modes) == {"messages", "updates", "custom"}
 
     @pytest.mark.anyio
+    async def test_custom_events_without_messages_complete(
+        self, mock_graph: MagicMock, agent_input: AgentInput
+    ) -> None:
+        """A custom-event-only agent (no chat messages) completes successfully.
+
+        Non-conversational agents emit structured output as custom events and
+        produce no assistant message; that must not be reported as a graph that
+        produced nothing.
+        """
+
+        async def mock_astream(*args: Any, **kwargs: Any) -> Any:
+            yield ((), "custom", {"event": "brief", "data": {"ok": True}})
+
+        mock_graph.astream = mock_astream
+        agent = LangGraphBaseAgent(
+            mock_graph, output_parser=_MessagesParser, use_custom_parser=True
+        )
+
+        events = [e async for e in agent.stream(RequestContext(), agent_input)]
+
+        customs = [e for e in events if e.custom_event is not None]
+        assert [e.custom_event for e in customs] == [
+            {"event": "brief", "data": {"ok": True}}
+        ]
+        assert events[-1].event == "result"
+        assert isinstance(events[-1].data, dict)
+        assert events[-1].data["response"] == ""
+        assert events[-1].data["message_count"] == 0
+
+    @pytest.mark.anyio
+    async def test_custom_parser_without_messages_or_events_raises(
+        self, mock_graph: MagicMock, agent_input: AgentInput
+    ) -> None:
+        """No messages and no custom events is still an empty graph."""
+
+        async def mock_astream(*args: Any, **kwargs: Any) -> Any:
+            yield ((), "updates", {"node": {}})  # No messages, no custom events
+
+        mock_graph.astream = mock_astream
+        agent = LangGraphBaseAgent(
+            mock_graph, output_parser=_MessagesParser, use_custom_parser=True
+        )
+
+        with pytest.raises(RuntimeError, match="without producing messages"):
+            _ = [e async for e in agent.stream(RequestContext(), agent_input)]
+
+    @pytest.mark.anyio
     async def test_platform_yields_custom_event_when_parser_omits_custom(
         self, mock_graph: MagicMock, agent_input: AgentInput
     ) -> None:

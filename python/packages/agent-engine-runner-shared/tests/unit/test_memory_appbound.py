@@ -213,6 +213,24 @@ def test_build_context_from_sources_rejects_format_style_and_include_memories() 
     tenant.build_context_from_sources.assert_not_called()
 
 
+def test_build_context_from_sources_rejects_collapse_duplicate_content_false() -> None:
+    # TenantRuntime's per-source path does not carry the flag; rejected loudly
+    # rather than silently ignored, and only when the caller disables it.
+    tenant = MagicMock()
+    rt = AppBoundRuntime(tenant)
+
+    with pytest.raises(MemoryNotSupportedError, match="collapse_duplicate_content"):
+        rt.build_context_from_sources(
+            query="q",
+            sources=[SourceSpec(source=MemorySource.SEMANTIC)],
+            collapse_duplicate_content=False,
+        )
+    tenant.build_context_from_sources.assert_not_called()
+
+    rt.build_context_from_sources(query="q", sources=[SourceSpec(source=MemorySource.SEMANTIC)])
+    tenant.build_context_from_sources.assert_called_once()
+
+
 def test_build_context_empty_string_no_crash() -> None:
     tenant = MagicMock()
     tenant.build_context.return_value = ""

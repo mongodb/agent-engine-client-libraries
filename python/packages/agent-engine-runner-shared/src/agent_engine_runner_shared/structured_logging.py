@@ -39,9 +39,6 @@ _SERVICE_BY_MODE: Dict[str, str] = {
     "orchestrator": "orchestration-engine",
     "aer": "agent-execution-runtime",
     "tool": "tool-executor",
-    # Function mode is a per-call tool executor, so it logs under the same
-    # service as the long-running tool server for routing and alerting.
-    "tool_function": "tool-executor",
 }
 
 # Source value attached to LogRecord by LoggingStream. For records that come

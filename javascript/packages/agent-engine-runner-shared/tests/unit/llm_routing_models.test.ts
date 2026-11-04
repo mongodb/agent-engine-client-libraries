@@ -55,6 +55,7 @@ import {
   LLMResult,
   accumulateStreamUsage,
   addTokenUsage,
+  coerceTokenUsage,
   mergeTokenUsage,
   normalizeLLMPodInvokeResponse,
   SecureLLMProxy,
@@ -797,5 +798,107 @@ describe("mergeTokenUsage", () => {
     expect(merged?.totalTokens).toBe(99);
     expect(merged?.inputTokens).toBe(1);
     expect(merged?.outputTokens).toBe(1);
+  });
+});
+
+describe("usage detail mappings", () => {
+  test("coercion keeps the cache breakdown", () => {
+    const usage = coerceTokenUsage({
+      input_tokens: 9891,
+      output_tokens: 56,
+      input_token_details: { cache_read: 9826, cache_creation: 63 },
+    });
+    expect(usage?.inputTokens).toBe(9891);
+    expect(usage?.inputTokenDetails).toEqual({
+      cache_read: 9826,
+      cache_creation: 63,
+    });
+  });
+
+  test("coercion drops non-numeric detail entries", () => {
+    const usage = coerceTokenUsage({
+      input_tokens: 10,
+      input_token_details: { cache_read: "n/a", cache_creation: -1 },
+    });
+    expect(usage?.inputTokenDetails).toBeUndefined();
+  });
+
+  test("merge lets the later snapshot win", () => {
+    const first = new LLMTokenUsage({
+      input_tokens: 10,
+      output_tokens: 2,
+      input_token_details: { cache_read: 0, cache_creation: 100 },
+    });
+    const second = new LLMTokenUsage({
+      input_tokens: 110,
+      output_tokens: 3,
+      input_token_details: { cache_read: 100, cache_creation: 10 },
+    });
+    expect(mergeTokenUsage(first, second)?.inputTokenDetails).toEqual({
+      cache_read: 100,
+      cache_creation: 10,
+    });
+  });
+
+  test("additive accumulation sums detail deltas", () => {
+    const first = new LLMTokenUsage({
+      input_tokens: 10,
+      input_token_details: { cache_read: 0 },
+    });
+    const second = new LLMTokenUsage({
+      input_tokens: 0,
+      input_token_details: { cache_read: 9 },
+    });
+    expect(addTokenUsage(first, second)?.inputTokenDetails).toEqual({
+      cache_read: 9,
+    });
+    expect(
+      addTokenUsage(
+        new LLMTokenUsage({
+          input_tokens: 1,
+          input_token_details: { cache_read: 10 },
+        }),
+        new LLMTokenUsage({
+          input_tokens: 0,
+          input_token_details: { cache_read: 5 },
+        }),
+      )?.inputTokenDetails,
+    ).toEqual({ cache_read: 15 });
+  });
+
+  test("a zero detail delta does not erase an earlier count", () => {
+    const first = new LLMTokenUsage({
+      input_tokens: 10,
+      input_token_details: { cache_read: 10 },
+    });
+    const second = new LLMTokenUsage({
+      input_tokens: 0,
+      input_token_details: { cache_read: 0 },
+    });
+    expect(accumulateStreamUsage(first, second)?.inputTokenDetails).toEqual({
+      cache_read: 10,
+    });
+  });
+
+  test("the detail survives the LangChain usage metadata", () => {
+    const usage = new LLMTokenUsage({
+      input_tokens: 9891,
+      output_tokens: 56,
+      input_token_details: { cache_read: 9826 },
+    });
+    expect(usage.toLangchainUsageMetadata()).toMatchObject({
+      input_tokens: 9891,
+      input_token_details: { cache_read: 9826 },
+    });
+  });
+
+  test("the detail round-trips through JSON", () => {
+    const usage = new LLMTokenUsage({
+      input_tokens: 5,
+      input_token_details: { cache_read: 4 },
+    });
+    expect(JSON.parse(JSON.stringify(usage))).toMatchObject({
+      input_token_details: { cache_read: 4 },
+    });
   });
 });

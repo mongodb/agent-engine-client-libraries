@@ -9,8 +9,8 @@ invocation may happen on different tasks.
 Batch downloads (``download_files`` / ``adownload_files``) fan out concurrently
 in native mode, with one ``filesystem_download`` call per file so OE policy
 and audit stay independent. Under a durable ``AttemptContext`` they stay
-sequential: unkeyed activities are exclusive on the attempt gate, and
-overlapping them raises CONFLICT.
+sequential: a worker pool picks up the next file as one finishes, so positions
+would depend on completion order.
 """
 
 from __future__ import annotations
@@ -46,8 +46,13 @@ from agent_engine_runner_shared.secure_wrapper import (
     PolicyDeniedException,
     TerminalExecutionError,
     ToolCallTimeoutError,
+    ToolOutcomeUnknownError,
 )
-from agent_engine_runner_shared.workflow import current_attempt_context
+from agent_engine_runner_shared.workflow import OwningToolCall, current_attempt_context
+from langgraph.config import get_config
+
+from agent_engine_sdk_langgraph.durable_deep_agent import in_deep_agent_task
+from agent_engine_sdk_langgraph.durable_subgraphs import send_task_index
 
 logger = logging.getLogger(__name__)
 
@@ -152,6 +157,10 @@ def _classify_error(exc: Exception) -> tuple[str, bool]:
         return f"{_NON_RETRYABLE} Policy denied this operation", False
     if isinstance(exc, TerminalExecutionError):
         return f"{_NON_RETRYABLE} This execution already ended", False
+    if isinstance(exc, ToolOutcomeUnknownError):
+        # The operation may have applied, so a retry could repeat its effect. The
+        # model needs OE's explanation to check before acting; it names no topology.
+        return f"{_NON_RETRYABLE} {exc.error}", False
     if isinstance(exc, ToolCallTimeoutError):
         # Non-retryable: the call already consumed its whole deadline, so an
         # automatic retry spends another full one to most likely fail the same
@@ -190,6 +199,30 @@ def _build_search_result(
     return result_cls(matches=matches)
 
 
+def _owning_tool_call() -> OwningToolCall | None:
+    """Return what a durable backend operation serves, or None when it serves no call.
+
+    LangChain sends each tool call the model requested to its own graph task, so
+    the task's send index is the call's place in the model's list. Filesystem
+    middleware evicts a large result outside any middleware of ours, so the graph
+    task's metadata is the one place every operation can read this. A subagent's
+    own nodes serve its ``task`` call. Should LangGraph stop reporting the task
+    path, the operation is exclusive again: an overlap fails with a clean conflict
+    rather than recording a wrong position.
+    """
+    if current_attempt_context() is None:
+        return None
+    try:
+        metadata = get_config().get("metadata") or {}
+    except RuntimeError:
+        # Outside a graph task LangGraph has no config to read.
+        metadata = {}
+    index = send_task_index(metadata)
+    if index is not None:
+        return OwningToolCall(index)
+    return OwningToolCall() if in_deep_agent_task() else None
+
+
 class AgentEngineToolPodBackend(SandboxBackendProtocol):
     """Backend that routes all operations through Atlas Agent Engine's secure path.
 
@@ -213,7 +246,12 @@ class AgentEngineToolPodBackend(SandboxBackendProtocol):
     def _call_tool(self, tool_name: str, arguments: dict[str, Any]) -> Any:
         """Execute a tool via SecureToolWrapper and JSON-parse string results."""
         wrapper = _get_wrapper()
-        result = wrapper.execute_tool(tool_name, arguments, is_local=False)
+        result = wrapper.execute_tool(
+            tool_name,
+            arguments,
+            is_local=False,
+            owning_tool_call=_owning_tool_call(),
+        )
         if isinstance(result, str):
             try:
                 return json.loads(result)
@@ -541,8 +579,8 @@ class AgentEngineToolPodBackend(SandboxBackendProtocol):
 
         Native-mode batches fan out on a bounded thread pool so skills
         loading pays one round-trip of latency instead of a sum. Durable
-        attempts stay sequential: unkeyed activities are exclusive under
-        the attempt gate, and overlapping them raises CONFLICT.
+        attempts stay sequential: a worker pool picks up the next file as one
+        finishes, so positions would depend on completion order.
 
         Returns a list of ``FileDownloadResponse`` in the same order as
         *paths*; on failure ``content`` is ``None`` and ``error`` carries
@@ -552,8 +590,7 @@ class AgentEngineToolPodBackend(SandboxBackendProtocol):
         """
         if len(paths) <= 1:
             return [self._download_one(p) for p in paths]
-        # Unkeyed activities are exclusive under the durable attempt gate;
-        # overlapping them raises CONFLICT.
+        # Durable attempts stay sequential; see above.
         if current_attempt_context() is not None:
             return [self._download_one(p) for p in paths]
 

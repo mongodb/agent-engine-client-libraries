@@ -69,7 +69,7 @@ export const ToolDefinitionSchema = z.object({
     (v) => typeof v === "function",
   ),
   remote: z.boolean().default(true),
-  provider_type: z.string().optional(),
+  provider: z.string().optional(),
   scopes: z.array(z.string()).default([]),
   network: z.array(z.string()).default([]),
   timeout_seconds: z.number().int().default(30),
@@ -95,6 +95,14 @@ export class LLMTokenUsage {
   /** Output tokens the model spent reasoning; part of the output count. */
   readonly reasoningTokens?: number;
   readonly model?: string;
+  /**
+   * Provider decomposition of `inputTokens`, e.g. Anthropic's
+   * `{cache_read, cache_creation}`. The provider already folds these into
+   * `inputTokens`, so they are reported alongside it, never added to it.
+   */
+  readonly inputTokenDetails?: Record<string, number>;
+  /** Provider decomposition of `outputTokens`, e.g. `{reasoning}`. */
+  readonly outputTokenDetails?: Record<string, number>;
 
   constructor(data: {
     input_tokens?: number;
@@ -104,6 +112,8 @@ export class LLMTokenUsage {
     total_tokens?: number;
     reasoning_tokens?: number;
     model?: string;
+    input_token_details?: Record<string, number>;
+    output_token_details?: Record<string, number>;
   }) {
     this.inputTokens = data.input_tokens;
     this.outputTokens = data.output_tokens;
@@ -112,6 +122,8 @@ export class LLMTokenUsage {
     this.totalTokens = data.total_tokens;
     this.reasoningTokens = data.reasoning_tokens;
     this.model = data.model;
+    this.inputTokenDetails = data.input_token_details;
+    this.outputTokenDetails = data.output_token_details;
 
     if (this.totalTokens === undefined) {
       const prompt = this.inputTokens ?? this.promptTokens;
@@ -138,6 +150,16 @@ export class LLMTokenUsage {
     if (this.reasoningTokens !== undefined)
       result["reasoning_tokens"] = this.reasoningTokens;
     if (this.model !== undefined) result["model"] = this.model;
+    if (
+      this.inputTokenDetails !== undefined &&
+      Object.keys(this.inputTokenDetails).length > 0
+    )
+      result["input_token_details"] = this.inputTokenDetails;
+    if (
+      this.outputTokenDetails !== undefined &&
+      Object.keys(this.outputTokenDetails).length > 0
+    )
+      result["output_token_details"] = this.outputTokenDetails;
     return result;
   }
 
@@ -146,6 +168,8 @@ export class LLMTokenUsage {
     input_tokens: number;
     output_tokens: number;
     total_tokens: number;
+    input_token_details?: Record<string, number>;
+    output_token_details?: Record<string, number>;
   } {
     const inputTokens = this.inputTokens ?? this.promptTokens ?? 0;
     const outputTokens = this.outputTokens ?? this.completionTokens ?? 0;
@@ -154,6 +178,12 @@ export class LLMTokenUsage {
       input_tokens: inputTokens,
       output_tokens: outputTokens,
       total_tokens: totalTokens,
+      ...(this.inputTokenDetails !== undefined
+        ? { input_token_details: this.inputTokenDetails }
+        : {}),
+      ...(this.outputTokenDetails !== undefined
+        ? { output_token_details: this.outputTokenDetails }
+        : {}),
     };
   }
 }
@@ -170,6 +200,8 @@ export const LLMTokenUsageSchema = z.preprocess(
       total_tokens: z.number().optional(),
       reasoning_tokens: z.number().optional(),
       model: z.string().optional(),
+      input_token_details: z.record(z.string(), z.number()).optional(),
+      output_token_details: z.record(z.string(), z.number()).optional(),
     })
     .transform((data) => new LLMTokenUsage(data)),
 );

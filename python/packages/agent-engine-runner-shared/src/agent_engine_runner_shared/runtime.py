@@ -409,12 +409,21 @@ class TenantRuntime:
 
         try:
             from agent_engine_runner_shared.tracing import (
+                platform_trace_exporter_enabled,
                 scrub_credentials,
                 setup_tracing,
                 start_mongodb_tracing_retry,
             )
 
             scrub = scrub_credentials
+
+            if platform_trace_exporter_enabled() and os.getenv("OE_URL", "").strip():
+                # The platform exporter is enabled, so the OE is the trace
+                # writer: the guest sends spans to it and opens no MongoDB
+                # trace-store connection.
+                setup_tracing(service_name=self.app_name)
+                logger.info("Tracing enabled")
+                return
 
             def connect() -> Any:
                 from pymongo import MongoClient
@@ -1601,16 +1610,9 @@ class TenantRuntime:
         log_level: Optional[str] = None,
     ) -> None:
         """Run the appropriate server based on mode."""
-        from agent_engine_runner_shared.server import AERServer, ToolFunctionRunner, ToolServer
+        from agent_engine_runner_shared.server import AERServer, ToolServer
 
         log_level = log_level or get_env("LOG_LEVEL", "info").lower()
-
-        # Function mode is not a server: it runs one tool and returns, binding
-        # no listener, so it has no host/port. It reuses tool execution via the
-        # ToolExecution mixin, not by being a ToolServer.
-        if self.mode == RuntimeMode.TOOL_FUNCTION:
-            await ToolFunctionRunner(self).run()
-            return
 
         servers = {
             RuntimeMode.AER: AERServer,

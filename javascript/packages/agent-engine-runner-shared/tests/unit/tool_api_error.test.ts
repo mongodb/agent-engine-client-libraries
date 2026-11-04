@@ -11,7 +11,13 @@
  */
 
 import { describe, test, expect } from "vitest";
-import { classifyToolAPIError } from "../../src/tool_api_error.js";
+import {
+  classifyToolAPIError,
+  executeErrorResponse,
+  redactThrownToolError,
+  redactToolErrorText,
+} from "../../src/tool_api_error.js";
+import { ToolExecutionError } from "../../src/secure_wrapper.js";
 
 function statusError(status: number, message = `HTTP ${status}`): Error {
   const e = new Error(message) as Error & { status: number };
@@ -467,4 +473,80 @@ describe("classifyToolAPIError — security", () => {
       }
     },
   );
+});
+
+describe("tool error redaction", () => {
+  const MONGO_URI =
+    "mongodb+srv://ada.lovelace:s3cr3t-pass@cluster0.example.mongodb.net/admin";
+
+  test("redacts connection-string credentials and keeps the error context", () => {
+    const text = redactToolErrorText(`Authentication failed for ${MONGO_URI}`);
+
+    expect(text).toBe(
+      "Authentication failed for mongodb+srv://<redacted>:<redacted>@cluster0.example.mongodb.net/admin",
+    );
+  });
+
+  test("redacts exact credential values, longest first", () => {
+    const text = redactToolErrorText("rejected abc123secret and abc123", [
+      "abc123",
+      "abc123secret",
+    ]);
+
+    expect(text).toBe("rejected <redacted> and <redacted>");
+  });
+
+  test("leaves an ordinary tool error unchanged", () => {
+    const message = "mixed inclusion and exclusion projection";
+    expect(redactToolErrorText(message, ["unrelated"])).toBe(message);
+  });
+
+  test("redacts a thrown error in place, keeping its identity and class", () => {
+    class DriverError extends Error {}
+    const error = new DriverError(`connect ${MONGO_URI}`);
+
+    const propagated = redactThrownToolError(error);
+
+    expect(propagated).toBe(error);
+    expect(propagated).toBeInstanceOf(DriverError);
+    expect(error.message).not.toContain("s3cr3t-pass");
+    expect(error.stack ?? "").not.toContain("s3cr3t-pass");
+  });
+
+  test("redacts the error field of a thrown ToolExecutionError", () => {
+    const error = new ToolExecutionError(`connect ${MONGO_URI}`);
+
+    expect(redactThrownToolError(error)).toBe(error);
+    expect(error.error).not.toContain("s3cr3t-pass");
+    expect(error.message).not.toContain("s3cr3t-pass");
+  });
+
+  test("redacts the message of a thrown non-Error object in place", () => {
+    const thrown = { message: `connect ${MONGO_URI}` };
+
+    expect(redactThrownToolError(thrown)).toBe(thrown);
+    expect(thrown.message).not.toContain("s3cr3t-pass");
+  });
+
+  test("redacts a thrown string", () => {
+    expect(redactThrownToolError(`connect ${MONGO_URI}`)).not.toContain(
+      "s3cr3t-pass",
+    );
+  });
+
+  test("Tool Pod error response carries the redacted message", async () => {
+    const response = await executeErrorResponse(
+      new Error(
+        `connect ${MONGO_URI} with sk-proj-abcdefghijklmnopqrstuvwxyz012345`,
+      ),
+      undefined,
+      "pod-1",
+      {},
+    );
+
+    expect(response.status).toBe("error");
+    expect(response.error).toContain("cluster0.example.mongodb.net");
+    expect(response.error).not.toContain("s3cr3t-pass");
+    expect(response.error).not.toContain("abcdefghijklmnopqrstuvwxyz012345");
+  });
 });

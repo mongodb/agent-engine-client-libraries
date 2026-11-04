@@ -685,7 +685,8 @@ def build_context_from_sources(
         thread_id: str | None = None,
         max_tokens: int | None = None,
         format_style: FormatStyle | str | None = None,
-        include_memories: bool = False) -> ContextResponse
+        include_memories: bool = False,
+        collapse_duplicate_content: bool = True) -> ContextResponse
 ```
 
 Build a memory context from an explicit, per-source-configured source set.
@@ -714,6 +715,13 @@ when the ``stm`` source is requested.
 - `include_memories` - When ``True``, the response's
   ``selected_memories`` carries the post-budget ``MemoryChunk``
   list; see :meth:`build_context`.
+- `collapse_duplicate_content` - When ``True`` (default), collapse
+  duplicate content — exact text matches and near-duplicates —
+  when merging results. Set ``False`` to receive every candidate
+  each source contributed, up to its ``top_k``; a document
+  surfacing from both the vector and text legs is still returned
+  once either way. ``max_tokens`` still applies after merging, so
+  disabling this may require a larger budget to see every row.
 
 
 **Raises**:

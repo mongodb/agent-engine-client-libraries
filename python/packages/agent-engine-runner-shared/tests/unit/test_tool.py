@@ -1072,7 +1072,7 @@ class TestToolAPIErrorClassification:
             resp = httpx.Response(429, request=httpx.Request("GET", "https://api.example.com/x"))
             raise httpx.HTTPStatusError("rate limited", request=resp.request, response=resp)
 
-        server = self._make_server({"provider_type": "atlas"})
+        server = self._make_server({"provider": "atlas"})
         server.runtime._tools["call_api"] = raise_429
 
         response = await server._handle_execute(self._request())
@@ -1088,7 +1088,7 @@ class TestToolAPIErrorClassification:
 
     @pytest.mark.asyncio
     async def test_undeclared_provider_still_classified(self):
-        """A tool without a provider_type still classifies transport errors;
+        """A tool without a provider still classifies transport errors;
         the provider in the safe message defaults to 'External'."""
 
         def raise_timeout():
@@ -1114,7 +1114,7 @@ class TestToolAPIErrorClassification:
         def raise_value():
             raise ValueError("bad input")
 
-        server = self._make_server({"provider_type": "atlas"})
+        server = self._make_server({"provider": "atlas"})
         server.runtime._tools["call_api"] = raise_value
 
         response = await server._handle_execute(self._request())
@@ -1122,6 +1122,32 @@ class TestToolAPIErrorClassification:
         assert response.status == "error"
         assert response.tool_api_error is None
         assert response.error == "bad input"
+
+    @pytest.mark.asyncio
+    async def test_unclassified_error_text_is_redacted(self, monkeypatch):
+        """A raw tool exception reaches OE (and MongoDB) through this response,
+        so credentials echoed in its text are masked while the cause stays readable."""
+        monkeypatch.setenv("WAREHOUSE_API_TOKEN", "wh-7f3e9a")
+        monkeypatch.setenv("WAREHOUSE_REGION", "eu-west-1")
+        openai_key = "sk-" + "Ab3dEf6hIj9kLm2nOp5qRs"
+
+        def raise_leaky():
+            raise RuntimeError(
+                "ServerSelectionTimeoutError: mongodb+srv://app:Pa55w0rd@c0.example.net/db; "
+                f"fallback key {openai_key}; warehouse token wh-7f3e9a in eu-west-1"
+            )
+
+        server = self._make_server({})
+        server.runtime._tools["call_api"] = raise_leaky
+
+        response = await server._handle_execute(self._request())
+
+        assert response.status == "error"
+        assert response.tool_api_error is None
+        assert response.error == (
+            "ServerSelectionTimeoutError: mongodb+srv://<redacted>:<redacted>@c0.example.net/db; "
+            "fallback key sk-<redacted>; warehouse token <redacted> in eu-west-1"
+        )
 
 
 class _SyncPostStream:

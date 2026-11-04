@@ -79,6 +79,7 @@ from agent_engine_runner_shared.server.chunk_types import (
     LLM_INVOCATION_ERROR_CODE,
     LLM_INVOCATION_ERROR_SOURCE,
     POLICY_DENIED_ERROR_CODE,
+    RUN_TIMEOUT_ERROR_CODE,
     SUBAGENT_END,
     SUBAGENT_START,
     TEXT,
@@ -126,9 +127,10 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Whole-turn execution timeout. Matches the platform's stream deadline so a turn
-# is not cut off short of the limit the caller was promised.
-EXECUTION_TIMEOUT = get_env_float("RUNNER_EXECUTION_TIMEOUT", 600.0)
+# Whole-turn execution timeout. The platform stamps it in vm-mode; this default
+# covers container mode and local dev. It sits under the 70-minute stream
+# deadline so the runner, not the stream, ends a long turn.
+EXECUTION_TIMEOUT = get_env_float("RUNNER_EXECUTION_TIMEOUT", 3600.0)
 
 # Bound on the cancelled-turn checkpoint write during drain teardown. The OE's
 # cancel drain deadline is 5s and the write is one Mongo upsert; 3s leaves the
@@ -493,6 +495,12 @@ class AERServer(BaseServer):
 
     async def on_shutdown(self) -> None:
         """Clean up resources."""
+        try:
+            from agent_engine_runner_shared.tracing import shutdown_tracing
+
+            await asyncio.to_thread(shutdown_tracing)
+        except Exception:
+            logger.debug("Tracing shutdown failed", exc_info=True)
         await self._callback_delivery.shutdown()
         async with self._client_lock:
             for client in self._clients.values():
@@ -969,10 +977,10 @@ class AERServer(BaseServer):
             # otherwise hold /execute open indefinitely. A global agent returns
             # None without awaiting anything, so the bound never fires for one.
             try:
-                graph = await asyncio.wait_for(
-                    self.runtime.build_graph(agent_input, ctx),
-                    timeout=EXECUTION_TIMEOUT,
-                )
+                # wait_for can swallow a drain cancellation when its child
+                # completes concurrently; keep the build in the handler task.
+                async with asyncio.timeout(EXECUTION_TIMEOUT):
+                    graph = await self.runtime.build_graph(agent_input, ctx)
             except asyncio.TimeoutError as exc:
                 raise RuntimeError(
                     "the per-execution graph build did not complete within "
@@ -1128,27 +1136,38 @@ class AERServer(BaseServer):
             prep_complete = True
 
             # Execute via BaseAgent.stream()
+            run_deadline = asyncio.timeout(EXECUTION_TIMEOUT)
             try:
-                execution_outcome = await asyncio.wait_for(
-                    self._execute_via_agent_stream(
+                async with run_deadline:
+                    execution_outcome = await self._execute_via_agent_stream(
                         agent,
                         ctx,
                         agent_input,
                         request.platform_api_url,
                         request.execution_id,
-                    ),
-                    timeout=EXECUTION_TIMEOUT,
-                )
+                    )
             except asyncio.TimeoutError:
                 execution_timed_out = True
-                error_msg = f"Execution timed out after {EXECUTION_TIMEOUT} seconds"
+                # Agent code can raise TimeoutError before our deadline expires.
+                # Only our timer proves that the run limit was reached.
+                run_limit_reached = run_deadline.expired()
+                error_msg = (
+                    f"Execution timed out after {EXECUTION_TIMEOUT} seconds"
+                    if run_limit_reached
+                    else "Execution timed out."
+                )
+                timeout_metadata: dict[str, JsonValue] = {
+                    "error_code": RUN_TIMEOUT_ERROR_CODE
+                    if run_limit_reached
+                    else TIMEOUT_ERROR_CODE
+                }
                 await self._deliver_error_chunk(
-                    request, error_msg, {"error_code": TIMEOUT_ERROR_CODE}, label="timeout"
+                    request, error_msg, timeout_metadata, label="timeout"
                 )
                 stage_callback(
                     status="ERROR",
                     error=error_msg,
-                    metadata={"error_code": TIMEOUT_ERROR_CODE},
+                    metadata=timeout_metadata,
                 )
                 raise HTTPException(status_code=504, detail=error_msg)
 
@@ -1257,9 +1276,7 @@ class AERServer(BaseServer):
             )
             raise HTTPException(status_code=500, detail=str(e))
         except ToolCallTimeoutError as e:
-            # A deadline breach, not a crash: carry the same discriminator as the
-            # whole-turn timeout so a consumer handles both the same way, and 504
-            # rather than 500 for the same reason.
+            # Per-call timeouts remain retryable independently of the run limit.
             timeout_meta: dict[str, JsonValue] = {
                 "error_code": TIMEOUT_ERROR_CODE,
                 "tool_name": e.tool_name,
@@ -2178,6 +2195,19 @@ class AERServer(BaseServer):
                     writer.pending_writes,
                     SESSION_FINISH_MEMORY_DRAIN_TIMEOUT_S,
                 )
+        # Flush trace spans before the OE frees this pod: /finish triggers a
+        # zero-grace teardown, so spans still queued in the BatchSpanProcessor
+        # would otherwise be lost. Best-effort and bounded.
+        try:
+            from agent_engine_runner_shared.tracing import force_flush_tracing
+
+            if not await asyncio.to_thread(force_flush_tracing):
+                logger.warning(
+                    "Trace flush before session release timed out; some spans may be lost"
+                )
+        except Exception:
+            logger.debug("Trace flush before session release failed", exc_info=True)
+
         url = f"{request.platform_api_url.rstrip('/')}/executions/{request.execution_id}/finish"
         try:
             client = await self._get_client(request.platform_api_url)

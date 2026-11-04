@@ -27,6 +27,8 @@ def isolated_tracer_provider(monkeypatch):
     monkeypatch.setattr(tracing_setup, "_retry_stop_event", None)
     monkeypatch.setattr(tracing_setup, "_retry_thread", None)
     monkeypatch.setattr(tracing_setup, "_tracing_mongo_client", None)
+    monkeypatch.setattr(tracing_setup, "_platform_exporter", None)
+    monkeypatch.setattr(tracing_setup, "_platform_exporter_attached", False)
     yield tracing_setup
     # shutdown_tracing() signals and joins the retry thread itself.
     if tracing_setup._tracer_provider is not None or tracing_setup._retry_thread is not None:
@@ -160,7 +162,10 @@ def test_tracing_status_disabled_by_default(monkeypatch, isolated_tracer_provide
     """No store URI configured -> database_exporter is "disabled", not degraded."""
     monkeypatch.setenv("AGENTIC_OBSERVABILITY_DIR", str(tmp_path))
     isolated_tracer_provider.setup_tracing(service_name="svc-no-store")
-    assert isolated_tracer_provider.tracing_status() == {"database_exporter": "disabled"}
+    assert isolated_tracer_provider.tracing_status() == {
+        "database_exporter": "disabled",
+        "platform_exporter": "disabled",
+    }
 
 
 def test_tracing_status_attached_when_collection_provided(
@@ -172,7 +177,10 @@ def test_tracing_status_attached_when_collection_provided(
     isolated_tracer_provider.setup_tracing(
         service_name="svc-attached", mongodb_collection=collection
     )
-    assert isolated_tracer_provider.tracing_status() == {"database_exporter": "attached"}
+    assert isolated_tracer_provider.tracing_status() == {
+        "database_exporter": "attached",
+        "platform_exporter": "disabled",
+    }
 
 
 def test_tracing_status_degraded_after_retry_starts(
@@ -182,7 +190,10 @@ def test_tracing_status_degraded_after_retry_starts(
     monkeypatch.setenv("AGENTIC_OBSERVABILITY_DIR", str(tmp_path))
     isolated_tracer_provider.setup_tracing(service_name="svc-degraded")
     isolated_tracer_provider.start_mongodb_tracing_retry(lambda: None, interval=999)
-    assert isolated_tracer_provider.tracing_status() == {"database_exporter": "degraded"}
+    assert isolated_tracer_provider.tracing_status() == {
+        "database_exporter": "degraded",
+        "platform_exporter": "disabled",
+    }
 
 
 def test_attach_mongodb_tracing_routes_new_spans_to_store(
@@ -192,11 +203,17 @@ def test_attach_mongodb_tracing_routes_new_spans_to_store(
     monkeypatch.setenv("AGENTIC_OBSERVABILITY_DIR", str(tmp_path))
     isolated_tracer_provider.setup_tracing(service_name="svc-late-attach")
     isolated_tracer_provider.start_mongodb_tracing_retry(lambda: None, interval=999)
-    assert isolated_tracer_provider.tracing_status() == {"database_exporter": "degraded"}
+    assert isolated_tracer_provider.tracing_status() == {
+        "database_exporter": "degraded",
+        "platform_exporter": "disabled",
+    }
 
     collection = MagicMock()
     isolated_tracer_provider.attach_mongodb_tracing(collection)
-    assert isolated_tracer_provider.tracing_status() == {"database_exporter": "attached"}
+    assert isolated_tracer_provider.tracing_status() == {
+        "database_exporter": "attached",
+        "platform_exporter": "disabled",
+    }
 
     provider = isolated_tracer_provider._tracer_provider
     tracer = provider.get_tracer("test")
@@ -252,10 +269,16 @@ def test_start_mongodb_tracing_retry_attaches_on_recovery(
 
     monkeypatch.setattr(isolated_tracer_provider, "attach_mongodb_tracing", attach_and_signal)
     isolated_tracer_provider.start_mongodb_tracing_retry(connect, interval=0.01)
-    assert isolated_tracer_provider.tracing_status() == {"database_exporter": "degraded"}
+    assert isolated_tracer_provider.tracing_status() == {
+        "database_exporter": "degraded",
+        "platform_exporter": "disabled",
+    }
 
     assert attached.wait(timeout=2.0), "retry did not attach within 2s"
-    assert isolated_tracer_provider.tracing_status() == {"database_exporter": "attached"}
+    assert isolated_tracer_provider.tracing_status() == {
+        "database_exporter": "attached",
+        "platform_exporter": "disabled",
+    }
     assert connect.call_count >= 1
     # A span emitted after recovery routes to the store.
     provider = isolated_tracer_provider._tracer_provider
@@ -289,7 +312,10 @@ def test_start_mongodb_tracing_retry_keeps_degraded_when_store_stays_down(
     # firing proves the loop is live while the status stays degraded.
     assert third_attempt.wait(timeout=2.0), "retry loop did not fire within 2s"
 
-    assert isolated_tracer_provider.tracing_status() == {"database_exporter": "degraded"}
+    assert isolated_tracer_provider.tracing_status() == {
+        "database_exporter": "degraded",
+        "platform_exporter": "disabled",
+    }
     # shutdown_tracing() (in the fixture) signals the retry thread to stop.
 
 
@@ -333,7 +359,10 @@ def test_env_interval_drives_retry_cadence(monkeypatch, isolated_tracer_provider
 
     isolated_tracer_provider.start_mongodb_tracing_retry(always_fail)  # no interval arg
     assert third_attempt.wait(timeout=2.0), "retry loop ignored the env cadence"
-    assert isolated_tracer_provider.tracing_status() == {"database_exporter": "degraded"}
+    assert isolated_tracer_provider.tracing_status() == {
+        "database_exporter": "degraded",
+        "platform_exporter": "disabled",
+    }
 
 
 def test_shutdown_during_in_flight_retry_stops_further_retries(
@@ -404,7 +433,10 @@ def test_shutdown_during_in_flight_retry_closes_client_it_opened(
     isolated_tracer_provider.shutdown_tracing()
 
     collection.database.client.close.assert_called_once()
-    assert isolated_tracer_provider.tracing_status() == {"database_exporter": "disabled"}
+    assert isolated_tracer_provider.tracing_status() == {
+        "database_exporter": "disabled",
+        "platform_exporter": "disabled",
+    }
 
 
 def test_shutdown_closes_retry_recovered_client(monkeypatch, isolated_tracer_provider, tmp_path):
@@ -432,7 +464,10 @@ def test_shutdown_closes_retry_recovered_client(monkeypatch, isolated_tracer_pro
         MagicMock(return_value=collection), interval=0.01
     )
     assert attached.wait(timeout=2.0), "retry did not attach within 2s"
-    assert isolated_tracer_provider.tracing_status() == {"database_exporter": "attached"}
+    assert isolated_tracer_provider.tracing_status() == {
+        "database_exporter": "attached",
+        "platform_exporter": "disabled",
+    }
 
     isolated_tracer_provider.shutdown_tracing()
 

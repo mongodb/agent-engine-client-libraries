@@ -434,7 +434,7 @@ describe("LangGraphBaseAgent native interrupt resume", () => {
               (await wrapper.executeTool(
                 "list_repos",
                 {},
-                { providerType: "keycloak", scopes: ["repo"], isLocal: false },
+                { provider: "keycloak", scopes: ["repo"], isLocal: false },
               )) as JsonValue,
             );
           } catch (error) {

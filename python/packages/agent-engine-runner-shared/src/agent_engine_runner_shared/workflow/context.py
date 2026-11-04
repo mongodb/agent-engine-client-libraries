@@ -45,7 +45,9 @@ __all__ = [
     "advance_step_ordinal",
     "allocate_activity_ordinal",
     "allocate_activity_position",
+    "allocate_tool_effect_position",
     "in_spawned_task",
+    "OwningToolCall",
     "activity_requires_reconstruction",
     "attempt_context_scope",
     "child_operation_boundary_scope",
@@ -276,6 +278,8 @@ class _ActivityOrdinalAllocator:
     _next_by_path: dict[_OperationPathKey, int] = field(default_factory=dict)
     _by_path_and_key: dict[tuple[_OperationPathKey, str], int] = field(default_factory=dict)
     _preallocated_paths_by_key: dict[str, list[_OperationPathKey]] = field(default_factory=dict)
+    # Path -> the ordinals of the keys last preallocated there, in list order.
+    _latest_batch_by_path: dict[_OperationPathKey, list[int]] = field(default_factory=dict)
     # Key -> {spawning scope: owner} for keys a spawned task took, so a later
     # preallocation of the same key in that scope fails instead of having lost
     # a race it would win on another attempt. Kept per scope so a take in one
@@ -294,8 +298,14 @@ class _ActivityOrdinalAllocator:
             self._calls_by_scope[id(scope)] = (scope, count + 1)
             return count + 1
 
-    def preallocate(self, path: _OperationPathKey, keys: Sequence[str]) -> list[int]:
-        """Assign ordinals to keys in list order. Idempotent per key."""
+    def preallocate(
+        self, path: _OperationPathKey, keys: Sequence[str], *, orders_tool_effects: bool
+    ) -> list[int]:
+        """Assign ordinals to keys in list order. Idempotent per key.
+
+        ``orders_tool_effects`` makes these keys the batch ``batched_ordinal``
+        reads; see ``preallocate_activity_ordinals``.
+        """
         ordinals: list[int] = []
         with self._lock:
             for key in keys:
@@ -314,7 +324,15 @@ class _ActivityOrdinalAllocator:
                     self._by_path_and_key[path_key] = ordinal
                     self._preallocated_paths_by_key.setdefault(key, []).append(path)
                 ordinals.append(self._by_path_and_key[path_key])
+            if orders_tool_effects:
+                self._latest_batch_by_path[path] = ordinals
         return ordinals
+
+    def batched_ordinal(self, path: _OperationPathKey, index: int) -> int | None:
+        """The ordinal at `index` of the latest batch at `path`, if it had several keys."""
+        with self._lock:
+            batch = self._latest_batch_by_path.get(path, [])
+            return batch[index] if len(batch) > 1 and index < len(batch) else None
 
     def allocate_position(
         self,
@@ -526,6 +544,9 @@ _INTERRUPTED_ACTIVITIES: ContextVar[_InterruptedActivities | None] = ContextVar(
 _ACTIVITY_RECONSTRUCTION: ContextVar[_ActivityReconstruction | None] = ContextVar(
     "workflow_activity_reconstruction", default=None
 )
+
+
+_TOOL_EFFECTS_SEGMENT = "tool:effects"
 
 
 def tool_activity_key(tool_call_id: str) -> str:
@@ -792,13 +813,23 @@ def preallocate_child_operation_ordinals(
     return _require_child_path_allocator().preallocate(parent, current_step_ordinal(), boundaries)
 
 
-def preallocate_activity_ordinals(keys: Sequence[str]) -> list[int]:
+def preallocate_activity_ordinals(
+    keys: Sequence[str], *, orders_tool_effects: bool = True
+) -> list[int]:
     """Assign monotonic ordinals to stable keys in the given order.
 
     Call this before concurrent dispatch (for example after an LLM returns a
     ToolCall batch) so inverted worker scheduling cannot redefine identity.
+
+    The keys also become the batch that positions the backend operations of
+    these calls (``allocate_tool_effect_position``). Pass
+    ``orders_tool_effects=False`` for the tool calls of a model call that a
+    tool call makes itself: it shares its caller's path, so replacing the batch
+    there would move a sibling's operation depending on which ran first.
     """
-    return _require_allocator().preallocate(_current_operation_path_key(), keys)
+    return _require_allocator().preallocate(
+        _current_operation_path_key(), keys, orders_tool_effects=orders_tool_effects
+    )
 
 
 def allocate_activity_ordinal(key: str | None = None) -> int:
@@ -819,6 +850,45 @@ def allocate_activity_position(key: str | None = None) -> tuple[OperationPath, i
             segments=[OperationPathSegment(name=name, ordinal=index) for name, index in path]
         ),
         ordinal,
+    )
+
+
+@dataclass(frozen=True)
+class OwningToolCall:
+    """The tool call or subagent one backend operation is performed for.
+
+    ``index`` is the call's place among the calls its model turn requested. It is
+    None for a subagent's own nodes, which already have a path of their own.
+    """
+
+    index: int | None = None
+
+
+def allocate_tool_effect_position(owner: OwningToolCall) -> tuple[OperationPath, int]:
+    """Return the position of one operation a tool call performs on its own behalf.
+
+    Operations of tool calls one model turn requested may reach OE in any order,
+    so a shared ordinal sequence would give them different positions on another
+    attempt. Each therefore takes its ordinals under a path derived from its
+    call's preallocated ordinal, which the model's list order fixes. An operation
+    of a lone call stays in the current path: nothing overlaps it, and a turn
+    recorded before derived paths existed still replays.
+
+    Operations within one call number by first arrival. A call whose concurrent
+    branches each perform several operations can arrive differently on another
+    attempt, which OE refuses as nondeterministic rather than repeating an effect.
+    """
+    allocator = _require_allocator()
+    path = _current_operation_path_key()
+    if owner.index is not None:
+        call_ordinal = allocator.batched_ordinal(path, owner.index)
+        if call_ordinal is not None:
+            path = (*path, (_TOOL_EFFECTS_SEGMENT, call_ordinal))
+    return (
+        OperationPath(
+            segments=[OperationPathSegment(name=name, ordinal=index) for name, index in path]
+        ),
+        allocator.allocate(path),
     )
 
 

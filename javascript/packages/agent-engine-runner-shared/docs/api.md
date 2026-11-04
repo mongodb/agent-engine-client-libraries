@@ -55,6 +55,13 @@
     - [requireAvailableNames()](#api-requireavailablenames)
   - [ConnectorBundleError](#api-connectorbundleerror)
   - [ConnectorDefinitionError](#api-connectordefinitionerror)
+  - [ConnectorExecutor](#api-connectorexecutor)
+    - [close()](#api-close-1)
+    - [execute()](#api-execute)
+  - [ConnectorHTTPError](#api-connectorhttperror)
+  - [ConnectorToolRegistration](#api-connectortoolregistration)
+  - [ConnectorToolRuntime](#api-connectortoolruntime)
+    - [close()](#api-close-2)
   - [ContentPolicyOTLPSpanExporter](#api-contentpolicyotlpspanexporter)
     - [export()](#api-export)
     - [forceFlush()](#api-forceflush)
@@ -122,7 +129,7 @@
     - [stream()](#api-stream)
     - [responseFromStreamChunks()](#api-responsefromstreamchunks)
   - [SecureToolWrapper](#api-securetoolwrapper)
-    - [close()](#api-close-1)
+    - [close()](#api-close-3)
     - [executeTool()](#api-executetool)
     - [nextOperationalStep()](#api-nextoperationalstep)
     - [observeOperationalStep()](#api-observeoperationalstep)
@@ -143,18 +150,17 @@
   - [TerminalExecutionError](#api-terminalexecutionerror)
   - [ToolCallTimeoutError](#api-toolcalltimeouterror)
   - [ToolExecutionError](#api-toolexecutionerror)
-  - [ToolFunctionRunner](#api-toolfunctionrunner)
-    - [run()](#api-run-1)
+  - [ToolOutcomeUnknownError](#api-tooloutcomeunknownerror)
   - [ToolPlatformError](#api-toolplatformerror)
   - [ToolServer](#api-toolserver)
-    - [close()](#api-close-2)
+    - [close()](#api-close-4)
     - [createApp()](#api-createapp-1)
     - [getHealthDetails()](#api-gethealthdetails-1)
     - [onShutdown()](#api-onshutdown-1)
     - [onStartup()](#api-onstartup-1)
     - [registerCommonRoutes()](#api-registercommonroutes-1)
     - [registerRoutes()](#api-registerroutes-1)
-    - [run()](#api-run-2)
+    - [run()](#api-run-1)
   - [UnsupportedChildOperationFanOutError](#api-unsupportedchildoperationfanouterror)
   - [WorkflowClient](#api-workflowclient)
     - [completeExecution()](#api-completeexecution)
@@ -172,8 +178,13 @@
   - [BundledConnector](#api-bundledconnector)
   - [CaptureExceptionArgs](#api-captureexceptionargs)
   - [ChildOperationBoundary](#api-childoperationboundary)
+  - [ConnectorExecutorOptions](#api-connectorexecutoroptions)
   - [ConnectorRegistrationMetadata](#api-connectorregistrationmetadata)
+  - [ConnectorRuntimeTarget](#api-connectorruntimetarget)
+    - [getAgentConfig()](#api-getagentconfig-1)
   - [ConnectorToolSchema](#api-connectortoolschema)
+  - [ConnectorTransportRequest](#api-connectortransportrequest)
+  - [ConnectorTransportResponse](#api-connectortransportresponse)
   - [ExecutionStore](#api-executionstore)
   - [ExtractedUsage](#api-extractedusage)
   - [GraphBuilderLike](#api-graphbuilderlike)
@@ -191,7 +202,7 @@
   - [ITenantRuntime](#api-itenantruntime)
     - [buildGraph()?](#api-buildgraph-2)
     - [getAgent()](#api-getagent-2)
-    - [getAgentConfig()](#api-getagentconfig-1)
+    - [getAgentConfig()](#api-getagentconfig-2)
     - [getMongodbUri()](#api-getmongodburi-1)
     - [usesPerInvocationBuild()?](#api-usesperinvocationbuild-2)
     - [warmUpAgent()?](#api-warmupagent-1)
@@ -235,9 +246,10 @@
   - [AttemptStartRequest](#api-attemptstartrequest)
   - [AttemptStartResponse](#api-attemptstartresponse)
   - [Auth](#api-auth)
-  - [AuthType](#api-authtype)
+  - [BasicAuth](#api-basicauth)
   - [BranchLineage](#api-branchlineage)
   - [CompleteExecutionCommand](#api-completeexecutioncommand)
+  - [ConnectorTransport](#api-connectortransport)
   - [Credential](#api-credential)
   - [ElicitationInfo](#api-elicitationinfo)
   - [ExecuteRequest](#api-executerequest)
@@ -305,7 +317,6 @@
   - [ToolDefinitions](#api-tooldefinitions)
   - [ToolExecuteRequest](#api-toolexecuterequest)
   - [ToolExecuteResponse](#api-toolexecuteresponse)
-  - [ToolFunctionRequest](#api-toolfunctionrequest)
   - [ToolPodExecuteRequest](#api-toolpodexecuterequest)
   - [ToolPodExecuteResponse](#api-toolpodexecuteresponse)
   - [ToolResponseFormat](#api-toolresponseformat)
@@ -339,12 +350,14 @@
   - [ATTR\_SKILLS\_LOADED\_COUNT](#api-attr_skills_loaded_count)
   - [ATTR\_SKILLS\_SOURCE\_COUNT](#api-attr_skills_source_count)
   - [AuthSchema](#api-authschema)
+  - [BasicAuthSchema](#api-basicauthschema)
   - [BranchLineageSchema](#api-branchlineageschema)
   - [BUILTIN\_TOOL\_NAMES](#api-builtin_tool_names)
   - [CALL\_INTERRUPTED\_ARTIFACT\_KEY](#api-call_interrupted_artifact_key)
   - [CompleteExecutionCommandSchema](#api-completeexecutioncommandschema)
   - [CredentialSchema](#api-credentialschema)
   - [DEFAULT\_CONNECTOR\_TIMEOUT\_SECONDS](#api-default_connector_timeout_seconds)
+  - [DEFAULT\_EXECUTION\_TIMEOUT\_SECONDS](#api-default_execution_timeout_seconds)
   - [DEFAULT\_MCP\_OAUTH\_CLIENT\_NAME](#api-default_mcp_oauth_client_name)
   - [DEFAULT\_MCP\_OAUTH\_REDIRECT\_URI](#api-default_mcp_oauth_redirect_uri)
   - [DEFAULT\_PORTS](#api-default_ports)
@@ -398,6 +411,10 @@
   - [LLMPodInvokeResponseSchema](#api-llmpodinvokeresponseschema)
   - [LLMPodStreamEventSchema](#api-llmpodstreameventschema)
   - [LLMResultSchema](#api-llmresultschema)
+  - [MAX\_ERROR\_ENVELOPE\_BYTES](#api-max_error_envelope_bytes)
+  - [MAX\_REDIRECTS](#api-max_redirects)
+  - [MAX\_RESPONSE\_BYTES](#api-max_response_bytes)
+  - [MAX\_RETRIES](#api-max_retries)
   - [MAX\_TOOL\_ARGUMENT\_BYTES](#api-max_tool_argument_bytes)
   - [MemoryWriteSchema](#api-memorywriteschema)
   - [MessageRoleSchema](#api-messageroleschema)
@@ -434,12 +451,12 @@
   - [ToolDefinitionsSchema](#api-tooldefinitionsschema)
   - [ToolExecuteRequestSchema](#api-toolexecuterequestschema)
   - [ToolExecuteResponseSchema](#api-toolexecuteresponseschema)
-  - [ToolFunctionRequestSchema](#api-toolfunctionrequestschema)
   - [ToolPodExecuteRequestSchema](#api-toolpodexecuterequestschema)
   - [ToolPodExecuteResponseSchema](#api-toolpodexecuteresponseschema)
   - [ToolResultRequestSchema](#api-toolresultrequestschema)
   - [ToolsListResponseSchema](#api-toolslistresponseschema)
   - [UnknownOutcomePolicySchema](#api-unknownoutcomepolicyschema)
+  - [USER\_AGENT](#api-user_agent)
   - [WorkflowDeclarationSchema](#api-workflowdeclarationschema)
   - [WorkflowErrorCodeSchema](#api-workflowerrorcodeschema)
   - [WorkflowErrorSchema](#api-workflowerrorschema)
@@ -453,15 +470,13 @@
   - [advanceStepOrdinal()](#api-advancestepordinal)
   - [allocateActivityOrdinal()](#api-allocateactivityordinal)
   - [allocateActivityPosition()](#api-allocateactivityposition)
+  - [allocateToolEffectPosition()](#api-allocatetooleffectposition)
   - [appliesToStage()](#api-appliestostage)
   - [attachMongoTracing()](#api-attachmongotracing)
   - [attemptStartRequestFromExecute()](#api-attemptstartrequestfromexecute)
-  - [authCredentialBindings()](#api-authcredentialbindings)
-  - [authHeaderName()](#api-authheadername)
   - [authHeaderNames()](#api-authheadernames)
   - [boundText()](#api-boundtext)
   - [buildActivityCommand()](#api-buildactivitycommand)
-  - [buildResultPayload()](#api-buildresultpayload)
   - [callMcpTool()](#api-callmcptool)
   - [captureException()](#api-captureexception)
   - [captureMessage()](#api-capturemessage)
@@ -604,6 +619,7 @@
   - [recordSuspendRequest()](#api-recordsuspendrequest)
   - [redactFields()](#api-redactfields)
   - [registerBuiltinTools()](#api-registerbuiltintools)
+  - [registerConnectorTools()](#api-registerconnectortools)
   - [registerGuardrailPolicyEngine()](#api-registerguardrailpolicyengine)
   - [registerInstrumentor()](#api-registerinstrumentor)
   - [registerLlm()](#api-registerllm)
@@ -668,6 +684,7 @@
   - [validateSegment()](#api-validatesegment)
   - [validateUrl()](#api-validateurl)
   - [valueToJson()](#api-valuetojson)
+  - [withConnectorEnvironment()](#api-withconnectorenvironment)
   - [withExecutionSignal()](#api-withexecutionsignal)
   - [withMetrics()](#api-withmetrics)
   - [writeTerminationMessage()](#api-writeterminationmessage)
@@ -764,6 +781,18 @@ const POLICY_DENIED_ERROR_CODE: "policy_denied" = "policy_denied";
 
 ***
 
+<a id="namespace-chunkTypes-api-run_timeout_error_code"></a>
+
+##### RUN\_TIMEOUT\_ERROR\_CODE
+
+```ts
+const RUN_TIMEOUT_ERROR_CODE: "run_timeout" = "run_timeout";
+```
+
+Only a positively identified whole-turn deadline gets run-limit copy.
+
+***
+
 <a id="namespace-chunkTypes-api-step"></a>
 
 ##### STEP
@@ -820,10 +849,9 @@ const TIMEOUT_ERROR_CODE: "timeout" = "timeout";
 ```
 
 Machine-readable discriminator set on `metadata.error_code` of an ERROR
-chunk/callback when a deadline expired rather than the work failing. Covers
-both flavours — one tool/LLM call overrunning, and the whole turn overrunning —
-because a consumer's response to either is the same: offer more time or a
-retry, not a bug report. Forwarded verbatim like the values above.
+chunk/callback when a tool or LLM call exceeds its deadline. Older runners
+also use this code for whole-turn expiry, so consumers cannot assume which
+deadline a bare timeout describes.
 
 ***
 
@@ -919,7 +947,6 @@ Runtime mode for the Runner SDK.
 | :------ | :------ |
 | <a id="api-enumeration-member-aer"></a> `AER` | `"aer"` |
 | <a id="api-enumeration-member-tool-2"></a> `TOOL` | `"tool"` |
-| <a id="api-enumeration-member-tool_function"></a> `TOOL_FUNCTION` | `"tool_function"` |
 
 ***
 
@@ -2019,9 +2046,13 @@ MemoryRuntime.searchTaxonomic
 
 ### AsyncMutex
 
-Promise-chain mutex serializing async work within one ToolServer instance.
-Mirrors Python's asyncio.Lock on ToolServer._execute_gate.
-Exported for tests that build a ToolServer without its constructor.
+Promise-chain mutex serializing async work within one process.
+
+Mirrors Python's asyncio.Lock on ToolServer._execute_gate. Lives in its own
+module rather than in server/tool.ts so hooks.ts can take the same lock:
+hooks.ts is imported by server/tool.ts, so importing back into it would be a
+cycle. server/tool.ts re-exports this for the callers that already import it
+from there.
 
 <a id="api-constructor-6"></a>
 
@@ -2382,6 +2413,239 @@ Error.constructor
 
 ***
 
+<a id="api-connectorexecutor"></a>
+
+### ConnectorExecutor
+
+Execute one compiled connector operation against its configured origin.
+
+<a id="api-constructor-12"></a>
+
+#### Constructor
+
+```ts
+new ConnectorExecutor(definitions, options?): ConnectorExecutor;
+```
+
+**Parameters**
+
+| Parameter | Type |
+| :------ | :------ |
+| `definitions` | \{ `auth?`: \| \{ `api_keys?`: `object`[] \| `null`; `basic?`: \| \{ `password`: `string`; `username`: `string`; \} \| `null`; `bearer?`: `string` \| `null`; `headers?`: `Record`\<`string`, `string`\> \| `null`; `provider?`: `string` \| `null`; `scopes?`: `string`[] \| `null`; \} \| `null`; `externalize?`: `Record`\<`string`, `unknown`\> \| `null`; `source`: \{ `base_url`: `string`; `generator?`: `string` \| `null`; `name`: `string`; `openapi?`: `string` \| `null`; `spec_sha256?`: `string` \| `null`; \}; `tools`: `object`[]; \} |
+| `definitions.auth?` | \| \{ `api_keys?`: `object`[] \| `null`; `basic?`: \| \{ `password`: `string`; `username`: `string`; \} \| `null`; `bearer?`: `string` \| `null`; `headers?`: `Record`\<`string`, `string`\> \| `null`; `provider?`: `string` \| `null`; `scopes?`: `string`[] \| `null`; \} \| `null` |
+| `definitions.externalize?` | `Record`\<`string`, `unknown`\> \| `null` |
+| `definitions.source` | \{ `base_url`: `string`; `generator?`: `string` \| `null`; `name`: `string`; `openapi?`: `string` \| `null`; `spec_sha256?`: `string` \| `null`; \} |
+| `definitions.source.base_url` | `string` |
+| `definitions.source.generator?` | `string` \| `null` |
+| `definitions.source.name` | `string` |
+| `definitions.source.openapi?` | `string` \| `null` |
+| `definitions.source.spec_sha256?` | `string` \| `null` |
+| `definitions.tools` | `object`[] |
+| `options` | [`ConnectorExecutorOptions`](#api-connectorexecutoroptions) |
+
+**Returns**
+
+[`ConnectorExecutor`](#api-connectorexecutor)
+
+#### Methods
+
+<a id="api-close-1"></a>
+
+##### close()
+
+```ts
+close(): Promise<void>;
+```
+
+Release pooled connections after in-flight calls have finished.
+
+**Returns**
+
+`Promise`\<`void`\>
+
+<a id="api-execute"></a>
+
+##### execute()
+
+```ts
+execute(
+   name,
+   arguments_,
+   __namedParameters?
+): Promise<string>;
+```
+
+Execute a named operation and return bounded UTF-8 response text.
+
+Invalid definitions, arguments, secrets, and redirects fail before a
+useful response is surfaced. Only GET/HEAD/OPTIONS retry 429/503.
+
+**Parameters**
+
+| Parameter | Type |
+| :------ | :------ |
+| `name` | `string` |
+| `arguments_` | `Record`\<`string`, `unknown`\> |
+| `__namedParameters` | \{ `authorization?`: \| \{ `expires_at?`: `number` \| `null`; `token`: `string`; \} \| `null`; `env?`: `Readonly`\<`Record`\<`string`, `string`\>\>; \} |
+| `__namedParameters.authorization?` | \| \{ `expires_at?`: `number` \| `null`; `token`: `string`; \} \| `null` |
+| `__namedParameters.env?` | `Readonly`\<`Record`\<`string`, `string`\>\> |
+
+**Returns**
+
+`Promise`\<`string`\>
+
+***
+
+<a id="api-connectorhttperror"></a>
+
+### ConnectorHTTPError
+
+#### Extends
+
+- `Error`
+
+<a id="api-constructor-13"></a>
+
+#### Constructor
+
+```ts
+new ConnectorHTTPError(status, data?): ConnectorHTTPError;
+```
+
+**Parameters**
+
+| Parameter | Type |
+| :------ | :------ |
+| `status` | `number` |
+| `data?` | `unknown` |
+
+**Returns**
+
+[`ConnectorHTTPError`](#api-connectorhttperror)
+
+**Overrides**
+
+```ts
+Error.constructor
+```
+
+#### Properties
+
+| Property | Modifier | Type |
+| :------ | :------ | :------ |
+| <a id="api-property-response"></a> `response` | `readonly` | `object` |
+| `response.data?` | `public` | `unknown` |
+| `response.status` | `public` | `number` |
+| <a id="api-property-status"></a> `status` | `readonly` | `number` |
+
+***
+
+<a id="api-connectortoolregistration"></a>
+
+### ConnectorToolRegistration
+
+One connector tool and the Tool Pod callable bound to its executor.
+
+<a id="api-constructor-14"></a>
+
+#### Constructor
+
+```ts
+new ConnectorToolRegistration(tool, callable): ConnectorToolRegistration;
+```
+
+**Parameters**
+
+| Parameter | Type |
+| :------ | :------ |
+| `tool` | [`BundledTool`](#api-bundledtool) |
+| `callable` | (`arguments_`) => `Promise`\<`string`\> |
+
+**Returns**
+
+[`ConnectorToolRegistration`](#api-connectortoolregistration)
+
+#### Properties
+
+| Property | Modifier | Type |
+| :------ | :------ | :------ |
+| <a id="api-property-callable"></a> `callable` | `readonly` | (`arguments_`) => `Promise`\<`string`\> |
+| <a id="api-property-tool"></a> `tool` | `readonly` | [`BundledTool`](#api-bundledtool) |
+
+#### Accessors
+
+<a id="api-metadata"></a>
+
+##### metadata
+
+**Get Signature**
+
+```ts
+get metadata(): ConnectorRegistrationMetadata;
+```
+
+**Returns**
+
+[`ConnectorRegistrationMetadata`](#api-connectorregistrationmetadata)
+
+***
+
+<a id="api-connectortoolruntime"></a>
+
+### ConnectorToolRuntime
+
+<a id="api-constructor-15"></a>
+
+#### Constructor
+
+```ts
+new ConnectorToolRuntime(bundle): ConnectorToolRuntime;
+```
+
+**Parameters**
+
+| Parameter | Type |
+| :------ | :------ |
+| `bundle` | [`ConnectorBundle`](#api-connectorbundle) |
+
+**Returns**
+
+[`ConnectorToolRuntime`](#api-connectortoolruntime)
+
+#### Accessors
+
+<a id="api-registrations"></a>
+
+##### registrations
+
+**Get Signature**
+
+```ts
+get registrations(): readonly ConnectorToolRegistration[];
+```
+
+**Returns**
+
+readonly [`ConnectorToolRegistration`](#api-connectortoolregistration)[]
+
+#### Methods
+
+<a id="api-close-2"></a>
+
+##### close()
+
+```ts
+close(): Promise<void>;
+```
+
+Release every connector's pooled transport once.
+
+**Returns**
+
+`Promise`\<`void`\>
+
+***
+
 <a id="api-contentpolicyotlpspanexporter"></a>
 
 ### ContentPolicyOTLPSpanExporter
@@ -2396,7 +2660,7 @@ never throw — they're surfaced only through `resultCallback`.
 
 - `SpanExporter`
 
-<a id="api-constructor-12"></a>
+<a id="api-constructor-16"></a>
 
 #### Constructor
 
@@ -2494,7 +2758,7 @@ SpanExporter.shutdown
 
 - `Error`
 
-<a id="api-constructor-13"></a>
+<a id="api-constructor-17"></a>
 
 #### Constructor
 
@@ -2529,7 +2793,7 @@ Error.constructor
 
 - `Error`
 
-<a id="api-constructor-14"></a>
+<a id="api-constructor-18"></a>
 
 #### Constructor
 
@@ -2567,7 +2831,7 @@ Error.constructor
 
 Own durable Memory projection, delivery, and pending user input.
 
-<a id="api-constructor-15"></a>
+<a id="api-constructor-19"></a>
 
 #### Constructor
 
@@ -2680,7 +2944,7 @@ Raised when tool execution fails.
 
 - [`ToolExecutionError`](#api-toolexecutionerror)
 
-<a id="api-constructor-16"></a>
+<a id="api-constructor-20"></a>
 
 #### Constructor
 
@@ -2712,7 +2976,7 @@ new ExternalAPICallError(
 
 **Overrides**
 
-[`ToolExecutionError`](#api-toolexecutionerror).[`constructor`](#api-constructor-42)
+[`ToolExecutionError`](#api-toolexecutionerror).[`constructor`](#api-constructor-46)
 
 #### Properties
 
@@ -2737,7 +3001,7 @@ new ExternalAPICallError(
 
 - `SpanExporter`
 
-<a id="api-constructor-17"></a>
+<a id="api-constructor-21"></a>
 
 #### Constructor
 
@@ -2834,7 +3098,7 @@ SpanExporter.shutdown
 
 - `Error`
 
-<a id="api-constructor-18"></a>
+<a id="api-constructor-22"></a>
 
 #### Constructor
 
@@ -2875,7 +3139,7 @@ Error.constructor
 
 Explicit provider/model options passed with an LLM invocation.
 
-<a id="api-constructor-19"></a>
+<a id="api-constructor-23"></a>
 
 #### Constructor
 
@@ -2974,7 +3238,7 @@ Mirrors Python's LLMRegistryLoadError.
 
 - `Error`
 
-<a id="api-constructor-20"></a>
+<a id="api-constructor-24"></a>
 
 #### Constructor
 
@@ -3007,7 +3271,7 @@ Error.constructor
 
 Framework-neutral LLM response.
 
-<a id="api-constructor-21"></a>
+<a id="api-constructor-25"></a>
 
 #### Constructor
 
@@ -3082,7 +3346,7 @@ underlying provider (OpenAI, Gemini, Anthropic, etc.). Implemented as
 a class to mirror `LLMResponse` in agent-engine-sdk and to host the
 `fromResponse` / `toResponse` / `extractUsage` conversion methods.
 
-<a id="api-constructor-22"></a>
+<a id="api-constructor-26"></a>
 
 #### Constructor
 
@@ -3193,7 +3457,7 @@ content extraction.
 
 Typed token-usage metadata for LLM calls.
 
-<a id="api-constructor-23"></a>
+<a id="api-constructor-27"></a>
 
 #### Constructor
 
@@ -3205,10 +3469,12 @@ new LLMTokenUsage(data): LLMTokenUsage;
 
 | Parameter | Type |
 | :------ | :------ |
-| `data` | \{ `completion_tokens?`: `number`; `input_tokens?`: `number`; `model?`: `string`; `output_tokens?`: `number`; `prompt_tokens?`: `number`; `reasoning_tokens?`: `number`; `total_tokens?`: `number`; \} |
+| `data` | \{ `completion_tokens?`: `number`; `input_token_details?`: `Record`\<`string`, `number`\>; `input_tokens?`: `number`; `model?`: `string`; `output_token_details?`: `Record`\<`string`, `number`\>; `output_tokens?`: `number`; `prompt_tokens?`: `number`; `reasoning_tokens?`: `number`; `total_tokens?`: `number`; \} |
 | `data.completion_tokens?` | `number` |
+| `data.input_token_details?` | `Record`\<`string`, `number`\> |
 | `data.input_tokens?` | `number` |
 | `data.model?` | `string` |
+| `data.output_token_details?` | `Record`\<`string`, `number`\> |
 | `data.output_tokens?` | `number` |
 | `data.prompt_tokens?` | `number` |
 | `data.reasoning_tokens?` | `number` |
@@ -3223,8 +3489,10 @@ new LLMTokenUsage(data): LLMTokenUsage;
 | Property | Modifier | Type | Description |
 | :------ | :------ | :------ | :------ |
 | <a id="api-property-completiontokens"></a> `completionTokens?` | `readonly` | `number` | - |
+| <a id="api-property-inputtokendetails"></a> `inputTokenDetails?` | `readonly` | `Record`\<`string`, `number`\> | Provider decomposition of `inputTokens`, e.g. Anthropic's `{cache_read, cache_creation}`. The provider already folds these into `inputTokens`, so they are reported alongside it, never added to it. |
 | <a id="api-property-inputtokens"></a> `inputTokens?` | `readonly` | `number` | - |
 | <a id="api-property-model"></a> `model?` | `readonly` | `string` | - |
+| <a id="api-property-outputtokendetails"></a> `outputTokenDetails?` | `readonly` | `Record`\<`string`, `number`\> | Provider decomposition of `outputTokens`, e.g. `{reasoning}`. |
 | <a id="api-property-outputtokens"></a> `outputTokens?` | `readonly` | `number` | - |
 | <a id="api-property-prompttokens"></a> `promptTokens?` | `readonly` | `number` | - |
 | <a id="api-property-reasoningtokens"></a> `reasoningTokens?` | `readonly` | `number` | Output tokens the model spent reasoning; part of the output count. |
@@ -3262,7 +3530,9 @@ Returns LangChain's expected usage-metadata keys.
 
 | Name | Type |
 | :------ | :------ |
+| `input_token_details?` | `Record`\<`string`, `number`\> |
 | `input_tokens` | `number` |
+| `output_token_details?` | `Record`\<`string`, `number`\> |
 | `output_tokens` | `number` |
 | `total_tokens` | `number` |
 
@@ -3274,7 +3544,7 @@ Returns LangChain's expected usage-metadata keys.
 
 Typed final tool call requested by an LLM.
 
-<a id="api-constructor-24"></a>
+<a id="api-constructor-28"></a>
 
 #### Constructor
 
@@ -3332,7 +3602,7 @@ Returns a LangChain-compatible tool-call dict (excludes index).
 
 Serializable bound-tool schema forwarded with an LLM call.
 
-<a id="api-constructor-25"></a>
+<a id="api-constructor-29"></a>
 
 #### Constructor
 
@@ -3393,7 +3663,7 @@ Returns the schema in the shape LangChain bind_tools expects.
 
 - `Error`
 
-<a id="api-constructor-26"></a>
+<a id="api-constructor-30"></a>
 
 #### Constructor
 
@@ -3429,7 +3699,7 @@ Raised when remote MCP configuration cannot be resolved.
 
 - `Error`
 
-<a id="api-constructor-27"></a>
+<a id="api-constructor-31"></a>
 
 #### Constructor
 
@@ -3465,7 +3735,7 @@ Raised when a remote MCP tool returns an MCP error result or a transport failure
 
 - `Error`
 
-<a id="api-constructor-28"></a>
+<a id="api-constructor-32"></a>
 
 #### Constructor
 
@@ -3495,7 +3765,7 @@ Error.constructor
 
 ### Metrics
 
-<a id="api-constructor-29"></a>
+<a id="api-constructor-33"></a>
 
 #### Constructor
 
@@ -3592,7 +3862,7 @@ static reset(): void;
 
 - `SpanExporter`
 
-<a id="api-constructor-30"></a>
+<a id="api-constructor-34"></a>
 
 #### Constructor
 
@@ -3689,7 +3959,7 @@ SpanExporter.shutdown
 
 - `NullExecutionCallback`
 
-<a id="api-constructor-31"></a>
+<a id="api-constructor-35"></a>
 
 #### Constructor
 
@@ -3873,7 +4143,7 @@ before the first await.
 
 - [`OperationalStepSource`](#api-operationalstepsource)
 
-<a id="api-constructor-32"></a>
+<a id="api-constructor-36"></a>
 
 #### Constructor
 
@@ -3953,7 +4223,7 @@ Contract implemented by native and future remote guardrail engines.
 
 - [`GuardrailPolicyEngine`](#api-guardrailpolicyengine)
 
-<a id="api-constructor-33"></a>
+<a id="api-constructor-37"></a>
 
 #### Constructor
 
@@ -4017,7 +4287,7 @@ Return engine-owned evidence and optional transformed text when triggered.
 
 - `Error`
 
-<a id="api-constructor-34"></a>
+<a id="api-constructor-38"></a>
 
 #### Constructor
 
@@ -4064,7 +4334,7 @@ Error.constructor
 
 - [`WorkflowClientError`](#api-workflowclienterror)
 
-<a id="api-constructor-35"></a>
+<a id="api-constructor-39"></a>
 
 #### Constructor
 
@@ -4085,7 +4355,7 @@ new ReplayedActivityFailedError(code, message): ReplayedActivityFailedError;
 
 **Overrides**
 
-[`WorkflowClientError`](#api-workflowclienterror).[`constructor`](#api-constructor-48)
+[`WorkflowClientError`](#api-workflowclienterror).[`constructor`](#api-constructor-52)
 
 #### Properties
 
@@ -4107,7 +4377,7 @@ TS getters under camelCase names; Python field names on
 `AgentFeatureConfig` are preserved verbatim so wire/log parity is
 maintained.
 
-<a id="api-constructor-36"></a>
+<a id="api-constructor-40"></a>
 
 #### Constructor
 
@@ -4119,7 +4389,7 @@ new RuntimeAgentConfig(init?): RuntimeAgentConfig;
 
 | Parameter | Type | Description |
 | :------ | :------ | :------ |
-| `init` | \{ `connectors?`: `object`[]; `entrypoint?`: `string` \| `null`; `features?`: \{ `deep_agent`: `boolean` \| `null`; `durable_workflow`: `boolean` \| `null`; `guardrails`: `boolean` \| `null`; `memory`: `boolean` \| `null`; `playground`: `boolean` \| `null`; `use_custom_parser`: `boolean` \| `null`; \}; `framework?`: `string` \| `null`; `language?`: `string` \| `null`; `mcp?`: \{ `servers`: `Record`\<`string`, \{ `allowed_tools`: `string`[] \| `null`; `auth`: \{ `client_id_env`: `string` \| `null`; `client_name`: `string` \| `null`; `client_secret_env`: `string` \| `null`; `redirect_uri`: `string` \| `null`; `scope`: `string` \| `null`; `token_env`: `string` \| `null`; `token_url`: `string` \| `null`; `type`: `"none"` \| `"bearer_env"` \| `"oauth"` \| `"client_credentials"`; \}; `headers`: `Record`\<`string`, `string`\>; `timeout_seconds`: `number`; `transport`: `"streamable_http"`; `url`: `string`; \}\>; \}; `path?`: `string` \| `null`; `requiredSecrets?`: \{ `aer?`: `string`[]; `disable_restriction?`: `boolean`; `tools?`: `Record`\<`string`, `string`[]\>; \}; \} | - |
+| `init` | \{ `connectors?`: `object`[]; `entrypoint?`: `string` \| `null`; `features?`: \{ `deep_agent`: `boolean` \| `null`; `durable_workflow`: `boolean` \| `null`; `guardrails`: `boolean` \| `null`; `memory`: `boolean` \| `null`; `playground`: `boolean` \| `null`; `use_custom_parser`: `boolean` \| `null`; \}; `framework?`: `string` \| `null`; `language?`: `string` \| `null`; `mcp?`: \{ `servers`: `Record`\<`string`, \{ `allowed_tools`: `string`[] \| `null`; `auth`: \{ `client_id_env`: `string` \| `null`; `client_name`: `string` \| `null`; `client_secret_env`: `string` \| `null`; `redirect_uri`: `string` \| `null`; `scope`: `string` \| `null`; `token_env`: `string` \| `null`; `token_url`: `string` \| `null`; `type`: `"none"` \| `"bearer_env"` \| `"oauth"` \| `"client_credentials"`; \}; `headers`: `Record`\<`string`, `string`\>; `scopes`: `string`[]; `timeout_seconds`: `number`; `transport`: `"streamable_http"`; `url`: `string` \| `null`; \}\>; \}; `path?`: `string` \| `null`; `requiredSecrets?`: \{ `aer?`: `string`[]; `disable_restriction?`: `boolean`; `tools?`: `Record`\<`string`, `string`[]\>; \}; \} | - |
 | `init.connectors?` | `object`[] | - |
 | `init.entrypoint?` | `string` \| `null` | - |
 | `init.features?` | \{ `deep_agent`: `boolean` \| `null`; `durable_workflow`: `boolean` \| `null`; `guardrails`: `boolean` \| `null`; `memory`: `boolean` \| `null`; `playground`: `boolean` \| `null`; `use_custom_parser`: `boolean` \| `null`; \} | - |
@@ -4131,8 +4401,8 @@ new RuntimeAgentConfig(init?): RuntimeAgentConfig;
 | `init.features.use_custom_parser` | `boolean` \| `null` | Opt-in for author-defined streaming output shaping. When true the adapter runs the registered output parser and emits `custom_event` frames; off leaves the stream unchanged. |
 | `init.framework?` | `string` \| `null` | - |
 | `init.language?` | `string` \| `null` | - |
-| `init.mcp?` | \{ `servers`: `Record`\<`string`, \{ `allowed_tools`: `string`[] \| `null`; `auth`: \{ `client_id_env`: `string` \| `null`; `client_name`: `string` \| `null`; `client_secret_env`: `string` \| `null`; `redirect_uri`: `string` \| `null`; `scope`: `string` \| `null`; `token_env`: `string` \| `null`; `token_url`: `string` \| `null`; `type`: `"none"` \| `"bearer_env"` \| `"oauth"` \| `"client_credentials"`; \}; `headers`: `Record`\<`string`, `string`\>; `timeout_seconds`: `number`; `transport`: `"streamable_http"`; `url`: `string`; \}\>; \} | - |
-| `init.mcp.servers` | `Record`\<`string`, \{ `allowed_tools`: `string`[] \| `null`; `auth`: \{ `client_id_env`: `string` \| `null`; `client_name`: `string` \| `null`; `client_secret_env`: `string` \| `null`; `redirect_uri`: `string` \| `null`; `scope`: `string` \| `null`; `token_env`: `string` \| `null`; `token_url`: `string` \| `null`; `type`: `"none"` \| `"bearer_env"` \| `"oauth"` \| `"client_credentials"`; \}; `headers`: `Record`\<`string`, `string`\>; `timeout_seconds`: `number`; `transport`: `"streamable_http"`; `url`: `string`; \}\> | - |
+| `init.mcp?` | \{ `servers`: `Record`\<`string`, \{ `allowed_tools`: `string`[] \| `null`; `auth`: \{ `client_id_env`: `string` \| `null`; `client_name`: `string` \| `null`; `client_secret_env`: `string` \| `null`; `redirect_uri`: `string` \| `null`; `scope`: `string` \| `null`; `token_env`: `string` \| `null`; `token_url`: `string` \| `null`; `type`: `"none"` \| `"bearer_env"` \| `"oauth"` \| `"client_credentials"`; \}; `headers`: `Record`\<`string`, `string`\>; `scopes`: `string`[]; `timeout_seconds`: `number`; `transport`: `"streamable_http"`; `url`: `string` \| `null`; \}\>; \} | - |
+| `init.mcp.servers` | `Record`\<`string`, \{ `allowed_tools`: `string`[] \| `null`; `auth`: \{ `client_id_env`: `string` \| `null`; `client_name`: `string` \| `null`; `client_secret_env`: `string` \| `null`; `redirect_uri`: `string` \| `null`; `scope`: `string` \| `null`; `token_env`: `string` \| `null`; `token_url`: `string` \| `null`; `type`: `"none"` \| `"bearer_env"` \| `"oauth"` \| `"client_credentials"`; \}; `headers`: `Record`\<`string`, `string`\>; `scopes`: `string`[]; `timeout_seconds`: `number`; `transport`: `"streamable_http"`; `url`: `string` \| `null`; \}\> | - |
 | `init.path?` | `string` \| `null` | - |
 | `init.requiredSecrets?` | \{ `aer?`: `string`[]; `disable_restriction?`: `boolean`; `tools?`: `Record`\<`string`, `string`[]\>; \} | - |
 | `init.requiredSecrets.aer?` | `string`[] | - |
@@ -4159,7 +4429,7 @@ new RuntimeAgentConfig(init?): RuntimeAgentConfig;
 | <a id="api-property-framework"></a> `framework` | `readonly` | `string` \| `null` | Application framework from agent.yaml; omitted means unset at advertise time. |
 | <a id="api-property-language"></a> `language` | `readonly` | `string` \| `null` | Runtime language from agent.yaml; omitted means unset at advertise time. |
 | <a id="api-property-mcp"></a> `mcp` | `readonly` | `object` | - |
-| `mcp.servers` | `public` | `Record`\<`string`, \{ `allowed_tools`: `string`[] \| `null`; `auth`: \{ `client_id_env`: `string` \| `null`; `client_name`: `string` \| `null`; `client_secret_env`: `string` \| `null`; `redirect_uri`: `string` \| `null`; `scope`: `string` \| `null`; `token_env`: `string` \| `null`; `token_url`: `string` \| `null`; `type`: `"none"` \| `"bearer_env"` \| `"oauth"` \| `"client_credentials"`; \}; `headers`: `Record`\<`string`, `string`\>; `timeout_seconds`: `number`; `transport`: `"streamable_http"`; `url`: `string`; \}\> | - |
+| `mcp.servers` | `public` | `Record`\<`string`, \{ `allowed_tools`: `string`[] \| `null`; `auth`: \{ `client_id_env`: `string` \| `null`; `client_name`: `string` \| `null`; `client_secret_env`: `string` \| `null`; `redirect_uri`: `string` \| `null`; `scope`: `string` \| `null`; `token_env`: `string` \| `null`; `token_url`: `string` \| `null`; `type`: `"none"` \| `"bearer_env"` \| `"oauth"` \| `"client_credentials"`; \}; `headers`: `Record`\<`string`, `string`\>; `scopes`: `string`[]; `timeout_seconds`: `number`; `transport`: `"streamable_http"`; `url`: `string` \| `null`; \}\> | - |
 | <a id="api-property-path"></a> `path` | `readonly` | `string` \| `null` | - |
 | <a id="api-property-requiredsecrets"></a> `requiredSecrets` | `readonly` | `object` | - |
 | `requiredSecrets.aer` | `public` | `string`[] | - |
@@ -4215,7 +4485,7 @@ Return a feature flag value, falling back to `defaultValue` when omitted.
 
 ### SecureLLMProxy
 
-<a id="api-constructor-37"></a>
+<a id="api-constructor-41"></a>
 
 #### Constructor
 
@@ -4370,7 +4640,7 @@ Static — can be called without a proxy instance (e.g. after parallel streaming
 
 ### SecureToolWrapper
 
-<a id="api-constructor-38"></a>
+<a id="api-constructor-42"></a>
 
 #### Constructor
 
@@ -4429,7 +4699,7 @@ Current operational-step watermark for compatibility readers.
 
 #### Methods
 
-<a id="api-close-1"></a>
+<a id="api-close-3"></a>
 
 ##### close()
 
@@ -4540,7 +4810,7 @@ graph builder and starts the per-mode Fastify server.
 
 - [`ITenantRuntime`](#api-itenantruntime)
 
-<a id="api-constructor-39"></a>
+<a id="api-constructor-43"></a>
 
 #### Constructor
 
@@ -4645,7 +4915,7 @@ Parsed `agent.yaml` configuration.
 
 **Implementation of**
 
-[`ITenantRuntime`](#api-itenantruntime).[`getAgentConfig`](#api-getagentconfig-1)
+[`ITenantRuntime`](#api-itenantruntime).[`getAgentConfig`](#api-getagentconfig-2)
 
 <a id="api-getcurrentsessionid"></a>
 
@@ -4840,7 +5110,7 @@ model call and durable step (see [SecureToolWrapper.throwIfPlatformFailed](#api-
 
 - [`ToolPlatformError`](#api-toolplatformerror)
 
-<a id="api-constructor-40"></a>
+<a id="api-constructor-44"></a>
 
 #### Constructor
 
@@ -4861,13 +5131,13 @@ new TerminalExecutionError(error, options?): TerminalExecutionError;
 
 **Overrides**
 
-[`ToolPlatformError`](#api-toolplatformerror).[`constructor`](#api-constructor-44)
+[`ToolPlatformError`](#api-toolplatformerror).[`constructor`](#api-constructor-48)
 
 #### Properties
 
 | Property | Modifier | Type | Inherited from |
 | :------ | :------ | :------ | :------ |
-| <a id="api-property-error-2"></a> `error` | `readonly` | `string` | [`ToolPlatformError`](#api-toolplatformerror).[`error`](#api-property-error-5) |
+| <a id="api-property-error-2"></a> `error` | `readonly` | `string` | [`ToolPlatformError`](#api-toolplatformerror).[`error`](#api-property-error-6) |
 
 ***
 
@@ -4885,7 +5155,7 @@ the developer to debug governance instead of their tool.
 
 - [`ToolExecutionError`](#api-toolexecutionerror)
 
-<a id="api-constructor-41"></a>
+<a id="api-constructor-45"></a>
 
 #### Constructor
 
@@ -4913,7 +5183,7 @@ new ToolCallTimeoutError(
 
 **Overrides**
 
-[`ToolExecutionError`](#api-toolexecutionerror).[`constructor`](#api-constructor-42)
+[`ToolExecutionError`](#api-toolexecutionerror).[`constructor`](#api-constructor-46)
 
 #### Properties
 
@@ -4939,10 +5209,11 @@ Raised when tool execution fails.
 #### Extended by
 
 - [`ToolCallTimeoutError`](#api-toolcalltimeouterror)
+- [`ToolOutcomeUnknownError`](#api-tooloutcomeunknownerror)
 - [`ToolPlatformError`](#api-toolplatformerror)
 - [`ExternalAPICallError`](#api-externalapicallerror)
 
-<a id="api-constructor-42"></a>
+<a id="api-constructor-46"></a>
 
 #### Constructor
 
@@ -4975,56 +5246,46 @@ Error.constructor
 
 ***
 
-<a id="api-toolfunctionrunner"></a>
+<a id="api-tooloutcomeunknownerror"></a>
 
-### ToolFunctionRunner
+### ToolOutcomeUnknownError
 
-Runs one metadata-delivered tool call and exits. Not a server.
+The runner was lost while this durable tool call was in flight, so it may
+have taken effect and OE did not run it again. `error` is OE's message,
+written for the model reading it.
 
-Reads the ToolFunctionRequest envelope from the guest metadata directory,
-invokes the named tool from the registry, reports the ToolResultRequest
-to {oe_url}/tool/result, and returns. Mirrors Python's ToolFunctionRunner.
+#### Extends
 
-`metadataDir` is injectable for tests.
+- [`ToolExecutionError`](#api-toolexecutionerror)
 
-<a id="api-constructor-43"></a>
+<a id="api-constructor-47"></a>
 
 #### Constructor
 
 ```ts
-new ToolFunctionRunner(runtime, __namedParameters?): ToolFunctionRunner;
+new ToolOutcomeUnknownError(error, options?): ToolOutcomeUnknownError;
 ```
 
 **Parameters**
 
 | Parameter | Type |
 | :------ | :------ |
-| `runtime` | [`ITenantRuntime`](#api-itenantruntime) |
-| `__namedParameters` | \{ `metadataDir?`: `string`; \} |
-| `__namedParameters.metadataDir?` | `string` |
+| `error` | `string` |
+| `options?` | `ErrorOptions` |
 
 **Returns**
 
-[`ToolFunctionRunner`](#api-toolfunctionrunner)
+[`ToolOutcomeUnknownError`](#api-tooloutcomeunknownerror)
 
-#### Methods
+**Overrides**
 
-<a id="api-run-1"></a>
+[`ToolExecutionError`](#api-toolexecutionerror).[`constructor`](#api-constructor-46)
 
-##### run()
+#### Properties
 
-```ts
-run(): Promise<void>;
-```
-
-Run one tool from the metadata-delivered request and report the result.
-
-Re-raises if the result POST cannot be delivered after retries so fctr
-records the execution as failed.
-
-**Returns**
-
-`Promise`\<`void`\>
+| Property | Modifier | Type | Inherited from |
+| :------ | :------ | :------ | :------ |
+| <a id="api-property-error-5"></a> `error` | `readonly` | `string` | [`ToolExecutionError`](#api-toolexecutionerror).[`error`](#api-property-error-4) |
 
 ***
 
@@ -5047,7 +5308,7 @@ model call and durable step (see [SecureToolWrapper.throwIfPlatformFailed](#api-
 
 - [`TerminalExecutionError`](#api-terminalexecutionerror)
 
-<a id="api-constructor-44"></a>
+<a id="api-constructor-48"></a>
 
 #### Constructor
 
@@ -5068,13 +5329,13 @@ new ToolPlatformError(error, options?): ToolPlatformError;
 
 **Overrides**
 
-[`ToolExecutionError`](#api-toolexecutionerror).[`constructor`](#api-constructor-42)
+[`ToolExecutionError`](#api-toolexecutionerror).[`constructor`](#api-constructor-46)
 
 #### Properties
 
 | Property | Modifier | Type | Inherited from |
 | :------ | :------ | :------ | :------ |
-| <a id="api-property-error-5"></a> `error` | `readonly` | `string` | [`ToolExecutionError`](#api-toolexecutionerror).[`error`](#api-property-error-4) |
+| <a id="api-property-error-6"></a> `error` | `readonly` | `string` | [`ToolExecutionError`](#api-toolexecutionerror).[`error`](#api-property-error-4) |
 
 ***
 
@@ -5086,7 +5347,7 @@ new ToolPlatformError(error, options?): ToolPlatformError;
 
 - `BaseServer`
 
-<a id="api-constructor-45"></a>
+<a id="api-constructor-49"></a>
 
 #### Constructor
 
@@ -5186,7 +5447,7 @@ BaseServer.modeName
 
 #### Methods
 
-<a id="api-close-2"></a>
+<a id="api-close-4"></a>
 
 ##### close()
 
@@ -5327,7 +5588,7 @@ registerRoutes(app): void;
 BaseServer.registerRoutes
 ```
 
-<a id="api-run-2"></a>
+<a id="api-run-1"></a>
 
 ##### run()
 
@@ -5362,7 +5623,7 @@ BaseServer.run
 
 - `Error`
 
-<a id="api-constructor-46"></a>
+<a id="api-constructor-50"></a>
 
 #### Constructor
 
@@ -5392,7 +5653,7 @@ Error.constructor
 
 ### WorkflowClient
 
-<a id="api-constructor-47"></a>
+<a id="api-constructor-51"></a>
 
 #### Constructor
 
@@ -5556,7 +5817,7 @@ startAttempt(request): Promise<AttemptContext | null>;
 
 - [`ReplayedActivityFailedError`](#api-replayedactivityfailederror)
 
-<a id="api-constructor-48"></a>
+<a id="api-constructor-52"></a>
 
 #### Constructor
 
@@ -5667,7 +5928,7 @@ Given a list of session_ids, return a SessionsSummaryResponse.
 | Property | Modifier | Type |
 | :------ | :------ | :------ |
 | <a id="api-property-definitions"></a> `definitions` | `readonly` | `object` |
-| `definitions.auth?` | `public` | \| \{ `credentials?`: `object`[] \| `null`; `env?`: `string` \| `null`; `header?`: `string` \| `null`; `headers?`: `Record`\<`string`, `string`\> \| `null`; `location?`: `"path"` \| `"header"` \| `"query"` \| `"cookie"` \| `null`; `name?`: `string` \| `null`; `password_env?`: `string` \| `null`; `prefix`: `string`; `provider_type?`: `string` \| `null`; `scopes`: `string`[]; `type`: `"none"` \| `"oauth"` \| `"bearer"` \| `"api_key"` \| `"basic"` \| `"api_keys"`; `username_env?`: `string` \| `null`; \} \| `null` |
+| `definitions.auth?` | `public` | \| \{ `api_keys?`: `object`[] \| `null`; `basic?`: \| \{ `password`: `string`; `username`: `string`; \} \| `null`; `bearer?`: `string` \| `null`; `headers?`: `Record`\<`string`, `string`\> \| `null`; `provider?`: `string` \| `null`; `scopes?`: `string`[] \| `null`; \} \| `null` |
 | `definitions.externalize?` | `public` | `Record`\<`string`, `unknown`\> \| `null` |
 | `definitions.source` | `public` | `object` |
 | `definitions.source.base_url` | `public` | `string` |
@@ -5714,6 +5975,21 @@ enclosing graph; see `allocateActivityPosition`.
 
 ***
 
+<a id="api-connectorexecutoroptions"></a>
+
+### ConnectorExecutorOptions
+
+#### Properties
+
+| Property | Modifier | Type |
+| :------ | :------ | :------ |
+| <a id="api-property-now"></a> `now?` | `readonly` | () => `number` |
+| <a id="api-property-sleep"></a> `sleep?` | `readonly` | (`milliseconds`) => `Promise`\<`void`\> |
+| <a id="api-property-timeoutseconds-1"></a> `timeoutSeconds?` | `readonly` | `number` |
+| <a id="api-property-transport"></a> `transport?` | `readonly` | [`ConnectorTransport`](#api-connectortransport) |
+
+***
+
 <a id="api-connectorregistrationmetadata"></a>
 
 ### ConnectorRegistrationMetadata
@@ -5727,10 +6003,39 @@ enclosing graph; see `allocateActivityPosition`.
 | <a id="api-property-is_local"></a> `is_local` | `readonly` | `false` |
 | <a id="api-property-name-6"></a> `name` | `readonly` | `string` |
 | <a id="api-property-network"></a> `network` | `readonly` | `string`[] |
-| <a id="api-property-provider_type"></a> `provider_type` | `readonly` | `string` \| `null` |
+| <a id="api-property-provider"></a> `provider` | `readonly` | `string` \| `null` |
 | <a id="api-property-redact_fields"></a> `redact_fields` | `readonly` | `string`[] |
 | <a id="api-property-scopes"></a> `scopes` | `readonly` | `string`[] |
 | <a id="api-property-timeout_seconds"></a> `timeout_seconds` | `readonly` | `number` |
+
+***
+
+<a id="api-connectorruntimetarget"></a>
+
+### ConnectorRuntimeTarget
+
+The runtime surface the connector registry reads from ToolServer.
+
+#### Properties
+
+| Property | Modifier | Type |
+| :------ | :------ | :------ |
+| <a id="api-property-tooldefinitions-1"></a> `toolDefinitions` | `readonly` | `Record`\<`string`, `Record`\<`string`, `unknown`\>\> |
+| <a id="api-property-tools-2"></a> `tools` | `readonly` | `Record`\<`string`, (`arguments_`) => `unknown`\> |
+
+#### Methods
+
+<a id="api-getagentconfig-1"></a>
+
+##### getAgentConfig()
+
+```ts
+getAgentConfig(): RuntimeAgentConfig;
+```
+
+**Returns**
+
+[`RuntimeAgentConfig`](#api-runtimeagentconfig)
 
 ***
 
@@ -5745,6 +6050,41 @@ enclosing graph; see `allocateActivityPosition`.
 | <a id="api-property-description-2"></a> `description` | `readonly` | `string` |
 | <a id="api-property-inputschema"></a> `inputSchema` | `readonly` | `Record`\<`string`, `unknown`\> |
 | <a id="api-property-name-7"></a> `name` | `readonly` | `string` |
+
+***
+
+<a id="api-connectortransportrequest"></a>
+
+### ConnectorTransportRequest
+
+One request handed to a transport, after validation and serialization.
+
+#### Properties
+
+| Property | Modifier | Type |
+| :------ | :------ | :------ |
+| <a id="api-property-body"></a> `body?` | `readonly` | `Uint8Array`\<`ArrayBufferLike`\> |
+| <a id="api-property-headers"></a> `headers` | `readonly` | `Readonly`\<`Record`\<`string`, `string`\>\> |
+| <a id="api-property-method"></a> `method` | `readonly` | `string` |
+| <a id="api-property-signal"></a> `signal` | `readonly` | `AbortSignal` |
+| <a id="api-property-url"></a> `url` | `readonly` | `string` |
+
+***
+
+<a id="api-connectortransportresponse"></a>
+
+### ConnectorTransportResponse
+
+The subset of a response the executor needs from a transport.
+
+#### Properties
+
+| Property | Modifier | Type |
+| :------ | :------ | :------ |
+| <a id="api-property-body-1"></a> `body` | `readonly` | `AsyncIterable`\<`Uint8Array`\<`ArrayBufferLike`\>, `any`, `any`\> & `object` |
+| <a id="api-property-headers-1"></a> `headers` | `readonly` | `object` |
+| `headers.get` | `public` | `string` \| `null` |
+| <a id="api-property-status-1"></a> `status` | `readonly` | `number` |
 
 ***
 
@@ -5770,7 +6110,7 @@ enclosing graph; see `allocateActivityPosition`.
 | `sessionFinish.closed` | `boolean` | - |
 | `sessionFinish.requested` | `boolean` | - |
 | <a id="api-property-sessionid"></a> `sessionId` | `string` \| `null` | - |
-| <a id="api-property-signal"></a> `signal` | `AbortSignal` \| `null` | Execution-wide abort signal (fires on the AER execution timeout). Combined into in-flight OE/LLM fetches via [withExecutionSignal](#api-withexecutionsignal) so a timeout cancels active network I/O instead of leaving it to run. Null outside an AER execution (e.g. a single Tool Pod call). |
+| <a id="api-property-signal-1"></a> `signal` | `AbortSignal` \| `null` | Execution-wide abort signal (fires on the AER execution timeout). Combined into in-flight OE/LLM fetches via [withExecutionSignal](#api-withexecutionsignal) so a timeout cancels active network I/O instead of leaving it to run. Null outside an AER execution (e.g. a single Tool Pod call). |
 | <a id="api-property-suspendrequest"></a> `suspendRequest` | `object` | Out-of-band suspend signal. Only the author-facing `suspendPayloadToJson` writes it, so untrusted tool-result content — which cannot reach this process-local frame — can never forge a HITL suspend. A nested holder for the same reason as `sessionFinish`: a tool offloaded to a worker thread mutates the shared object, not a reassigned store field. |
 | `suspendRequest.payload` | `Record`\<`string`, `unknown`\> \| `null` | - |
 | <a id="api-property-traceid"></a> `traceId` | `string` \| `null` | Platform trace ID for log correlation. |
@@ -6017,8 +6357,8 @@ Minimal runtime interface that server classes depend on.
 | <a id="api-property-memorywriter-1"></a> `memoryWriter?` | `readonly` | `TurnMemoryWriter` \| `null` | Native-checkpoint turn writer, present only when Memory is enabled. |
 | <a id="api-property-orgid-1"></a> `orgId` | `readonly` | `string` \| `null` | - |
 | <a id="api-property-projectid-1"></a> `projectId?` | `readonly` | `string` \| `null` | Optional so pre-existing hand-written implementations (custom runtimes, test doubles) keep typechecking across the SDK bump that introduced it. The capability-advertise path treats absent and null alike by skipping. |
-| <a id="api-property-tooldefinitions-1"></a> `toolDefinitions` | `readonly` | `Record`\<`string`, `Record`\<`string`, `unknown`\>\> | Tool metadata (description, is_local, etc.), keyed by name. |
-| <a id="api-property-tools-2"></a> `tools` | `readonly` | `Record`\<`string`, [`ServerToolFn`](#api-servertoolfn)\> | Raw tool functions registered via `app.tool()`, keyed by name. |
+| <a id="api-property-tooldefinitions-2"></a> `toolDefinitions` | `readonly` | `Record`\<`string`, `Record`\<`string`, `unknown`\>\> | Tool metadata (description, is_local, etc.), keyed by name. |
+| <a id="api-property-tools-3"></a> `tools` | `readonly` | `Record`\<`string`, [`ServerToolFn`](#api-servertoolfn)\> | Raw tool functions registered via `app.tool()`, keyed by name. |
 
 #### Methods
 
@@ -6069,7 +6409,7 @@ Get a `BaseAgent` instance, optionally wired with execution callbacks.
 
 `BaseAgent`
 
-<a id="api-getagentconfig-1"></a>
+<a id="api-getagentconfig-2"></a>
 
 ##### getAgentConfig()
 
@@ -6169,9 +6509,10 @@ Discovered MCP tool bound to a configured server.
 | `serverConfig.auth.token_url` | `public` | `string` \| `null` |
 | `serverConfig.auth.type` | `public` | `"none"` \| `"bearer_env"` \| `"oauth"` \| `"client_credentials"` |
 | `serverConfig.headers` | `public` | `Record`\<`string`, `string`\> |
+| `serverConfig.scopes` | `public` | `string`[] |
 | `serverConfig.timeout_seconds` | `public` | `number` |
 | `serverConfig.transport` | `public` | `"streamable_http"` |
-| `serverConfig.url` | `public` | `string` |
+| `serverConfig.url` | `public` | `string` \| `null` |
 | <a id="api-property-servername"></a> `serverName` | `readonly` | `string` |
 | <a id="api-property-toolname-1"></a> `toolName` | `readonly` | `string` |
 
@@ -6345,7 +6686,7 @@ Public options for `registerAndRun`.
 | :------ | :------ | :------ |
 | <a id="api-property-completiontokens-1"></a> `completionTokens?` | `number` \| `null` | - |
 | <a id="api-property-durationms"></a> `durationMs` | `number` | - |
-| <a id="api-property-error-6"></a> `error?` | `string` \| `null` | - |
+| <a id="api-property-error-7"></a> `error?` | `string` \| `null` | - |
 | <a id="api-property-executionid-4"></a> `executionId` | `string` | - |
 | <a id="api-property-kind"></a> `kind?` | `string` \| `null` | - |
 | <a id="api-property-metadata-2"></a> `metadata?` | `Record`\<`string`, `unknown`\> | - |
@@ -6356,7 +6697,7 @@ Public options for `registerAndRun`.
 | <a id="api-property-podname"></a> `podName?` | `string` \| `null` | - |
 | <a id="api-property-prompttokens-1"></a> `promptTokens?` | `number` \| `null` | - |
 | <a id="api-property-result"></a> `result?` | `unknown` | - |
-| <a id="api-property-status"></a> `status` | `string` | - |
+| <a id="api-property-status-2"></a> `status` | `string` | - |
 | <a id="api-property-step"></a> `step` | `number` | - |
 | <a id="api-property-toolapierror"></a> `toolApiError?` | \| \{ `classification`: `string`; `error_code?`: `string` \| `null`; `http_status?`: `number` \| `null`; `provider_type?`: `string` \| `null`; `reason?`: `string` \| `null`; `retryable`: `boolean`; \} \| `null` | - |
 | <a id="api-property-toolcallid-1"></a> `toolCallId?` | `string` | - |
@@ -6380,7 +6721,7 @@ Public options for `registerAndRun`.
 | <a id="api-property-kind-1"></a> `kind?` | `string` \| `null` | - |
 | <a id="api-property-metadata-3"></a> `metadata?` | `Record`\<`string`, `unknown`\> | - |
 | <a id="api-property-oeurl-5"></a> `oeUrl` | `string` | - |
-| <a id="api-property-providertype"></a> `providerType?` | `string` \| `null` | - |
+| <a id="api-property-provider-1"></a> `provider?` | `string` \| `null` | - |
 | <a id="api-property-redactfields"></a> `redactFields?` | readonly `string`[] | Top-level tool argument names to redact from execution logs. |
 | <a id="api-property-reviewid"></a> `reviewId?` | `string` \| `null` | Asks OE to answer this invoke_llm call from a decided guardrail review. |
 | <a id="api-property-reviewprotocol"></a> `reviewProtocol?` | `number` \| `null` | Set by callers that pause for the guardrail review a halt names and then resolve the call with `reviewId`. |
@@ -6422,7 +6763,7 @@ Public options for `registerAndRun`.
 | <a id="api-property-payload-1"></a> `payload?` | `Record`\<`string`, `unknown`\> \| `null` | - |
 | <a id="api-property-requestid-1"></a> `requestId?` | `string` \| `null` | - |
 | <a id="api-property-sessionid-2"></a> `sessionId?` | `string` \| `null` | - |
-| <a id="api-property-signal-1"></a> `signal?` | `AbortSignal` \| `null` | - |
+| <a id="api-property-signal-2"></a> `signal?` | `AbortSignal` \| `null` | - |
 | <a id="api-property-traceid-1"></a> `traceId?` | `string` \| `null` | - |
 | <a id="api-property-userid-2"></a> `userId?` | `string` \| `null` | - |
 | <a id="api-property-workspaceid-1"></a> `workspaceId?` | `string` \| `null` | - |
@@ -6900,12 +7241,12 @@ This module is the TypeScript counterpart of
 
 ***
 
-<a id="api-authtype"></a>
+<a id="api-basicauth"></a>
 
-### AuthType
+### BasicAuth
 
 ```ts
-type AuthType = "none" | "bearer" | "api_key" | "basic" | "api_keys" | "oauth";
+type BasicAuth = z.infer<typeof BasicAuthSchema>;
 ```
 
 Compiled OpenAPI connector contract and authoring materialization.
@@ -6962,6 +7303,28 @@ the next invocation in the session.
 #### Generated
 
 from message mongodb.agentic.workflow.v1.CompleteExecutionCommand
+
+***
+
+<a id="api-connectortransport"></a>
+
+### ConnectorTransport
+
+```ts
+type ConnectorTransport = (request) => Promise<ConnectorTransportResponse>;
+```
+
+One HTTP hop. Tests inject a handler; production uses undici.
+
+#### Parameters
+
+| Parameter | Type |
+| :------ | :------ |
+| `request` | [`ConnectorTransportRequest`](#api-connectortransportrequest) |
+
+#### Returns
+
+`Promise`\<[`ConnectorTransportResponse`](#api-connectortransportresponse)\>
 
 ***
 
@@ -7853,16 +8216,6 @@ type ToolExecuteResponse = z.infer<typeof ToolExecuteResponseSchema>;
 
 ***
 
-<a id="api-toolfunctionrequest"></a>
-
-### ToolFunctionRequest
-
-```ts
-type ToolFunctionRequest = z.infer<typeof ToolFunctionRequestSchema>;
-```
-
-***
-
 <a id="api-toolpodexecuterequest"></a>
 
 ### ToolPodExecuteRequest
@@ -8324,8 +8677,8 @@ const ATTR_SKILLS_SOURCE_COUNT: "skills.source_count" = "skills.source_count";
 ### AuthSchema
 
 ```ts
-const AuthSchema: ZodObject<{
-  credentials: ZodOptional<ZodNullable<ZodArray<ZodObject<{
+const AuthSchema: ZodPipe<ZodUnknown, ZodObject<{
+  api_keys: ZodOptional<ZodNullable<ZodArray<ZodObject<{
      env: ZodString;
      location: ZodEnum<{
         cookie: "cookie";
@@ -8336,30 +8689,35 @@ const AuthSchema: ZodObject<{
      name: ZodString;
      prefix: ZodDefault<ZodString>;
   }, $strict>>>>;
-  env: ZodOptional<ZodNullable<ZodString>>;
-  header: ZodOptional<ZodNullable<ZodString>>;
+  basic: ZodOptional<ZodNullable<ZodPipe<ZodUnknown, ZodObject<{
+     password: ZodString;
+     username: ZodString;
+  }, $strict>>>>;
+  bearer: ZodOptional<ZodNullable<ZodString>>;
   headers: ZodOptional<ZodNullable<ZodRecord<ZodString, ZodString>>>;
-  location: ZodOptional<ZodNullable<ZodEnum<{
-     cookie: "cookie";
-     header: "header";
-     path: "path";
-     query: "query";
-  }>>>;
-  name: ZodOptional<ZodNullable<ZodString>>;
-  password_env: ZodOptional<ZodNullable<ZodString>>;
-  prefix: ZodDefault<ZodString>;
-  provider_type: ZodOptional<ZodNullable<ZodString>>;
-  scopes: ZodDefault<ZodArray<ZodString>>;
-  type: ZodDefault<ZodEnum<{
-     api_key: "api_key";
-     api_keys: "api_keys";
-     basic: "basic";
-     bearer: "bearer";
-     none: "none";
-     oauth: "oauth";
-  }>>;
-  username_env: ZodOptional<ZodNullable<ZodString>>;
-}, $strict>;
+  provider: ZodOptional<ZodNullable<ZodString>>;
+  scopes: ZodOptional<ZodNullable<ZodArray<ZodString>>>;
+}, $strict>>;
+```
+
+How each request of one connector authenticates. Exactly one credential
+key is present, and the key is the mechanism: `bearer`, `basic` and
+`api_keys` name workspace secrets read per call, and `provider` names the
+project's OAuth app whose token Delegated auth issues per call. Whose
+identity a provider call carries comes from the app's grant type, never
+from the binding. A key set to `null` is absent.
+
+***
+
+<a id="api-basicauthschema"></a>
+
+### BasicAuthSchema
+
+```ts
+const BasicAuthSchema: ZodPipe<ZodUnknown, ZodObject<{
+  password: ZodString;
+  username: ZodString;
+}, $strict>>;
 ```
 
 Compiled OpenAPI connector contract and authoring materialization.
@@ -8458,10 +8816,20 @@ This module is the TypeScript counterpart of
 ### DEFAULT\_CONNECTOR\_TIMEOUT\_SECONDS
 
 ```ts
-const DEFAULT_CONNECTOR_TIMEOUT_SECONDS: 30 = 30;
+const DEFAULT_CONNECTOR_TIMEOUT_SECONDS: 30 = DEFAULT_EXECUTION_TIMEOUT_SECONDS;
 ```
 
 Connector execution budget exposed as ordinary tool metadata.
+
+***
+
+<a id="api-default_execution_timeout_seconds"></a>
+
+### DEFAULT\_EXECUTION\_TIMEOUT\_SECONDS
+
+```ts
+const DEFAULT_EXECUTION_TIMEOUT_SECONDS: 30 = 30;
+```
 
 ***
 
@@ -8595,7 +8963,7 @@ ExecutionStatus: object;
 | :------ | :------ | :------ |
 | <a id="api-property-cancelled"></a> `CANCELLED` | `"cancelled"` | `"cancelled"` |
 | <a id="api-property-completed"></a> `COMPLETED` | `"completed"` | `"completed"` |
-| <a id="api-property-error-7"></a> `ERROR` | `"error"` | `"error"` |
+| <a id="api-property-error-8"></a> `ERROR` | `"error"` | `"error"` |
 | <a id="api-property-pending"></a> `PENDING` | `"pending"` | `"pending"` |
 | <a id="api-property-resuming"></a> `RESUMING` | `"resuming"` | `"resuming"` |
 | <a id="api-property-running"></a> `RUNNING` | `"running"` | `"running"` |
@@ -9561,16 +9929,20 @@ const LLMPodInvokeResponseSchema: ZodObject<{
   status: ZodString;
   usage: ZodOptional<ZodPreprocess<ZodPipe<ZodObject<{
      completion_tokens: ZodOptional<ZodNumber>;
+     input_token_details: ZodOptional<ZodRecord<ZodString, ZodNumber>>;
      input_tokens: ZodOptional<ZodNumber>;
      model: ZodOptional<ZodString>;
+     output_token_details: ZodOptional<ZodRecord<ZodString, ZodNumber>>;
      output_tokens: ZodOptional<ZodNumber>;
      prompt_tokens: ZodOptional<ZodNumber>;
      reasoning_tokens: ZodOptional<ZodNumber>;
      total_tokens: ZodOptional<ZodNumber>;
    }, $strip>, ZodTransform<LLMTokenUsage, {
      completion_tokens?: number;
+     input_token_details?: Record<string, number>;
      input_tokens?: number;
      model?: string;
+     output_token_details?: Record<string, number>;
      output_tokens?: number;
      prompt_tokens?: number;
      reasoning_tokens?: number;
@@ -9618,16 +9990,20 @@ const LLMPodStreamEventSchema: ZodObject<{
   tool_calls: ZodOptional<ZodArray<ZodRecord<ZodString, ZodUnknown>>>;
   usage: ZodOptional<ZodPreprocess<ZodPipe<ZodObject<{
      completion_tokens: ZodOptional<ZodNumber>;
+     input_token_details: ZodOptional<ZodRecord<ZodString, ZodNumber>>;
      input_tokens: ZodOptional<ZodNumber>;
      model: ZodOptional<ZodString>;
+     output_token_details: ZodOptional<ZodRecord<ZodString, ZodNumber>>;
      output_tokens: ZodOptional<ZodNumber>;
      prompt_tokens: ZodOptional<ZodNumber>;
      reasoning_tokens: ZodOptional<ZodNumber>;
      total_tokens: ZodOptional<ZodNumber>;
    }, $strip>, ZodTransform<LLMTokenUsage, {
      completion_tokens?: number;
+     input_token_details?: Record<string, number>;
      input_tokens?: number;
      model?: string;
+     output_token_details?: Record<string, number>;
      output_tokens?: number;
      prompt_tokens?: number;
      reasoning_tokens?: number;
@@ -9655,16 +10031,20 @@ const LLMResultSchema: ZodObject<{
   tool_calls: ZodDefault<ZodArray<ZodUnknown>>;
   usage: ZodOptional<ZodPreprocess<ZodPipe<ZodObject<{
      completion_tokens: ZodOptional<ZodNumber>;
+     input_token_details: ZodOptional<ZodRecord<ZodString, ZodNumber>>;
      input_tokens: ZodOptional<ZodNumber>;
      model: ZodOptional<ZodString>;
+     output_token_details: ZodOptional<ZodRecord<ZodString, ZodNumber>>;
      output_tokens: ZodOptional<ZodNumber>;
      prompt_tokens: ZodOptional<ZodNumber>;
      reasoning_tokens: ZodOptional<ZodNumber>;
      total_tokens: ZodOptional<ZodNumber>;
    }, $strip>, ZodTransform<LLMTokenUsage, {
      completion_tokens?: number;
+     input_token_details?: Record<string, number>;
      input_tokens?: number;
      model?: string;
+     output_token_details?: Record<string, number>;
      output_tokens?: number;
      prompt_tokens?: number;
      reasoning_tokens?: number;
@@ -9674,6 +10054,46 @@ const LLMResultSchema: ZodObject<{
 ```
 
 Runtime validation schema for LLMResult wire data. `content` is the only required field.
+
+***
+
+<a id="api-max_error_envelope_bytes"></a>
+
+### MAX\_ERROR\_ENVELOPE\_BYTES
+
+```ts
+const MAX_ERROR_ENVELOPE_BYTES: 4096 = 4_096;
+```
+
+***
+
+<a id="api-max_redirects"></a>
+
+### MAX\_REDIRECTS
+
+```ts
+const MAX_REDIRECTS: 5 = 5;
+```
+
+***
+
+<a id="api-max_response_bytes"></a>
+
+### MAX\_RESPONSE\_BYTES
+
+```ts
+const MAX_RESPONSE_BYTES: 200000 = 200_000;
+```
+
+***
+
+<a id="api-max_retries"></a>
+
+### MAX\_RETRIES
+
+```ts
+const MAX_RETRIES: 3 = 3;
+```
 
 ***
 
@@ -9812,7 +10232,7 @@ OpenInference span kinds, matching the Python SDK's `OpenInferenceSpanKind`.
 | :------ | :------ | :------ |
 | <a id="api-property-agent"></a> `AGENT` | `"AGENT"` | `"AGENT"` |
 | <a id="api-property-chain"></a> `CHAIN` | `"CHAIN"` | `"CHAIN"` |
-| <a id="api-property-tool"></a> `TOOL` | `"TOOL"` | `"TOOL"` |
+| <a id="api-property-tool-1"></a> `TOOL` | `"TOOL"` | `"TOOL"` |
 
 ***
 
@@ -9980,23 +10400,58 @@ const RuntimeMCPAuthConfigSchema: ZodObject<{
 
 ```ts
 const RuntimeMCPConfigSchema: ZodObject<{
-  servers: ZodDefault<ZodRecord<ZodString, ZodObject<{
+  servers: ZodDefault<ZodRecord<ZodString, ZodPipe<ZodObject<{
      allowed_tools: ZodDefault<ZodNullable<ZodArray<ZodString>>>;
-     auth: ZodDefault<ZodObject<{
-        client_id_env: ZodDefault<ZodNullable<...>>;
-        client_name: ZodDefault<ZodNullable<...>>;
-        client_secret_env: ZodDefault<ZodNullable<...>>;
-        redirect_uri: ZodDefault<ZodNullable<...>>;
-        scope: ZodDefault<ZodNullable<...>>;
-        token_env: ZodDefault<ZodNullable<...>>;
-        token_url: ZodDefault<ZodNullable<...>>;
-        type: ZodDefault<ZodEnum<...>>;
+     auth: ZodOptional<ZodObject<{
+        client_id_env: ZodDefault<...>;
+        client_name: ZodDefault<...>;
+        client_secret_env: ZodDefault<...>;
+        redirect_uri: ZodDefault<...>;
+        scope: ZodDefault<...>;
+        token_env: ZodDefault<...>;
+        token_url: ZodDefault<...>;
+        type: ZodDefault<...>;
      }, $strip>>;
      headers: ZodDefault<ZodRecord<ZodString, ZodString>>;
+     scopes: ZodOptional<ZodArray<ZodString>>;
      timeout_seconds: ZodDefault<ZodNumber>;
      transport: ZodDefault<ZodLiteral<"streamable_http">>;
-     url: ZodString;
-  }, $strip>>>;
+     url: ZodDefault<ZodNullable<ZodString>>;
+   }, $strip>, ZodTransform<{
+     allowed_tools: string[] | null;
+     auth: {
+        client_id_env: string | null;
+        client_name: string | null;
+        client_secret_env: string | null;
+        redirect_uri: string | null;
+        scope: string | null;
+        token_env: string | null;
+        token_url: string | null;
+        type: "none" | "bearer_env" | "oauth" | "client_credentials";
+     };
+     headers: Record<string, string>;
+     scopes: string[];
+     timeout_seconds: number;
+     transport: "streamable_http";
+     url: string | null;
+   }, {
+     allowed_tools: string[] | null;
+     auth?: {
+        client_id_env: string | null;
+        client_name: string | null;
+        client_secret_env: string | null;
+        redirect_uri: string | null;
+        scope: string | null;
+        token_env: string | null;
+        token_url: string | null;
+        type: "none" | "bearer_env" | "oauth" | "client_credentials";
+     };
+     headers: Record<string, string>;
+     scopes?: string[];
+     timeout_seconds: number;
+     transport: "streamable_http";
+     url: string | null;
+  }>>>>;
 }, $strip>;
 ```
 
@@ -10007,9 +10462,9 @@ const RuntimeMCPConfigSchema: ZodObject<{
 ### RuntimeMCPServerConfigSchema
 
 ```ts
-const RuntimeMCPServerConfigSchema: ZodObject<{
+const RuntimeMCPServerConfigSchema: ZodPipe<ZodObject<{
   allowed_tools: ZodDefault<ZodNullable<ZodArray<ZodString>>>;
-  auth: ZodDefault<ZodObject<{
+  auth: ZodOptional<ZodObject<{
      client_id_env: ZodDefault<ZodNullable<ZodString>>;
      client_name: ZodDefault<ZodNullable<ZodString>>;
      client_secret_env: ZodDefault<ZodNullable<ZodString>>;
@@ -10025,10 +10480,45 @@ const RuntimeMCPServerConfigSchema: ZodObject<{
      }>>;
   }, $strip>>;
   headers: ZodDefault<ZodRecord<ZodString, ZodString>>;
+  scopes: ZodOptional<ZodArray<ZodString>>;
   timeout_seconds: ZodDefault<ZodNumber>;
   transport: ZodDefault<ZodLiteral<"streamable_http">>;
-  url: ZodString;
-}, $strip>;
+  url: ZodDefault<ZodNullable<ZodString>>;
+}, $strip>, ZodTransform<{
+  allowed_tools: string[] | null;
+  auth: {
+     client_id_env: string | null;
+     client_name: string | null;
+     client_secret_env: string | null;
+     redirect_uri: string | null;
+     scope: string | null;
+     token_env: string | null;
+     token_url: string | null;
+     type: "none" | "bearer_env" | "oauth" | "client_credentials";
+  };
+  headers: Record<string, string>;
+  scopes: string[];
+  timeout_seconds: number;
+  transport: "streamable_http";
+  url: string | null;
+}, {
+  allowed_tools: string[] | null;
+  auth?: {
+     client_id_env: string | null;
+     client_name: string | null;
+     client_secret_env: string | null;
+     redirect_uri: string | null;
+     scope: string | null;
+     token_env: string | null;
+     token_url: string | null;
+     type: "none" | "bearer_env" | "oauth" | "client_credentials";
+  };
+  headers: Record<string, string>;
+  scopes?: string[];
+  timeout_seconds: number;
+  transport: "streamable_http";
+  url: string | null;
+}>>;
 ```
 
 ***
@@ -10285,7 +10775,7 @@ const ToolDefinitionSchema: ZodObject<{
   is_local: ZodDefault<ZodBoolean>;
   name: ZodString;
   parameters: ZodOptional<ZodRecord<ZodString, ZodUnknown>>;
-  provider_type: ZodOptional<ZodNullable<ZodString>>;
+  provider: ZodOptional<ZodNullable<ZodString>>;
   scopes: ZodDefault<ZodArray<ZodString>>;
 }, $strip>;
 ```
@@ -10300,37 +10790,14 @@ Definition of a registered tool.
 
 ```ts
 const ToolDefinitionsSchema: ZodObject<{
-  auth: ZodOptional<ZodNullable<ZodObject<{
-     credentials: ZodOptional<ZodNullable<ZodArray<ZodObject<{
-        env: ...;
-        location: ...;
-        name: ...;
-        prefix: ...;
-     }, $strict>>>>;
-     env: ZodOptional<ZodNullable<ZodString>>;
-     header: ZodOptional<ZodNullable<ZodString>>;
+  auth: ZodOptional<ZodNullable<ZodPipe<ZodUnknown, ZodObject<{
+     api_keys: ZodOptional<ZodNullable<ZodArray<ZodObject<..., ...>>>>;
+     basic: ZodOptional<ZodNullable<ZodPipe<ZodUnknown, ZodObject<..., ...>>>>;
+     bearer: ZodOptional<ZodNullable<ZodString>>;
      headers: ZodOptional<ZodNullable<ZodRecord<ZodString, ZodString>>>;
-     location: ZodOptional<ZodNullable<ZodEnum<{
-        cookie: "cookie";
-        header: "header";
-        path: "path";
-        query: "query";
-     }>>>;
-     name: ZodOptional<ZodNullable<ZodString>>;
-     password_env: ZodOptional<ZodNullable<ZodString>>;
-     prefix: ZodDefault<ZodString>;
-     provider_type: ZodOptional<ZodNullable<ZodString>>;
-     scopes: ZodDefault<ZodArray<ZodString>>;
-     type: ZodDefault<ZodEnum<{
-        api_key: "api_key";
-        api_keys: "api_keys";
-        basic: "basic";
-        bearer: "bearer";
-        none: "none";
-        oauth: "oauth";
-     }>>;
-     username_env: ZodOptional<ZodNullable<ZodString>>;
-  }, $strict>>>;
+     provider: ZodOptional<ZodNullable<ZodString>>;
+     scopes: ZodOptional<ZodNullable<ZodArray<ZodString>>>;
+  }, $strict>>>>;
   externalize: ZodOptional<ZodNullable<ZodRecord<ZodString, ZodUnknown>>>;
   source: ZodObject<{
      base_url: ZodString;
@@ -10394,7 +10861,7 @@ const ToolExecuteRequestSchema: ZodObject<{
   is_local: ZodDefault<ZodBoolean>;
   kind: ZodOptional<ZodString>;
   metadata: ZodDefault<ZodRecord<ZodString, ZodUnknown>>;
-  provider_type: ZodOptional<ZodNullable<ZodString>>;
+  provider: ZodOptional<ZodNullable<ZodString>>;
   redact_fields: ZodDefault<ZodArray<ZodString>>;
   review_id: ZodOptional<ZodNullable<ZodString>>;
   review_protocol: ZodOptional<ZodNullable<ZodNumber>>;
@@ -10464,39 +10931,6 @@ const ToolExecuteResponseSchema: ZodPreprocess<ZodObject<{
 Assemble `guardrail_meta` from the flat `guardrail_id`/`guardrail_category`
 fields the OE wire format sends, so callers work with a single structured
 object. Mirrors Python's `_assemble_guardrail_meta` model validator.
-
-***
-
-<a id="api-toolfunctionrequestschema"></a>
-
-### ToolFunctionRequestSchema
-
-```ts
-const ToolFunctionRequestSchema: ZodObject<{
-  request: ZodObject<{
-     arguments: ZodRecord<ZodString, ZodType<JsonValue, unknown, $ZodTypeInternals<JsonValue, unknown>>>;
-     authorization: ZodOptional<ZodObject<{
-        expires_at: ZodOptional<ZodNullable<ZodNumber>>;
-        token: ZodString;
-     }, $strip>>;
-     custom_headers: ZodOptional<ZodRecord<ZodString, ZodString>>;
-     execution_id: ZodString;
-     metadata: ZodDefault<ZodRecord<ZodString, ZodUnknown>>;
-     oe_owner_url: ZodOptional<ZodNullable<ZodString>>;
-     oe_url: ZodOptional<ZodString>;
-     payload: ZodOptional<ZodRecord<ZodString, ZodUnknown>>;
-     platform_trace_id: ZodOptional<ZodNullable<ZodString>>;
-     session_id: ZodString;
-     step_number: ZodOptional<ZodNumber>;
-     tool_call_id: ZodOptional<ZodString>;
-     tool_name: ZodString;
-     user_id: ZodOptional<ZodString>;
-  }, $strip>;
-  step: ZodNumber;
-}, $strip>;
-```
-
-The function-mode invocation envelope delivered at /run/meta/request.
 
 ***
 
@@ -10621,6 +11055,16 @@ const UnknownOutcomePolicySchema: GenEnum<UnknownOutcomePolicy>;
 ```
 
 Describes the enum mongodb.agentic.workflow.v1.UnknownOutcomePolicy.
+
+***
+
+<a id="api-user_agent"></a>
+
+### USER\_AGENT
+
+```ts
+const USER_AGENT: "agent-engine-connector" = "agent-engine-connector";
+```
 
 ***
 
@@ -10838,6 +11282,45 @@ that preallocated its key; pass the returned path to the activity command.
 
 ***
 
+<a id="api-allocatetooleffectposition"></a>
+
+### allocateToolEffectPosition()
+
+```ts
+function allocateToolEffectPosition(toolCallId): object;
+```
+
+Return the position of one operation a tool call performs on its own behalf,
+such as a file operation inside a filesystem tool.
+
+Operations of tool calls the same model turn requested may reach OE in any
+order, so a shared ordinal sequence would give them different positions on
+another attempt. Each therefore takes its ordinals under a path derived from
+its call's preallocated ordinal, which the model's list order fixes. An
+operation of a lone call stays in the current path: nothing overlaps it, and
+a turn recorded before derived paths existed still replays.
+
+Operations within one call number by first arrival. A call whose concurrent
+branches each perform several operations can arrive differently on another
+attempt, which OE refuses as nondeterministic rather than repeating an effect.
+
+#### Parameters
+
+| Parameter | Type |
+| :------ | :------ |
+| `toolCallId` | `string` |
+
+#### Returns
+
+`object`
+
+| Name | Type |
+| :------ | :------ |
+| `activityOrdinal` | `number` |
+| `operationPath` | [`OperationPath`](#api-operationpath) |
+
+***
+
 <a id="api-appliestostage"></a>
 
 ### appliesToStage()
@@ -10946,50 +11429,6 @@ function attemptStartRequestFromExecute(
 
 ***
 
-<a id="api-authcredentialbindings"></a>
-
-### authCredentialBindings()
-
-```ts
-function authCredentialBindings(auth): object[];
-```
-
-Normalize single and compound API keys into the executor's common form.
-
-#### Parameters
-
-| Parameter | Type |
-| :------ | :------ |
-| `auth` | \| \{ `credentials?`: `object`[] \| `null`; `env?`: `string` \| `null`; `header?`: `string` \| `null`; `headers?`: `Record`\<`string`, `string`\> \| `null`; `location?`: `"path"` \| `"header"` \| `"query"` \| `"cookie"` \| `null`; `name?`: `string` \| `null`; `password_env?`: `string` \| `null`; `prefix`: `string`; `provider_type?`: `string` \| `null`; `scopes`: `string`[]; `type`: `"none"` \| `"oauth"` \| `"bearer"` \| `"api_key"` \| `"basic"` \| `"api_keys"`; `username_env?`: `string` \| `null`; \} \| `null` \| `undefined` |
-
-#### Returns
-
-`object`[]
-
-***
-
-<a id="api-authheadername"></a>
-
-### authHeaderName()
-
-```ts
-function authHeaderName(auth): string | null;
-```
-
-Return the single generated auth header, when this auth shape has one.
-
-#### Parameters
-
-| Parameter | Type |
-| :------ | :------ |
-| `auth` | \| \{ `credentials?`: `object`[] \| `null`; `env?`: `string` \| `null`; `header?`: `string` \| `null`; `headers?`: `Record`\<`string`, `string`\> \| `null`; `location?`: `"path"` \| `"header"` \| `"query"` \| `"cookie"` \| `null`; `name?`: `string` \| `null`; `password_env?`: `string` \| `null`; `prefix`: `string`; `provider_type?`: `string` \| `null`; `scopes`: `string`[]; `type`: `"none"` \| `"oauth"` \| `"bearer"` \| `"api_key"` \| `"basic"` \| `"api_keys"`; `username_env?`: `string` \| `null`; \} \| `null` \| `undefined` |
-
-#### Returns
-
-`string` \| `null`
-
-***
-
 <a id="api-authheadernames"></a>
 
 ### authHeaderNames()
@@ -11004,7 +11443,7 @@ List auth-controlled headers so model parameters cannot collide with them.
 
 | Parameter | Type |
 | :------ | :------ |
-| `auth` | \| \{ `credentials?`: `object`[] \| `null`; `env?`: `string` \| `null`; `header?`: `string` \| `null`; `headers?`: `Record`\<`string`, `string`\> \| `null`; `location?`: `"path"` \| `"header"` \| `"query"` \| `"cookie"` \| `null`; `name?`: `string` \| `null`; `password_env?`: `string` \| `null`; `prefix`: `string`; `provider_type?`: `string` \| `null`; `scopes`: `string`[]; `type`: `"none"` \| `"oauth"` \| `"bearer"` \| `"api_key"` \| `"basic"` \| `"api_keys"`; `username_env?`: `string` \| `null`; \} \| `null` \| `undefined` |
+| `auth` | \| \{ `api_keys?`: `object`[] \| `null`; `basic?`: \| \{ `password`: `string`; `username`: `string`; \} \| `null`; `bearer?`: `string` \| `null`; `headers?`: `Record`\<`string`, `string`\> \| `null`; `provider?`: `string` \| `null`; `scopes?`: `string`[] \| `null`; \} \| `null` \| `undefined` |
 
 #### Returns
 
@@ -11067,52 +11506,6 @@ function buildActivityCommand(args): ActivityCommand;
 #### Returns
 
 [`ActivityCommand`](#api-activitycommand)
-
-***
-
-<a id="api-buildresultpayload"></a>
-
-### buildResultPayload()
-
-```ts
-function buildResultPayload(result, executionId): Record<string, unknown>;
-```
-
-Encode the result to a JSON-safe object for the /tool/result POST.
-
-A tool may return a value the JSON encoder cannot handle (e.g. a circular
-reference). Downgrade any encode failure to an error report so the OE still
-receives a terminal signal. Mirrors Python's _result_payload.
-
-#### Parameters
-
-| Parameter | Type | Description |
-| :------ | :------ | :------ |
-| `result` | \{ `completion_tokens?`: `number`; `duration_ms`: `number`; `error?`: `string`; `execution_id`: `string`; `kind?`: `string`; `metadata`: `Record`\<`string`, `unknown`\>; `model?`: `string`; `pod_name?`: `string`; `prompt_tokens?`: `number`; `result?`: `unknown`; `span_id?`: `string` \| `null`; `status`: `string`; `step_number`: `number`; `tool_api_error?`: \| \{ `classification`: `string`; `error_code?`: `string` \| `null`; `http_status?`: `number` \| `null`; `provider_type?`: `string` \| `null`; `reason?`: `string` \| `null`; `retryable`: `boolean`; \} \| `null`; `tool_call_id?`: `string`; `tool_name`: `string`; `total_tokens?`: `number`; `trace_id?`: `string` \| `null`; `workspace_id?`: `string`; \} | - |
-| `result.completion_tokens?` | `number` | Completion/output tokens used. |
-| `result.duration_ms` | `number` | Execution duration in milliseconds. |
-| `result.error?` | `string` | Error message if failed. |
-| `result.execution_id` | `string` | Execution identifier. |
-| `result.kind?` | `string` | Explicit observability kind. |
-| `result.metadata` | `Record`\<`string`, `unknown`\> | Observability metadata. |
-| `result.model?` | `string` | LLM model name. |
-| `result.pod_name?` | `string` | Hostname/pod name where tool was executed. |
-| `result.prompt_tokens?` | `number` | Prompt/input tokens used. |
-| `result.result?` | `unknown` | Tool result if successful. |
-| `result.span_id?` | `string` \| `null` | Active OTel span ID, for OE execution-log correlation. |
-| `result.status` | `string` | Execution status: success, error, suspend, interrupted. |
-| `result.step_number` | `number` | Step number. |
-| `result.tool_api_error?` | \| \{ `classification`: `string`; `error_code?`: `string` \| `null`; `http_status?`: `number` \| `null`; `provider_type?`: `string` \| `null`; `reason?`: `string` \| `null`; `retryable`: `boolean`; \} \| `null` | Structured external API failure classification. |
-| `result.tool_call_id?` | `string` | Stable LLM tool-call id; joins this result's execution-log record to its call and the session message. |
-| `result.tool_name` | `string` | Tool name. |
-| `result.total_tokens?` | `number` | Total tokens used. |
-| `result.trace_id?` | `string` \| `null` | Active OTel trace ID, for OE execution-log correlation. |
-| `result.workspace_id?` | `string` | Workspace identifier. |
-| `executionId` | `string` | - |
-
-#### Returns
-
-`Record`\<`string`, `unknown`\>
 
 ***
 
@@ -11458,8 +11851,8 @@ Mirrors common MCP client adapters: initialize each server, call
 
 | Parameter | Type |
 | :------ | :------ |
-| `config` | \{ `servers`: `Record`\<`string`, \{ `allowed_tools`: `string`[] \| `null`; `auth`: \{ `client_id_env`: `string` \| `null`; `client_name`: `string` \| `null`; `client_secret_env`: `string` \| `null`; `redirect_uri`: `string` \| `null`; `scope`: `string` \| `null`; `token_env`: `string` \| `null`; `token_url`: `string` \| `null`; `type`: `"none"` \| `"bearer_env"` \| `"oauth"` \| `"client_credentials"`; \}; `headers`: `Record`\<`string`, `string`\>; `timeout_seconds`: `number`; `transport`: `"streamable_http"`; `url`: `string`; \}\>; \} |
-| `config.servers` | `Record`\<`string`, \{ `allowed_tools`: `string`[] \| `null`; `auth`: \{ `client_id_env`: `string` \| `null`; `client_name`: `string` \| `null`; `client_secret_env`: `string` \| `null`; `redirect_uri`: `string` \| `null`; `scope`: `string` \| `null`; `token_env`: `string` \| `null`; `token_url`: `string` \| `null`; `type`: `"none"` \| `"bearer_env"` \| `"oauth"` \| `"client_credentials"`; \}; `headers`: `Record`\<`string`, `string`\>; `timeout_seconds`: `number`; `transport`: `"streamable_http"`; `url`: `string`; \}\> |
+| `config` | \{ `servers`: `Record`\<`string`, \{ `allowed_tools`: `string`[] \| `null`; `auth`: \{ `client_id_env`: `string` \| `null`; `client_name`: `string` \| `null`; `client_secret_env`: `string` \| `null`; `redirect_uri`: `string` \| `null`; `scope`: `string` \| `null`; `token_env`: `string` \| `null`; `token_url`: `string` \| `null`; `type`: `"none"` \| `"bearer_env"` \| `"oauth"` \| `"client_credentials"`; \}; `headers`: `Record`\<`string`, `string`\>; `scopes`: `string`[]; `timeout_seconds`: `number`; `transport`: `"streamable_http"`; `url`: `string` \| `null`; \}\>; \} |
+| `config.servers` | `Record`\<`string`, \{ `allowed_tools`: `string`[] \| `null`; `auth`: \{ `client_id_env`: `string` \| `null`; `client_name`: `string` \| `null`; `client_secret_env`: `string` \| `null`; `redirect_uri`: `string` \| `null`; `scope`: `string` \| `null`; `token_env`: `string` \| `null`; `token_url`: `string` \| `null`; `type`: `"none"` \| `"bearer_env"` \| `"oauth"` \| `"client_credentials"`; \}; `headers`: `Record`\<`string`, `string`\>; `scopes`: `string`[]; `timeout_seconds`: `number`; `transport`: `"streamable_http"`; `url`: `string` \| `null`; \}\> |
 
 #### Returns
 
@@ -13164,8 +13557,8 @@ Return whether `sdkToolName` belongs to a configured MCP server.
 
 | Parameter | Type |
 | :------ | :------ |
-| `config` | \{ `servers`: `Record`\<`string`, \{ `allowed_tools`: `string`[] \| `null`; `auth`: \{ `client_id_env`: `string` \| `null`; `client_name`: `string` \| `null`; `client_secret_env`: `string` \| `null`; `redirect_uri`: `string` \| `null`; `scope`: `string` \| `null`; `token_env`: `string` \| `null`; `token_url`: `string` \| `null`; `type`: `"none"` \| `"bearer_env"` \| `"oauth"` \| `"client_credentials"`; \}; `headers`: `Record`\<`string`, `string`\>; `timeout_seconds`: `number`; `transport`: `"streamable_http"`; `url`: `string`; \}\>; \} |
-| `config.servers` | `Record`\<`string`, \{ `allowed_tools`: `string`[] \| `null`; `auth`: \{ `client_id_env`: `string` \| `null`; `client_name`: `string` \| `null`; `client_secret_env`: `string` \| `null`; `redirect_uri`: `string` \| `null`; `scope`: `string` \| `null`; `token_env`: `string` \| `null`; `token_url`: `string` \| `null`; `type`: `"none"` \| `"bearer_env"` \| `"oauth"` \| `"client_credentials"`; \}; `headers`: `Record`\<`string`, `string`\>; `timeout_seconds`: `number`; `transport`: `"streamable_http"`; `url`: `string`; \}\> |
+| `config` | \{ `servers`: `Record`\<`string`, \{ `allowed_tools`: `string`[] \| `null`; `auth`: \{ `client_id_env`: `string` \| `null`; `client_name`: `string` \| `null`; `client_secret_env`: `string` \| `null`; `redirect_uri`: `string` \| `null`; `scope`: `string` \| `null`; `token_env`: `string` \| `null`; `token_url`: `string` \| `null`; `type`: `"none"` \| `"bearer_env"` \| `"oauth"` \| `"client_credentials"`; \}; `headers`: `Record`\<`string`, `string`\>; `scopes`: `string`[]; `timeout_seconds`: `number`; `transport`: `"streamable_http"`; `url`: `string` \| `null`; \}\>; \} |
+| `config.servers` | `Record`\<`string`, \{ `allowed_tools`: `string`[] \| `null`; `auth`: \{ `client_id_env`: `string` \| `null`; `client_name`: `string` \| `null`; `client_secret_env`: `string` \| `null`; `redirect_uri`: `string` \| `null`; `scope`: `string` \| `null`; `token_env`: `string` \| `null`; `token_url`: `string` \| `null`; `type`: `"none"` \| `"bearer_env"` \| `"oauth"` \| `"client_credentials"`; \}; `headers`: `Record`\<`string`, `string`\>; `scopes`: `string`[]; `timeout_seconds`: `number`; `transport`: `"streamable_http"`; `url`: `string` \| `null`; \}\> |
 | `sdkToolName` | `string` |
 
 #### Returns
@@ -13410,7 +13803,7 @@ Read and validate a local compiled artifact; never load an OpenAPI source.
 
 | Name | Type | Default value |
 | :------ | :------ | :------ |
-| `auth?` | \| \{ `credentials?`: `object`[] \| `null`; `env?`: `string` \| `null`; `header?`: `string` \| `null`; `headers?`: `Record`\<`string`, `string`\> \| `null`; `location?`: `"path"` \| `"header"` \| `"query"` \| `"cookie"` \| `null`; `name?`: `string` \| `null`; `password_env?`: `string` \| `null`; `prefix`: `string`; `provider_type?`: `string` \| `null`; `scopes`: `string`[]; `type`: `"none"` \| `"oauth"` \| `"bearer"` \| `"api_key"` \| `"basic"` \| `"api_keys"`; `username_env?`: `string` \| `null`; \} \| `null` | - |
+| `auth?` | \| \{ `api_keys?`: `object`[] \| `null`; `basic?`: \| \{ `password`: `string`; `username`: `string`; \} \| `null`; `bearer?`: `string` \| `null`; `headers?`: `Record`\<`string`, `string`\> \| `null`; `provider?`: `string` \| `null`; `scopes?`: `string`[] \| `null`; \} \| `null` | - |
 | `externalize?` | `Record`\<`string`, `unknown`\> \| `null` | - |
 | `source` | `object` | `SourceSchema` |
 | `source.base_url` | `string` | - |
@@ -13693,7 +14086,7 @@ cache directory.
 | Parameter | Type |
 | :------ | :------ |
 | `serverName` | `string` |
-| `config` | \{ `allowed_tools`: `string`[] \| `null`; `auth`: \{ `client_id_env`: `string` \| `null`; `client_name`: `string` \| `null`; `client_secret_env`: `string` \| `null`; `redirect_uri`: `string` \| `null`; `scope`: `string` \| `null`; `token_env`: `string` \| `null`; `token_url`: `string` \| `null`; `type`: `"none"` \| `"bearer_env"` \| `"oauth"` \| `"client_credentials"`; \}; `headers`: `Record`\<`string`, `string`\>; `timeout_seconds`: `number`; `transport`: `"streamable_http"`; `url`: `string`; \} |
+| `config` | \{ `allowed_tools`: `string`[] \| `null`; `auth`: \{ `client_id_env`: `string` \| `null`; `client_name`: `string` \| `null`; `client_secret_env`: `string` \| `null`; `redirect_uri`: `string` \| `null`; `scope`: `string` \| `null`; `token_env`: `string` \| `null`; `token_url`: `string` \| `null`; `type`: `"none"` \| `"bearer_env"` \| `"oauth"` \| `"client_credentials"`; \}; `headers`: `Record`\<`string`, `string`\>; `scopes`: `string`[]; `timeout_seconds`: `number`; `transport`: `"streamable_http"`; `url`: `string` \| `null`; \} |
 | `config.allowed_tools` | `string`[] \| `null` |
 | `config.auth?` | \{ `client_id_env`: `string` \| `null`; `client_name`: `string` \| `null`; `client_secret_env`: `string` \| `null`; `redirect_uri`: `string` \| `null`; `scope`: `string` \| `null`; `token_env`: `string` \| `null`; `token_url`: `string` \| `null`; `type`: `"none"` \| `"bearer_env"` \| `"oauth"` \| `"client_credentials"`; \} |
 | `config.auth.client_id_env?` | `string` \| `null` |
@@ -13705,9 +14098,10 @@ cache directory.
 | `config.auth.token_url?` | `string` \| `null` |
 | `config.auth.type?` | `"none"` \| `"bearer_env"` \| `"oauth"` \| `"client_credentials"` |
 | `config.headers?` | `Record`\<`string`, `string`\> |
+| `config.scopes?` | `string`[] |
 | `config.timeout_seconds?` | `number` |
 | `config.transport?` | `"streamable_http"` |
-| `config.url?` | `string` |
+| `config.url?` | `string` \| `null` |
 | `cacheDir?` | `string` |
 
 #### Returns
@@ -13739,7 +14133,7 @@ cache directory.
 | Parameter | Type |
 | :------ | :------ |
 | `serverName` | `string` |
-| `config` | \{ `allowed_tools`: `string`[] \| `null`; `auth`: \{ `client_id_env`: `string` \| `null`; `client_name`: `string` \| `null`; `client_secret_env`: `string` \| `null`; `redirect_uri`: `string` \| `null`; `scope`: `string` \| `null`; `token_env`: `string` \| `null`; `token_url`: `string` \| `null`; `type`: `"none"` \| `"bearer_env"` \| `"oauth"` \| `"client_credentials"`; \}; `headers`: `Record`\<`string`, `string`\>; `timeout_seconds`: `number`; `transport`: `"streamable_http"`; `url`: `string`; \} |
+| `config` | \{ `allowed_tools`: `string`[] \| `null`; `auth`: \{ `client_id_env`: `string` \| `null`; `client_name`: `string` \| `null`; `client_secret_env`: `string` \| `null`; `redirect_uri`: `string` \| `null`; `scope`: `string` \| `null`; `token_env`: `string` \| `null`; `token_url`: `string` \| `null`; `type`: `"none"` \| `"bearer_env"` \| `"oauth"` \| `"client_credentials"`; \}; `headers`: `Record`\<`string`, `string`\>; `scopes`: `string`[]; `timeout_seconds`: `number`; `transport`: `"streamable_http"`; `url`: `string` \| `null`; \} |
 | `config.allowed_tools` | `string`[] \| `null` |
 | `config.auth?` | \{ `client_id_env`: `string` \| `null`; `client_name`: `string` \| `null`; `client_secret_env`: `string` \| `null`; `redirect_uri`: `string` \| `null`; `scope`: `string` \| `null`; `token_env`: `string` \| `null`; `token_url`: `string` \| `null`; `type`: `"none"` \| `"bearer_env"` \| `"oauth"` \| `"client_credentials"`; \} |
 | `config.auth.client_id_env?` | `string` \| `null` |
@@ -13751,9 +14145,10 @@ cache directory.
 | `config.auth.token_url?` | `string` \| `null` |
 | `config.auth.type?` | `"none"` \| `"bearer_env"` \| `"oauth"` \| `"client_credentials"` |
 | `config.headers?` | `Record`\<`string`, `string`\> |
+| `config.scopes?` | `string`[] |
 | `config.timeout_seconds?` | `number` |
 | `config.transport?` | `"streamable_http"` |
-| `config.url?` | `string` |
+| `config.url?` | `string` \| `null` |
 | `cacheDir?` | `string` |
 
 #### Returns
@@ -13946,7 +14341,7 @@ Return the outbound hosts needed to reach a configured MCP server.
 
 | Parameter | Type |
 | :------ | :------ |
-| `config` | \{ `allowed_tools`: `string`[] \| `null`; `auth`: \{ `client_id_env`: `string` \| `null`; `client_name`: `string` \| `null`; `client_secret_env`: `string` \| `null`; `redirect_uri`: `string` \| `null`; `scope`: `string` \| `null`; `token_env`: `string` \| `null`; `token_url`: `string` \| `null`; `type`: `"none"` \| `"bearer_env"` \| `"oauth"` \| `"client_credentials"`; \}; `headers`: `Record`\<`string`, `string`\>; `timeout_seconds`: `number`; `transport`: `"streamable_http"`; `url`: `string`; \} |
+| `config` | \{ `allowed_tools`: `string`[] \| `null`; `auth`: \{ `client_id_env`: `string` \| `null`; `client_name`: `string` \| `null`; `client_secret_env`: `string` \| `null`; `redirect_uri`: `string` \| `null`; `scope`: `string` \| `null`; `token_env`: `string` \| `null`; `token_url`: `string` \| `null`; `type`: `"none"` \| `"bearer_env"` \| `"oauth"` \| `"client_credentials"`; \}; `headers`: `Record`\<`string`, `string`\>; `scopes`: `string`[]; `timeout_seconds`: `number`; `transport`: `"streamable_http"`; `url`: `string` \| `null`; \} |
 | `config.allowed_tools` | `string`[] \| `null` |
 | `config.auth` | \{ `client_id_env`: `string` \| `null`; `client_name`: `string` \| `null`; `client_secret_env`: `string` \| `null`; `redirect_uri`: `string` \| `null`; `scope`: `string` \| `null`; `token_env`: `string` \| `null`; `token_url`: `string` \| `null`; `type`: `"none"` \| `"bearer_env"` \| `"oauth"` \| `"client_credentials"`; \} |
 | `config.auth.client_id_env` | `string` \| `null` |
@@ -13958,9 +14353,10 @@ Return the outbound hosts needed to reach a configured MCP server.
 | `config.auth.token_url` | `string` \| `null` |
 | `config.auth.type` | `"none"` \| `"bearer_env"` \| `"oauth"` \| `"client_credentials"` |
 | `config.headers` | `Record`\<`string`, `string`\> |
+| `config.scopes` | `string`[] |
 | `config.timeout_seconds` | `number` |
 | `config.transport` | `"streamable_http"` |
-| `config.url` | `string` |
+| `config.url` | `string` \| `null` |
 
 #### Returns
 
@@ -14594,6 +14990,34 @@ the collision was silent and surfaced only when the built-in was invoked.
 
 ***
 
+<a id="api-registerconnectortools"></a>
+
+### registerConnectorTools()
+
+```ts
+function registerConnectorTools(target, reservedNames?): ConnectorToolRuntime | null;
+```
+
+Materialize, collision-check, and install connector tools on a runtime.
+
+Callers supply the names already reserved by their mode (built-ins, MCP
+tools, author tools). Returns `null` when the agent configures no
+connectors; otherwise the caller owns the returned runtime and must close it
+after the invocation lifecycle.
+
+#### Parameters
+
+| Parameter | Type | Default value |
+| :------ | :------ | :------ |
+| `target` | [`ConnectorRuntimeTarget`](#api-connectorruntimetarget) | `undefined` |
+| `reservedNames` | `Iterable`\<`string`\> | `[]` |
+
+#### Returns
+
+[`ConnectorToolRuntime`](#api-connectortoolruntime) \| `null`
+
+***
+
 <a id="api-registerguardrailpolicyengine"></a>
 
 ### registerGuardrailPolicyEngine()
@@ -14933,9 +15357,9 @@ function requestSessionFinish(): SessionFinishStatus;
 Record that the agent considers this session finished. Reads directly off
 `storage.getStore()` (not `current()`) so a call outside a run reports
 "unavailable" without ever touching the frozen `EMPTY_STORE` fallback.
-`wrapper` is null for Tool Pod / Function contexts (see server/tool.ts,
-server/function.ts) — only the AER holds the finish latch, so those
-contexts must also report "unavailable" rather than a misleading success.
+`wrapper` is null for Tool Pod contexts (see server/tool.ts) — only the AER
+holds the finish latch, so those contexts must also report "unavailable"
+rather than a misleading success.
 
 #### Returns
 
@@ -15049,8 +15473,8 @@ name against `agent.yaml` and calls the original MCP tool name.
 
 | Parameter | Type |
 | :------ | :------ |
-| `config` | \{ `servers`: `Record`\<`string`, \{ `allowed_tools`: `string`[] \| `null`; `auth`: \{ `client_id_env`: `string` \| `null`; `client_name`: `string` \| `null`; `client_secret_env`: `string` \| `null`; `redirect_uri`: `string` \| `null`; `scope`: `string` \| `null`; `token_env`: `string` \| `null`; `token_url`: `string` \| `null`; `type`: `"none"` \| `"bearer_env"` \| `"oauth"` \| `"client_credentials"`; \}; `headers`: `Record`\<`string`, `string`\>; `timeout_seconds`: `number`; `transport`: `"streamable_http"`; `url`: `string`; \}\>; \} |
-| `config.servers` | `Record`\<`string`, \{ `allowed_tools`: `string`[] \| `null`; `auth`: \{ `client_id_env`: `string` \| `null`; `client_name`: `string` \| `null`; `client_secret_env`: `string` \| `null`; `redirect_uri`: `string` \| `null`; `scope`: `string` \| `null`; `token_env`: `string` \| `null`; `token_url`: `string` \| `null`; `type`: `"none"` \| `"bearer_env"` \| `"oauth"` \| `"client_credentials"`; \}; `headers`: `Record`\<`string`, `string`\>; `timeout_seconds`: `number`; `transport`: `"streamable_http"`; `url`: `string`; \}\> |
+| `config` | \{ `servers`: `Record`\<`string`, \{ `allowed_tools`: `string`[] \| `null`; `auth`: \{ `client_id_env`: `string` \| `null`; `client_name`: `string` \| `null`; `client_secret_env`: `string` \| `null`; `redirect_uri`: `string` \| `null`; `scope`: `string` \| `null`; `token_env`: `string` \| `null`; `token_url`: `string` \| `null`; `type`: `"none"` \| `"bearer_env"` \| `"oauth"` \| `"client_credentials"`; \}; `headers`: `Record`\<`string`, `string`\>; `scopes`: `string`[]; `timeout_seconds`: `number`; `transport`: `"streamable_http"`; `url`: `string` \| `null`; \}\>; \} |
+| `config.servers` | `Record`\<`string`, \{ `allowed_tools`: `string`[] \| `null`; `auth`: \{ `client_id_env`: `string` \| `null`; `client_name`: `string` \| `null`; `client_secret_env`: `string` \| `null`; `redirect_uri`: `string` \| `null`; `scope`: `string` \| `null`; `token_env`: `string` \| `null`; `token_url`: `string` \| `null`; `type`: `"none"` \| `"bearer_env"` \| `"oauth"` \| `"client_credentials"`; \}; `headers`: `Record`\<`string`, `string`\>; `scopes`: `string`[]; `timeout_seconds`: `number`; `transport`: `"streamable_http"`; `url`: `string` \| `null`; \}\> |
 | `sdkToolName` | `string` |
 | `mcpServerName` | `string` |
 | `mcpToolName` | `string` |
@@ -15202,7 +15626,7 @@ Resolve an MCP SDK OAuth provider for the configured auth mode, if any.
 | Parameter | Type |
 | :------ | :------ |
 | `serverName` | `string` |
-| `config` | \{ `allowed_tools`: `string`[] \| `null`; `auth`: \{ `client_id_env`: `string` \| `null`; `client_name`: `string` \| `null`; `client_secret_env`: `string` \| `null`; `redirect_uri`: `string` \| `null`; `scope`: `string` \| `null`; `token_env`: `string` \| `null`; `token_url`: `string` \| `null`; `type`: `"none"` \| `"bearer_env"` \| `"oauth"` \| `"client_credentials"`; \}; `headers`: `Record`\<`string`, `string`\>; `timeout_seconds`: `number`; `transport`: `"streamable_http"`; `url`: `string`; \} |
+| `config` | \{ `allowed_tools`: `string`[] \| `null`; `auth`: \{ `client_id_env`: `string` \| `null`; `client_name`: `string` \| `null`; `client_secret_env`: `string` \| `null`; `redirect_uri`: `string` \| `null`; `scope`: `string` \| `null`; `token_env`: `string` \| `null`; `token_url`: `string` \| `null`; `type`: `"none"` \| `"bearer_env"` \| `"oauth"` \| `"client_credentials"`; \}; `headers`: `Record`\<`string`, `string`\>; `scopes`: `string`[]; `timeout_seconds`: `number`; `transport`: `"streamable_http"`; `url`: `string` \| `null`; \} |
 | `config.allowed_tools` | `string`[] \| `null` |
 | `config.auth` | \{ `client_id_env`: `string` \| `null`; `client_name`: `string` \| `null`; `client_secret_env`: `string` \| `null`; `redirect_uri`: `string` \| `null`; `scope`: `string` \| `null`; `token_env`: `string` \| `null`; `token_url`: `string` \| `null`; `type`: `"none"` \| `"bearer_env"` \| `"oauth"` \| `"client_credentials"`; \} |
 | `config.auth.client_id_env` | `string` \| `null` |
@@ -15214,9 +15638,10 @@ Resolve an MCP SDK OAuth provider for the configured auth mode, if any.
 | `config.auth.token_url` | `string` \| `null` |
 | `config.auth.type` | `"none"` \| `"bearer_env"` \| `"oauth"` \| `"client_credentials"` |
 | `config.headers` | `Record`\<`string`, `string`\> |
+| `config.scopes` | `string`[] |
 | `config.timeout_seconds` | `number` |
 | `config.transport` | `"streamable_http"` |
-| `config.url` | `string` |
+| `config.url` | `string` \| `null` |
 
 #### Returns
 
@@ -15239,7 +15664,7 @@ Resolve headers for a remote MCP server without exposing secret values in config
 | Parameter | Type |
 | :------ | :------ |
 | `serverName` | `string` |
-| `config` | \{ `allowed_tools`: `string`[] \| `null`; `auth`: \{ `client_id_env`: `string` \| `null`; `client_name`: `string` \| `null`; `client_secret_env`: `string` \| `null`; `redirect_uri`: `string` \| `null`; `scope`: `string` \| `null`; `token_env`: `string` \| `null`; `token_url`: `string` \| `null`; `type`: `"none"` \| `"bearer_env"` \| `"oauth"` \| `"client_credentials"`; \}; `headers`: `Record`\<`string`, `string`\>; `timeout_seconds`: `number`; `transport`: `"streamable_http"`; `url`: `string`; \} |
+| `config` | \{ `allowed_tools`: `string`[] \| `null`; `auth`: \{ `client_id_env`: `string` \| `null`; `client_name`: `string` \| `null`; `client_secret_env`: `string` \| `null`; `redirect_uri`: `string` \| `null`; `scope`: `string` \| `null`; `token_env`: `string` \| `null`; `token_url`: `string` \| `null`; `type`: `"none"` \| `"bearer_env"` \| `"oauth"` \| `"client_credentials"`; \}; `headers`: `Record`\<`string`, `string`\>; `scopes`: `string`[]; `timeout_seconds`: `number`; `transport`: `"streamable_http"`; `url`: `string` \| `null`; \} |
 | `config.allowed_tools` | `string`[] \| `null` |
 | `config.auth` | \{ `client_id_env`: `string` \| `null`; `client_name`: `string` \| `null`; `client_secret_env`: `string` \| `null`; `redirect_uri`: `string` \| `null`; `scope`: `string` \| `null`; `token_env`: `string` \| `null`; `token_url`: `string` \| `null`; `type`: `"none"` \| `"bearer_env"` \| `"oauth"` \| `"client_credentials"`; \} |
 | `config.auth.client_id_env` | `string` \| `null` |
@@ -15251,9 +15676,10 @@ Resolve headers for a remote MCP server without exposing secret values in config
 | `config.auth.token_url` | `string` \| `null` |
 | `config.auth.type` | `"none"` \| `"bearer_env"` \| `"oauth"` \| `"client_credentials"` |
 | `config.headers` | `Record`\<`string`, `string`\> |
+| `config.scopes` | `string`[] |
 | `config.timeout_seconds` | `number` |
 | `config.transport` | `"streamable_http"` |
-| `config.url` | `string` |
+| `config.url` | `string` \| `null` |
 
 #### Returns
 
@@ -15894,7 +16320,9 @@ function shellExecute(args): Promise<Record<string, unknown>>;
 
 Run a shell command and capture its output. Per
 `SandboxBackendProtocol.execute`, *timeout* is `null` = "use the backend
-default" (SHELL_DEFAULT_TIMEOUT_SECONDS), not "no timeout".
+default" (SHELL_DEFAULT_TIMEOUT_SECONDS), not "no timeout". So is `0`, which
+a sandbox protocol may read as "no timeout": this backend never runs a
+command unbounded.
 
 Threat model: `shell: true` is intentional — agents need pipes, redirects,
 globs. The sandbox is the Tool Pod itself.
@@ -16141,8 +16569,8 @@ Return detached tool descriptions without credentials or transport metadata.
 
 | Parameter | Type |
 | :------ | :------ |
-| `definitions` | \{ `auth?`: \| \{ `credentials?`: `object`[] \| `null`; `env?`: `string` \| `null`; `header?`: `string` \| `null`; `headers?`: `Record`\<`string`, `string`\> \| `null`; `location?`: `"path"` \| `"header"` \| `"query"` \| `"cookie"` \| `null`; `name?`: `string` \| `null`; `password_env?`: `string` \| `null`; `prefix`: `string`; `provider_type?`: `string` \| `null`; `scopes`: `string`[]; `type`: `"none"` \| `"oauth"` \| `"bearer"` \| `"api_key"` \| `"basic"` \| `"api_keys"`; `username_env?`: `string` \| `null`; \} \| `null`; `externalize?`: `Record`\<`string`, `unknown`\> \| `null`; `source`: \{ `base_url`: `string`; `generator?`: `string` \| `null`; `name`: `string`; `openapi?`: `string` \| `null`; `spec_sha256?`: `string` \| `null`; \}; `tools`: `object`[]; \} |
-| `definitions.auth?` | \| \{ `credentials?`: `object`[] \| `null`; `env?`: `string` \| `null`; `header?`: `string` \| `null`; `headers?`: `Record`\<`string`, `string`\> \| `null`; `location?`: `"path"` \| `"header"` \| `"query"` \| `"cookie"` \| `null`; `name?`: `string` \| `null`; `password_env?`: `string` \| `null`; `prefix`: `string`; `provider_type?`: `string` \| `null`; `scopes`: `string`[]; `type`: `"none"` \| `"oauth"` \| `"bearer"` \| `"api_key"` \| `"basic"` \| `"api_keys"`; `username_env?`: `string` \| `null`; \} \| `null` |
+| `definitions` | \{ `auth?`: \| \{ `api_keys?`: `object`[] \| `null`; `basic?`: \| \{ `password`: `string`; `username`: `string`; \} \| `null`; `bearer?`: `string` \| `null`; `headers?`: `Record`\<`string`, `string`\> \| `null`; `provider?`: `string` \| `null`; `scopes?`: `string`[] \| `null`; \} \| `null`; `externalize?`: `Record`\<`string`, `unknown`\> \| `null`; `source`: \{ `base_url`: `string`; `generator?`: `string` \| `null`; `name`: `string`; `openapi?`: `string` \| `null`; `spec_sha256?`: `string` \| `null`; \}; `tools`: `object`[]; \} |
+| `definitions.auth?` | \| \{ `api_keys?`: `object`[] \| `null`; `basic?`: \| \{ `password`: `string`; `username`: `string`; \} \| `null`; `bearer?`: `string` \| `null`; `headers?`: `Record`\<`string`, `string`\> \| `null`; `provider?`: `string` \| `null`; `scopes?`: `string`[] \| `null`; \} \| `null` |
 | `definitions.externalize?` | `Record`\<`string`, `unknown`\> \| `null` |
 | `definitions.source` | \{ `base_url`: `string`; `generator?`: `string` \| `null`; `name`: `string`; `openapi?`: `string` \| `null`; `spec_sha256?`: `string` \| `null`; \} |
 | `definitions.source.base_url` | `string` |
@@ -16330,6 +16758,39 @@ function valueToJson(value): unknown;
 #### Returns
 
 `unknown`
+
+***
+
+<a id="api-withconnectorenvironment"></a>
+
+### withConnectorEnvironment()
+
+```ts
+function withConnectorEnvironment<T>(env, fn): T;
+```
+
+Bind the tenant environment captured for one connector invocation.
+
+The Tool Pod may run concurrent calls whose metadata secrets differ. Keep
+the captured environment request-local instead of reading the live process
+environment when the executor eventually builds the request.
+
+#### Type Parameters
+
+| Type Parameter |
+| :------ |
+| `T` |
+
+#### Parameters
+
+| Parameter | Type |
+| :------ | :------ |
+| `env` | `Readonly`\<`Record`\<`string`, `string`\>\> |
+| `fn` | () => `T` |
+
+#### Returns
+
+`T`
 
 ***
 

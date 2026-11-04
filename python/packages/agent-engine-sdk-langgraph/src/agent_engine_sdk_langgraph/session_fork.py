@@ -163,7 +163,7 @@ async def _fork_durable_session(
     step_ordinal = _oe_step_ordinal(source)
     # Materialized state adds unwritten reducer defaults absent from the OE hash.
     source_state = channel_values_to_state_snapshot(
-        dict(source.checkpoint.get("channel_values") or {}),
+        checkpointer.committed_values(source.checkpoint, source.config),
         include_legacy_source=context.replay_mode,
     )
     branch_source = f"{identity.execution_id}/step/{step_ordinal}"

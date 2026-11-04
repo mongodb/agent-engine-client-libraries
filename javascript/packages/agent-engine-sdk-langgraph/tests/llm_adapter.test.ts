@@ -553,3 +553,223 @@ describe("LangChainLLMAdapter.stream", () => {
     ).rejects.toThrow(/streaming/);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Prompt caching — Anthropic breakpoint placement
+// ---------------------------------------------------------------------------
+
+interface CapturedCall {
+  messages: Array<{ content: unknown }>;
+  kwargs: Record<string, unknown> | undefined;
+}
+
+function firstCall(mock: { mock: { calls: unknown[][] } }): CapturedCall {
+  const call = mock.mock.calls[0] ?? [];
+  return {
+    messages: (call[0] ?? []) as Array<{ content: unknown }>,
+    kwargs: call[1] as Record<string, unknown> | undefined,
+  };
+}
+
+function blocksOf(
+  message: { content: unknown } | undefined,
+): Array<Record<string, unknown>> {
+  const content = message?.content;
+  return Array.isArray(content)
+    ? (content as Array<Record<string, unknown>>)
+    : [];
+}
+
+describe("LangChainLLMAdapter — prompt caching", () => {
+  function anthropicModel() {
+    return {
+      _llmType: () => "anthropic",
+      invoke: vi.fn().mockResolvedValue(new AIMessage({ content: "ok" })),
+      stream: vi
+        .fn()
+        .mockReturnValue(yieldChunks([new AIMessageChunk({ content: "ok" })])),
+    };
+  }
+
+  async function drain(
+    adapter: LangChainLLMAdapter,
+    messages: Message[],
+    kwargs: Record<string, unknown> = {},
+  ): Promise<void> {
+    for await (const _chunk of adapter.stream(messages, kwargs)) {
+      // consume the stream
+    }
+  }
+
+  it("marks the system prompt and hands the tail to the request option", async () => {
+    const llm = anthropicModel();
+    await drain(new LangChainLLMAdapter(llm as never), [
+      { role: "system", content: "you are helpful" },
+      { role: "user", content: "hi" },
+    ]);
+
+    const { messages, kwargs } = firstCall(llm.stream);
+    expect(blocksOf(messages[0])[0]).toEqual({
+      type: "text",
+      text: "you are helpful",
+      cache_control: { type: "ephemeral" },
+    });
+    // The tail stays a plain message: the provider marks its own tool_result
+    // block, and a marker nested inside one is rejected.
+    expect(messages[1]?.content).toBe("hi");
+    expect(kwargs).toEqual({ cache_control: { type: "ephemeral" } });
+  });
+
+  it("uses the caller's value for both breakpoints", async () => {
+    const llm = anthropicModel();
+    await drain(
+      new LangChainLLMAdapter(llm as never),
+      [
+        { role: "system", content: "you are helpful" },
+        { role: "user", content: "hi" },
+      ],
+      { cache_control: { type: "ephemeral", ttl: "1h" } },
+    );
+
+    const { messages, kwargs } = firstCall(llm.stream);
+    expect(blocksOf(messages[0])[0]?.["cache_control"]).toEqual({
+      type: "ephemeral",
+      ttl: "1h",
+    });
+    expect(kwargs).toEqual({ cache_control: { type: "ephemeral", ttl: "1h" } });
+  });
+
+  it("disables placement when the caller passes a falsy value", async () => {
+    const llm = anthropicModel();
+    await drain(
+      new LangChainLLMAdapter(llm as never),
+      [
+        { role: "system", content: "you are helpful" },
+        { role: "user", content: "hi" },
+      ],
+      { cache_control: false },
+    );
+
+    const { messages, kwargs } = firstCall(llm.stream);
+    expect(kwargs).toEqual({});
+    expect(messages[0]?.content).toBe("you are helpful");
+    expect(messages[1]?.content).toBe("hi");
+  });
+
+  it("omits the tail option when the request is system-only", async () => {
+    const llm = anthropicModel();
+    await drain(new LangChainLLMAdapter(llm as never), [
+      { role: "system", content: "you are helpful" },
+    ]);
+
+    const { messages, kwargs } = firstCall(llm.stream);
+    expect(kwargs).toEqual({});
+    expect(blocksOf(messages[0])[0]?.["cache_control"]).toEqual({
+      type: "ephemeral",
+    });
+  });
+
+  it("leaves other providers untouched", async () => {
+    const llm = {
+      invoke: vi.fn().mockResolvedValue(new AIMessage({ content: "ok" })),
+      stream: vi
+        .fn()
+        .mockReturnValue(yieldChunks([new AIMessageChunk({ content: "ok" })])),
+    };
+    await drain(
+      new LangChainLLMAdapter(llm as never),
+      [
+        { role: "system", content: "you are helpful" },
+        { role: "user", content: "hi" },
+      ],
+      { cache_control: { type: "ephemeral" } },
+    );
+
+    const { messages, kwargs } = firstCall(llm.stream);
+    expect(messages[0]?.content).toBe("you are helpful");
+    expect(kwargs).toEqual({ cache_control: { type: "ephemeral" } });
+  });
+
+  it("sends no request-level option to a translated transport", async () => {
+    // A subclass can keep the Anthropic class name while declaring another
+    // transport; it forwards call options unchanged, so the request-level
+    // field would reach a gateway that rejects it.
+    const llm = {
+      ...anthropicModel(),
+      _llmType: () => "anthropic-gateway",
+      getName: () => "ChatAnthropic",
+    };
+    await drain(new LangChainLLMAdapter(llm as never), [
+      { role: "system", content: "you are helpful" },
+      { role: "user", content: "hi" },
+    ]);
+
+    const { messages, kwargs } = firstCall(llm.stream);
+    expect(kwargs).toEqual({});
+    expect(blocksOf(messages[0])[0]?.["cache_control"]).toEqual({
+      type: "ephemeral",
+    });
+    // A block marker stands in for the request-level option the translated
+    // client would forward unchanged.
+    expect(blocksOf(messages[1])[0]).toEqual({
+      type: "text",
+      text: "hi",
+      cache_control: { type: "ephemeral" },
+    });
+  });
+
+  it("marks a translated singleton user message", async () => {
+    const llm = {
+      ...anthropicModel(),
+      _llmType: () => "anthropic-gateway",
+      getName: () => "ChatAnthropic",
+    };
+    await drain(new LangChainLLMAdapter(llm as never), [
+      { role: "user", content: "hi" },
+    ]);
+
+    const { messages, kwargs } = firstCall(llm.stream);
+    expect(kwargs).toEqual({});
+    expect(blocksOf(messages[0])[0]).toEqual({
+      type: "text",
+      text: "hi",
+      cache_control: { type: "ephemeral" },
+    });
+  });
+
+  it("leaves a translated tool-result tail unmarked", async () => {
+    const llm = {
+      ...anthropicModel(),
+      _llmType: () => "anthropic-gateway",
+      getName: () => "ChatAnthropic",
+    };
+    await drain(new LangChainLLMAdapter(llm as never), [
+      { role: "system", content: "you are helpful" },
+      { role: "user", content: "hi" },
+      { role: "tool", content: "tool output", toolCallId: "call_1" },
+    ]);
+
+    const { messages, kwargs } = firstCall(llm.stream);
+    expect(kwargs).toEqual({});
+    // Preparation ran: the system prompt carries its breakpoint.
+    expect(blocksOf(messages[0])[0]?.["cache_control"]).toEqual({
+      type: "ephemeral",
+    });
+    // Marking the tail would nest the breakpoint inside the tool_result block.
+    expect(messages[2]?.content).toBe("tool output");
+  });
+
+  it("places the system marker on the non-streaming invoke path too", async () => {
+    const llm = anthropicModel();
+    await new LangChainLLMAdapter(llm as never).invoke([
+      { role: "system", content: "you are helpful" },
+      { role: "user", content: "hi" },
+    ]);
+
+    const { messages, kwargs } = firstCall(llm.invoke);
+    expect(blocksOf(messages[0])[0]?.["cache_control"]).toEqual({
+      type: "ephemeral",
+    });
+    expect(kwargs).toEqual({ cache_control: { type: "ephemeral" } });
+  });
+});

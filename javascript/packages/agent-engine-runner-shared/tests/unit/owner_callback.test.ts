@@ -2,7 +2,7 @@
  * Tests for the shared owner-callback pre-attempt policy (`ownerDelivered`).
  *
  * This is the single place the fallback status matrix lives; call-site tests
- * (progress, aer, function mode, secure wrapper) verify wiring, not policy.
+ * (progress, aer, secure wrapper) verify wiring, not policy.
  * Mirrors Python's tests/unit/test_owner_callback.py.
  */
 

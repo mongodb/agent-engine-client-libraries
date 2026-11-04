@@ -325,7 +325,10 @@ class TestDownloadFilesParserGuards:
         tool_name, args = mock_wrapper.execute_tool.call_args.args
         assert tool_name == "filesystem_download"
         assert args == {"file_path": "a.txt"}
-        assert mock_wrapper.execute_tool.call_args.kwargs == {"is_local": False}
+        assert mock_wrapper.execute_tool.call_args.kwargs == {
+            "is_local": False,
+            "owning_tool_call": None,
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -373,7 +376,7 @@ def _wrapper_with_delay(
     """Mock wrapper that sleeps per call so overlap is observable."""
 
     def execute_tool(
-        _tool_name: str, arguments: dict[str, Any], *, is_local: bool
+        _tool_name: str, arguments: dict[str, Any], *, is_local: bool, **_: Any
     ) -> str:
         assert is_local is False
         path = arguments["file_path"]

@@ -23,6 +23,7 @@ import type {
 import type { AERQueryPlugin } from "./server/query.js";
 import { resetCheckpointWorkspaceState } from "./checkpoint_workspace.js";
 import { withTimeout } from "./timeout.js";
+import { AsyncMutex } from "./async_mutex.js";
 import { getEnvFloat } from "./utils.js";
 
 // Accepts a serialized SuspendPayload, returns the human decision.
@@ -75,7 +76,7 @@ let activeEntrypointEvaluations = 0;
  * Matches the AER's execution bound so a builder that works there works here.
  */
 function discoveryTimeoutMs(): number {
-  return getEnvFloat("RUNNER_EXECUTION_TIMEOUT", 600.0) * 1000;
+  return getEnvFloat("RUNNER_EXECUTION_TIMEOUT", 3600.0) * 1000;
 }
 
 function withEntrypointStore<T>(fn: () => T): T {
@@ -287,6 +288,22 @@ function restoreAfterFailedEntrypoint(
   );
 }
 
+/** The graph builder a server hands in, narrowed to the two methods used here. */
+type RegistryGraphBuilder = {
+  getAgent?: () => unknown;
+  buildGraph?: (
+    agentInput?: AgentInput,
+    ctx?: RequestContext,
+  ) => Promise<unknown>;
+} | null;
+
+/**
+ * Serializes the whole populate / reset / restore lifetime across every server
+ * in this process. See populateLlmRegistryFromEntrypoint for why it is here
+ * rather than in a server.
+ */
+const llmRegistryPopulationLock = new AsyncMutex();
+
 /**
  * Run the user's agent entrypoint to populate the named-LLM registry.
  *
@@ -302,19 +319,12 @@ function restoreAfterFailedEntrypoint(
  * path so the caller can attribute a later registry lookup miss to its real
  * cause rather than to a missing `app.llm()` call.
  *
- * Shared by ToolServer.onStartup and ToolFunctionRunner._prepare — mirrors
- * Python's ToolExecution.prepare() which both inherit.
+ * Used by ToolServer.onStartup — mirrors Python's ToolExecution.prepare().
  *
  * @internal — exported for server/ consumers; not part of the public API.
  */
 export async function populateLlmRegistryFromEntrypoint(
-  graphBuilder: {
-    getAgent?: () => unknown;
-    buildGraph?: (
-      agentInput?: AgentInput,
-      ctx?: RequestContext,
-    ) => Promise<unknown>;
-  } | null,
+  graphBuilder: RegistryGraphBuilder,
   logger: {
     warn(msg: string): void;
     info(msg: string): void;
@@ -326,7 +336,32 @@ export async function populateLlmRegistryFromEntrypoint(
 ): Promise<boolean> {
   if (graphBuilder === null || typeof graphBuilder.getAgent !== "function")
     return true;
+  // One population at a time. The registry is process-global and the reset
+  // below runs before the build is awaited, so without this lock a second
+  // caller clears the registrations a live build is still working from, and
+  // that build then captures a baseline which is not its own.
+  return llmRegistryPopulationLock.runExclusive(() =>
+    populateLlmRegistryLocked(
+      graphBuilder,
+      logger,
+      warnings,
+      onEntrypointError,
+      strategy,
+    ),
+  );
+}
 
+async function populateLlmRegistryLocked(
+  graphBuilder: NonNullable<RegistryGraphBuilder>,
+  logger: {
+    warn(msg: string): void;
+    info(msg: string): void;
+    error(msg: string): void;
+  },
+  warnings: { entrypointFailed: string; noLlmRegistered: string },
+  onEntrypointError?: (error: unknown) => void,
+  strategy?: { usesPerInvocationBuild: boolean },
+): Promise<boolean> {
   const preSnapshot = snapshotLlmRegistry();
   resetLlmRegistry();
   try {

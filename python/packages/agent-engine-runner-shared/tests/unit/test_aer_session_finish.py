@@ -27,6 +27,7 @@ Scenarios:
 from __future__ import annotations
 
 import asyncio
+import threading
 from typing import Any, Optional
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -322,6 +323,66 @@ async def test_memory_writes_drain_before_finish_post() -> None:
 
     assert writer._idx >= 3  # polled until it saw 0
     assert finish_calls == ["http://oe/executions/exec-drain/finish"]
+
+
+async def test_trace_flush_completes_before_finish_post(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The finish POST must wait for the trace flush, not race it.
+
+    /finish triggers a zero-grace teardown, so a flush that is merely started
+    (or reordered after the POST) loses the turn's spans. This pins the
+    ordering: no finish POST while the flush is in progress, and the flush
+    completes first.
+    """
+    server = _make_server()
+
+    flush_started = threading.Event()
+    release_flush = threading.Event()
+    order: list[str] = []
+
+    def _gated_flush() -> bool:
+        order.append("flush-start")
+        flush_started.set()
+        assert release_flush.wait(timeout=2.0), "flush was never released"
+        order.append("flush-end")
+        return True
+
+    monkeypatch.setattr("agent_engine_runner_shared.tracing.force_flush_tracing", _gated_flush)
+
+    finish_calls: list[str] = []
+
+    async def _fake_post_json_with_retries(client: Any, url: str, payload: dict) -> None:
+        order.append("finish")
+        finish_calls.append(url)
+
+    with (
+        patch.object(AERServer, "_get_client", new=AsyncMock(return_value=MagicMock())),
+        patch(
+            "agent_engine_runner_shared.server.aer.post_json_with_retries",
+            new=_fake_post_json_with_retries,
+        ),
+    ):
+        finish_task = asyncio.create_task(
+            server._release_finished_session(_execute_request("exec-flush"))
+        )
+        try:
+            for _ in range(200):
+                if flush_started.is_set():
+                    break
+                await asyncio.sleep(0.01)
+            assert flush_started.is_set(), "trace flush was not reached"
+            assert order == ["flush-start"]
+            assert finish_calls == []
+
+            release_flush.set()
+            await asyncio.wait_for(finish_task, timeout=2.0)
+        finally:
+            release_flush.set()
+            if not finish_task.done():
+                finish_task.cancel()
+
+    assert order == ["flush-start", "flush-end", "finish"]
 
 
 @pytest.mark.parametrize("durable", [False, True])

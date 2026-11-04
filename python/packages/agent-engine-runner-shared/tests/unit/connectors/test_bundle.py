@@ -62,7 +62,7 @@ def test_registration_metadata_is_the_shared_aer_and_tool_pod_projection():
         "name": "jiradc_getComments",
         "description": "Returns comments for an issue.",
         "is_local": False,
-        "provider_type": None,
+        "provider": None,
         "scopes": [],
         "network": ["jira.example"],
         "timeout_seconds": 30,
@@ -73,11 +73,11 @@ def test_registration_metadata_is_the_shared_aer_and_tool_pod_projection():
 
 def test_oauth_metadata_is_explicit_and_not_in_model_schema():
     """Register the provider key and connector-wide scopes outside model arguments."""
-    bundle = _bundle_for(type="oauth", provider_type="custom-github", scopes=["repo"])
+    bundle = _bundle_for(provider="custom-github", scopes=["repo"])
     for tool in bundle.tools:
-        assert tool.registration_metadata["provider_type"] == "custom-github"
+        assert tool.registration_metadata["provider"] == "custom-github"
         assert tool.registration_metadata["scopes"] == ["repo"]
-        assert "provider_type" not in tool.schema
+        assert "provider" not in tool.schema
         assert "authorization" not in tool.schema["inputSchema"]["properties"]
     metadata = bundle.tools[0].registration_metadata
     metadata["scopes"].clear()

@@ -46,9 +46,9 @@ from agent_engine_runner_shared.server.callback_delivery import CallbackDelivery
 from agent_engine_runner_shared.server.chunk_types import (
     DONE,
     ERROR,
+    RUN_TIMEOUT_ERROR_CODE,
     SUBAGENT_END,
     TEXT,
-    TIMEOUT_ERROR_CODE,
 )
 
 # ---------------------------------------------------------------------------
@@ -1084,6 +1084,7 @@ async def test_pre_done_exception_still_routes_through_outer_error_callback() ->
 
 async def test_timeout_error_chunk_failure_still_reports_504_with_timeout_message(
     caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Symmetric to the DONE chunk wrap: when execution times out AND the ERROR
     chunk delivery exhausts its retries, the timeout handler's caller-side
@@ -1091,8 +1092,16 @@ async def test_timeout_error_chunk_failure_still_reports_504_with_timeout_messag
     and raise ``HTTPException(504)`` with the timeout message — not 500 with
     the chunk-delivery error masking the timeout root cause.
     """
+    from agent_engine_runner_shared.server import aer
+
+    monkeypatch.setattr(aer, "EXECUTION_TIMEOUT", 0.01)
     server = _make_server()
-    _wire_execute_path(server, stream_raises=asyncio.TimeoutError())
+    _wire_execute_path(server)
+
+    async def _stall(*_args: Any, **_kwargs: Any) -> None:
+        await asyncio.Event().wait()
+
+    server._execute_via_agent_stream = _stall  # type: ignore[assignment]
 
     chunk_error = httpx.ConnectError("oe unreachable")
 
@@ -1124,7 +1133,7 @@ async def test_timeout_error_chunk_failure_still_reports_504_with_timeout_messag
         {
             "status": "ERROR",
             "error": exc_info.value.detail,
-            "metadata": {"error_code": TIMEOUT_ERROR_CODE},
+            "metadata": {"error_code": RUN_TIMEOUT_ERROR_CODE},
         },
     ]
 

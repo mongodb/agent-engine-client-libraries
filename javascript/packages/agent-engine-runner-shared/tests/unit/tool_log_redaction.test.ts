@@ -51,7 +51,6 @@ import {
   toolRedactFields,
 } from "../../src/utils.js";
 import { ToolServer } from "../../src/server/tool.js";
-import { ToolFunctionRunner } from "../../src/server/function.js";
 import {
   SecureToolWrapper,
   createSecureToolFunction,
@@ -323,42 +322,6 @@ describe("ToolServer.doHandleExecute redaction", () => {
   });
 });
 
-describe("ToolFunctionRunner._invokeToolFn redaction", () => {
-  beforeEach(() => {
-    for (const k of ["info", "error", "warn", "debug"] as const)
-      mocks.logger[k].mockClear();
-  });
-
-  test("applies the tool definition's redact_fields to the request log", async () => {
-    const runtime = makeMockRuntime();
-    runtime.tools = { stripe_charge: () => ({ ok: true }) };
-    runtime.toolDefinitions = {
-      stripe_charge: { redact_fields: ["card_number", "cvv"] },
-    };
-    const runner = new ToolFunctionRunner(runtime as unknown as ITenantRuntime);
-
-    const response = await (
-      runner as unknown as {
-        _invokeToolFn: (
-          request: ToolPodExecuteRequest,
-        ) => Promise<{ status: string }>;
-      }
-    )._invokeToolFn(
-      makeExecuteRequest("stripe_charge", {
-        card_number: "4111111111111111",
-        cvv: "123",
-        amount: 42,
-      }),
-    );
-
-    expect(response.status).toBe("success");
-    const out = debugOutput();
-    expect(out).toContain("card_number=<redacted>");
-    expect(out).not.toContain("4111111111111111");
-    expect(out).not.toContain("123");
-  });
-});
-
 describe("SecureToolWrapper.executeTool redaction", () => {
   beforeEach(() => {
     for (const k of ["info", "error", "warn", "debug"] as const)
@@ -417,7 +380,7 @@ describe("SecureToolWrapper.executeTool redaction", () => {
       { card_number: "4111111111111111" },
       {
         metadata: undefined,
-        providerType: undefined,
+        provider: undefined,
         scopes: undefined,
         toolCallId: undefined,
         rawOnInterrupt: true,

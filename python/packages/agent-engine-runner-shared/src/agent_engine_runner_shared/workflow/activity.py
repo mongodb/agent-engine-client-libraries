@@ -313,8 +313,9 @@ def unwrap_activity_outcome(outcome: ActivityOutcome) -> Any:
 
 # Concurrent activities share one attempt when adapters assign stable positions.
 # LLM calls use the platform-owned operational step; adapters may also
-# preallocate tool positions from framework call IDs. Remaining unkeyed effects
-# stay exclusive.
+# preallocate tool positions from framework call IDs, and an operation a tool
+# call performs numbers under a path derived from that call. Remaining unkeyed
+# effects stay exclusive.
 # The gate is attempt-local: multiple nonexclusive starts may overlap, but an
 # exclusive start conflicts with any active activity and any start conflicts
 # with an active exclusive owner.

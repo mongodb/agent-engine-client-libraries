@@ -429,3 +429,33 @@ def test_unknown_http_status_is_unknown_not_retryable():
     assert error.classification == "UNKNOWN"
     assert error.retryable is False
     assert error.http_status == 500
+
+
+def test_redact_tool_error_text_replaces_exact_credentials_longest_first():
+    from agent_engine_runner_shared.tool_api_error import redact_tool_error_text
+
+    text = redact_tool_error_text(
+        "connect failed: token abcd1234-long rejected, retry with abcd",
+        credentials=["abcd", "abcd1234-long", ""],
+    )
+
+    assert text == "connect failed: token <redacted> rejected, retry with <redacted>"
+
+
+def test_redact_tool_error_text_applies_pattern_rules():
+    from agent_engine_runner_shared.tool_api_error import redact_tool_error_text
+
+    key = "sk-" + "Ab3dEf6hIj9kLm2nOp5qRs"
+    text = redact_tool_error_text(
+        f"mongodb://u:p@db.example.net:27017 refused; key {key}", credentials=()
+    )
+
+    assert text == "mongodb://<redacted>:<redacted>@db.example.net:27017 refused; key sk-<redacted>"
+
+
+def test_redact_tool_error_text_leaves_benign_text_unchanged():
+    from agent_engine_runner_shared.tool_api_error import redact_tool_error_text
+
+    text = "mixed inclusion and exclusion projection"
+
+    assert redact_tool_error_text(text, credentials=["unrelated-value"]) == text

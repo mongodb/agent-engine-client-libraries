@@ -175,7 +175,7 @@ describe("durable Tool effects", () => {
         { q: "teal" },
         {
           metadata: { source: "agent" },
-          providerType: "oauth",
+          provider: "oauth",
           scopes: ["write", "read"],
           toolCallId: "call-1",
         },
@@ -189,7 +189,7 @@ describe("durable Tool effects", () => {
       arguments: { q: "teal" },
       is_local: false,
       metadata: { source: "agent" },
-      provider_type: "oauth",
+      provider: "oauth",
       scopes: ["read", "write"],
       tool_call_id: "call-1",
     });
@@ -745,6 +745,43 @@ describe("durable Tool effects", () => {
     expect(outcomeBodies[0]?.["outcome_kind"]).toBe(
       "ACTIVITY_OUTCOME_KIND_FAILED",
     );
+  });
+
+  test("Tool failure outcomes record credentials redacted", async () => {
+    const outcomeBodies: Record<string, unknown>[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+        const url = String(input);
+        if (url.endsWith("/executor/activity/start")) {
+          return dispatchResponse("tool-failed-secret");
+        }
+        if (url.endsWith("/tool/execute")) {
+          return jsonResponse({
+            proceed: true,
+            status: "error",
+            error: "connect mongodb://ada:s3cr3t-pass@db.example.net failed",
+          });
+        }
+        if (url.endsWith("/executor/activity/outcome")) {
+          outcomeBodies.push(requestBody(init));
+          return jsonResponse({});
+        }
+        throw new Error(`unexpected URL: ${url}`);
+      }),
+    );
+
+    await expect(
+      runWithAttemptContext(attempt, () =>
+        new SecureToolWrapper("http://oe", "execution").executeTool(
+          "lookup",
+          {},
+        ),
+      ),
+    ).rejects.toBeInstanceOf(ToolExecutionError);
+    const recorded = JSON.stringify(outcomeBodies[0]);
+    expect(recorded).toContain("db.example.net");
+    expect(recorded).not.toContain("s3cr3t-pass");
   });
 
   test("runs an approved local callback as a durable Tool activity", async () => {

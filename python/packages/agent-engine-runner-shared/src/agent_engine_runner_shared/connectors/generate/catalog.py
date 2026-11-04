@@ -21,6 +21,8 @@ from agent_engine_runner_shared.connectors.generate.naming import (
 from agent_engine_runner_shared.connectors.generate.parameters import _collect_parameters
 from agent_engine_runner_shared.connectors.generate.security import (
     _operation_auth,
+    _OperationAuth,
+    _presentation,
     _resolve_schemes,
 )
 from agent_engine_runner_shared.connectors.generate.spec import (
@@ -92,24 +94,65 @@ def _discover_operations(
     return operations, skipped
 
 
+def _declared_auth(
+    document: _SpecDocument, root: dict[str, Any], provenance: str
+) -> dict[tuple[str, str], _OperationAuth]:
+    """Map each operation's method and path to the credential its document declares.
+
+    Overrides read this to borrow the document's API-key placement and OAuth
+    scopes, including from operations whose alternatives conflict, so only an
+    operation whose security cannot be resolved is left out instead of
+    failing the document.
+    """
+    operations, _ = _discover_operations(document, root, provenance)
+    try:
+        schemes = _resolve_schemes(document, root)
+    except GenerateError:
+        schemes = None
+    declared = {}
+    for _, operation, method, path in operations:
+        try:
+            auth = _operation_auth(schemes, document, operation, f"operation {method} {path}")
+        except GenerateError:
+            continue
+        if auth is not None:
+            declared[(method, path)] = auth
+    return declared
+
+
+def _tool_names(
+    name: str, operations: list[tuple[dict[str, Any], dict[str, Any], str, str]]
+) -> list[str]:
+    """Assign each operation its tool name, which no credential influences."""
+    raw_names = [
+        _operation_raw_name(operation, method, path) for _, operation, method, path in operations
+    ]
+    identities = [
+        f"{name}_{method} {path} {raw_name}"
+        for raw_name, (_, _, method, path) in zip(raw_names, operations)
+    ]
+    return _assign_tool_names(name, raw_names, identities)
+
+
+def _override_operations(
+    document: _SpecDocument, root: dict[str, Any], provenance: str, name: str
+) -> dict[str, tuple[str, str]]:
+    """Map the tool names a compile with an auth override assigns to each method and path."""
+    operations, _ = _discover_operations(document, root, provenance)
+    return {
+        tool: (method, path)
+        for tool, (_, _, method, path) in zip(_tool_names(name, operations), operations)
+    }
+
+
 def _credential_parameters(auth: dict[str, Any] | None) -> set[tuple[str, str]]:
     """Identify wire fields supplied by auth so they are not exposed to the model."""
     if not auth:
         return set()
-    kind = auth.get("type")
-    if kind in ("bearer", "basic"):
+    if any(key in auth for key in ("bearer", "basic", "provider")):
         credentials = [{"location": "header", "name": "authorization"}]
-    elif kind == "api_key":
-        credentials = [
-            {
-                "location": auth.get("location", "header"),
-                "name": auth.get("name") or auth.get("header") or "X-API-Key",
-            }
-        ]
-    elif kind == "api_keys":
-        credentials = auth.get("credentials", [])
     else:
-        credentials = []
+        credentials = auth.get("api_keys", [])
     result = {
         (
             str(credential.get("location")),
@@ -194,9 +237,11 @@ def _build_catalog(
 ) -> tuple[ToolDefinitions, tuple[str, ...]]:
     """Compile a document using one base URL and one credential presentation.
 
-    Invalid global state rejects the document. Unsupported operation-local state
-    is collected so compatibility mode can produce a useful partial catalog with
-    explicit provenance instead of silently changing request semantics.
+    Without ``auth_override`` each operation's own security decides; an empty
+    override compiles every operation anonymously. Invalid global state rejects
+    the document. Unsupported operation-local state is collected so
+    compatibility mode can produce a useful partial catalog with explicit
+    provenance instead of silently changing request semantics.
     """
     resolved_base = base_url or _default_base_url(document, provenance)
     if not resolved_base:
@@ -206,28 +251,25 @@ def _build_catalog(
     operations, skipped = _discover_operations(document, root, provenance)
 
     if auth_override is not None:
-        authenticated = [(entry, auth_override) for entry in operations]
+        authenticated = [(entry, auth_override or None) for entry in operations]
     else:
         schemes = _resolve_schemes(document, root)
         authenticated = []
         for item, operation, method, path in operations:
             where = f"operation {method} {_quote(path)}"
             try:
-                auth = _operation_auth(schemes, document, operation, where)
+                declared = _operation_auth(schemes, document, operation, where)
             except GenerateError as exc:
                 skipped.append(str(exc))
                 continue
-            authenticated.append(((item, operation, method, path), auth))
+            if declared is not None and declared.record is None:
+                skipped.append(
+                    f"{where}: conflicting authentication alternatives cannot share one credential"
+                )
+                continue
+            authenticated.append(((item, operation, method, path), declared and declared.record))
 
-    raw_names = [
-        _operation_raw_name(operation, method, path)
-        for (_, operation, method, path), _ in authenticated
-    ]
-    identities = [
-        f"{name}_{method} {path} {raw_name}"
-        for raw_name, ((_, _, method, path), _) in zip(raw_names, authenticated)
-    ]
-    names = _assign_tool_names(name, raw_names, identities)
+    names = _tool_names(name, [entry for entry, _ in authenticated])
     compiled = []
     for ((item, operation, method, path), operation_auth), tool_name in zip(authenticated, names):
         try:
@@ -242,8 +284,11 @@ def _build_catalog(
         catalog_auth = next((auth for auth, _, _, _ in compiled if auth is not None), None)
 
     tools = []
+    oauth_only = False
     for operation_auth, tool, method, path in compiled:
-        if operation_auth is not None and operation_auth != catalog_auth:
+        if operation_auth is not None and _presentation(operation_auth) != _presentation(
+            catalog_auth
+        ):
             skipped.append(
                 f"operation {method} {_quote(path)} requires a different credential than the selected catalog"
             )
@@ -253,6 +298,11 @@ def _build_catalog(
             )
         else:
             tools.append(tool)
+            oauth_only = oauth_only or bool(operation_auth and "provider" in operation_auth)
+    if auth_override is None and oauth_only:
+        # One operation that accepts only OAuth makes the catalog need a
+        # delegated token, even where others also accept a static one.
+        catalog_auth = {"provider": {}}
 
     if skipped and not skip_unsupported:
         raise GenerateError(
@@ -262,7 +312,7 @@ def _build_catalog(
         raise GenerateError("the document declares no supported operations")
 
     externalize: dict[str, Any] = {}
-    if catalog_auth is not None:
+    if catalog_auth:
         externalize["auth"] = catalog_auth
     if skipped:
         externalize["skipped"] = skipped

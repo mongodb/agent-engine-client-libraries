@@ -14,9 +14,9 @@
  *
  * Batch downloads (`downloadFiles`) fan out concurrently in native mode, with
  * one `filesystem_download` call per file so OE policy and audit stay
- * independent. Under a durable `AttemptContext` they stay sequential: unkeyed
- * activities are exclusive on the attempt gate, and overlapping them raises
- * CONFLICT.
+ * independent. Under a durable `AttemptContext` they stay sequential: a worker
+ * pool picks up the next file as one finishes, so positions would depend on
+ * completion order.
  */
 
 import type {
@@ -35,6 +35,7 @@ import type {
   SandboxBackendProtocolV2,
   WriteResult,
 } from "deepagents";
+import { getConfig } from "@langchain/langgraph";
 import {
   currentAttemptContext,
   getCurrentWrapper,
@@ -42,8 +43,11 @@ import {
   PolicyDeniedException,
   TerminalExecutionError,
   ToolCallTimeoutError,
+  ToolOutcomeUnknownError,
   type SecureToolWrapper,
 } from "@mongodb-js/agent-engine-runner-shared";
+
+import { currentDeepAgentTaskCallId } from "../durable_deep_agent.js";
 
 const logger = getLogger("agent_engine_sdk_langgraph.backends.toolpod");
 
@@ -100,6 +104,11 @@ function classifyError(exc: unknown): string {
   if (exc instanceof TerminalExecutionError) {
     return `${NON_RETRYABLE} This execution already ended`;
   }
+  if (exc instanceof ToolOutcomeUnknownError) {
+    // The operation may have applied, so a retry could repeat its effect. The
+    // model needs OE's explanation to check before acting; it names no topology.
+    return `${NON_RETRYABLE} ${exc.error}`;
+  }
   if (exc instanceof ToolCallTimeoutError) {
     // Non-retryable: the call already consumed its whole deadline, so an
     // automatic retry spends another full one to most likely fail the same way.
@@ -130,6 +139,34 @@ function getWrapper(): SecureToolWrapper {
     );
   }
   return wrapper;
+}
+
+/**
+ * The tool call a durable backend operation serves, or undefined when it serves
+ * none, such as a root model node's. A subagent's own nodes serve its `task`.
+ *
+ * `lg_tool_call` is how LangChain's `createAgent` hands a tool task its call.
+ * Filesystem middleware evicts a large result outside any middleware of ours,
+ * so the graph task's input is the one place every operation can read this.
+ * Should a LangChain release drop it, the operation is exclusive again: an
+ * overlap fails with a clean conflict rather than recording a wrong position.
+ */
+function owningToolCallId(): string | undefined {
+  if (currentAttemptContext() === null) return undefined;
+  let taskInput: unknown;
+  try {
+    const scratchpad = getConfig()?.configurable?.["__pregel_scratchpad"] as
+      | { currentTaskInput?: unknown }
+      | undefined;
+    taskInput = scratchpad?.currentTaskInput;
+  } catch {
+    // Outside a graph task LangGraph has no config to read.
+  }
+  const toolCall = isObject(taskInput) ? taskInput["lg_tool_call"] : undefined;
+  const id = isObject(toolCall) ? toolCall["id"] : undefined;
+  return typeof id === "string" && id !== ""
+    ? id
+    : currentDeepAgentTaskCallId();
 }
 
 /** A handler wire result is always a JSON object. */
@@ -180,7 +217,10 @@ export class AgentEngineToolPodBackend implements SandboxBackendProtocolV2 {
   ): Promise<CallOutcome> {
     try {
       const wrapper = getWrapper();
-      const raw = await wrapper.executeTool(toolName, args, { isLocal: false });
+      const raw = await wrapper.executeTool(toolName, args, {
+        isLocal: false,
+        owningToolCallId: owningToolCallId(),
+      });
       if (isObject(raw)) return { ok: true, result: raw };
       return {
         ok: false,
@@ -458,14 +498,13 @@ export class AgentEngineToolPodBackend implements SandboxBackendProtocolV2 {
    *
    * Native-mode batches fan out on a bounded worker pool so skills loading
    * pays one round-trip of latency instead of a sum. Durable attempts stay
-   * sequential: unkeyed activities are exclusive under the attempt gate, and
-   * overlapping them raises CONFLICT.
+   * sequential: a worker pool picks up the next file as one finishes, so
+   * positions would depend on completion order.
    */
   async downloadFiles(paths: string[]): Promise<FileDownloadResponse[]> {
     if (paths.length <= 1 || currentAttemptContext() != null) {
-      // Single path skips pool overhead. Durable attempts stay sequential:
-      // unkeyed activities are exclusive under the attempt gate, and
-      // overlapping them raises CONFLICT.
+      // Single path skips pool overhead. Durable attempts stay sequential; see
+      // above.
       const responses: FileDownloadResponse[] = [];
       for (const path of paths) {
         responses.push(await this.downloadOne(path));

@@ -183,6 +183,7 @@
   * [PolicyDeniedException](#agent_engine_runner_shared.secure_wrapper.PolicyDeniedException)
   * [OERetryAfterError](#agent_engine_runner_shared.secure_wrapper.OERetryAfterError)
   * [ToolExecutionError](#agent_engine_runner_shared.secure_wrapper.ToolExecutionError)
+  * [ToolOutcomeUnknownError](#agent_engine_runner_shared.secure_wrapper.ToolOutcomeUnknownError)
   * [ToolPlatformError](#agent_engine_runner_shared.secure_wrapper.ToolPlatformError)
   * [TerminalExecutionError](#agent_engine_runner_shared.secure_wrapper.TerminalExecutionError)
   * [raise\_for\_oe\_rejection](#agent_engine_runner_shared.secure_wrapper.raise_for_oe_rejection)
@@ -2436,9 +2437,9 @@ return parse(html)
 Runtime-transparent custom-event emission across Atlas Agent Engine runtimes.
 
 Authors call :func:`emit_custom_event` without knowing which runtime is
-hosting the code (AER agent process vs Tool Pod / function mode). The active
-runtime installs exactly one :class:`CustomEventTransport` before invoking
-tenant code; the helper dispatches to that transport.
+hosting the code (AER agent process vs Tool Pod). The active runtime installs
+exactly one :class:`CustomEventTransport` before invoking tenant code; the
+helper dispatches to that transport.
 
 Atlas Agent Engine transports an opaque author-final JSON object as ``custom_event``.
 It does not interpret keys — customers who need a shaped vocabulary (e.g.
@@ -2570,7 +2571,7 @@ no transport is installed (outside an execution context).
 class OEHTTPCustomEventTransport()
 ```
 
-Tool Pod / function-mode transport: POST final ``custom_event`` chunks to OE.
+Tool Pod transport: POST final ``custom_event`` chunks to OE.
 
 Delivery is awaited with a bounded timeout and is non-fatal: delivery
 failures are logged and swallowed so a progress event cannot fail the tool.
@@ -2586,10 +2587,10 @@ class FeatureOffCustomEventTransport()
 Fail closed when ``use_custom_parser`` is disabled.
 
 Runtime-neutral rejecting transport shared by AER streaming (when Atlas Agent Engine
-does not subscribe to LangGraph ``custom``) and Tool Pod / function mode
-(when OE POSTs would otherwise succeed while Gateway strips client
-delivery). Authors must not observe a successful emit when the workspace
-cannot deliver custom events to clients.
+does not subscribe to LangGraph ``custom``) and the Tool Pod (when OE POSTs
+would otherwise succeed while Gateway strips client delivery). Authors
+must not observe a successful emit when the workspace cannot deliver custom
+events to clients.
 
 <a id="agent_engine_runner_shared.custom_events.install_tool_custom_event_transport"></a>
 
@@ -2600,7 +2601,7 @@ def install_tool_custom_event_transport(
         *, enabled: bool = True) -> Token[Optional[CustomEventTransport]]
 ```
 
-Install Tool Pod / function-mode custom-event transport; return reset token.
+Install the Tool Pod custom-event transport; return reset token.
 
 When ``enabled`` is false (workspace does not have ``use_custom_parser``),
 install a rejecting transport so emit fails closed instead of POSTing an
@@ -2855,6 +2856,19 @@ class ToolExecutionError(Exception)
 
 Raised when tool execution fails.
 
+<a id="agent_engine_runner_shared.secure_wrapper.ToolOutcomeUnknownError"></a>
+
+## ToolOutcomeUnknownError
+
+```python
+class ToolOutcomeUnknownError(ToolExecutionError)
+```
+
+The runner was lost while this durable tool call was in flight.
+
+It may have taken effect and OE did not run it again. ``error`` is OE's
+message, written for the model reading it.
+
 <a id="agent_engine_runner_shared.secure_wrapper.ToolPlatformError"></a>
 
 ## ToolPlatformError
@@ -2977,7 +2991,7 @@ def request_oe_approval(
         is_local: bool = True,
         metadata: Optional[Dict[str, Any]] = None,
         redact_fields: Optional[list[str]] = None,
-        provider_type: Optional[str] = None,
+        provider: Optional[str] = None,
         scopes: Optional[list[str]] = None,
         tool_call_id: Optional[str] = None,
         custom_headers: Optional[Dict[str, str]] = None,
@@ -3163,22 +3177,22 @@ Clean up resources owned by this execution's wrapper.
 #### execute\_tool
 
 ```python
-def execute_tool(
-        tool_name: str,
-        arguments: Dict[str, Any],
-        *,
-        metadata: Optional[Dict[str, Any]] = None,
-        provider_type: Optional[str] = None,
-        scopes: Optional[list[str]] = None,
-        tool_call_id: Optional[str] = None,
-        raw_on_interrupt: bool = False,
-        redact_fields: Optional[list[str]] = None,
-        is_local: bool = True,
-        local_executor: Optional[Callable[[], Any]] = None,
-        is_framework_control_flow: Optional[Callable[[BaseException],
-                                                     bool]] = None,
-        call_channel_expected: bool = False,
-        on_unknown_outcome: Optional[UnknownOutcomePolicy] = None) -> Any
+def execute_tool(tool_name: str,
+                 arguments: Dict[str, Any],
+                 *,
+                 metadata: Optional[Dict[str, Any]] = None,
+                 provider: Optional[str] = None,
+                 scopes: Optional[list[str]] = None,
+                 tool_call_id: Optional[str] = None,
+                 raw_on_interrupt: bool = False,
+                 redact_fields: Optional[list[str]] = None,
+                 is_local: bool = True,
+                 local_executor: Optional[Callable[[], Any]] = None,
+                 is_framework_control_flow: Optional[Callable[[BaseException],
+                                                              bool]] = None,
+                 call_channel_expected: bool = False,
+                 on_unknown_outcome: Optional[UnknownOutcomePolicy] = None,
+                 owning_tool_call: Optional[OwningToolCall] = None) -> Any
 ```
 
 Execute a tool call through OE.
@@ -3206,6 +3220,10 @@ Its consent answer never becomes a tool result or Memory content.
 - `on_unknown_outcome` - What a retry does when the runner was lost while
   this tool was in flight in a durable workflow: ``"rerun"`` runs it
   again, ``"fail"`` refuses the retry.
+- `owning_tool_call` - The tool call or subagent this operation is performed
+  for, when it is not itself a tool the model requested. In a durable
+  workflow it runs alongside other activities, at a position derived
+  from that call.
 
 
 **Returns**:
@@ -3233,7 +3251,7 @@ def create_secure_tool_function(
         allow_direct: bool = False,
         metadata: Optional[Dict[str, Any]] = None,
         is_local: bool = True,
-        provider_type: Optional[str] = None,
+        provider: Optional[str] = None,
         scopes: Optional[list[str]] = None,
         response_format: Literal["content",
                                  "content_and_artifact"] = "content",
@@ -3929,7 +3947,7 @@ stdout output so the Local Dev UI can read the agent's logs.
 **Arguments**:
 
 - `app_name` - Application name for log file naming
-- `mode` - Runtime mode (aer, tool, tool_function)
+- `mode` - Runtime mode (aer, tool)
 - `log_dir` - Directory for log files (default: ./logs)
 - `log_level` - Log level (default: from LOG_LEVEL env or INFO)
 - `backup_count` - Number of rotated backup files to keep

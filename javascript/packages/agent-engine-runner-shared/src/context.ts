@@ -363,9 +363,9 @@ export function recordCurrentMemoryMetadata(
  * Record that the agent considers this session finished. Reads directly off
  * `storage.getStore()` (not `current()`) so a call outside a run reports
  * "unavailable" without ever touching the frozen `EMPTY_STORE` fallback.
- * `wrapper` is null for Tool Pod / Function contexts (see server/tool.ts,
- * server/function.ts) — only the AER holds the finish latch, so those
- * contexts must also report "unavailable" rather than a misleading success.
+ * `wrapper` is null for Tool Pod contexts (see server/tool.ts) — only the AER
+ * holds the finish latch, so those contexts must also report "unavailable"
+ * rather than a misleading success.
  */
 export function requestSessionFinish(): SessionFinishStatus {
   const store = storage.getStore();

@@ -31,19 +31,27 @@ const PUSH = "__pregel_push";
 function sendTaskBoundary(
   metadata: Record<string, unknown> | undefined,
 ): ChildOperationBoundary | null {
-  const taskPath = metadata?.["langgraph_path"];
+  const index = sendTaskIndex(metadata);
   const step = metadata?.["langgraph_step"];
+  if (index === null || !isIndex(step)) return null;
+  const name = `langgraph.task:${PUSH}:${step}:${index}`;
+  return { name, occurrenceKey: name, spawnedTask: true };
+}
+
+/** A top-level `Send` task's index in its send list, or null for other tasks. */
+export function sendTaskIndex(
+  metadata: Record<string, unknown> | undefined,
+): number | null {
+  const taskPath = metadata?.["langgraph_path"];
   if (
     !Array.isArray(taskPath) ||
     taskPath.length < 2 ||
     taskPath[0] !== PUSH ||
-    !isIndex(taskPath[1]) ||
-    !isIndex(step)
+    !isIndex(taskPath[1])
   ) {
     return null;
   }
-  const name = `langgraph.task:${PUSH}:${step}:${taskPath[1]}`;
-  return { name, occurrenceKey: name, spawnedTask: true };
+  return taskPath[1];
 }
 
 function isIndex(value: unknown): value is number {

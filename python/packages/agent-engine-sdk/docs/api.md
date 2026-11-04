@@ -283,10 +283,14 @@ Typed token-usage metadata for LLM calls.
 #### to\_langchain\_usage\_metadata
 
 ```python
-def to_langchain_usage_metadata() -> dict[str, int]
+def to_langchain_usage_metadata() -> dict[str, Any]
 ```
 
 Return LangChain's expected usage-metadata keys.
+
+Provider detail mappings (``input_token_details.cache_read`` and
+friends) ride along unchanged so an agent can read the cache breakdown
+from the message it already has.
 
 <a id="agent_engine_sdk.models.LLMToolCall"></a>
 

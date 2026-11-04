@@ -227,16 +227,14 @@ def _materialize_connector(tool_yaml_path: Path, root: Path) -> ToolDefinitions:
     auth = document.get("auth")
     if auth is not None and not isinstance(auth, dict):
         raise MaterializeError(f"connector {name!r}: auth must be a mapping")
-    if auth:
-        # Validate the credential binding through the shared model before
-        # normalizing, so malformed intent (env without type, credentials on
-        # none) fails loudly instead of silently degrading to no auth.
+    if auth is not None:
+        # Validate the credential binding through the shared model first, so an
+        # empty or earlier-format block fails naming its replacement instead of
+        # silently meaning no credential.
         try:
             Auth.model_validate(auth)
         except ValueError as exc:
             raise MaterializeError(f"connector {name!r}: invalid auth: {exc}") from exc
-        if auth.get("type", "none") == "none":
-            auth = None
     expose = document.get("expose") or {}
     if not isinstance(expose, dict):
         raise MaterializeError(f"connector {name!r}: expose must be a mapping")

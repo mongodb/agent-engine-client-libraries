@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Durable Deep Agents on the pinned deepagents version remember the conversation
+  between turns. deepagents 0.7 keeps `messages` in a `DeltaChannel`, which
+  checkpoints omit between snapshots, so every durable turn committed its state
+  without messages. Sessions already committed that way stay empty. A turn in
+  flight across this upgrade fails on replay, because its recorded steps hold no
+  messages, and must be run again.
+- Durable Deep Agent tool calls from one model turn can run Tool Pod backend
+  operations at the same time. A backend operation left in flight by a lost
+  runner now reaches the model as non-retryable, with the Orchestration Engine's
+  explanation.
+- Tool results from parallel calls of a durable Deep Agent turn all reach the
+  model. Their message IDs collided, so one result was replaced by a failure
+  placeholder.
+- Messages from durable Deep Agents on deepagents versions that keep `messages`
+  in a `DeltaChannel` keep the same IDs when a replacement attempt rebuilds them.
+- A model-supplied `timeout` of 0 on the Deep Agent `execute` tool runs the
+  command under the Tool Pod's default timeout. It used to kill the command
+  immediately.
+
 ### Changed
 - `app.checkpointer()` loads checkpoints with an explicit type allowlist instead
   of LangGraph's permissive default, which imports and calls any callable named

@@ -42,6 +42,7 @@ from agent_engine_sdk_langgraph.messages import (
 from agent_engine_sdk_langgraph.durable_deep_agent import (
     _stamp_deep_agent_message_ids,
 )
+from agent_engine_sdk_langgraph.durable_subgraphs import send_task_index
 from agent_engine_runner_shared.metrics import Metrics
 from agent_engine_runner_shared.secure_llm_proxy import SecureLLMProxy
 from agent_engine_runner_shared.secure_wrapper import (
@@ -94,6 +95,24 @@ def _task_run_activity_key() -> str | None:
     if not isinstance(task_id, str) or not task_id or scratchpad is None:
         return None
     return f"llm:{task_id}:{next_scoped_call_index(scratchpad)}"
+
+
+def _within_tool_call() -> bool:
+    """Whether this model call is made by a tool call, inside the call's Send task.
+
+    A custom tool may call the model itself, as ``with_structured_output`` does.
+    That call shares the turn's operation path, so its tool calls must not
+    replace the turn's batch, which positions the sibling calls' backend
+    operations.
+    """
+    if current_attempt_context() is None:
+        return False
+    try:
+        metadata = get_config().get("metadata") or {}
+    except RuntimeError:
+        # Outside a graph task LangGraph has no config to read.
+        return False
+    return send_task_index(metadata) is not None
 
 
 def _repair_missing_tool_messages(messages: list[BaseMessage]) -> list[BaseMessage]:
@@ -381,6 +400,7 @@ class SecureWrappedLLM(BaseChatModel):
                 operational_steps=wrapper.operational_steps,
                 durable_memory=wrapper.durable_memory,
                 guardrail_review_protocol=True,
+                within_tool_call=_within_tool_call(),
             )
 
         # proxy.stream() (the provider round trip via OE) is left
@@ -485,6 +505,7 @@ class SecureWrappedLLM(BaseChatModel):
                 operational_steps=wrapper.operational_steps,
                 durable_memory=wrapper.durable_memory,
                 guardrail_review_protocol=True,
+                within_tool_call=_within_tool_call(),
             )
 
         # Gap between request.prepare and response.process is the provider

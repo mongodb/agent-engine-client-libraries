@@ -33,6 +33,7 @@ export {
   activityRequiresReconstruction,
   allocateActivityOrdinal,
   allocateActivityPosition,
+  allocateToolEffectPosition,
   advanceStepOrdinal,
   childOperationBoundaryScope,
   currentAttemptContext,

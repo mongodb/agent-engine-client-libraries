@@ -283,7 +283,7 @@ function materializeConnector(
         `connector '${name}': invalid auth: ${formatZodIssues(parsed.error)}`,
       );
     }
-    auth = parsed.data.type === "none" ? null : parsed.data;
+    auth = parsed.data;
   }
 
   const exposeValue = document["expose"] ?? {};

@@ -34,6 +34,7 @@ def reset_tracing_flags(monkeypatch):
     """Isolate tracing_setup's exporter-state flags across tests."""
     monkeypatch.setattr(tracing_setup, "_mongodb_exporter_attached", False)
     monkeypatch.setattr(tracing_setup, "_mongodb_degraded", False)
+    monkeypatch.setattr(tracing_setup, "_platform_exporter_attached", False)
     return monkeypatch
 
 
@@ -50,7 +51,10 @@ def test_health_reports_degraded_when_trace_store_unreachable(reset_tracing_flag
     assert resp.status_code == 200
     body = resp.json()
     assert body["status"] == "degraded"
-    assert body["details"]["tracing"] == {"database_exporter": "degraded"}
+    assert body["details"]["tracing"] == {
+        "database_exporter": "degraded",
+        "platform_exporter": "disabled",
+    }
     # Mode-specific details survive alongside the nested tracing detail.
     assert body["details"]["tools_registered"] == 2
     assert body["component"] == "test-app"
@@ -66,8 +70,45 @@ def test_health_reports_healthy_when_trace_store_attached(reset_tracing_flags):
     assert resp.status_code == 200
     body = resp.json()
     assert body["status"] == "healthy"
-    assert body["details"]["tracing"] == {"database_exporter": "attached"}
+    assert body["details"]["tracing"] == {
+        "database_exporter": "attached",
+        "platform_exporter": "disabled",
+    }
     assert body["details"]["tools_registered"] == 2
+
+
+def test_health_reports_degraded_when_platform_exporter_failed(reset_tracing_flags):
+    reset_tracing_flags.setattr(tracing_setup, "_platform_exporter_attached", True)
+    reset_tracing_flags.setattr(
+        tracing_setup, "_platform_exporter", SimpleNamespace(last_error="export failed")
+    )
+
+    resp = _health_client().get("/health")
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "degraded"
+    assert body["details"]["tracing"] == {
+        "database_exporter": "disabled",
+        "platform_exporter": "degraded",
+    }
+
+
+def test_health_reports_healthy_when_platform_exporter_attached(reset_tracing_flags):
+    reset_tracing_flags.setattr(tracing_setup, "_platform_exporter_attached", True)
+    reset_tracing_flags.setattr(
+        tracing_setup, "_platform_exporter", SimpleNamespace(last_error=None)
+    )
+
+    resp = _health_client().get("/health")
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "healthy"
+    assert body["details"]["tracing"] == {
+        "database_exporter": "disabled",
+        "platform_exporter": "attached",
+    }
 
 
 def test_health_reports_tracing_disabled_when_no_store_configured(reset_tracing_flags):
@@ -76,7 +117,10 @@ def test_health_reports_tracing_disabled_when_no_store_configured(reset_tracing_
     assert resp.status_code == 200
     body = resp.json()
     assert body["status"] == "healthy"
-    assert body["details"]["tracing"] == {"database_exporter": "disabled"}
+    assert body["details"]["tracing"] == {
+        "database_exporter": "disabled",
+        "platform_exporter": "disabled",
+    }
     assert body["details"]["tools_registered"] == 2
 
 

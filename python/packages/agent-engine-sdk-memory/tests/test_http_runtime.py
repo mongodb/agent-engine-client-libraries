@@ -312,6 +312,7 @@ def test_build_context_from_sources_omits_absent_optionals(
         "max_tokens",
         "format_style",
         "include_memories",
+        "collapse_duplicate_content",
     ):
         assert absent not in body
 
@@ -328,6 +329,25 @@ def test_build_context_from_sources_serializes_format_style_and_include_memories
     body = json.loads(rec.requests[-1].content)
     assert body["format_style"] == "openai"
     assert body["include_memories"] is True
+
+
+def test_build_context_from_sources_collapse_duplicate_content_wire_shape():
+    # Default-true flag: the key leaves the body only when the caller disabled
+    # the collapse. Assert both directions — a test of only the False case
+    # would also pass with the gate inverted.
+    rec = _Recorder()
+    rt = _gateway_runtime(_context_ok_handler(rec))
+
+    rt.build_context_from_sources(query="q", sources=[SourceSpec(source="semantic")])
+    assert "collapse_duplicate_content" not in json.loads(rec.requests[-1].content)
+
+    rt.build_context_from_sources(
+        query="q",
+        sources=[SourceSpec(source="semantic")],
+        collapse_duplicate_content=False,
+    )
+    body = json.loads(rec.requests[-1].content)
+    assert body["collapse_duplicate_content"] is False
 
 
 def _memories_response(handler_recorder):

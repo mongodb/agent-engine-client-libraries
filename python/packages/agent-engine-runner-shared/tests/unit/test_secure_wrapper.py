@@ -845,7 +845,7 @@ class TestSecureToolWrapper:
                 wrapper.execute_tool(
                     "github_tool",
                     {},
-                    provider_type="github",
+                    provider="github",
                     scopes=["repo:read"],
                     is_local=True,
                     local_executor=local_executor,
@@ -994,6 +994,84 @@ class TestSecureToolWrapper:
         assert tae.http_status == 429
         assert tae.retryable is True
         assert "RATE_LIMITED" in report.call_args.kwargs["error"]
+
+    def _run_failing_local_tool(self, failure: BaseException) -> tuple[Any, Any, Any]:
+        from agent_engine_runner_shared.models import ToolExecuteResponse
+        from agent_engine_runner_shared.secure_wrapper import SecureToolWrapper
+
+        wrapper = SecureToolWrapper("http://localhost:8080", "exec-123")
+        with patch(
+            "agent_engine_runner_shared.secure_wrapper.request_oe_approval",
+            return_value=ToolExecuteResponse(proceed=True, route_to="callback"),
+        ):
+            with patch("agent_engine_runner_shared.secure_wrapper.report_oe_result") as report:
+                with patch("agent_engine_runner_shared.secure_wrapper.log_tool_result") as log:
+                    with pytest.raises(type(failure)) as raised:
+                        wrapper.execute_tool(
+                            "failing_tool",
+                            {},
+                            local_executor=lambda: (_ for _ in ()).throw(failure),
+                        )
+        return raised.value, report, log
+
+    def test_execute_local_tool_redacts_reported_logged_and_reraised_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("WAREHOUSE_API_TOKEN", "wh-7f3e9a")
+        atlas_secret = "mdb_sa_sk_" + "Zx9-Yw8_Vu7Ts6Rq5"
+        pem = "-----BEGIN " + "PRIVATE KEY-----\nMIIEvQ\n-----END " + "PRIVATE KEY-----"
+
+        failure = ValueError(
+            "connect mongodb://app:Pa55w0rd@db.example.net:27017 failed; "
+            f"secret {atlas_secret}; key {pem}; token wh-7f3e9a",
+            42,
+        )
+        raised, report, log = self._run_failing_local_tool(failure)
+
+        expected = (
+            "connect mongodb://<redacted>:<redacted>@db.example.net:27017 failed; "
+            "secret mdb_sa_sk_<redacted>; key <redacted>; token <redacted>"
+        )
+        assert report.call_args.kwargs["status"] == "error"
+        assert report.call_args.kwargs["error"] == f"ValueError: ('{expected}', 42)"
+        assert log.call_args.kwargs["error"] == report.call_args.kwargs["error"]
+        # The model reads the re-raised error: same instance and class, masked text.
+        assert raised is failure
+        assert type(raised) is ValueError
+        assert raised.args == (expected, 42)
+
+    def test_execute_local_tool_redacts_tool_execution_error_field(self) -> None:
+        from agent_engine_runner_shared.secure_wrapper import ToolExecutionError
+
+        key = "sk-" + "Ab3dEf6hIj9kLm2nOp5qRs"
+        failure = ToolExecutionError(f"upstream rejected {key}")
+        raised, report, _ = self._run_failing_local_tool(failure)
+
+        assert raised is failure
+        # Adapters hand ToolExecutionError.error to the model, not str(error).
+        assert raised.error == "upstream rejected sk-<redacted>"
+        assert raised.args == ("Tool execution error: upstream rejected sk-<redacted>",)
+        assert key not in report.call_args.kwargs["error"]
+
+    def test_execute_local_tool_redacts_non_string_error_argument(self) -> None:
+        failure = ValueError({"password": "s3cr3t-pass"})
+        raised, report, _ = self._run_failing_local_tool(failure)
+
+        assert raised is failure
+        assert "s3cr3t-pass" not in str(raised)
+        assert "s3cr3t-pass" not in repr(raised)
+        assert "s3cr3t-pass" not in report.call_args.kwargs["error"]
+
+    def test_execute_local_tool_leaves_benign_error_untouched(self) -> None:
+        args = ("mixed inclusion and exclusion projection",)
+        failure = ValueError(*args)
+        raised, report, _ = self._run_failing_local_tool(failure)
+
+        assert raised is failure
+        assert raised.args == args
+        assert report.call_args.kwargs["error"] == (
+            "ValueError: mixed inclusion and exclusion projection"
+        )
 
     def test_execute_local_tool_settles_cancellation_before_reraising(self) -> None:
         import asyncio
@@ -3149,7 +3227,7 @@ class TestDurableTimeoutOutcome:
                         "native_command",
                         {"value": 1},
                         metadata={"trace": "platform-value"},
-                        provider_type="oauth",
+                        provider="oauth",
                         scopes=["write", "read"],
                         tool_call_id="call-1",
                         is_local=True,
@@ -3159,7 +3237,7 @@ class TestDurableTimeoutOutcome:
         assert result == "remote-result"
         assert activity["semantic_input"] == {"arguments": {"value": 1}}
         assert execute_native.call_args.kwargs["metadata"] == {"trace": "platform-value"}
-        assert execute_native.call_args.kwargs["provider_type"] == "oauth"
+        assert execute_native.call_args.kwargs["provider"] == "oauth"
         assert execute_native.call_args.kwargs["scopes"] == ["write", "read"]
         assert execute_native.call_args.kwargs["tool_call_id"] == "call-1"
         assert execute_native.call_args.kwargs["is_local"] is True
@@ -3924,3 +4002,56 @@ class TestExternalAPICallError:
         assert not isinstance(exc_info.value, ExternalAPICallError)
         # The tool's own failure, recorded by OE, is not a platform failure.
         assert not isinstance(exc_info.value, ToolPlatformError)
+
+
+class TestDurableToolFailureRedaction:
+    def test_encoded_failure_message_is_redacted(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from agent_engine_runner_shared.secure_wrapper import (
+            _DURABLE_TOOL_FAILURE_PREFIX,
+            _decode_durable_tool_failure,
+            _encode_durable_tool_failure,
+        )
+
+        monkeypatch.setenv("WAREHOUSE_API_TOKEN", "wh-7f3e9a")
+        key = "sk-" + "Ab3dEf6hIj9kLm2nOp5qRs"
+        encoded = _encode_durable_tool_failure(
+            RuntimeError(f"mongodb+srv://app:Pa55w0rd@c0.example.net key {key} token wh-7f3e9a")
+        )
+
+        payload = json.loads(encoded.removeprefix(_DURABLE_TOOL_FAILURE_PREFIX))
+        expected = (
+            "mongodb+srv://<redacted>:<redacted>@c0.example.net key sk-<redacted> token <redacted>"
+        )
+        assert payload["message"] == expected
+        assert "Pa55w0rd" not in encoded and key not in encoded and "wh-7f3e9a" not in encoded
+        assert _decode_durable_tool_failure(encoded, RuntimeError(encoded)).error == expected
+
+    def test_encoded_external_api_failure_message_is_redacted(self) -> None:
+        from agent_engine_runner_shared.secure_wrapper import (
+            ExternalAPICallError,
+            _decode_durable_tool_failure,
+            _encode_durable_tool_failure,
+        )
+        from agent_engine_runner_shared.tool_api_error import ToolAPIError
+
+        key = "sk-" + "Ab3dEf6hIj9kLm2nOp5qRs"
+        encoded = _encode_durable_tool_failure(
+            ExternalAPICallError(f"rejected {key}", ToolAPIError(classification="AUTH_FAILED"))
+        )
+
+        decoded = _decode_durable_tool_failure(encoded, RuntimeError(encoded))
+        assert key not in encoded
+        assert isinstance(decoded, ExternalAPICallError)
+        assert decoded.error == "rejected sk-<redacted>"
+
+    def test_encoded_benign_failure_message_is_unchanged(self) -> None:
+        from agent_engine_runner_shared.secure_wrapper import (
+            _decode_durable_tool_failure,
+            _encode_durable_tool_failure,
+        )
+
+        message = "mixed inclusion and exclusion projection"
+        encoded = _encode_durable_tool_failure(ValueError(message))
+        decoded = _decode_durable_tool_failure(encoded, RuntimeError(encoded))
+
+        assert decoded.error == message

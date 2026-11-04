@@ -251,12 +251,10 @@ function otlpEndpointConfigured(): boolean {
 
 /**
  * Upper bound (ms) on how long a `TenantRuntime.shutdown()` flush can spend
- * waiting on the OTLP exporter. `TOOL_FUNCTION` mode calls `shutdown()`
- * synchronously on every invocation (its process-exit flush timer is
- * unref'd and would otherwise never fire), so an unreachable/slow collector
- * would otherwise add up to the OTel default export timeout (10s) of tail
- * latency to *every* one-shot invocation. Deliberately short relative to
- * that default.
+ * waiting on the OTLP exporter. `shutdown()` runs on the SIGTERM/SIGINT drain
+ * path, so an unreachable/slow collector would otherwise add up to the OTel
+ * default export timeout (10s) of latency to every pod termination.
+ * Deliberately short relative to that default.
  */
 const OTLP_EXPORT_TIMEOUT_MILLIS = 3000;
 
@@ -469,12 +467,10 @@ export function attachMongoTracing(collection: Collection): void {
 }
 
 /**
- * Schedule a retry attempt. The timer is unref'd: TOOL_FUNCTION runtimes
- * return after a single invocation without calling shutdownTracing, so a
- * referenced retry timer would pin the event loop and keep the supposedly
- * one-shot process alive while the store is down (Python's retry thread is a
- * daemon for the same reason). The retry is best-effort background work — it
- * must never be the handle keeping the process running.
+ * Schedule a retry attempt. The timer is unref'd so it never pins the event
+ * loop: the retry is best-effort background work and must not be the handle
+ * keeping the process alive (Python's retry thread is a daemon for the same
+ * reason).
  */
 function scheduleRetry(
   attempt: () => void,

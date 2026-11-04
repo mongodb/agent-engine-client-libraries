@@ -10,9 +10,11 @@
  */
 
 import type { Operation, ToolDefinitions } from "./definitions.js";
+import { DEFAULT_EXECUTION_TIMEOUT_SECONDS } from "./executor.js";
 
 /** Connector execution budget exposed as ordinary tool metadata. */
-export const DEFAULT_CONNECTOR_TIMEOUT_SECONDS = 30;
+export const DEFAULT_CONNECTOR_TIMEOUT_SECONDS =
+  DEFAULT_EXECUTION_TIMEOUT_SECONDS;
 
 export class ConnectorBundleError extends Error {
   constructor(message: string) {
@@ -36,7 +38,7 @@ export interface ConnectorRegistrationMetadata {
   readonly name: string;
   readonly description: string;
   readonly is_local: false;
-  readonly provider_type: string | null;
+  readonly provider: string | null;
   readonly scopes: string[];
   readonly network: string[];
   readonly timeout_seconds: number;
@@ -69,15 +71,15 @@ export class BundledTool {
   /** Return detached AER/Tool Pod policy, with delegated binding outside the schema. */
   get registrationMetadata(): ConnectorRegistrationMetadata {
     const auth = this.connector.definitions.auth;
-    const delegated = auth && auth.type === "oauth" ? auth : null;
+    const provider = auth?.provider ?? null;
     return {
       name: this.operation.name,
       description:
         this.operation.description.trim() ||
         `REST connector tool ${this.operation.name}`,
       is_local: false,
-      provider_type: delegated?.provider_type ?? null,
-      scopes: delegated ? [...delegated.scopes] : [],
+      provider,
+      scopes: provider ? [...(auth?.scopes ?? [])] : [],
       network: this.network,
       timeout_seconds: DEFAULT_CONNECTOR_TIMEOUT_SECONDS,
       redact_fields: [],

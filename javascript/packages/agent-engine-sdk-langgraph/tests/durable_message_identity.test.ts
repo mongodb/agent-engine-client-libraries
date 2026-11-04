@@ -8,9 +8,11 @@ import { tool } from "@langchain/core/tools";
 import {
   Annotation,
   Command,
+  END,
   MessagesAnnotation,
   Overwrite,
   START,
+  Send,
   StateGraph,
 } from "@langchain/langgraph";
 import { ToolNode } from "@langchain/langgraph/prebuilt";
@@ -233,6 +235,57 @@ describe("durable message identity", () => {
     expect(first.messages[0]?.content).toBe("replacement");
     expect(first.messages[0]?.id).toBe(replay.messages[0]?.id);
     expect(first.messages[0]?.id).toMatch(/^durable-message:execution-1:1:/);
+  });
+
+  it("keeps each tool message from parallel Send tasks of one node", async () => {
+    const echo = tool(async ({ text }) => text, {
+      name: "echo",
+      description: "Return the text.",
+      schema: z.object({ text: z.string() }),
+    });
+    const toolCall = (text: string) => ({
+      id: `call-${text}`,
+      name: "echo",
+      args: { text },
+      type: "tool_call" as const,
+    });
+    const run = async (texts: string[], attemptId: string) => {
+      const calls = texts.map(toolCall);
+      const graph = new StateGraph(MessagesAnnotation)
+        .addNode("model", () => ({
+          messages: [new AIMessage({ content: "", tool_calls: calls })],
+        }))
+        .addNode("tools", new ToolNode([echo]))
+        .addEdge(START, "model")
+        .addConditionalEdges(
+          "model",
+          () => calls.map((call) => new Send("tools", { lg_tool_call: call })),
+          ["tools"],
+        )
+        .addEdge("tools", END)
+        .compile();
+      new LangGraphBaseAgent(graph as never);
+      const { messages } = await runWithAttemptContext(
+        attempt(attemptId, 1n),
+        () => graph.invoke({ messages: [] }),
+      );
+      return messages.filter((message) => ToolMessage.isInstance(message));
+    };
+
+    const parallel = await run(["first", "second"], "attempt-1");
+    const replay = await run(["first", "second"], "attempt-2");
+    const lone = await run(["first"], "attempt-3");
+
+    expect(parallel.map((message) => message.content).sort()).toEqual([
+      "first",
+      "second",
+    ]);
+    expect(replay.map((message) => message.id)).toEqual(
+      parallel.map((message) => message.id),
+    );
+    // A turn recorded with one call keeps the ID it already has.
+    const first = parallel.find((message) => message.content === "first");
+    expect(lone[0]?.id).toBe(first?.id);
   });
 
   it("does not interpret role-like ordinary state as messages", async () => {

@@ -6,8 +6,7 @@ source:
   name: jiradc
   base_url: https://jira.example/rest
 auth:
-  type: bearer
-  env: JIRA_TOKEN
+  bearer: JIRA_TOKEN
 tools:
   - name: jiradc_getComments
     description: Returns comments for an issue.

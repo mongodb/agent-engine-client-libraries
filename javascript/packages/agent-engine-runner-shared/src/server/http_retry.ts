@@ -2,9 +2,9 @@
  * Shared retry-policy and bounded POST helpers for OE transports.
  *
  * Mirrors Python's `agent_engine_runner_shared.server.http_retry`. The AER chunk/callback
- * path (`server/aer.ts`), function mode (`server/function.ts`) and the tool
- * result settlement loop (`secure_wrapper.ts`) share policy here so their
- * cooperative back-pressure behaviour stays identical.
+ * path (`server/aer.ts`) and the tool result settlement loop
+ * (`secure_wrapper.ts`) share policy here so their cooperative back-pressure
+ * behaviour stays identical.
  */
 
 import { getLogger } from "../logger.js";

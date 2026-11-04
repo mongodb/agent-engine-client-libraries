@@ -21,7 +21,14 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from agent_engine_runner_shared.utils import is_platform_env_var
 
-__all__ = ["Auth", "Credential", "StrictSafeLoader", "ToolDefinitions", "load_tool_defs"]
+__all__ = [
+    "Auth",
+    "BasicAuth",
+    "Credential",
+    "StrictSafeLoader",
+    "ToolDefinitions",
+    "load_tool_defs",
+]
 
 _HEADER = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
 _RESERVED_HEADERS = {
@@ -161,132 +168,168 @@ class Credential(_Model):
         return self
 
 
+_CREDENTIAL_KEYS = ("bearer", "basic", "api_keys", "provider")
+_AUTH_KEYS = {*_CREDENTIAL_KEYS, "scopes", "headers"}
+_ONE_KEY = "one of bearer, basic, api_keys or provider"
+_USE_BEARER = "use bearer: <secret>"
+_USE_BASIC = "use basic: {username: <secret>, password: <secret>}"
+_USE_API_KEYS = "use api_keys: [{env, location, name}]"
+_USE_PROVIDER = "use provider: <OAuth app>"
+# Earlier spellings each name the key that replaces them. There are no aliases:
+# connectors are experimental, so a binding is rewritten rather than translated.
+_REPLACED_TYPES = {
+    "none": "remove the auth block for no credential",
+    "bearer": _USE_BEARER,
+    "basic": _USE_BASIC,
+    "api_key": _USE_API_KEYS,
+    "api_keys": _USE_API_KEYS,
+    "oauth": _USE_PROVIDER,
+}
+_REPLACED_FIELDS = {
+    "env": f"{_USE_BEARER} or api_keys: [{{env, location, name}}]",
+    "header": _USE_API_KEYS,
+    "location": _USE_API_KEYS,
+    "name": _USE_API_KEYS,
+    "prefix": _USE_API_KEYS,
+    "username_env": _USE_BASIC,
+    "password_env": _USE_BASIC,
+    "credentials": _USE_API_KEYS,
+    "provider_type": _USE_PROVIDER,
+}
+
+
+def unsupported_auth_key(auth: dict[Any, Any]) -> str | None:
+    """Describe the first key an auth block may not contain, naming its replacement.
+
+    The text is part of the contract the TypeScript runtime repeats, so checks
+    run in a fixed order. Values are never quoted: a secret pasted where a
+    secret name belongs must not reach an error or a log. An unknown key is
+    named only when it is a plain identifier.
+    """
+    if "type" in auth:
+        kind = auth["type"]
+        replacement = _REPLACED_TYPES.get(kind) if isinstance(kind, str) else None
+        return f"auth.type is not supported; {replacement or f'use {_ONE_KEY}'}"
+    for field, replacement in _REPLACED_FIELDS.items():
+        if field in auth:
+            return f"auth.{field} is not supported; {replacement}"
+    unknown = sorted(str(key) for key in auth if key not in _AUTH_KEYS)
+    if not unknown:
+        return None
+    if re.fullmatch(r"[A-Za-z0-9_-]{1,64}", unknown[0]):
+        return f"auth.{unknown[0]} is not supported; use {_ONE_KEY}"
+    return f"auth contains an unsupported key; use {_ONE_KEY}"
+
+
+class BasicAuth(_Model):
+    username: str = Field(description="Workspace secret holding the username")
+    password: str = Field(description="Workspace secret holding the password")
+
+    @model_validator(mode="before")
+    @classmethod
+    def require_both(cls, data: Any) -> Any:
+        """Refuse any other shape with the shared message instead of a field error."""
+        if (
+            not isinstance(data, dict)
+            or set(data) != {"username", "password"}
+            or not all(isinstance(value, str) for value in data.values())
+        ):
+            raise ValueError("auth.basic requires username and password secrets")
+        return data
+
+    @model_validator(mode="after")
+    def validate_secrets(self) -> Self:
+        """Require two distinct tenant-owned secrets."""
+        if not _validate_secret_env(self.username) or not _validate_secret_env(self.password):
+            raise ValueError("auth.basic username and password must name workspace secrets")
+        if self.username == self.password:
+            raise ValueError("auth.basic username and password must be different secrets")
+        return self
+
+
 class Auth(_Model):
-    type: Literal["none", "bearer", "api_key", "basic", "api_keys", "oauth"] = Field(
-        default="none", description="Static auth presentation or request-local delegated OAuth"
+    """How each request of one connector authenticates.
+
+    Exactly one credential key is present, and the key is the mechanism:
+    ``bearer``, ``basic`` and ``api_keys`` name workspace secrets read per call,
+    and ``provider`` names the project's OAuth app whose token Delegated auth
+    issues per call. Whose identity a provider call carries comes from the
+    app's grant type, never from the binding.
+    """
+
+    bearer: str | None = Field(default=None, description="Workspace secret sent as a Bearer token")
+    basic: BasicAuth | None = Field(default=None, description="Workspace secrets for HTTP Basic")
+    api_keys: list[Credential] | None = Field(
+        default=None, description="Workspace secrets and where each key goes"
     )
-    provider_type: str | None = Field(
-        default=None, description="Project-scoped Broker provider key"
+    provider: str | None = Field(default=None, description="Project OAuth app for delegated auth")
+    scopes: list[str] | None = Field(
+        default=None, description="Scopes requested instead of the OAuth app's defaults"
     )
-    scopes: list[str] = Field(
-        default_factory=list, description="Connector-wide delegated permissions"
+    headers: dict[str, str] | None = Field(
+        default=None, description="Constant non-secret headers sent on every request"
     )
-    env: str | None = Field(default=None, description="Tenant secret environment reference")
-    header: str | None = Field(default=None, description="API key header name")
-    location: Literal["header", "query", "path", "cookie"] | None = None
-    name: str | None = None
-    prefix: str = ""
-    username_env: str | None = None
-    password_env: str | None = None
-    credentials: list[Credential] | None = Field(default=None, min_length=2)
-    headers: dict[str, str] | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def refuse_earlier_keys(cls, data: Any) -> Any:
+        """Refuse ``type`` and its fields before field parsing, naming the replacement."""
+        if isinstance(data, dict) and (message := unsupported_auth_key(data)):
+            raise ValueError(message)
+        return data
 
     @model_validator(mode="after")
     def validate_auth(self) -> Self:
-        """Require exactly the fields belonging to the selected auth presentation."""
-        configured = {
-            name
-            for name in self.__class__.model_fields
-            if name == "type" or getattr(self, name) not in (None, "", [], {})
-        }
-        allowed = {
-            "none": {"type"},
-            "bearer": {"type", "env", "headers"},
-            "api_key": {"type", "env", "header", "location", "name", "prefix", "headers"},
-            "basic": {"type", "username_env", "password_env", "headers"},
-            "api_keys": {"type", "credentials", "headers"},
-            "oauth": {"type", "provider_type", "scopes", "headers"},
-        }[self.type]
-        if configured - allowed:
-            raise ValueError(f"{self.type} auth contains fields for another auth type")
+        """Require exactly one credential key and validate what that key names."""
+        present = [key for key in _CREDENTIAL_KEYS if getattr(self, key) is not None]
+        if not present:
+            raise ValueError(f"auth requires {_ONE_KEY}")
+        if len(present) > 1:
+            raise ValueError(f"auth takes only {_ONE_KEY}; found {', '.join(present)}")
+        if self.scopes is not None and self.provider is None:
+            raise ValueError("auth.scopes requires provider")
 
-        credential_headers: set[str] = set()
-        if self.type == "oauth":
-            if not self.provider_type or any(
-                ord(character) <= 32 or ord(character) >= 127 for character in self.provider_type
+        credential_headers = {"authorization"}
+        if self.provider is not None:
+            if not self.provider or any(
+                ord(character) <= 32 or ord(character) >= 127 for character in self.provider
             ):
-                raise ValueError("OAuth auth requires an explicit provider key without whitespace")
-            if len(set(self.scopes)) != len(self.scopes) or any(
-                re.fullmatch(r"[!\x23-\x5B\x5D-\x7E]+", scope) is None for scope in self.scopes
+                raise ValueError("auth.provider must name an OAuth app without whitespace")
+            scopes = self.scopes or []
+            if len(set(scopes)) != len(scopes) or any(
+                re.fullmatch(r"[!\x23-\x5B\x5D-\x7E]+", scope) is None for scope in scopes
             ):
-                raise ValueError("OAuth scopes must be unique OAuth scope tokens")
-            credential_headers.add("authorization")
-        elif self.type == "bearer":
-            if not _validate_secret_env(self.env):
-                raise ValueError("bearer auth requires one tenant secret env")
-            credential_headers.add("authorization")
-        elif self.type == "api_key":
-            location = self.location or "header"
-            name = self.name or self.header or "X-API-Key"
-            if self.header is not None and (location != "header" or self.name is not None):
-                raise ValueError("legacy auth.header cannot be combined with location or name")
-            if not _validate_secret_env(self.env):
-                raise ValueError("API key auth requires a tenant-owned environment reference")
-            assert self.env is not None
-            Credential(env=self.env, location=location, name=name, prefix=self.prefix)
-            if location == "header":
-                credential_headers.add(name.lower())
-        elif self.type == "basic":
-            if not _validate_secret_env(self.username_env) or not _validate_secret_env(
-                self.password_env
-            ):
-                raise ValueError("basic auth requires tenant-owned username and password envs")
-            if self.username_env == self.password_env:
-                raise ValueError("basic auth username and password must use different secrets")
-            credential_headers.add("authorization")
-        elif self.type == "api_keys":
-            if not self.credentials:
-                raise ValueError("multi-key auth requires at least two credentials")
-            identities = [
-                (credential.location, credential.name.lower()) for credential in self.credentials
-            ]
+                raise ValueError("auth.scopes must be unique OAuth scope tokens")
+        elif self.bearer is not None:
+            if not _validate_secret_env(self.bearer):
+                raise ValueError("auth.bearer must name a workspace secret")
+        elif self.api_keys is not None:
+            if not self.api_keys:
+                raise ValueError("auth.api_keys requires at least one key")
+            identities = [(key.location, key.name.lower()) for key in self.api_keys]
             if len(identities) != len(set(identities)):
-                raise ValueError("multi-key auth has duplicate credential destinations")
+                raise ValueError("auth.api_keys has duplicate credential destinations")
             credential_headers = {
-                credential.name.lower()
-                for credential in self.credentials
-                if credential.location == "header"
+                key.name.lower() for key in self.api_keys if key.location == "header"
             }
         _validate_static_headers(self.headers, credential_headers)
         return self
 
-    def header_name(self) -> str | None:
-        """Return the single generated auth header, when this auth shape has one."""
-        if self.type in ("bearer", "oauth"):
-            return "Authorization"
-        if self.type == "api_key":
-            if (self.location or "header") == "header":
-                return self.name or self.header or "X-API-Key"
-        return None
-
     def header_names(self) -> set[str]:
         """List auth-controlled headers so model parameters cannot collide with them."""
-        if self.type in ("bearer", "basic", "oauth"):
-            names = {"authorization"}
-        elif self.type == "api_key" and (header_name := self.header_name()):
-            names = {header_name.lower()}
-        elif self.type == "api_keys":
-            names = {
-                credential.name.lower()
-                for credential in self.credentials or []
-                if credential.location == "header"
-            }
+        if self.api_keys is not None:
+            names = {key.name.lower() for key in self.api_keys if key.location == "header"}
         else:
-            names = set()
+            names = {"authorization"}
         return names | {name.lower() for name in (self.headers or {})}
 
-    def credential_bindings(self) -> list[Credential]:
-        """Normalize single and compound API keys into the executor's common form."""
-        if self.type == "api_key" and self.env:
-            return [
-                Credential(
-                    env=self.env,
-                    location=self.location or "header",
-                    name=self.name or self.header or "X-API-Key",
-                    prefix=self.prefix,
-                )
-            ]
-        return list(self.credentials or [])
+    def secret_names(self) -> list[str]:
+        """Return the workspace secrets this binding reads, in binding order."""
+        if self.bearer is not None:
+            return [self.bearer]
+        if self.basic is not None:
+            return [self.basic.username, self.basic.password]
+        return [key.env for key in self.api_keys or []]
 
 
 class Parameters(_Model):
@@ -520,7 +563,7 @@ class ToolDefinitions(_Model):
         auth_headers = self.auth.header_names() if self.auth else set()
         if any(auth_headers & {name.lower() for name in tool.params.header} for tool in self.tools):
             raise ValueError("auth header cannot be a model argument")
-        credentials = self.auth.credential_bindings() if self.auth else []
+        credentials = (self.auth.api_keys if self.auth else None) or []
         for credential in credentials:
             if credential.location == "query" and any(
                 credential.name in tool.params.query for tool in self.tools

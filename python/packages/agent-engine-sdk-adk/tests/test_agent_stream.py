@@ -217,6 +217,25 @@ async def test_partial_tokens_stream_but_only_final_event_is_persisted(
 
 
 @pytest.mark.asyncio
+async def test_replay_turn_emits_only_the_final_result(fixture: Any) -> None:
+    attempt = _attempt()
+    attempt.replay_mode = True
+    run = fixture(
+        [
+            _text_event("2", partial=True),
+            _text_event("22C"),
+        ],
+        attempt=attempt,
+    )
+
+    events = await run.collect()
+
+    assert [event.data["content"] for event in events if event.event == "token"] == []
+    terminal = next(event for event in events if event.event == "result")
+    assert terminal.data["response"] == "22C"
+
+
+@pytest.mark.asyncio
 async def test_invoke_returns_only_the_final_non_partial_response(fixture: Any) -> None:
     run = fixture(
         [

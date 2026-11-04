@@ -1,9 +1,9 @@
 """Runtime-transparent custom-event emission across Atlas Agent Engine runtimes.
 
 Authors call :func:`emit_custom_event` without knowing which runtime is
-hosting the code (AER agent process vs Tool Pod / function mode). The active
-runtime installs exactly one :class:`CustomEventTransport` before invoking
-tenant code; the helper dispatches to that transport.
+hosting the code (AER agent process vs Tool Pod). The active runtime installs
+exactly one :class:`CustomEventTransport` before invoking tenant code; the
+helper dispatches to that transport.
 
 Atlas Agent Engine transports an opaque author-final JSON object as ``custom_event``.
 It does not interpret keys — customers who need a shaped vocabulary (e.g.
@@ -142,7 +142,7 @@ async def emit_custom_event(payload: Mapping[str, Any]) -> None:
 
 
 class OEHTTPCustomEventTransport:
-    """Tool Pod / function-mode transport: POST final ``custom_event`` chunks to OE.
+    """Tool Pod transport: POST final ``custom_event`` chunks to OE.
 
     Delivery is awaited with a bounded timeout and is non-fatal: delivery
     failures are logged and swallowed so a progress event cannot fail the tool.
@@ -192,10 +192,10 @@ class FeatureOffCustomEventTransport:
     """Fail closed when ``use_custom_parser`` is disabled.
 
     Runtime-neutral rejecting transport shared by AER streaming (when Atlas Agent Engine
-    does not subscribe to LangGraph ``custom``) and Tool Pod / function mode
-    (when OE POSTs would otherwise succeed while Gateway strips client
-    delivery). Authors must not observe a successful emit when the workspace
-    cannot deliver custom events to clients.
+    does not subscribe to LangGraph ``custom``) and the Tool Pod (when OE POSTs
+    would otherwise succeed while Gateway strips client delivery). Authors
+    must not observe a successful emit when the workspace cannot deliver custom
+    events to clients.
     """
 
     _MESSAGE = (
@@ -214,7 +214,7 @@ class FeatureOffCustomEventTransport:
 def install_tool_custom_event_transport(
     *, enabled: bool = True
 ) -> Token[Optional[CustomEventTransport]]:
-    """Install Tool Pod / function-mode custom-event transport; return reset token.
+    """Install the Tool Pod custom-event transport; return reset token.
 
     When ``enabled`` is false (workspace does not have ``use_custom_parser``),
     install a rejecting transport so emit fails closed instead of POSTing an

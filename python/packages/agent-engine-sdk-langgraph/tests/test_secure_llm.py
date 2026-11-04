@@ -357,6 +357,7 @@ class TestSecureWrappedLLMGenerate:
             operational_steps=mock_wrapper.operational_steps,
             durable_memory=None,
             guardrail_review_protocol=True,
+            within_tool_call=False,
         )
         call_kwargs = mock_proxy.stream.call_args.kwargs
         assert call_kwargs["step"] == 1

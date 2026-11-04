@@ -36,8 +36,7 @@ expose:
     - jiradc_getComments
     - jiradc_addComment
 auth:
-  type: bearer
-  env: JIRA_TOKEN
+  bearer: JIRA_TOKEN
 `;
 
 function temporaryRoot(): string {
@@ -179,32 +178,29 @@ describe("connector materialization", () => {
       writeAuthoring(
         root,
         TOOL_YAML.replace(
-          "  type: bearer\n  env: JIRA_TOKEN\n",
-          "  type: oauth\n  provider_type: custom-github\n  scopes: [repo]\n",
+          "  bearer: JIRA_TOKEN\n",
+          "  provider: custom-github\n  scopes: [repo]\n",
         ),
       );
       const bundle = materializeConnectors(["connectors/jira/tool.yaml"], {
         root,
       });
       for (const tool of bundle.tools) {
-        expect(tool.registrationMetadata.provider_type).toBe("custom-github");
+        expect(tool.registrationMetadata.provider).toBe("custom-github");
         expect(tool.registrationMetadata.scopes).toEqual(["repo"]);
-        expect(tool.schema).not.toHaveProperty("provider_type");
+        expect(tool.schema).not.toHaveProperty("provider");
       }
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
   });
 
-  it("treats auth none as no credential binding", () => {
+  it("treats a missing auth block as no credential binding", () => {
     const root = temporaryRoot();
     try {
       writeAuthoring(
         root,
-        TOOL_YAML.replace(
-          "  type: bearer\n  env: JIRA_TOKEN\n",
-          "  type: none\n",
-        ),
+        TOOL_YAML.replace("auth:\n  bearer: JIRA_TOKEN\n", ""),
       );
       const bundle = materializeConnectors(["connectors/jira/tool.yaml"], {
         root,
@@ -235,7 +231,7 @@ describe("connector materialization", () => {
     try {
       const base = TOOL_YAML.replace(
         "expose:\n  allow:\n    - jiradc_getComments\n    - jiradc_addComment\n" +
-          "auth:\n  type: bearer\n  env: JIRA_TOKEN\n",
+          "auth:\n  bearer: JIRA_TOKEN\n",
         "expose:\n  allow_all: true\n  disallow: ",
       );
       for (const value of ["false", "{}", "0", "jiradc_addComment"]) {
@@ -314,24 +310,22 @@ describe("connector materialization", () => {
   it("rejects malformed authoring auth", () => {
     const root = temporaryRoot();
     try {
-      for (const auth of [
-        "auth:\n  env: JIRA_TOKEN\n",
-        "auth:\n  type: none\n  env: JIRA_TOKEN\n",
-      ]) {
+      for (const [auth, message] of [
+        ["auth:\n  env: JIRA_TOKEN\n", "auth.env is not supported"],
+        ["auth:\n  type: none\n", "remove the auth block for no credential"],
+        ["auth: {}\n", "auth requires one of bearer, basic, api_keys"],
+      ] as const) {
         writeAuthoring(
           root,
-          TOOL_YAML.replace("auth:\n  type: bearer\n  env: JIRA_TOKEN\n", auth),
+          TOOL_YAML.replace("auth:\n  bearer: JIRA_TOKEN\n", auth),
         );
         expect(() =>
           materializeConnectors(["connectors/jira/tool.yaml"], { root }),
-        ).toThrow("invalid auth");
+        ).toThrow(message);
       }
       writeAuthoring(
         root,
-        TOOL_YAML.replace(
-          "auth:\n  type: bearer\n  env: JIRA_TOKEN\n",
-          "auth: []\n",
-        ),
+        TOOL_YAML.replace("auth:\n  bearer: JIRA_TOKEN\n", "auth: []\n"),
       );
       expect(() =>
         materializeConnectors(["connectors/jira/tool.yaml"], { root }),
@@ -415,16 +409,15 @@ describe("connector materialization", () => {
       writeAuthoring(
         root,
         TOOL_YAML.replace(
-          "auth:\n  type: bearer\n  env: JIRA_TOKEN\n",
-          "shared_auth: &shared_auth\n  type: bearer\n  env: JIRA_TOKEN\nauth:\n  <<: *shared_auth\n",
+          "auth:\n  bearer: JIRA_TOKEN\n",
+          "shared_auth: &shared_auth\n  bearer: JIRA_TOKEN\nauth:\n  <<: *shared_auth\n",
         ),
       );
       const bundle = materializeConnectors(["connectors/jira/tool.yaml"], {
         root,
       });
       expect(bundle.connectors[0]?.definitions.auth).toMatchObject({
-        type: "bearer",
-        env: "JIRA_TOKEN",
+        bearer: "JIRA_TOKEN",
       });
     } finally {
       rmSync(root, { recursive: true, force: true });

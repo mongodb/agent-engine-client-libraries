@@ -11,15 +11,17 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from google.protobuf import json_format
 from google.protobuf.struct_pb2 import Value
-from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 from langchain_core.runnables import RunnableConfig
+from langgraph.channels.delta import DeltaChannel
 from langgraph.checkpoint.base import empty_checkpoint
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.errors import GraphInterrupt
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 from langgraph.types import Interrupt, Send
-from agent_engine_sdk import RequestContext
+from agent_engine_sdk import RequestContext, SessionForkResponse
 from typing_extensions import TypedDict
 
 from agent_engine_sdk_langgraph.agent import LangGraphBaseAgent
@@ -806,6 +808,325 @@ class TestDurableStateCompletion:
                 match="without final application state",
             ):
                 await saver.complete_execution(attempt)
+
+
+def _append_messages(state: list[Any], writes: Any) -> list[Any]:
+    """Batch reducer for a ``DeltaChannel``: every write adds to the list."""
+    return [*state, *(message for write in writes for message in write)]
+
+
+_STORAGE_FORMS = pytest.mark.parametrize(
+    "snapshot_frequency",
+    [
+        pytest.param(1000, id="stored-as-deltas"),
+        # The channel's value is then a snapshot object, not a message list.
+        pytest.param(1, id="stored-as-snapshots"),
+    ],
+)
+
+
+class TestConversationInADeltaChannel:
+    """deepagents keeps ``messages`` in a channel checkpoints store as deltas."""
+
+    @staticmethod
+    async def _turn(
+        agent: LangGraphBaseAgent,
+        monkeypatch: pytest.MonkeyPatch,
+        message: str,
+        *,
+        execution_id: str,
+        previous: StateSnapshot | None = None,
+    ) -> _WorkflowClient:
+        """Run one durable turn and return what it committed to OE."""
+        from agent_engine_sdk import AgentInput
+
+        from agent_engine_sdk_langgraph import platform_checkpointer as module
+
+        client = _WorkflowClient()
+        monkeypatch.setattr(module, "AsyncWorkflowClient", lambda _: client)
+        attempt = _attempt(
+            attempt_id=f"attempt-{execution_id}", execution_id=execution_id
+        )
+        if previous is not None:
+            attempt.previous_state.CopyFrom(previous)
+        url_token = current_oe_url.set("http://oe")
+        try:
+            with attempt_context_scope(attempt):
+                await agent.invoke(
+                    RequestContext(user_id="user-1", session_id="session-1"),
+                    AgentInput(payload={"message": message}),
+                )
+        finally:
+            current_oe_url.reset(url_token)
+        return client
+
+    @staticmethod
+    def _contents(state: StateSnapshot) -> list[str]:
+        return [message.content.string_value for message in state.messages]
+
+    @pytest.mark.anyio
+    async def test_a_deep_agent_remembers_the_previous_turn(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from deepagents import create_deep_agent
+
+        model_inputs: list[list[str]] = []
+
+        class _Model(GenericFakeChatModel):
+            def bind_tools(self, *_: Any, **__: Any) -> Any:
+                return self
+
+            def _generate(
+                self, messages: list[BaseMessage], *args: Any, **kwargs: Any
+            ) -> Any:
+                model_inputs.append(
+                    [
+                        str(message.content)
+                        for message in messages
+                        if isinstance(message, (HumanMessage, AIMessage))
+                    ]
+                )
+                return super()._generate(messages, *args, **kwargs)
+
+        agent = LangGraphBaseAgent(
+            create_deep_agent(
+                model=_Model(
+                    messages=iter(
+                        [
+                            AIMessage("hello Max"),
+                            AIMessage("you are Max"),
+                            AIMessage("yes, Max"),
+                        ]
+                    )
+                ),
+                checkpointer=PlatformCheckpointer(native=InMemorySaver()),
+            ),
+            prepare_input=lambda input_, _ctx: {
+                "messages": [HumanMessage(input_.payload["message"])]
+            },
+        )
+
+        first = await self._turn(
+            agent, monkeypatch, "my name is Max", execution_id="turn-1"
+        )
+        (first_completion,) = first.completions
+        second = await self._turn(
+            agent,
+            monkeypatch,
+            "what is my name?",
+            execution_id="turn-2",
+            previous=first_completion.state,
+        )
+        assert model_inputs[-1] == ["my name is Max", "hello Max", "what is my name?"]
+
+        (second_completion,) = second.completions
+        await self._turn(
+            agent,
+            monkeypatch,
+            "are you sure?",
+            execution_id="turn-3",
+            previous=second_completion.state,
+        )
+        assert model_inputs[-1] == [
+            "my name is Max",
+            "hello Max",
+            "what is my name?",
+            "you are Max",
+            "are you sure?",
+        ]
+
+    @staticmethod
+    def _two_step_agent(snapshot_frequency: int) -> LangGraphBaseAgent:
+        # The functional form evaluates the annotation with this test's parameter.
+        turn_state = TypedDict(
+            "turn_state",
+            {
+                "messages": Annotated[
+                    list[Any],
+                    DeltaChannel(
+                        _append_messages, snapshot_frequency=snapshot_frequency
+                    ),
+                ]
+            },
+        )
+        graph: StateGraph[Any] = StateGraph(turn_state)
+        graph.add_node("first", lambda _: {"messages": [AIMessage("first step")]})
+        graph.add_node("second", lambda _: {"messages": [AIMessage("second step")]})
+        graph.add_edge(START, "first")
+        graph.add_edge("first", "second")
+        return LangGraphBaseAgent(
+            graph.compile(checkpointer=PlatformCheckpointer(native=InMemorySaver())),
+            prepare_input=lambda input_, _ctx: {
+                "messages": [HumanMessage(input_.payload["message"])]
+            },
+        )
+
+    @pytest.mark.anyio
+    @_STORAGE_FORMS
+    async def test_every_committed_state_holds_the_conversation(
+        self, monkeypatch: pytest.MonkeyPatch, snapshot_frequency: int
+    ) -> None:
+        agent = self._two_step_agent(snapshot_frequency)
+
+        first = await self._turn(agent, monkeypatch, "go", execution_id="turn-1")
+
+        assert [self._contents(commit.state) for commit in first.commits] == [
+            ["go"],
+            ["go", "first step"],
+            ["go", "first step", "second step"],
+        ]
+        (first_completion,) = first.completions
+        earlier = ["go", "first step", "second step"]
+        assert self._contents(first_completion.state) == earlier
+
+        second = await self._turn(
+            agent,
+            monkeypatch,
+            "again",
+            execution_id="turn-2",
+            previous=first_completion.state,
+        )
+
+        assert [self._contents(commit.state) for commit in second.commits] == [
+            [*earlier, "again"],
+            [*earlier, "again", "first step"],
+            [*earlier, "again", "first step", "second step"],
+        ]
+        (second_completion,) = second.completions
+        assert self._contents(second_completion.state) == [
+            *earlier,
+            "again",
+            "first step",
+            "second step",
+        ]
+
+    @pytest.mark.anyio
+    async def test_parallel_writes_commit_in_the_order_the_graph_applied_them(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        class State(TypedDict):
+            messages: Annotated[list[Any], DeltaChannel(_append_messages)]
+
+        live: list[list[str]] = []
+
+        def read(state: State) -> dict[str, Any]:
+            live.append([str(message.content) for message in state["messages"]])
+            return {}
+
+        graph: StateGraph[Any] = StateGraph(State)
+        # Enough tasks that an order by task ID, which is random per attempt,
+        # cannot match by chance, and past 9 so paths must compare as numbers.
+        graph.add_conditional_edges(
+            START,
+            lambda _: [Send("work", {"index": index}) for index in range(12)],
+            ["work"],
+        )
+        graph.add_node(
+            "work",
+            lambda task: {"messages": [AIMessage(f"result {task['index']}")]},
+        )
+        graph.add_node("read", read)
+        graph.add_edge("work", "read")
+        agent = LangGraphBaseAgent(
+            graph.compile(checkpointer=PlatformCheckpointer(native=InMemorySaver())),
+            prepare_input=lambda input_, _ctx: {
+                "messages": [HumanMessage(input_.payload["message"])]
+            },
+        )
+
+        client = await self._turn(agent, monkeypatch, "go", execution_id="turn-1")
+
+        (seen_by_read,) = live
+        assert seen_by_read == ["go", *(f"result {index}" for index in range(12))]
+        (completion,) = client.completions
+        assert self._contents(completion.state) == seen_by_read
+
+    @pytest.mark.anyio
+    async def test_a_paused_graph_restores_parallel_writes_in_applied_order(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from agent_engine_sdk_langgraph import platform_checkpointer as module
+
+        class State(TypedDict):
+            messages: Annotated[list[Any], DeltaChannel(_append_messages)]
+
+        # Each task waits for the next, so results arrive in reverse of task order.
+        finished = [asyncio.Event() for _ in range(4)]
+        finished[3].set()
+
+        async def work(task: dict[str, int]) -> dict[str, Any]:
+            index = task["index"]
+            await finished[index + 1].wait()
+            finished[index].set()
+            return {"messages": [AIMessage(f"result {index}")]}
+
+        graph: StateGraph[Any] = StateGraph(State)
+        graph.add_conditional_edges(
+            START,
+            lambda _: [Send("work", {"index": index}) for index in range(3)],
+            ["work"],
+        )
+        graph.add_node("work", work)
+        graph.add_node("after", lambda _: {})
+        graph.add_edge("work", "after")
+        monkeypatch.setattr(module, "AsyncWorkflowClient", lambda _: _WorkflowClient())
+        compiled = graph.compile(
+            checkpointer=PlatformCheckpointer(native=InMemorySaver()),
+            interrupt_before=["after"],
+        )
+        config = _config("session-thread")
+        expected = ["go", "result 0", "result 1", "result 2"]
+
+        url_token = current_oe_url.set("http://oe")
+        try:
+            with attempt_context_scope(_attempt()):
+                await compiled.ainvoke({"messages": [HumanMessage("go")]}, config)
+                restored_async = await compiled.aget_state(config)
+                restored_sync = compiled.get_state(config)
+        finally:
+            current_oe_url.reset(url_token)
+
+        for restored in (restored_async, restored_sync):
+            assert [m.content for m in restored.values["messages"]] == expected
+
+    @pytest.mark.anyio
+    @_STORAGE_FORMS
+    async def test_a_fork_sends_the_state_committed_for_that_step(
+        self, monkeypatch: pytest.MonkeyPatch, snapshot_frequency: int
+    ) -> None:
+        from agent_engine_sdk_langgraph import platform_checkpointer as module
+
+        created: list[dict[str, Any]] = []
+
+        async def create_branch(**kwargs: Any) -> SessionForkResponse:
+            created.append(kwargs)
+            return SessionForkResponse(session_id="branch", execution_id="exec-2")
+
+        monkeypatch.setattr(
+            "agent_engine_sdk_langgraph.session_fork.create_durable_branch",
+            create_branch,
+        )
+        client = _WorkflowClient()
+        monkeypatch.setattr(module, "AsyncWorkflowClient", lambda _: client)
+        agent = self._two_step_agent(snapshot_frequency)
+        config = _config("session-thread")
+
+        url_token = current_oe_url.set("http://oe")
+        try:
+            with attempt_context_scope(_attempt()):
+                await agent._graph.ainvoke({"messages": [HumanMessage("go")]}, config)
+                await agent._graph.aupdate_state(config, None)
+        finally:
+            current_oe_url.reset(url_token)
+
+        (branch,) = created
+        assert self._contents(branch["state"]) == [
+            "go",
+            "first step",
+            "second step",
+        ]
+        # OE refuses a branch whose state differs from what it committed there.
+        assert branch["state"] == client.commits[-1].state
 
 
 class _GraphState(TypedDict):

@@ -686,6 +686,9 @@ def test_redaction_preserves_dropped_attributes_and_events_counts():
 def isolated_tracer_provider(monkeypatch):
     """Ensure setup_tracing()'s module-level singleton doesn't leak across tests."""
     monkeypatch.setattr(tracing_setup, "_tracer_provider", None)
+    # These tests exercise the MongoDB / OTLP paths; an ambient OE_URL would
+    # route setup_tracing() to the platform exporter instead.
+    monkeypatch.delenv("OE_URL", raising=False)
     yield tracing_setup
     if tracing_setup._tracer_provider is not None:
         tracing_setup.shutdown_tracing()

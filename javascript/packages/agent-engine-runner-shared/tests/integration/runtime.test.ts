@@ -15,34 +15,6 @@
  */
 
 import { describe, test, expect, vi } from "vitest";
-import type * as TracingSetup from "../../src/tracing/setup.js";
-
-// vi.hoisted so the mock factories below can reference these before the
-// module graph loads. shutdownTracing is spied-but-delegated (importOriginal)
-// so tracing state actually resets between tests; ToolFunctionRunner's run()
-// is fully replaced per-test via toolFunctionRunMock.
-const tracingMocks = vi.hoisted(() => ({
-  shutdownTracing: vi.fn(),
-}));
-const toolFunctionRunMock = vi.hoisted(() => vi.fn());
-
-vi.mock("../../src/tracing/setup.js", async (importOriginal) => {
-  const actual = await importOriginal<typeof TracingSetup>();
-  return {
-    ...actual,
-    shutdownTracing: tracingMocks.shutdownTracing.mockImplementation(
-      actual.shutdownTracing,
-    ),
-  };
-});
-
-vi.mock("../../src/server/function.js", () => ({
-  ToolFunctionRunner: class {
-    run(): Promise<void> {
-      return toolFunctionRunMock();
-    }
-  },
-}));
 
 import { TenantRuntime } from "../../src/index.js";
 import type { ServerToolFn } from "../../src/index.js";
@@ -129,38 +101,5 @@ describe("TenantRuntime", () => {
     expect(toolOne({ x: 5 })).toBe(6);
     expect(toolTwo({ x: 5 })).toBe(10);
     expect(toolThree({ x: 5 })).toBe(4);
-  });
-});
-
-describe("TenantRuntime TOOL_FUNCTION mode shutdown", () => {
-  // BatchSpanProcessor's periodic flush timer is unref'd so it can't pin a
-  // long-running server's event loop — but the same unref means nothing
-  // keeps a one-shot function-mode process alive long enough for that timer
-  // to fire on its own. Without an explicit shutdown, this invocation's
-  // spans (Mongo and OTLP) are lost the moment the process
-  // exits. These tests pin that registerAndRun() now flushes before
-  // returning, for both a successful and a failing invocation.
-  test("flushes tracing after a successful invocation", async () => {
-    vi.stubEnv("RUNNER_MODE", "tool_function");
-    toolFunctionRunMock.mockResolvedValueOnce(undefined);
-    tracingMocks.shutdownTracing.mockClear();
-
-    const runtime = new TenantRuntime({ appName: "fn-mode-success" });
-    await runtime.registerAndRun();
-
-    expect(toolFunctionRunMock).toHaveBeenCalledOnce();
-    expect(tracingMocks.shutdownTracing).toHaveBeenCalledOnce();
-  });
-
-  test("flushes tracing even when the invocation throws", async () => {
-    vi.stubEnv("RUNNER_MODE", "tool_function");
-    const failure = new Error("tool invocation failed");
-    toolFunctionRunMock.mockRejectedValueOnce(failure);
-    tracingMocks.shutdownTracing.mockClear();
-
-    const runtime = new TenantRuntime({ appName: "fn-mode-failure" });
-    await expect(runtime.registerAndRun()).rejects.toThrow(failure);
-
-    expect(tracingMocks.shutdownTracing).toHaveBeenCalledOnce();
   });
 });

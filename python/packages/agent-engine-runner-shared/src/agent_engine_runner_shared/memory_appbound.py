@@ -320,6 +320,7 @@ class AppBoundRuntime:
         max_tokens: int | None = None,
         format_style: FormatStyle | str | None = None,
         include_memories: bool = False,
+        collapse_duplicate_content: bool = True,
     ) -> ContextResponse:
         # format_style/include_memories are not threaded through TenantRuntime's
         # per-source path yet; reject loudly instead of silently dropping them.
@@ -328,6 +329,15 @@ class AppBoundRuntime:
                 "format_style and include_memories are not supported for "
                 "app-bound build_context_from_sources; use an HTTP mode "
                 "(api_key/project_id) for response shaping"
+            )
+        # Same rule for collapse_duplicate_content: TenantRuntime's per-source
+        # path does not carry the flag, so a non-default value must not be
+        # silently ignored.
+        if not collapse_duplicate_content:
+            raise MemoryNotSupportedError(
+                "collapse_duplicate_content is not supported for "
+                "app-bound build_context_from_sources; use an HTTP mode "
+                "(api_key/project_id) to control duplicate collapse"
             )
         # Unlike build_context, the per-source path returns a full ContextResponse
         # so the per-source metadata (ranking_strategy, source_outcomes) reaches

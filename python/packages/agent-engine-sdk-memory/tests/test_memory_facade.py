@@ -97,6 +97,7 @@ class FakeRuntime:
         max_tokens: int | None = None,
         format_style: FormatStyle | str | None = None,
         include_memories: bool = False,
+        collapse_duplicate_content: bool = True,
     ) -> ContextResponse:
         self._record("build_context_from_sources", locals())
         return ContextResponse(formatted_context="ctx", metadata=ContextMetadata())
@@ -868,6 +869,20 @@ def test_build_context_from_sources_omits_format_kwargs_when_unset() -> None:
     spy.assert_called_once()
     assert "format_style" not in spy.call_args.kwargs
     assert "include_memories" not in spy.call_args.kwargs
+    assert "collapse_duplicate_content" not in spy.call_args.kwargs
+
+
+def test_build_context_from_sources_forwards_collapse_duplicate_content_false() -> None:
+    runtime = FakeRuntime()
+    m = _bound(runtime)
+    m.build_context_from_sources(
+        query="q",
+        sources=[SourceSpec(source="semantic")],
+        collapse_duplicate_content=False,
+    )
+
+    call = runtime.calls["build_context_from_sources"]
+    assert call["collapse_duplicate_content"] is False
 
 
 @pytest.mark.parametrize("format_style", ["jinj2", "", "markdown"])

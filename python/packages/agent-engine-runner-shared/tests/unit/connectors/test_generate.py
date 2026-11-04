@@ -23,11 +23,7 @@ from agent_engine_runner_shared.connectors import (
     regenerate_catalog,
     scaffold_tool_yaml,
 )
-from agent_engine_runner_shared.connectors.definitions import (
-    Auth,
-    Credential,
-    ToolDefinitions,
-)
+from agent_engine_runner_shared.connectors.definitions import ToolDefinitions
 
 SPEC = """\
 openapi: 3.0.1
@@ -446,7 +442,7 @@ servers:""",
         )
 
         dumped = definitions.model_dump(exclude_none=True)
-        assert dumped["externalize"] == {"auth": {"type": "bearer"}}
+        assert dumped["externalize"] == {"auth": {"bearer": {}}}
 
     @pytest.mark.parametrize("scope", ["document", "operation"])
     def test_anonymous_security_alternative_does_not_require_auth(self, tmp_path, scope):
@@ -521,32 +517,33 @@ class TestCompileRejections:
             compile_catalog(str(out / "spec.yaml"), name="weather", out_dir=out)
 
     @pytest.mark.parametrize(
-        ("scheme", "expected"),
+        ("scheme", "record", "block"),
         [
-            ("{type: http, scheme: bearer}", {"type": "bearer"}),
-            ("{type: http, scheme: basic}", {"type": "basic"}),
-            ("{type: oauth2, flows: {}}", {"type": "bearer"}),
+            ("{type: http, scheme: bearer}", {"bearer": {}}, {"bearer": "WEATHER_TOKEN"}),
             (
-                "{type: openIdConnect, "
-                "openIdConnectUrl: https://auth.example/.well-known/openid-configuration}",
-                {"type": "bearer"},
+                "{type: http, scheme: basic}",
+                {"basic": {}},
+                {"basic": {"username": "WEATHER_USERNAME", "password": "WEATHER_PASSWORD"}},
             ),
             (
                 "{type: apiKey, in: header, name: X-Key}",
-                {"type": "api_key", "location": "header", "name": "X-Key"},
+                {"api_keys": [{"location": "header", "name": "X-Key"}]},
+                {"api_keys": [{"env": "WEATHER_X_KEY", "location": "header", "name": "X-Key"}]},
             ),
             (
                 "{type: apiKey, in: query, name: key}",
-                {"type": "api_key", "location": "query", "name": "key"},
+                {"api_keys": [{"location": "query", "name": "key"}]},
+                {"api_keys": [{"env": "WEATHER_KEY", "location": "query", "name": "key"}]},
             ),
             (
                 "{type: apiKey, in: cookie, name: session}",
-                {"type": "api_key", "location": "cookie", "name": "session"},
+                {"api_keys": [{"location": "cookie", "name": "session"}]},
+                {"api_keys": [{"env": "WEATHER_SESSION", "location": "cookie", "name": "session"}]},
             ),
         ],
-        ids=["bearer", "basic", "oauth2", "oidc", "header-key", "query-key", "cookie-key"],
+        ids=["bearer", "basic", "header-key", "query-key", "cookie-key"],
     )
-    def test_source_auth_maps_to_supported_presentation(self, tmp_path, scheme, expected):
+    def test_source_auth_proposes_the_binding(self, tmp_path, scheme, record, block):
         spec = SPEC.replace(
             "servers:",
             """security:
@@ -560,7 +557,9 @@ servers:""".replace("SCHEME", scheme),
 
         result = compile_catalog(str(out / "spec.yaml"), name="weather", out_dir=out)
         definitions = load_tool_defs(result.catalog)
-        assert definitions.externalize == {"auth": expected}
+        assert definitions.externalize == {"auth": record}
+        assert result.tool_yaml is not None
+        assert yaml.safe_load(result.tool_yaml.read_text(encoding="utf-8"))["auth"] == block
 
     def test_required_api_keys_compile_to_the_compound_auth_primitive(self, tmp_path):
         spec = SPEC.replace(
@@ -587,8 +586,7 @@ servers:""",
 
         assert definitions.externalize == {
             "auth": {
-                "type": "api_keys",
-                "credentials": [
+                "api_keys": [
                     {"location": "header", "name": "X-Client-ID"},
                     {"location": "query", "name": "client_secret"},
                 ],
@@ -598,8 +596,7 @@ servers:""",
 
         materialized = definitions.model_dump(exclude_none=True)
         materialized["auth"] = {
-            "type": "api_keys",
-            "credentials": [
+            "api_keys": [
                 {"env": "CLIENT_ID", "location": "header", "name": "X-Client-ID"},
                 {
                     "env": "CLIENT_SECRET",
@@ -757,7 +754,7 @@ servers:""",
 
         assert [tool.name for tool in definitions.tools] == ["weather_getForecast"]
         assert definitions.externalize == {
-            "auth": {"type": "api_key", "location": "header", "name": "X-Key"},
+            "auth": {"api_keys": [{"location": "header", "name": "X-Key"}]},
             "skipped": list(result.skipped),
         }
         assert len(result.skipped) == 1
@@ -796,7 +793,7 @@ servers:""",
 
         assert [tool.name for tool in definitions.tools] == ["weather_createAlert"]
         assert definitions.externalize is not None
-        assert definitions.externalize["auth"] == {"type": "bearer"}
+        assert definitions.externalize["auth"] == {"bearer": {}}
         assert len(result.skipped) == 1
         assert "allowReserved" in result.skipped[0]
 
@@ -841,7 +838,7 @@ servers:""",
         )
 
         dumped = definitions.model_dump(exclude_none=True)
-        assert dumped["externalize"] == {"auth": {"type": "bearer"}}
+        assert dumped["externalize"] == {"auth": {"bearer": {}}}
         assert "auth" not in dumped
 
     def test_declared_security_without_schemes_fails_closed(self, tmp_path):
@@ -1033,6 +1030,352 @@ servers:""",
             compile_catalog(str(out / "spec.yaml"), name="weather", out_dir=out)
 
 
+# createAlert documents its query key as an argument too, in a form only omitting it compiles.
+RESERVED_KEY_ARGUMENT_SPEC = SPEC.replace(
+    "      operationId: createAlert",
+    "      operationId: createAlert\n"
+    "      parameters:\n"
+    "        - {name: api_key, in: query, allowReserved: true, schema: {type: string}}",
+)
+
+
+def _secured(spec: str, schemes: str, forecast: str, alert: str) -> str:
+    """Give each operation its own security requirement over shared schemes."""
+    return (
+        spec.replace(
+            "      operationId: getForecast",
+            f"      operationId: getForecast\n      security:\n        - {forecast}",
+        )
+        .replace(
+            "      operationId: createAlert",
+            f"      operationId: createAlert\n      security:\n        - {alert}",
+        )
+        .replace("servers:", f"components:\n  securitySchemes:\n{schemes}servers:")
+    )
+
+
+OAUTH_SCHEMES = "    oauth: {type: oauth2, flows: {}}\n"
+STATIC_SCHEMES = (
+    "    key: {type: apiKey, in: header, name: X-Key}\n    bearer: {type: http, scheme: bearer}\n"
+)
+
+
+class TestAuthProposal:
+    """The auth block tool.yaml starts with: proposed from the document, or overridden."""
+
+    @staticmethod
+    def _auth_block(result) -> dict | None:
+        return yaml.safe_load(result.tool_yaml.read_text(encoding="utf-8")).get("auth")
+
+    @pytest.mark.parametrize(
+        "scheme",
+        [
+            "{type: oauth2, flows: {}}",
+            "{type: openIdConnect, "
+            "openIdConnectUrl: https://auth.example/.well-known/openid-configuration}",
+        ],
+        ids=["oauth2", "oidc"],
+    )
+    def test_oauth_without_provider_fails_before_writing(self, tmp_path, scheme):
+        spec = SPEC.replace(
+            "servers:",
+            f"security:\n  - auth: []\ncomponents:\n  securitySchemes:\n    auth: {scheme}\nservers:",
+        )
+        out = _connector_dir(tmp_path, spec)
+
+        with pytest.raises(GenerateError, match="pass --provider <OAuth app>"):
+            compile_catalog(str(out / "spec.yaml"), name="weather", out_dir=out)
+
+        assert sorted(path.name for path in out.iterdir()) == ["spec.yaml"]
+
+    def test_operation_that_also_accepts_a_static_token_proposes_bearer(self, tmp_path):
+        # The OAuth alternative is listed first; HTTP Bearer still satisfies the operation.
+        either = "oauth: [read]\n        - bearer: []"
+        spec = _secured(SPEC, OAUTH_SCHEMES + STATIC_SCHEMES, either, either)
+        out = _connector_dir(tmp_path, spec)
+
+        result = compile_catalog(str(out / "spec.yaml"), name="weather", out_dir=out)
+
+        assert load_tool_defs(result.catalog).externalize == {"auth": {"bearer": {}}}
+        assert self._auth_block(result) == {"bearer": "WEATHER_TOKEN"}
+
+    def test_catalog_records_provider_when_any_operation_accepts_only_oauth(self, tmp_path):
+        # The first operation accepts a static token, so only the later OAuth-only
+        # operation tells a catalog consumer that a delegated token is needed.
+        spec = _secured(
+            SPEC, OAUTH_SCHEMES + STATIC_SCHEMES, "bearer: []\n        - oauth: [read]", "oauth: []"
+        )
+        out = _connector_dir(tmp_path, spec)
+
+        result = compile_catalog(
+            str(out / "spec.yaml"), name="weather", allow=["weather_getForecast"], out_dir=out
+        )
+
+        assert load_tool_defs(result.catalog).externalize == {"auth": {"provider": {}}}
+        assert self._auth_block(result) == {"bearer": "WEATHER_TOKEN"}
+
+    @pytest.mark.parametrize(
+        ("allow", "scopes"),
+        [(None, ["read", "write"]), (["weather_getForecast"], ["read"])],
+        ids=["all-operations", "allowed-operations"],
+    )
+    def test_provider_scopes_default_to_the_exposed_operations(self, tmp_path, allow, scopes):
+        spec = _secured(SPEC, OAUTH_SCHEMES, "oauth: [read]", "oauth: [write, read]")
+        out = _connector_dir(tmp_path, spec)
+
+        result = compile_catalog(
+            str(out / "spec.yaml"), name="weather", provider="weather-app", allow=allow, out_dir=out
+        )
+
+        assert load_tool_defs(result.catalog).externalize == {"auth": {"provider": {}}}
+        assert self._auth_block(result) == {"provider": "weather-app", "scopes": scopes}
+
+    def test_scopes_replace_the_documents(self, tmp_path):
+        spec = _secured(SPEC, OAUTH_SCHEMES, "oauth: [read]", "oauth: [write]")
+        out = _connector_dir(tmp_path, spec)
+
+        result = compile_catalog(
+            str(out / "spec.yaml"),
+            name="weather",
+            provider="weather-app",
+            scopes=["admin"],
+            out_dir=out,
+        )
+
+        assert self._auth_block(result) == {"provider": "weather-app", "scopes": ["admin"]}
+
+    def test_provider_overrides_a_static_credential(self, tmp_path):
+        spec = _secured(SPEC, STATIC_SCHEMES, "bearer: []", "bearer: []")
+        out = _connector_dir(tmp_path, spec)
+
+        result = compile_catalog(
+            str(out / "spec.yaml"), name="weather", provider="weather-app", out_dir=out
+        )
+
+        assert load_tool_defs(result.catalog).externalize == {"auth": {"provider": {}}}
+        assert self._auth_block(result) == {"provider": "weather-app"}
+
+    @pytest.mark.parametrize(
+        ("auth", "record", "block"),
+        [
+            ("none", None, None),
+            (
+                "basic",
+                {"auth": {"basic": {}}},
+                {"basic": {"username": "WEATHER_USERNAME", "password": "WEATHER_PASSWORD"}},
+            ),
+            (
+                "api_keys",
+                {"auth": {"api_keys": [{"location": "header", "name": "X-Key"}]}},
+                {"api_keys": [{"env": "WEATHER_X_KEY", "location": "header", "name": "X-Key"}]},
+            ),
+        ],
+    )
+    def test_auth_choice_presents_one_credential_on_every_operation(
+        self, tmp_path, auth, record, block
+    ):
+        # Without a choice these operations conflict: one takes a key, one a token.
+        spec = _secured(SPEC, STATIC_SCHEMES, "key: []", "bearer: []")
+        out = _connector_dir(tmp_path, spec)
+
+        result = compile_catalog(str(out / "spec.yaml"), name="weather", auth=auth, out_dir=out)
+
+        definitions = load_tool_defs(result.catalog)
+        assert len(definitions.tools) == 2
+        assert definitions.externalize == record
+        assert self._auth_block(result) == block
+
+    @pytest.mark.parametrize("skip_unsupported", [False, True], ids=["strict", "compatibility"])
+    def test_auth_api_keys_takes_the_placement_of_the_exposed_operations(
+        self, tmp_path, skip_unsupported
+    ):
+        # The first operation in the document declares another key, which the
+        # exposed operation's API would not accept. Only the exposed operation's
+        # own key removes its api_key argument, whose allowReserved cannot compile.
+        schemes = (
+            "    legacy: {type: apiKey, in: header, name: X-Legacy-Key}\n"
+            "    current: {type: apiKey, in: query, name: api_key}\n"
+        )
+        spec = _secured(RESERVED_KEY_ARGUMENT_SPEC, schemes, "legacy: []", "current: []")
+        out = _connector_dir(tmp_path, spec)
+
+        result = compile_catalog(
+            str(out / "spec.yaml"),
+            name="weather",
+            auth="api_keys",
+            allow=["weather_createAlert"],
+            skip_unsupported=skip_unsupported,
+            out_dir=out,
+        )
+
+        placement = {"location": "query", "name": "api_key"}
+        definitions = load_tool_defs(result.catalog)
+        assert "weather_createAlert" in {tool.name for tool in definitions.tools}
+        assert self._auth_block(result) == {"api_keys": [{"env": "WEATHER_API_KEY", **placement}]}
+        assert definitions.externalize == {"auth": {"api_keys": [placement]}}
+
+    def test_auth_api_keys_refuses_an_allowed_operation_its_placement_cannot_compile(
+        self, tmp_path
+    ):
+        # The exposed operation's key is a header, which leaves its api_key
+        # argument to compile, and allowReserved on that argument cannot. The
+        # other operation still compiles, so only the allow rule can catch it.
+        schemes = (
+            "    legacy: {type: apiKey, in: query, name: api_key}\n"
+            "    current: {type: apiKey, in: header, name: X-Key}\n"
+        )
+        spec = _secured(RESERVED_KEY_ARGUMENT_SPEC, schemes, "legacy: []", "current: []")
+        out = _connector_dir(tmp_path, spec)
+
+        with pytest.raises(GenerateError, match="weather_createAlert"):
+            compile_catalog(
+                str(out / "spec.yaml"),
+                name="weather",
+                auth="api_keys",
+                allow=["weather_createAlert"],
+                skip_unsupported=True,
+                out_dir=out,
+            )
+
+        assert sorted(path.name for path in out.iterdir()) == ["spec.yaml"]
+
+    def test_auth_api_keys_reports_an_allow_list_that_matches_nothing(self, tmp_path):
+        # The rule is the mistake, so the error must not ask for a hand-written key.
+        spec = _secured(SPEC, STATIC_SCHEMES, "key: []", "key: []")
+        out = _connector_dir(tmp_path, spec)
+
+        with pytest.raises(GenerateError, match="weather_typo") as refusal:
+            compile_catalog(
+                str(out / "spec.yaml"),
+                name="weather",
+                auth="api_keys",
+                allow=["weather_typo"],
+                out_dir=out,
+            )
+
+        assert "by hand" not in str(refusal.value)
+        assert sorted(path.name for path in out.iterdir()) == ["spec.yaml"]
+
+    @pytest.mark.parametrize(
+        ("spec", "allow"),
+        [
+            (SPEC, None),
+            (_secured(SPEC, STATIC_SCHEMES, "key: []", "{}"), ["weather_createAlert"]),
+        ],
+        ids=["no-operation-declares-a-key", "only-an-excluded-operation-declares-a-key"],
+    )
+    def test_auth_api_keys_needs_a_declared_placement(self, tmp_path, spec, allow):
+        out = _connector_dir(tmp_path, spec)
+
+        with pytest.raises(GenerateError, match="write auth.api_keys in tool.yaml by hand"):
+            compile_catalog(
+                str(out / "spec.yaml"), name="weather", auth="api_keys", allow=allow, out_dir=out
+            )
+
+        assert sorted(path.name for path in out.iterdir()) == ["spec.yaml"]
+
+    @pytest.mark.parametrize(
+        ("options", "message"),
+        [
+            ({"auth": "oauth"}, "--auth must be one of none, bearer, basic, api_keys"),
+            ({"auth": "bearer", "provider": "weather-app"}, "cannot be combined"),
+            ({"scopes": ["read"]}, "--scopes requires --provider"),
+        ],
+        ids=["unknown-choice", "auth-and-provider", "scopes-without-provider"],
+    )
+    def test_contradictory_choices_are_refused(self, tmp_path, options, message):
+        out = _connector_dir(tmp_path)
+
+        with pytest.raises(GenerateError, match=message):
+            compile_catalog(str(out / "spec.yaml"), name="weather", out_dir=out, **options)
+
+    @pytest.mark.parametrize("name", ["3scale", "-jira", "_jira", "tool", "llm"])
+    def test_unusable_derived_secret_name_fails_before_writing(self, tmp_path, name):
+        # Workspace secrets start with a letter (not 3SCALE_ or _JIRA_);
+        # TOOL_ and LLM_ are platform-owned.
+        out = _connector_dir(tmp_path)
+
+        with pytest.raises(GenerateError, match="not a usable workspace secret"):
+            compile_catalog(str(out / "spec.yaml"), name=name, auth="bearer", out_dir=out)
+
+        assert sorted(path.name for path in out.iterdir()) == ["spec.yaml"]
+
+    def test_overlong_derived_secret_name_fails_before_writing(self, tmp_path):
+        # A workspace secret name has at most 128 characters; 40 + 1 + 92 is longer.
+        header = "X-" + "Key" * 30
+        spec = _secured(
+            SPEC, f"    key: {{type: apiKey, in: header, name: {header}}}\n", "key: []", "key: []"
+        )
+        out = _connector_dir(tmp_path, spec)
+
+        with pytest.raises(GenerateError, match="not a usable workspace secret"):
+            compile_catalog(str(out / "spec.yaml"), name="w" * 40, out_dir=out)
+
+        assert sorted(path.name for path in out.iterdir()) == ["spec.yaml"]
+
+    def test_api_keys_deriving_one_secret_name_fail_before_writing(self, tmp_path):
+        # Both names derive WEATHER_X_KEY, so one key would be sent as the other.
+        both = "{hyphen: [], underscore: []}"
+        schemes = (
+            "    hyphen: {type: apiKey, in: header, name: X-Key}\n"
+            "    underscore: {type: apiKey, in: header, name: X_Key}\n"
+        )
+        out = _connector_dir(tmp_path, _secured(SPEC, schemes, both, both))
+
+        with pytest.raises(GenerateError, match="X-Key.*X_Key.*derive the same secret name"):
+            compile_catalog(str(out / "spec.yaml"), name="weather", out_dir=out)
+
+        assert sorted(path.name for path in out.iterdir()) == ["spec.yaml"]
+
+        # The way out the message gives: compile anonymously, then name each secret by hand.
+        result = compile_catalog(str(out / "spec.yaml"), name="weather", auth="none", out_dir=out)
+        assert result.tool_yaml is not None
+        authoring = yaml.safe_load(result.tool_yaml.read_text(encoding="utf-8"))
+        authoring["auth"] = {
+            "api_keys": [
+                {"env": "WEATHER_HYPHEN_KEY", "location": "header", "name": "X-Key"},
+                {"env": "WEATHER_UNDERSCORE_KEY", "location": "header", "name": "X_Key"},
+            ]
+        }
+        result.tool_yaml.write_text(yaml.safe_dump(authoring), encoding="utf-8")
+
+        assert load_tool_defs(regenerate_catalog(result.tool_yaml).catalog).externalize == {
+            "auth": {
+                "api_keys": [
+                    {"location": "header", "name": "X-Key"},
+                    {"location": "header", "name": "X_Key"},
+                ]
+            }
+        }
+
+    @pytest.mark.parametrize(
+        ("options", "block"),
+        [
+            ({"provider": "weather-app"}, {"provider": "weather-app", "scopes": ["read"]}),
+            (
+                {"auth": "api_keys"},
+                {"api_keys": [{"env": "WEATHER_X_KEY", "location": "header", "name": "X-Key"}]},
+            ),
+        ],
+        ids=["provider", "api-keys"],
+    )
+    def test_choice_takes_the_matching_alternative_of_each_operation(
+        self, tmp_path, options, block
+    ):
+        # Each operation accepts OAuth or an API key, which present differently,
+        # so only an explicit choice compiles it.
+        either = "oauth: [read]\n        - key: []"
+        spec = _secured(SPEC, OAUTH_SCHEMES + STATIC_SCHEMES, either, either)
+        out = _connector_dir(tmp_path, spec)
+
+        with pytest.raises(GenerateError, match="conflicting authentication alternatives"):
+            compile_catalog(str(out / "spec.yaml"), name="weather", out_dir=out)
+        result = compile_catalog(str(out / "spec.yaml"), name="weather", out_dir=out, **options)
+
+        assert len(load_tool_defs(result.catalog).tools) == 2
+        assert self._auth_block(result) == block
+
+
 class TestScaffold:
     def _compiled(self, tmp_path: Path) -> Path:
         out = _connector_dir(tmp_path)
@@ -1070,18 +1413,118 @@ class TestScaffold:
         assert authoring["expose"] == {"allow_all": True}
         assert "auth" not in authoring
 
-    def test_scaffold_binds_auth_only_when_supplied(self, tmp_path):
+    def test_scaffold_auth_choice_derives_secrets_from_the_name(self, tmp_path):
         self._compiled(tmp_path)
 
         tool_yaml = scaffold_tool_yaml(
             "../weather/tool_defs.yaml",
+            name="tenant-weather",
             base_url="https://tenant.example/api",
-            auth=Auth(type="bearer", env="WEATHER_TOKEN"),
+            auth="bearer",
             out_dir=tmp_path / "connectors" / "consumer",
         )
 
         authoring = yaml.safe_load(tool_yaml.read_text(encoding="utf-8"))
-        assert authoring["auth"] == {"type": "bearer", "env": "WEATHER_TOKEN"}
+        assert authoring["name"] == "tenant-weather"
+        assert authoring["auth"] == {"bearer": "TENANT_WEATHER_TOKEN"}
+
+    def test_scaffold_refuses_an_empty_name_instead_of_the_catalogs(self, tmp_path):
+        self._compiled(tmp_path)
+        out = tmp_path / "connectors" / "consumer"
+
+        with pytest.raises(GenerateError, match="connector name must"):
+            scaffold_tool_yaml(
+                "../weather/tool_defs.yaml",
+                name="",
+                base_url="https://tenant.example/api",
+                out_dir=out,
+            )
+
+        assert not (out / "tool.yaml").exists()
+
+    @pytest.mark.parametrize(
+        ("record", "block"),
+        [
+            # The catalog never chooses which workspace secret a binding reads.
+            ({"bearer": "AGENTIC_API_KEY"}, {"bearer": "WEATHER_TOKEN"}),
+            (
+                {"api_keys": [{"env": "AGENTIC_API_KEY", "location": "header", "name": "X-Key"}]},
+                {"api_keys": [{"env": "WEATHER_X_KEY", "location": "header", "name": "X-Key"}]},
+            ),
+            (
+                {"bearer": {}, "headers": {"X-Injected": "AGENTIC_API_KEY"}},
+                {"bearer": "WEATHER_TOKEN"},
+            ),
+            # A record written before the auth block lost its type proposes nothing.
+            ({"type": "bearer"}, None),
+            # So does the empty record an anonymous override used to write.
+            ({}, None),
+        ],
+        ids=["bearer-secret", "api-key-secret", "headers", "typed-record", "empty-record"],
+    )
+    def test_scaffold_reads_only_the_catalog_credential_kind(self, tmp_path, record, block):
+        catalog = self._compiled(tmp_path)
+        document = yaml.safe_load(catalog.read_text(encoding="utf-8"))
+        document["externalize"] = {"auth": record}
+        catalog.write_text(yaml.safe_dump(document), encoding="utf-8")
+
+        tool_yaml = scaffold_tool_yaml(
+            "../weather/tool_defs.yaml",
+            base_url="https://tenant.example/api",
+            out_dir=tmp_path / "connectors" / "consumer",
+        )
+
+        assert yaml.safe_load(tool_yaml.read_text(encoding="utf-8")).get("auth") == block
+
+    @pytest.mark.parametrize(
+        "record",
+        [
+            "bearer",
+            {"bearer": {}, "basic": {}},
+            {"session": {}},
+            {"api_keys": []},
+            {"api_keys": [{"location": "header"}]},
+            {"api_keys": [{"location": "header", "name": "X-Key\ninjected: true"}]},
+        ],
+        ids=["scalar", "two-kinds", "unknown-kind", "no-keys", "no-key-name", "newline"],
+    )
+    def test_scaffold_refuses_a_malformed_catalog_record(self, tmp_path, record):
+        catalog = self._compiled(tmp_path)
+        document = yaml.safe_load(catalog.read_text(encoding="utf-8"))
+        document["externalize"] = {"auth": record}
+        catalog.write_text(yaml.safe_dump(document), encoding="utf-8")
+        out = tmp_path / "connectors" / "consumer"
+
+        with pytest.raises(GenerateError):
+            scaffold_tool_yaml(
+                "../weather/tool_defs.yaml", base_url="https://tenant.example/api", out_dir=out
+            )
+
+        assert not (out / "tool.yaml").exists()
+
+    def test_scaffold_oauth_catalog_needs_a_provider(self, tmp_path):
+        catalog = self._compiled(tmp_path)
+        document = yaml.safe_load(catalog.read_text(encoding="utf-8"))
+        document["externalize"] = {"auth": {"provider": {}}}
+        catalog.write_text(yaml.safe_dump(document), encoding="utf-8")
+        out = tmp_path / "connectors" / "consumer"
+
+        with pytest.raises(GenerateError, match="pass --provider"):
+            scaffold_tool_yaml(
+                "../weather/tool_defs.yaml", base_url="https://tenant.example/api", out_dir=out
+            )
+        tool_yaml = scaffold_tool_yaml(
+            "../weather/tool_defs.yaml",
+            base_url="https://tenant.example/api",
+            provider="weather-app",
+            scopes=["read"],
+            out_dir=out,
+        )
+
+        assert yaml.safe_load(tool_yaml.read_text(encoding="utf-8"))["auth"] == {
+            "provider": "weather-app",
+            "scopes": ["read"],
+        }
 
     def test_scaffold_refuses_overwrite(self, tmp_path):
         self._compiled(tmp_path)
@@ -1146,30 +1589,27 @@ class TestScaffold:
 
 
 class TestRegenerate:
-    def test_oauth_regeneration_preserves_binding_and_secret_free_bearer_catalog(self, tmp_path):
+    def test_provider_regeneration_preserves_binding_and_secret_free_catalog(self, tmp_path):
         """Public compilation emits OAuth guidance; regeneration preserves its binding."""
         out = _connector_dir(tmp_path)
         result = compile_catalog(
             str(out / "spec.yaml"),
             name="weather",
-            auth=Auth(type="oauth", provider_type="weather-service", scopes=["read"]),
+            provider="weather-service",
+            scopes=["read"],
             out_dir=out,
         )
         authoring = result.tool_yaml
         assert authoring is not None
         before = authoring.read_text(encoding="utf-8")
         document = yaml.safe_load(before)
-        assert document["auth"] == {
-            "type": "oauth",
-            "provider_type": "weather-service",
-            "scopes": ["read"],
-        }
-        assert "delegated OAuth" in before
+        assert document["auth"] == {"provider": "weather-service", "scopes": ["read"]}
+        assert "OAuth through the project's OAuth app" in before
         assert "anonymously" not in before
         regenerated = regenerate_catalog(authoring)
         assert authoring.read_text(encoding="utf-8") == before
         catalog = yaml.safe_load(regenerated.catalog.read_text(encoding="utf-8"))
-        assert catalog["externalize"]["auth"] == {"type": "bearer"}
+        assert catalog["externalize"]["auth"] == {"provider": {}}
 
     def test_regeneration_preserves_authoring_and_rewrites_catalog(self, tmp_path):
         out = _connector_dir(tmp_path)
@@ -1187,8 +1627,7 @@ class TestRegenerate:
             "  allow:\n"
             "    - weather_getForecast\n"
             "auth:\n"
-            "  type: bearer\n"
-            "  env: WEATHER_TOKEN\n",
+            "  bearer: WEATHER_TOKEN\n",
             encoding="utf-8",
         )
         before = authoring.read_text(encoding="utf-8")
@@ -1203,6 +1642,33 @@ class TestRegenerate:
             "weather_getForecast",
             "weather_createAlert",
         ]
+
+    @pytest.mark.parametrize(
+        ("binding", "record"),
+        [
+            (None, None),
+            (
+                {"bearer": "WEATHER_TOKEN", "headers": {"X-Api-Version": "2"}},
+                {"auth": {"bearer": {}, "headers": {"X-Api-Version": "2"}}},
+            ),
+        ],
+        ids=["no-block", "bearer-with-headers"],
+    )
+    def test_regeneration_compiles_the_authored_binding(self, tmp_path, binding, record):
+        # The document asks for a key; the authored block decides what the catalog records.
+        spec = _secured(SPEC, STATIC_SCHEMES, "key: []", "key: []")
+        out = _connector_dir(tmp_path, spec)
+        result = compile_catalog(str(out / "spec.yaml"), name="weather", out_dir=out)
+        assert result.tool_yaml is not None
+        authoring = yaml.safe_load(result.tool_yaml.read_text(encoding="utf-8"))
+        authoring.pop("auth")
+        if binding is not None:
+            authoring["auth"] = binding
+        result.tool_yaml.write_text(yaml.safe_dump(authoring), encoding="utf-8")
+
+        regenerated = load_tool_defs(regenerate_catalog(result.tool_yaml).catalog)
+
+        assert regenerated.externalize == record
 
     def test_regeneration_of_edited_spec_picks_up_changes(self, tmp_path):
         out = _connector_dir(tmp_path)
@@ -1631,7 +2097,7 @@ servers:""",
         )
 
         dumped = definitions.model_dump(exclude_none=True)
-        assert dumped["externalize"] == {"auth": {"type": "bearer"}}
+        assert dumped["externalize"] == {"auth": {"bearer": {}}}
 
     def _compiled(self, tmp_path: Path) -> Path:
         out = _connector_dir(tmp_path)
@@ -1760,12 +2226,7 @@ class TestAuthoringGuidance:
         out = _connector_dir(tmp_path)
         monkeypatch.chdir(out)
 
-        result = compile_catalog(
-            "spec.yaml",
-            name="weather",
-            auth=Auth(type="bearer", env="WEATHER_TOKEN"),
-            out_dir=".",
-        )
+        result = compile_catalog("spec.yaml", name="weather", auth="bearer", out_dir=".")
 
         assert result.tool_yaml is not None
         text = result.tool_yaml.read_text(encoding="utf-8")
@@ -1785,7 +2246,7 @@ class TestAuthoringGuidance:
                 "spec": "spec.yaml",
             },
             "expose": {"allow_all": True},
-            "auth": {"type": "bearer", "env": "WEATHER_TOKEN"},
+            "auth": {"bearer": "WEATHER_TOKEN"},
         }
 
     def test_guidance_reports_the_bound_port(self, tmp_path, monkeypatch):
@@ -1816,40 +2277,53 @@ class TestAuthoringGuidance:
         assert "sandboxes.tool.secrets" not in text
 
     def test_scaffold_states_every_credential_secret(self, tmp_path):
-        out = _connector_dir(tmp_path)
+        spec = SPEC.replace(
+            "servers:",
+            """security:
+  - first: []
+    second: []
+components:
+  securitySchemes:
+    first: {type: apiKey, in: header, name: X-First}
+    second: {type: apiKey, in: query, name: second}
+servers:""",
+        )
+        out = _connector_dir(tmp_path, spec)
         compile_catalog(str(out / "spec.yaml"), name="weather", out_dir=out)
 
         tool_yaml = scaffold_tool_yaml(
             "../weather/tool_defs.yaml",
             base_url="https://tenant.example/api",
-            auth=Auth(
-                type="api_keys",
-                credentials=[
-                    Credential(env="FIRST_KEY", location="header", name="X-First"),
-                    Credential(env="SECOND_KEY", location="query", name="second"),
-                ],
-            ),
             out_dir=tmp_path / "connectors" / "consumer",
         )
 
         text = tool_yaml.read_text(encoding="utf-8")
         assert "allow tenant.example:443 from the tool sandbox" in text
-        assert "grant FIRST_KEY, SECOND_KEY to the tool sandbox under" in text
+        assert "grant WEATHER_X_FIRST, WEATHER_SECOND to the tool sandbox under" in text
 
     def test_basic_auth_states_both_credential_secrets(self, tmp_path, monkeypatch):
         out = _connector_dir(tmp_path)
         monkeypatch.chdir(out)
 
-        result = compile_catalog(
-            "spec.yaml",
-            name="weather",
-            auth=Auth(type="basic", username_env="API_USER", password_env="API_PASS"),
-            out_dir=".",
-        )
+        result = compile_catalog("spec.yaml", name="weather", auth="basic", out_dir=".")
 
         assert result.tool_yaml is not None
         text = result.tool_yaml.read_text(encoding="utf-8")
-        assert "#   secret   grant API_USER, API_PASS to the tool sandbox under" in text
+        assert (
+            "#   secret   grant WEATHER_USERNAME, WEATHER_PASSWORD to the tool sandbox under"
+            in text
+        )
+
+    def test_provider_names_the_oauth_app(self, tmp_path, monkeypatch):
+        out = _connector_dir(tmp_path)
+        monkeypatch.chdir(out)
+
+        result = compile_catalog("spec.yaml", name="weather", provider="weather-app", out_dir=".")
+
+        assert result.tool_yaml is not None
+        text = result.tool_yaml.read_text(encoding="utf-8")
+        assert "#   auth     OAuth through the project's OAuth app weather-app" in text
+        assert "#   secret   none required in the tool sandbox; tokens are request-local" in text
 
     def test_metacharacter_destination_is_shell_quoted(self, tmp_path, monkeypatch):
         out = _connector_dir(tmp_path)

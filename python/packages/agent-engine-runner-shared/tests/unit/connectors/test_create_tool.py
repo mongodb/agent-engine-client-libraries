@@ -35,7 +35,6 @@ class TestCompileMode:
             [
                 "--spec",
                 "connectors/jira/spec.yaml",
-                "--name",
                 "jira",
                 "--out-dir",
                 "connectors/jira",
@@ -51,6 +50,19 @@ class TestCompileMode:
             "connectors/jira/tool.yaml",
         ]
 
+    def test_name_after_double_dash_is_the_connector_name(self, tmp_path, capsys, monkeypatch):
+        # The CLI passes the name last, after "--", so a name is never read as a flag.
+        out = _connector_dir(tmp_path)
+        monkeypatch.chdir(tmp_path)
+
+        code, _, err = _run(
+            capsys,
+            ["--spec", "connectors/jira/spec.yaml", "--out-dir", "connectors/jira", "--", "-jira"],
+        )
+
+        assert code == 0, err
+        assert yaml.safe_load((out / "tool.yaml").read_text(encoding="utf-8"))["name"] == "-jira"
+
     def test_scaffold_mode_with_allow_list(self, tmp_path, capsys, monkeypatch):
         out = _connector_dir(tmp_path)
         monkeypatch.chdir(tmp_path)
@@ -58,7 +70,6 @@ class TestCompileMode:
             [
                 "--spec",
                 "connectors/jira/spec.yaml",
-                "--name",
                 "jira",
                 "--out-dir",
                 "connectors/jira",
@@ -82,7 +93,35 @@ class TestCompileMode:
 
         assert code == 0
         authoring = yaml.safe_load((out / "tool.yaml").read_text(encoding="utf-8"))
+        assert authoring["name"] == "jira"
         assert authoring["expose"] == {"allow": ["jira_getForecast"]}
+
+    def test_scaffold_mode_takes_a_connector_name(self, tmp_path, capsys, monkeypatch):
+        out = _connector_dir(tmp_path)
+        monkeypatch.chdir(tmp_path)
+        main(["--spec", "connectors/jira/spec.yaml", "jira", "--out-dir", "connectors/jira"])
+        consumer = tmp_path / "connectors" / "tenant"
+
+        code, _, err = _run(
+            capsys,
+            [
+                "tenant-jira",
+                "--tool-defs",
+                "../jira/tool_defs.yaml",
+                "--base-url",
+                "https://jira.corp/rest",
+                "--auth",
+                "bearer",
+                "--out-dir",
+                str(consumer),
+            ],
+        )
+
+        assert code == 0, err
+        authoring = yaml.safe_load((consumer / "tool.yaml").read_text(encoding="utf-8"))
+        assert authoring["name"] == "tenant-jira"
+        assert authoring["auth"] == {"bearer": "TENANT_JIRA_TOKEN"}
+        assert (out / "tool_defs.yaml").exists()
 
     def test_regenerate_mode(self, tmp_path, capsys, monkeypatch):
         out = _connector_dir(tmp_path)
@@ -91,7 +130,6 @@ class TestCompileMode:
             [
                 "--spec",
                 "connectors/jira/spec.yaml",
-                "--name",
                 "jira",
                 "--out-dir",
                 "connectors/jira",
@@ -122,7 +160,7 @@ class TestFailures:
         )
 
         code, _, err = _run(
-            capsys, ["--spec", str(out2 / "spec.yaml"), "--name", "jira", "--out-dir", str(out2)]
+            capsys, ["--spec", str(out2 / "spec.yaml"), "jira", "--out-dir", str(out2)]
         )
         assert code == 1
         assert "error:" in err
@@ -135,7 +173,7 @@ class TestFailures:
         code, _, err = _run(capsys, ["--spec", str(out / "spec.yaml"), "--out-dir", str(out)])
 
         assert code == 1
-        assert "--name is required" in err
+        assert "a connector name is required with --spec" in err
 
     def test_missing_base_url_in_scaffold_mode(self, tmp_path, capsys, monkeypatch):
         out = _connector_dir(tmp_path)
@@ -144,7 +182,6 @@ class TestFailures:
             [
                 "--spec",
                 "connectors/jira/spec.yaml",
-                "--name",
                 "jira",
                 "--out-dir",
                 "connectors/jira",
@@ -164,7 +201,6 @@ class TestFailures:
             [
                 "--spec",
                 "connectors/jira/spec.yaml",
-                "--name",
                 "jira",
                 "--out-dir",
                 "connectors/jira",
@@ -189,26 +225,25 @@ class TestFailures:
         assert code == 1
         assert "--allow" in err
 
-    def test_auth_without_env_is_a_generate_error(self, tmp_path, capsys, monkeypatch):
-        _connector_dir(tmp_path)
+    @pytest.mark.parametrize(
+        ("flags", "expected"),
+        [
+            (["--name", "jira"], "unrecognized arguments"),
+            (["--auth-env", "JIRA_TOKEN"], "unrecognized arguments"),
+            (["--auth-header", "X-Key"], "unrecognized arguments"),
+            (["--auth", "oauth"], "invalid choice"),
+            (["--auth", "api_key"], "invalid choice"),
+        ],
+    )
+    def test_removed_flags_are_usage_refusals(self, tmp_path, capsys, monkeypatch, flags, expected):
+        out = _connector_dir(tmp_path)
         monkeypatch.chdir(tmp_path)
 
-        code, _, err = _run(
-            capsys,
-            [
-                "--spec",
-                "spec.yaml",
-                "--name",
-                "jira",
-                "--auth",
-                "bearer",
-                "--out-dir",
-                "connectors/jira",
-            ],
-        )
+        code, _, err = _run(capsys, [*_COMPILE, *flags])
 
         assert code == 1
-        assert "--auth-env" in err
+        assert expected in err
+        assert not (out / "tool_defs.yaml").exists()
 
     def test_mutually_exclusive_modes_are_a_usage_refusal(self, capsys):
         """argparse usage errors are input validation: the helper maps them to
@@ -225,7 +260,6 @@ class TestFailures:
                 [
                     "--spec",
                     "connectors/jira/spec.yaml",
-                    "--name",
                     "jira",
                     "--out-dir",
                     "connectors/jira",
@@ -241,7 +275,6 @@ class TestFailures:
             [
                 "--spec",
                 "connectors/jira/spec.yaml",
-                "--name",
                 "jira",
                 "--allow",
                 "jira_getForecast",
@@ -263,7 +296,6 @@ class TestFailures:
             [
                 "--spec",
                 "connectors/jira/spec.yaml",
-                "--name",
                 "jira",
                 "--out-dir",
                 "connectors/jira",
@@ -282,7 +314,6 @@ class TestFailures:
             [
                 "--spec",
                 "connectors/jira/spec.yaml",
-                "--name",
                 "jira",
                 "--allow",
                 "jira_getForecast",
@@ -320,12 +351,9 @@ servers:""",
             [
                 "--spec",
                 "connectors/jira/spec.yaml",
-                "--name",
                 "jira",
                 "--auth",
                 "bearer",
-                "--auth-env",
-                "JIRA_TOKEN",
                 "--out-dir",
                 "connectors/jira",
             ],
@@ -333,7 +361,9 @@ servers:""",
 
         assert code == 0
         catalog = yaml.safe_load((out / "tool_defs.yaml").read_text(encoding="utf-8"))
-        assert catalog["externalize"] == {"auth": {"type": "bearer"}}
+        assert catalog["externalize"] == {"auth": {"bearer": {}}}
+        authoring = yaml.safe_load((out / "tool.yaml").read_text(encoding="utf-8"))
+        assert authoring["auth"] == {"bearer": "JIRA_TOKEN"}
 
     def test_auth_none_overrides_an_oauth_spec(self, tmp_path, capsys, monkeypatch):
         monkeypatch.chdir(tmp_path)
@@ -357,7 +387,6 @@ servers:""",
             [
                 "--spec",
                 "connectors/jira/spec.yaml",
-                "--name",
                 "jira",
                 "--auth",
                 "none",
@@ -368,9 +397,8 @@ servers:""",
 
         assert code == 0
         catalog = yaml.safe_load((out / "tool_defs.yaml").read_text(encoding="utf-8"))
-        # The explicit anonymous override is recorded as an empty auth
-        # descriptor so the runtime binds no credential.
-        assert catalog["externalize"] == {"auth": {}}
+        assert "externalize" not in catalog
+        assert "auth" not in yaml.safe_load((out / "tool.yaml").read_text(encoding="utf-8"))
 
     def test_without_auth_flag_the_spec_scheme_governs(self, tmp_path, capsys, monkeypatch):
         monkeypatch.chdir(tmp_path)
@@ -394,18 +422,20 @@ servers:""",
             [
                 "--spec",
                 "connectors/jira/spec.yaml",
-                "--name",
                 "jira",
                 "--out-dir",
                 "connectors/jira",
             ],
         )
 
-        # Without --auth the document's own basic scheme resolves and is
-        # recorded so the runtime can bind it with brokered credentials.
+        # Without --auth the document's own basic scheme proposes the block.
         assert code == 0
         catalog = yaml.safe_load((out / "tool_defs.yaml").read_text(encoding="utf-8"))
-        assert catalog["externalize"] == {"auth": {"type": "basic"}}
+        assert catalog["externalize"] == {"auth": {"basic": {}}}
+        authoring = yaml.safe_load((out / "tool.yaml").read_text(encoding="utf-8"))
+        assert authoring["auth"] == {
+            "basic": {"username": "JIRA_USERNAME", "password": "JIRA_PASSWORD"}
+        }
 
     def test_out_dir_whose_name_starts_with_dots_is_contained(self, tmp_path, capsys, monkeypatch):
         """A directory named "..generated" is a contained out-dir, not a
@@ -421,7 +451,6 @@ servers:""",
             [
                 "--spec",
                 str(out / "spec.yaml"),
-                "--name",
                 "jira",
                 "--out-dir",
                 str(out),
@@ -476,7 +505,7 @@ servers:""",
         )
 
         code, _, err = _run(
-            capsys, ["--spec", str(out / "spec.yaml"), "--name", "jira", "--out-dir", str(out)]
+            capsys, ["--spec", str(out / "spec.yaml"), "jira", "--out-dir", str(out)]
         )
 
         assert code == 2
@@ -484,73 +513,55 @@ servers:""",
         assert "Traceback" not in err
 
 
-_COMPILE = ["--spec", "connectors/jira/spec.yaml", "--name", "jira", "--out-dir", "connectors/jira"]
+_COMPILE = ["--spec", "connectors/jira/spec.yaml", "jira", "--out-dir", "connectors/jira"]
 
 
 class TestDelegatedOAuth:
-    def test_oauth_compile_writes_the_delegated_binding(self, tmp_path, capsys, monkeypatch):
+    def test_provider_compile_writes_the_delegated_binding(self, tmp_path, capsys, monkeypatch):
         out = _connector_dir(tmp_path)
         monkeypatch.chdir(tmp_path)
 
         code, _, err = _run(
-            capsys,
-            [
-                *_COMPILE,
-                "--auth",
-                "oauth",
-                "--provider-type",
-                "github",
-                "--scopes",
-                "repo, read:org",
-            ],
+            capsys, [*_COMPILE, "--provider", "github", "--scopes", "repo, read:org"]
         )
 
         assert code == 0, err
         authoring = (out / "tool.yaml").read_text(encoding="utf-8")
         assert yaml.safe_load(authoring)["auth"] == {
-            "type": "oauth",
-            "provider_type": "github",
+            "provider": "github",
             "scopes": ["repo", "read:org"],
         }
-        # The guidance names the key the project's credential provider must use.
         assert (
-            "#   auth     delegated OAuth; register a credential provider with provider "
-            "type github in this project\n"
+            "#   auth     OAuth through the project's OAuth app github; its grant\n"
+            "#            decides whether tools call as each user or as the agent's client\n"
         ) in authoring
         catalog = yaml.safe_load((out / "tool_defs.yaml").read_text(encoding="utf-8"))
-        assert catalog["externalize"] == {"auth": {"type": "bearer"}}
+        assert catalog["externalize"] == {"auth": {"provider": {}}}
 
-    def test_oauth_without_scopes_binds_no_scopes(self, tmp_path, capsys, monkeypatch):
+    def test_provider_without_scopes_binds_no_scopes(self, tmp_path, capsys, monkeypatch):
         out = _connector_dir(tmp_path)
         monkeypatch.chdir(tmp_path)
 
-        code, _, err = _run(capsys, [*_COMPILE, "--auth", "oauth", "--provider-type", "github"])
+        code, _, err = _run(capsys, [*_COMPILE, "--provider", "github"])
 
         assert code == 0, err
         authoring = yaml.safe_load((out / "tool.yaml").read_text(encoding="utf-8"))
-        assert authoring["auth"] == {"type": "oauth", "provider_type": "github"}
+        assert authoring["auth"] == {"provider": "github"}
 
     @pytest.mark.parametrize(
         ("flags", "expected"),
         [
-            (["--auth", "oauth"], "--auth oauth requires --provider-type"),
-            (["--auth", "oauth", "--provider-type", "github", "--scopes", ""], "empty"),
-            (["--auth", "oauth", "--provider-type", "github", "--scopes", "repo,,admin"], "empty"),
-            (["--auth", "oauth", "--provider-type", "github", "--scopes", "repo,repo"], "unique"),
-            (["--auth", "oauth", "--provider-type", "github", "--scopes", "re po"], "unique"),
-            (["--auth", "oauth", "--provider-type", "git hub"], "provider key"),
-            (
-                ["--auth", "oauth", "--provider-type", "github", "--auth-env", "GH_TOKEN"],
-                "--auth oauth cannot take --auth-env or --auth-header",
-            ),
-            (
-                ["--auth", "bearer", "--auth-env", "GH_TOKEN", "--provider-type", "github"],
-                "require --auth oauth",
-            ),
-            (["--scopes", "repo"], "require --auth oauth"),
+            (["--provider", "github", "--scopes", ""], "empty"),
+            (["--provider", "github", "--scopes", "repo,,admin"], "empty"),
+            (["--provider", "github", "--scopes", "repo,repo"], "unique"),
+            (["--provider", "github", "--scopes", "re po"], "unique"),
+            (["--provider", "git hub"], "auth.provider must name an OAuth app"),
+            (["--auth", "bearer", "--provider", "github"], "cannot be combined"),
+            (["--scopes", "repo"], "--scopes requires --provider"),
+            (["--auth", "api_keys"], "write auth.api_keys in tool.yaml by hand"),
         ],
     )
-    def test_invalid_oauth_input_is_refused_before_writing(
+    def test_invalid_auth_input_is_refused_before_writing(
         self, tmp_path, capsys, monkeypatch, flags, expected
     ):
         out = _connector_dir(tmp_path)
@@ -563,39 +574,32 @@ class TestDelegatedOAuth:
         assert not (out / "tool.yaml").exists()
         assert not (out / "tool_defs.yaml").exists()
 
-    def test_regeneration_refuses_oauth_flags(self, tmp_path, capsys, monkeypatch):
+    @pytest.mark.parametrize(
+        "flags",
+        [["jira"], ["--auth", "bearer"], ["--provider", "github"], ["--scopes", "repo"]],
+    )
+    def test_regeneration_refuses_auth_choices(self, tmp_path, capsys, monkeypatch, flags):
         _connector_dir(tmp_path)
         monkeypatch.chdir(tmp_path)
 
-        code, _, err = _run(
-            capsys,
-            [
-                "--config",
-                "connectors/jira/tool.yaml",
-                "--auth",
-                "oauth",
-                "--provider-type",
-                "github",
-            ],
-        )
+        code, _, err = _run(capsys, ["--config", "connectors/jira/tool.yaml", *flags])
 
         assert code == 1
-        assert "preserves the authored settings" in err
+        assert "keeps the name and settings written in tool.yaml" in err
 
     @pytest.mark.parametrize(
         ("flags", "expected"),
         [
+            (["--auth", "bearer"], {"bearer": "JIRA_TOKEN"}),
             (
-                ["--auth", "bearer", "--auth-env", "JIRA_TOKEN"],
-                {"type": "bearer", "env": "JIRA_TOKEN"},
-            ),
-            (
-                ["--auth", "api_key", "--auth-env", "JIRA_KEY", "--auth-header", "X-Key"],
-                {"type": "api_key", "env": "JIRA_KEY", "header": "X-Key"},
+                ["--auth", "basic"],
+                {"basic": {"username": "JIRA_USERNAME", "password": "JIRA_PASSWORD"}},
             ),
         ],
     )
-    def test_static_credentials_are_unchanged(self, tmp_path, capsys, monkeypatch, flags, expected):
+    def test_static_choice_derives_secret_names(
+        self, tmp_path, capsys, monkeypatch, flags, expected
+    ):
         out = _connector_dir(tmp_path)
         monkeypatch.chdir(tmp_path)
 
@@ -639,7 +643,6 @@ class TestUnmatchedAllowOnLargeCatalogs:
             [
                 "--spec",
                 "connectors/items/items.json",
-                "--name",
                 "items",
                 "--out-dir",
                 "connectors/items",

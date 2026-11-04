@@ -7,7 +7,8 @@ import json
 from typing import Any
 
 from langchain_core.messages import BaseMessage, RemoveMessage, convert_to_messages
-from langchain_core.runnables import RunnableLambda
+from langchain_core.runnables import RunnableConfig, RunnableLambda
+from langgraph.channels.delta import DeltaChannel
 from langgraph.graph import add_messages
 from langgraph.types import Command, Overwrite
 
@@ -16,6 +17,7 @@ from agent_engine_runner_shared.workflow.context import (
     current_operation_path,
     current_step_ordinal,
 )
+from agent_engine_sdk_langgraph.durable_subgraphs import send_task_index
 
 _INSTALLED_ATTRIBUTE = "_agent_engine_durable_message_identity_installed"
 
@@ -116,14 +118,28 @@ def _identity_runnable(
     node_name: str,
     message_channels: frozenset[str],
 ) -> RunnableLambda[Any, Any]:
-    def assign(output: Any) -> Any:
+    def assign(output: Any, config: RunnableConfig) -> Any:
+        # Send tasks of one node can share its name, operation path and step, and
+        # the reducer keeps one message per ID. Only a later task adds its index,
+        # so a lone or first task keeps the ID a recorded turn already has.
+        index = send_task_index(config.get("metadata") or {})
         return _with_durable_message_identity(
             output,
-            node_name=node_name,
+            node_name=f"{node_name}#send{index}" if index else node_name,
             message_channels=message_channels,
         )
 
     return RunnableLambda(assign)
+
+
+def _is_message_channel(name: str, channel: Any) -> bool:
+    """Whether a channel holds messages a reducer would give random IDs."""
+    if name == "__root__":
+        return False
+    # deepagents keeps ``messages`` in a DeltaChannel with its own reducer.
+    return getattr(channel, "operator", None) is add_messages or (
+        name == "messages" and isinstance(channel, DeltaChannel)
+    )
 
 
 def install_durable_message_identity(graph: Any) -> None:
@@ -151,7 +167,7 @@ def install_durable_message_identity(graph: Any) -> None:
         message_channels = frozenset(
             name
             for name, channel in channels.items()
-            if name != "__root__" and getattr(channel, "operator", None) is add_messages
+            if _is_message_channel(name, channel)
         )
         if not message_channels:
             continue

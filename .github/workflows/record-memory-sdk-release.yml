@@ -1,0 +1,68 @@
+#
+# Records the memory SDK wheel after "SDK release" succeeds on the default
+# branch.
+#
+# workflow_run loads this file from the default branch, and the job checks
+# out the commit that published. A manual run of SDK release from another
+# branch does not get here, so it cannot execute the recorder. The publish
+# job only uploads the manifest artifact.
+#
+name: record memory SDK release
+
+on:
+  workflow_run:
+    workflows: ["SDK release"]
+    types: [completed]
+    branches: [main]
+
+permissions:
+  contents: read
+
+# Each recorder decides whether to promote from a read of the current
+# manifest. Overlapping runs could let an older version overwrite a newer one,
+# so they run one at a time in SDK release completion order.
+concurrency:
+  group: record-memory-sdk-release
+  cancel-in-progress: false
+
+jobs:
+  record:
+    # head_branch is only a name: a fork pull request from a branch called
+    # main matches it. Also require a push or dispatch in this repository so
+    # the checked-out commit is one that landed on the default branch.
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_branch == 'main' &&
+      github.event.workflow_run.head_repository.full_name == github.repository &&
+      (github.event.workflow_run.event == 'push' ||
+       github.event.workflow_run.event == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          persist-credentials: false
+
+      - name: Record memory SDK release
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          SOURCE_RUN_ID: ${{ github.event.workflow_run.id }}
+        run: |
+          set -euo pipefail
+          # The run id is inserted into a gh API path. A non-numeric value
+          # would change the request target, so reject it before calling.
+          case "$SOURCE_RUN_ID" in
+            ''|*[!0-9]*) echo "ERROR: workflow run id is not numeric" >&2; exit 1 ;;
+          esac
+          names="$(gh api --paginate --jq '.artifacts[].name' \
+            "repos/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_RUN_ID}/artifacts")"
+          if ! printf '%s\n' "$names" | grep -qx 'sdk-memory-manifest'; then
+            echo "SDK release did not record a memory SDK wheel; leaving the current manifest unchanged"
+            exit 0
+          fi
+          gh run download "$SOURCE_RUN_ID" -n sdk-memory-manifest -D "$RUNNER_TEMP/sdk-memory-record"
+          bash ./scripts/publish-memory-sdk-release.sh \
+            "$RUNNER_TEMP/sdk-memory-record/sdk-memory-manifest.json"

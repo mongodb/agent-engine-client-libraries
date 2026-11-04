@@ -298,8 +298,8 @@ export const ToolExecuteRequestSchema = z.object({
   is_local: z.boolean().default(true),
   /** Top-level tool argument names to redact from execution logs. */
   redact_fields: z.array(z.string()).default([]),
-  /** Credential provider type for delegated auth. */
-  provider_type: z.string().nullish(),
+  /** Credential provider key for delegated auth. */
+  provider: z.string().nullish(),
   /** Requested OAuth scopes for delegated auth. */
   scopes: z.array(z.string()).default([]),
   /** Observability metadata. */
@@ -1050,6 +1050,10 @@ export class LLMResult {
       if (this.usage.totalTokens !== undefined)
         dump["total_tokens"] = this.usage.totalTokens;
       if (this.usage.model !== undefined) dump["model"] = this.usage.model;
+      if (this.usage.inputTokenDetails !== undefined)
+        dump["input_token_details"] = this.usage.inputTokenDetails;
+      if (this.usage.outputTokenDetails !== undefined)
+        dump["output_token_details"] = this.usage.outputTokenDetails;
       metadata = dump;
     }
     return new LLMResponse({
@@ -1074,6 +1078,41 @@ function usageInt(value: unknown): number | undefined {
   if (typeof value === "number" && Number.isFinite(value) && value >= 0)
     return Math.trunc(value);
   return undefined;
+}
+
+/** Return the non-negative integer entries of a usage detail mapping. */
+function usageDetails(value: unknown): Record<string, number> | undefined {
+  if (!isRecord(value)) return undefined;
+  const details: Record<string, number> = {};
+  for (const [key, raw] of Object.entries(value)) {
+    const parsed = usageInt(raw);
+    if (parsed !== undefined) details[key] = parsed;
+  }
+  return Object.keys(details).length > 0 ? details : undefined;
+}
+
+/** Merge detail mappings, letting the newer snapshot win per key. */
+function mergeDetails(
+  prior: Record<string, number> | undefined,
+  incoming: Record<string, number> | undefined,
+): Record<string, number> | undefined {
+  if (prior === undefined) return incoming;
+  if (incoming === undefined) return prior;
+  return { ...prior, ...incoming };
+}
+
+/** Add detail mappings key-wise, for additive delta providers. */
+function sumDetails(
+  prior: Record<string, number> | undefined,
+  incoming: Record<string, number> | undefined,
+): Record<string, number> | undefined {
+  if (prior === undefined) return incoming;
+  if (incoming === undefined) return prior;
+  const summed: Record<string, number> = { ...prior };
+  for (const [key, value] of Object.entries(incoming)) {
+    summed[key] = (summed[key] ?? 0) + value;
+  }
+  return summed;
 }
 
 function hasTokenCounts(usage: LLMTokenUsage): boolean {
@@ -1142,6 +1181,18 @@ function coerceTokenUsageInner(value: unknown): LLMTokenUsage | undefined {
   } catch {
     // ignore
   }
+  try {
+    const inputDetails = usageDetails(
+      rec["input_token_details"] ?? rec["inputTokenDetails"],
+    );
+    if (inputDetails !== undefined) data.input_token_details = inputDetails;
+    const outputDetails = usageDetails(
+      rec["output_token_details"] ?? rec["outputTokenDetails"],
+    );
+    if (outputDetails !== undefined) data.output_token_details = outputDetails;
+  } catch {
+    // ignore
+  }
   if (
     data.input_tokens === undefined &&
     data.output_tokens === undefined &&
@@ -1180,6 +1231,14 @@ export function mergeTokenUsage(
     total_tokens: total,
     reasoning_tokens: next.reasoningTokens ?? existing.reasoningTokens,
     model,
+    input_token_details: mergeDetails(
+      existing.inputTokenDetails,
+      next.inputTokenDetails,
+    ),
+    output_token_details: mergeDetails(
+      existing.outputTokenDetails,
+      next.outputTokenDetails,
+    ),
   });
 }
 
@@ -1268,6 +1327,14 @@ export function addTokenUsage(
     total_tokens: total,
     reasoning_tokens: reasoning,
     model,
+    input_token_details: sumDetails(
+      existing.inputTokenDetails,
+      next.inputTokenDetails,
+    ),
+    output_token_details: sumDetails(
+      existing.outputTokenDetails,
+      next.outputTokenDetails,
+    ),
   });
 }
 
@@ -1727,8 +1794,8 @@ export const ToolDefinitionSchema = z.object({
   description: z.string().default(""),
   /** Whether tool runs locally. */
   is_local: z.boolean().default(true),
-  /** Credential provider type for delegated auth. */
-  provider_type: z.string().nullish(),
+  /** Credential provider key for delegated auth. */
+  provider: z.string().nullish(),
   /** Requested OAuth scopes for delegated auth. */
   scopes: z.array(z.string()).default([]),
   /** JSON schema for parameters. */

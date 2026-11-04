@@ -40,8 +40,7 @@ source:
 expose:
   allow_all: true
 auth:
-  type: bearer
-  env: JIRA_TOKEN
+  bearer: JIRA_TOKEN
 """
 
 OAUTH_TOOL_YAML_TEXT = """\
@@ -52,8 +51,7 @@ source:
 expose:
   allow_all: true
 auth:
-  type: oauth
-  provider_type: github
+  provider: github
   scopes: [repo]
 """
 
@@ -187,7 +185,7 @@ class TestToolServerStartup:
             "name": "jiradc_getComments",
             "description": "Returns comments for an issue.",
             "is_local": False,
-            "provider_type": None,
+            "provider": None,
             "scopes": [],
             "network": ["jira.example"],
             "timeout_seconds": 30,
@@ -1112,6 +1110,36 @@ class TestToolServerMCPExecution:
 
         assert response.status == "success"
         assert response.result == MCPToolResult(content=[{"type": "text", "text": "ok"}])
+
+    @pytest.mark.asyncio
+    async def test_unexpected_mcp_resolution_error_is_redacted_in_response_and_log(
+        self, monkeypatch, caplog
+    ):
+        import logging as _logging
+
+        import agent_engine_runner_shared.server.tool as tool_server
+
+        def fail_resolution(*_args, **_kwargs):
+            raise ValueError("bad url https://svc:Pa55w0rd@mcp.example.net/mcp")
+
+        monkeypatch.setattr(ToolServer, "_configured_mcp_tool", fail_resolution)
+        runtime = _make_runtime(deep_agent_enabled=False)
+
+        with caplog.at_level(_logging.ERROR, logger=tool_server.__name__):
+            response = await ToolServer(runtime)._handle_execute(
+                ToolPodExecuteRequest(
+                    execution_id="exec-1",
+                    tool_name="github__search_issues",
+                    arguments={},
+                    session_id="session-1",
+                    metadata={"mcp_server": "github", "mcp_tool": "search_issues"},
+                )
+            )
+
+        assert response.status == "error"
+        assert "Pa55w0rd" not in (response.error or "")
+        assert "mcp.example.net" in caplog.text
+        assert "Pa55w0rd" not in caplog.text
 
     @pytest.mark.asyncio
     async def test_executes_discovered_mcp_tool_original_name(self, monkeypatch):

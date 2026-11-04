@@ -27,7 +27,7 @@ def _write_connector_authoring(
     names = tool_names or ["jiradc_getComments", "jiradc_addComment"]
     definitions = {
         "source": {"name": "jiradc", "base_url": "https://jira.example/rest"},
-        "auth": {"type": "bearer", "env": "JIRA_TOKEN"},
+        "auth": {"bearer": "JIRA_TOKEN"},
         "tools": [
             {
                 "name": name,
@@ -59,8 +59,7 @@ def _write_connector_authoring(
         "expose:\n"
         "  allow_all: true\n"
         "auth:\n"
-        "  type: bearer\n"
-        "  env: JIRA_TOKEN\n",
+        "  bearer: JIRA_TOKEN\n",
         encoding="utf-8",
     )
     (tmp_path / "agent.yaml").write_text(
@@ -133,7 +132,7 @@ class TestApp:
             "name": "jiradc_getComments",
             "description": "Description for jiradc_getComments.",
             "is_local": False,
-            "provider_type": None,
+            "provider": None,
             "scopes": [],
             "network": ["jira.example"],
             "timeout_seconds": 30,
@@ -161,7 +160,7 @@ class TestApp:
 
         definitions = {
             "source": {"name": "jiradc", "base_url": "https://jira.example/rest"},
-            "auth": {"type": "bearer", "env": "JIRA_TOKEN"},
+            "auth": {"bearer": "JIRA_TOKEN"},
             "tools": [
                 {
                     "name": "jiradc_getComments",
@@ -188,8 +187,7 @@ class TestApp:
             "expose:\n"
             "  allow_all: true\n"
             "auth:\n"
-            "  type: bearer\n"
-            "  env: JIRA_TOKEN\n",
+            "  bearer: JIRA_TOKEN\n",
             encoding="utf-8",
         )
 
@@ -238,7 +236,7 @@ class TestApp:
             description="Existing tool",
             args_schema={},
             is_local=True,
-            provider_type=None,
+            provider=None,
             scopes=[],
             network=[],
             timeout_seconds=30,
@@ -553,7 +551,7 @@ class TestApp:
             description="Existing tool",
             args_schema={},
             is_local=True,
-            provider_type=None,
+            provider=None,
             scopes=[],
             network=[],
             timeout_seconds=30,
@@ -568,7 +566,7 @@ class TestApp:
                 description="MCP tool",
                 args_schema={},
                 is_local=False,
-                provider_type=None,
+                provider=None,
                 scopes=[],
                 network=["api.githubcopilot.com"],
                 timeout_seconds=30,
@@ -606,7 +604,7 @@ class TestApp:
             description="  Spaced description  ",
             args_schema={},
             is_local=True,
-            provider_type=None,
+            provider=None,
             scopes=[],
             network=[],
             timeout_seconds=30,

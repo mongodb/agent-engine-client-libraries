@@ -36,7 +36,10 @@ import {
   type Instrumentor,
   type AERQueryPlugin,
 } from "../../src/index.js";
-import { populateLlmRegistryFromEntrypoint } from "../../src/hooks.js";
+import {
+  populateLlmRegistryFromEntrypoint,
+  snapshotLlmRegistry,
+} from "../../src/hooks.js";
 
 afterEach(() => {
   resetHooks();
@@ -251,7 +254,7 @@ describe("populateLlmRegistryFromEntrypoint", () => {
     noLlmRegistered: "No LLM registered after entrypoint",
   };
 
-  test("preserves this binding when calling getAgent", () => {
+  test("preserves this binding when calling getAgent", async () => {
     const logger = { warn: vi.fn(), info: vi.fn() };
     class MockGraphBuilder {
       builderFn = (): unknown => ({});
@@ -264,10 +267,83 @@ describe("populateLlmRegistryFromEntrypoint", () => {
       }
     }
 
-    populateLlmRegistryFromEntrypoint(new MockGraphBuilder(), logger, warnings);
+    await populateLlmRegistryFromEntrypoint(
+      new MockGraphBuilder(),
+      logger,
+      warnings,
+    );
 
     expect(logger.warn).not.toHaveBeenCalledWith(warnings.entrypointFailed);
     expect(getNamedLlm("__default__")).toEqual({ model: "test" });
+  });
+
+  test("a concurrent population does not reset the registry under a live build", async () => {
+    // Two overlapping populations of the process-global registry. The reset
+    // happens before the build is awaited, so without the lock the second
+    // caller clears the registrations the first build is still working from,
+    // and that build then captures a baseline which is not its own.
+    const logger = { warn: vi.fn(), info: vi.fn(), error: vi.fn() };
+    const strategy = { usesPerInvocationBuild: true };
+
+    let releaseFirstBuild: () => void = () => {};
+    const firstBuildGate = new Promise<void>((resolve) => {
+      releaseFirstBuild = resolve;
+    });
+    let releaseSecondBuild: () => void = () => {};
+    const secondBuildGate = new Promise<void>((resolve) => {
+      releaseSecondBuild = resolve;
+    });
+    let firstBuildStarted: () => void = () => {};
+    const firstBuildReached = new Promise<void>((resolve) => {
+      firstBuildStarted = resolve;
+    });
+
+    let seenWhenFirstBuildResumed: string[] = [];
+    let builds = 0;
+    const graphBuilder = {
+      getAgent: () => ({}),
+      async buildGraph(): Promise<unknown> {
+        builds += 1;
+        if (builds === 1) {
+          entrypointScope(() => registerLlm("primary", { model: "first" }));
+          firstBuildStarted();
+          await firstBuildGate;
+          // What a real build reads here is what requireInvariantLlmIds will
+          // capture as the pod's baseline.
+          seenWhenFirstBuildResumed = [...snapshotLlmRegistry().keys()];
+          return {};
+        }
+        // The second build is slow too: it has not registered anything yet.
+        await secondBuildGate;
+        entrypointScope(() => registerLlm("primary", { model: "second" }));
+        return {};
+      },
+    };
+
+    const first = populateLlmRegistryFromEntrypoint(
+      graphBuilder,
+      logger,
+      warnings,
+      undefined,
+      strategy,
+    );
+    await firstBuildReached;
+
+    // A second request starts populating while the first build is still live.
+    const second = populateLlmRegistryFromEntrypoint(
+      graphBuilder,
+      logger,
+      warnings,
+      undefined,
+      strategy,
+    );
+
+    releaseFirstBuild();
+    await first;
+    releaseSecondBuild();
+    await second;
+
+    expect(seenWhenFirstBuildResumed).toEqual(["primary"]);
   });
 });
 

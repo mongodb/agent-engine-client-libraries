@@ -1030,7 +1030,7 @@ describe("AERServer execution timeout reports exactly one ERROR callback", () =>
 
     // Mirror the module's timeout computation so the test is robust to env.
     const timeoutMs =
-      (Number(process.env.RUNNER_EXECUTION_TIMEOUT) || 600) * 1000;
+      (Number(process.env.RUNNER_EXECUTION_TIMEOUT) || 3600) * 1000;
 
     vi.useFakeTimers();
     try {

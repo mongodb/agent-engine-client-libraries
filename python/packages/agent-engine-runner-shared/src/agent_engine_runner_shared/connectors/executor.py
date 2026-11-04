@@ -81,7 +81,7 @@ class ConnectorExecutor:
         if re.search(r"\{[^{}]+\}", self._definitions.source.base_url) and not any(
             credential.location == "path"
             for credential in (
-                self._definitions.auth.credential_bindings() if self._definitions.auth else []
+                (self._definitions.auth.api_keys if self._definitions.auth else None) or []
             )
         ):
             raise ValueError("connector path credential must be materialized before execution")
@@ -226,10 +226,10 @@ class ConnectorExecutor:
         """
         auth = self._definitions.auth
         base_url = self._definitions.source.base_url.rstrip("/")
-        if not auth or auth.type == "none":
+        if auth is None:
             return base_url, [], False
 
-        if auth.type == "oauth":
+        if auth.provider is not None:
             # Delegated calls must never fall back to a process/tenant secret;
             # the existing OE gate binds this authorization to the saved user.
             token = authorization.token if authorization else None
@@ -244,20 +244,18 @@ class ConnectorExecutor:
         secrets = env if env is not None else tenant_env_vars()
         auth_query: list[tuple[str, str]] = []
         has_path_auth = False
-        if auth.type == "bearer":
-            assert auth.env
-            headers["Authorization"] = f"Bearer {self._secret(secrets, auth.env)}"
-        elif auth.type == "basic":
-            assert auth.username_env and auth.password_env
-            username = self._secret(secrets, auth.username_env)
+        if auth.bearer is not None:
+            headers["Authorization"] = f"Bearer {self._secret(secrets, auth.bearer)}"
+        elif auth.basic is not None:
+            username = self._secret(secrets, auth.basic.username)
             if ":" in username:
                 raise ValueError("configured connector basic username is invalid")
-            value = f"{username}:{self._secret(secrets, auth.password_env)}"
+            value = f"{username}:{self._secret(secrets, auth.basic.password)}"
             headers["Authorization"] = "Basic " + base64.b64encode(value.encode("ascii")).decode(
                 "ascii"
             )
         else:
-            for credential in auth.credential_bindings():
+            for credential in auth.api_keys or []:
                 value = credential.prefix + self._secret(secrets, credential.env)
                 if credential.location == "header":
                     headers[credential.name] = value
@@ -345,7 +343,8 @@ class ConnectorExecutor:
         Invalid definitions/arguments/secrets raise ValueError before dispatch.
         HTTP and transport failures use httpx exceptions understood by ToolAPIError.
         Only GET/HEAD/OPTIONS retry 429/503; writes are never automatically replayed.
-        OAuth requires explicit request-local authorization; static modes ignore it.
+        A provider binding requires explicit request-local authorization; secret
+        bindings ignore it.
         """
         deadline = time.monotonic() + self._timeout_seconds
         tool = self._operations.get(name)

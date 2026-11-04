@@ -30,6 +30,8 @@ import { Memory } from "@mongodb-js/agent-engine-sdk-memory";
 import {
   AppBoundCrudClient,
   AppBoundRuntime,
+  BUILTIN_TOOL_NAMES,
+  ConnectorBundleError,
   clearWorkflowAdapter,
   createSecureToolFunction,
   discoverMcpTools,
@@ -41,6 +43,7 @@ import {
   getCheckpointWorkspaceId,
   getLogger,
   getStoreDbName,
+  resolveRuntimeBundle,
   resolveStoreDbName,
   makeMcpToolCallable,
   mcpServerNetworkHosts,
@@ -232,7 +235,7 @@ export interface AppOptions {
 
 export interface ToolDecoratorOptions {
   isLocal?: boolean;
-  providerType?: string;
+  provider?: string;
   scopes?: readonly string[];
   network?: readonly string[];
   timeout?: number;
@@ -432,12 +435,10 @@ export class App extends BaseApp {
   private mongoClient: unknown = null;
   private _checkpointer: PlatformCheckpointer | null = null;
   // Resolved once configured MCP servers have been discovered and registered
-  // as tools. `TenantRuntime.runAsync()` awaits `ready()` (which returns this
-  // promise) before binding the server, so no request can land before MCP
-  // tools are registered. Discovery is async (a `tools/list` HTTP round trip
-  // per server) but the constructor itself must stay synchronous, unlike
-  // Python's `App.__init__` which can block on `asyncio.run()`.
-  private readonly mcpToolsReady: Promise<void>;
+  // as tools, followed by connector registration. `TenantRuntime.runAsync()`
+  // awaits `ready()` before binding the server, so no request can land before
+  // both sets of tools are registered.
+  private readonly toolsReady: Promise<void>;
   // Per-project-resolved store DB name for the checkpointer + query plugin.
   // Resolved asynchronously in run() (the Node driver's listDatabases is async,
   // unlike pymongo) so the synchronous checkpointer() can read it. Null until
@@ -493,17 +494,19 @@ export class App extends BaseApp {
       }),
     };
     this.runtime = new TenantRuntime(runtimeOpts);
-    this.mcpToolsReady = this.registerMcpTools();
-    void this.mcpToolsReady.catch(() => undefined);
+    this.toolsReady = this.registerMcpTools().then(() => {
+      this.registerConnectorTools();
+    });
+    void this.toolsReady.catch(() => undefined);
   }
 
   /**
-   * Resolved once configured MCP servers have been discovered and registered
-   * as tools. `TenantRuntime.runAsync()` awaits this (via `GraphBuilderLike.ready()`)
-   * before starting the server.
+   * Resolved once configured MCP servers have been discovered and connector
+   * tools registered. `TenantRuntime.runAsync()` awaits this (via
+   * `GraphBuilderLike.ready()`) before starting the server.
    */
   async ready(): Promise<void> {
-    return this.mcpToolsReady;
+    return this.toolsReady;
   }
 
   /**
@@ -537,7 +540,7 @@ export class App extends BaseApp {
         description,
         argsSchema: binding.inputSchema as Record<string, JsonValue>,
         isLocal: false,
-        providerType: null,
+        provider: null,
         scopes: [],
         network: mcpServerNetworkHosts(binding.serverConfig),
         timeoutSeconds: binding.serverConfig.timeout_seconds,
@@ -548,6 +551,57 @@ export class App extends BaseApp {
       });
     }
     logger.info(`Registered ${bindings.length} MCP tool(s)`);
+  }
+
+  /**
+   * Register connector operations as remote AER tools.
+   *
+   * Python registers these synchronously in `App.__init__`. TypeScript has to
+   * wait for MCP discovery first so a connector name that collides with a
+   * discovered MCP tool fails before the server accepts work.
+   */
+  private registerConnectorTools(): void {
+    if (this.runtime.mode !== RuntimeMode.AER) return;
+    const bundle = resolveRuntimeBundle(this.runtime.getAgentConfig());
+    if (bundle.tools.length === 0) return;
+
+    bundle.requireAvailableNames(
+      new Set([
+        ...Object.keys(this.runtime.tools),
+        ...this.lcTools.keys(),
+        ...BUILTIN_TOOL_NAMES,
+      ]),
+    );
+    for (const bundledTool of bundle.tools) {
+      const operation = bundledTool.operation;
+      const metadata = bundledTool.registrationMetadata;
+      const remoteOnly = (): never => {
+        throw new Error("connector tools execute only through the Tool Pod");
+      };
+      const langchainTool = lcTool(
+        (_arguments: Record<string, unknown>) => remoteOnly(),
+        {
+          name: operation.name,
+          description: metadata.description,
+          schema: operation.inputSchema as never,
+        },
+      );
+      this.registerToolDefinition({
+        name: operation.name,
+        func: remoteOnly,
+        description: metadata.description,
+        argsSchema: operation.inputSchema as Record<string, JsonValue>,
+        isLocal: false,
+        provider: metadata.provider,
+        scopes: metadata.scopes,
+        network: metadata.network,
+        timeoutSeconds: metadata.timeout_seconds,
+        redactFields: metadata.redact_fields,
+        langchainTool,
+        connector: metadata.connector,
+      });
+    }
+    logger.info(`Registered ${bundle.tools.length} connector tool(s)`);
   }
 
   // ----- Read-only properties -----
@@ -574,7 +628,7 @@ export class App extends BaseApp {
     description: string;
     argsSchema: Record<string, JsonValue>;
     isLocal: boolean;
-    providerType: string | null;
+    provider: string | null;
     scopes: readonly string[];
     network: readonly string[];
     timeoutSeconds: number;
@@ -583,9 +637,16 @@ export class App extends BaseApp {
     /** Set for MCP-discovered tools so `getTools()` forwards Tool-Pod call metadata. */
     mcpServer?: string;
     mcpTool?: string;
+    /** Set for connector tools so registration metadata and errors identify the connector. */
+    connector?: string;
     onUnknownOutcome?: OnUnknownOutcome | undefined;
   }): void {
     if (args.name in this.runtime.tools || this.lcTools.has(args.name)) {
+      if (args.connector !== undefined) {
+        throw new ConnectorBundleError(
+          `connector tool ${JSON.stringify(args.name)} is already registered`,
+        );
+      }
       throw new Error(`tool '${args.name}' is already registered`);
     }
     const description = args.description.trim();
@@ -593,13 +654,14 @@ export class App extends BaseApp {
       name: args.name,
       description,
       is_local: args.isLocal,
-      provider_type: args.providerType,
+      provider: args.provider,
       scopes: args.scopes,
       network: args.network,
       timeout_seconds: args.timeoutSeconds,
       redact_fields: args.redactFields,
       ...(args.mcpServer !== undefined && { mcp_server: args.mcpServer }),
       ...(args.mcpTool !== undefined && { mcp_tool: args.mcpTool }),
+      ...(args.connector !== undefined && { connector: args.connector }),
       ...(args.onUnknownOutcome !== undefined && {
         on_unknown_outcome: args.onUnknownOutcome,
       }),
@@ -628,7 +690,7 @@ export class App extends BaseApp {
       args_schema: args.argsSchema,
       callable: args.func,
       remote: !args.isLocal,
-      ...(args.providerType !== null && { provider_type: args.providerType }),
+      ...(args.provider !== null && { provider: args.provider }),
       scopes: [...args.scopes],
       network: [...args.network],
       timeout_seconds: args.timeoutSeconds,
@@ -646,7 +708,7 @@ export class App extends BaseApp {
     options: ToolDecoratorOptions = {},
   ): <F extends (...input: never[]) => unknown>(fn: F) => F {
     const isLocal = options.isLocal ?? true;
-    const providerType = options.providerType ?? null;
+    const provider = options.provider ?? null;
     const scopes = options.scopes ?? [];
     const network = options.network ?? [];
     const timeout = options.timeout ?? 30;
@@ -678,7 +740,7 @@ export class App extends BaseApp {
         // rather than crash agent startup.
         argsSchema: schema ? deriveArgsSchema(name, schema) : {},
         isLocal,
-        providerType,
+        provider,
         scopes,
         network,
         timeoutSeconds: timeout,
@@ -1461,7 +1523,7 @@ export class App extends BaseApp {
       if (typeof mcpServer === "string" && typeof mcpTool === "string") {
         toolCallMetadata = { mcp_server: mcpServer, mcp_tool: mcpTool };
       }
-      const providerType = normalizeOptionalStr(toolMetadata["provider_type"]);
+      const provider = normalizeOptionalStr(toolMetadata["provider"]);
       let scopes: string[] = [];
       const rawScopes = toolMetadata["scopes"];
       if (Array.isArray(rawScopes)) {
@@ -1494,7 +1556,7 @@ export class App extends BaseApp {
         {
           metadata: toolCallMetadata,
           isLocal: toolMetadata["is_local"] !== false,
-          providerType,
+          provider,
           scopes,
           responseFormat: "content_and_artifact",
           toolDeclaredFormat,

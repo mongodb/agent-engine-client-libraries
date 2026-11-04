@@ -1,6 +1,7 @@
 """Tests for LangChainLLMAdapter."""
 
 import json
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -759,3 +760,89 @@ class TestAstream:
 
         assert len(chunks) == 1
         assert chunks[0].content == "awaitable"
+
+
+class TestPromptCaching:
+    """Adapter-level tests that the breakpoints reach the provider call.
+
+    The placement rules live in ``anthropic_cache`` and are tested there; these
+    assertions run the real adapter so a break in message conversion or option
+    forwarding still fails.
+    """
+
+    def _anthropic(self) -> Any:
+        langchain_anthropic = pytest.importorskip("langchain_anthropic")
+        return langchain_anthropic.ChatAnthropic(
+            model_name="claude-sonnet-5", api_key="test-key"
+        )
+
+    @pytest.mark.anyio
+    async def test_astream_marks_system_and_passes_tail_option(self, monkeypatch):
+        ChatAnthropic = pytest.importorskip("langchain_anthropic").ChatAnthropic
+        model = ChatAnthropic(model_name="claude-sonnet-5", api_key="test-key")
+        captured: dict[str, Any] = {}
+
+        async def fake_astream(_self, messages, **kwargs):
+            captured["messages"] = messages
+            captured["kwargs"] = kwargs
+            chunk = MagicMock()
+            chunk.content = "ok"
+            chunk.tool_call_chunks = []
+            chunk.tool_calls = []
+            chunk.usage_metadata = None
+            yield chunk
+
+        monkeypatch.setattr(ChatAnthropic, "astream", fake_astream)
+
+        adapter = LangChainLLMAdapter(model)
+        async for _chunk in adapter.astream(
+            [
+                Message(role="system", content="you are helpful"),
+                Message(role="user", content="hi"),
+            ],
+            cache_control={"type": "ephemeral", "ttl": "1h"},
+        ):
+            pass
+
+        assert captured["kwargs"]["cache_control"] == {
+            "type": "ephemeral",
+            "ttl": "1h",
+        }
+        assert captured["messages"][0].content == [
+            {
+                "type": "text",
+                "text": "you are helpful",
+                "cache_control": {"type": "ephemeral", "ttl": "1h"},
+            }
+        ]
+        assert captured["messages"][1].content == "hi"
+
+    @pytest.mark.anyio
+    async def test_astream_omits_tail_option_without_a_conversation(self, monkeypatch):
+        """A system-only request marks the system prompt once, not twice."""
+        ChatAnthropic = pytest.importorskip("langchain_anthropic").ChatAnthropic
+        model = ChatAnthropic(model_name="claude-sonnet-5", api_key="test-key")
+        captured: dict[str, Any] = {}
+
+        async def fake_astream(_self, messages, **kwargs):
+            captured["messages"] = messages
+            captured["kwargs"] = kwargs
+            chunk = MagicMock()
+            chunk.content = "ok"
+            chunk.tool_call_chunks = []
+            chunk.tool_calls = []
+            chunk.usage_metadata = None
+            yield chunk
+
+        monkeypatch.setattr(ChatAnthropic, "astream", fake_astream)
+
+        adapter = LangChainLLMAdapter(model)
+        async for _chunk in adapter.astream(
+            [Message(role="system", content="you are helpful")]
+        ):
+            pass
+
+        assert "cache_control" not in captured["kwargs"]
+        assert captured["messages"][0].content[0]["cache_control"] == {
+            "type": "ephemeral"
+        }

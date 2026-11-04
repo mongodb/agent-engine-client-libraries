@@ -34,7 +34,7 @@ import {
   normalizeContent,
   normalizeToolCallArgs,
 } from "@mongodb-js/agent-engine-runner-shared";
-import { platformMessagesToLc } from "./messages.js";
+import { prepareProviderCall } from "./provider_call.js";
 
 // ---------------------------------------------------------------------------
 // Minimal contract for the underlying LangChain chat model
@@ -60,6 +60,12 @@ export interface LangChainChatModelLike {
     tools: ReadonlyArray<Record<string, JsonValue>>,
     kwargs?: { tool_choice?: unknown },
   ): LangChainChatModelLike;
+  /**
+   * Provider identity accessors, read by provider-specific request shaping to
+   * decide whether a client speaks a given wire format.
+   */
+  _llmType?(): string;
+  getName?(): string;
 }
 
 // ---------------------------------------------------------------------------
@@ -103,8 +109,8 @@ export class LangChainLLMAdapter implements BaseLLM {
     messages: readonly Message[],
     kwargs: Readonly<Record<string, unknown>> = {},
   ): Promise<LLMResponse> {
-    const lcMessages = platformMessagesToLc(messages);
-    const response = await this.llm.invoke(lcMessages, kwargs);
+    const call = prepareProviderCall(this.llm, messages, kwargs);
+    const response = await this.llm.invoke(call.messages, call.kwargs);
     return responseToLlmResponse(response);
   }
 
@@ -113,7 +119,7 @@ export class LangChainLLMAdapter implements BaseLLM {
     messages: readonly Message[],
     kwargs: Readonly<Record<string, unknown>> = {},
   ): AsyncIterable<LLMStreamChunk> {
-    const lcMessages = platformMessagesToLc(messages);
+    const call = prepareProviderCall(this.llm, messages, kwargs);
 
     if (typeof this.llm.stream !== "function") {
       throw new Error(
@@ -121,7 +127,7 @@ export class LangChainLLMAdapter implements BaseLLM {
       );
     }
 
-    const streamResult = this.llm.stream(lcMessages, kwargs);
+    const streamResult = this.llm.stream(call.messages, call.kwargs);
     // LangChain.js streams are AsyncIterable directly; some adapters return a Promise<AsyncIterable>.
     const stream = isPromise(streamResult) ? await streamResult : streamResult;
     let running: LLMTokenUsage | undefined;
@@ -264,7 +270,7 @@ function coerceToDict(tc: unknown): Record<string, unknown> | undefined {
   return undefined;
 }
 
-function isPlainObject(value: unknown): boolean {
+function isPlainObject(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 

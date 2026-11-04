@@ -8,7 +8,7 @@
  * graph construction.
  *
  * Scope deltas vs. Python (see `AGENTS.md` for rationale):
- *   - No memory-server mode (`RuntimeMode` has `AER`, `TOOL`, and `TOOL_FUNCTION`).
+ *   - No memory-server mode (`RuntimeMode` has `AER` and `TOOL`).
  *   - `setupTracing` owns the MongoClient build (async). Python builds it
  *     inline in `_setup_tracing` (sync pymongo).
  *   - `shutdown()` and SIGTERM/SIGINT wiring are TS additions — Python's
@@ -28,7 +28,6 @@ import {
   type ITenantRuntime,
   type ServerToolFn,
 } from "./server/base.js";
-import { ToolFunctionRunner } from "./server/function.js";
 import { ToolServer } from "./server/tool.js";
 import {
   scrubCredentials,
@@ -435,26 +434,6 @@ export class TenantRuntime implements ITenantRuntime {
     // to the OTel no-op tracer and are silently dropped. Setup failures are
     // already logged-and-swallowed in `initTracing`, so this never rejects.
     await this.tracingReady;
-
-    // Function mode is not a server: one invocation, report result, return.
-    // Must branch before the server dispatch so no HTTP listener is bound.
-    // graphBuilder.ready() runs inside ToolFunctionRunner after the request
-    // is read, so startup failures still carry platform_trace_id.
-    if (this.mode === RuntimeMode.TOOL_FUNCTION) {
-      try {
-        await new ToolFunctionRunner(this).run();
-      } finally {
-        // BatchSpanProcessor's periodic flush timer is unref'd (so it can't
-        // pin a long-running server's event loop) — but that same unref
-        // means nothing keeps a one-shot function-mode process alive long
-        // enough for that timer to ever fire. Without an explicit shutdown
-        // here, this invocation's spans (Mongo and OTLP)
-        // are silently lost the moment the process exits. Runs even when
-        // run() throws, so a failed invocation's spans aren't lost either.
-        await this.shutdown();
-      }
-      return;
-    }
 
     // Block startup on the graph builder's own async setup (e.g. MCP tool
     // discovery) so no request can land before tools are registered.

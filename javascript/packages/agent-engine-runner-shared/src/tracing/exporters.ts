@@ -19,6 +19,12 @@ import type { Collection } from "mongodb";
 
 import { getLogger } from "../logger.js";
 
+import {
+  ConversationDeltaTracker,
+  hasInputMessages,
+  traceStream,
+} from "./conversation.js";
+
 const logger = getLogger("agent_engine_runner_shared.tracing");
 
 const EXPORT_SUCCESS = 0; // ExportResultCode.SUCCESS
@@ -143,6 +149,8 @@ export class JSONLSpanExporter implements SpanExporter {
 }
 
 export class MongoDBSpanExporter implements SpanExporter {
+  private conversations = new ConversationDeltaTracker();
+
   constructor(private readonly collection: Collection) {}
 
   export(
@@ -153,14 +161,37 @@ export class MongoDBSpanExporter implements SpanExporter {
       resultCallback({ code: EXPORT_SUCCESS });
       return;
     }
-    const docs = spans.map((s) => spanToDoc(s));
+    // Trim on a copy: a failed insert must not advance past messages the store
+    // never received, or later calls would omit them.
+    const staged = this.conversations.copy();
+    const docs = spans.map((s) => this.trimConversation(spanToDoc(s), staged));
     this.collection
       .insertMany(docs)
-      .then(() => resultCallback({ code: EXPORT_SUCCESS }))
+      .then(() => {
+        this.conversations = staged;
+        resultCallback({ code: EXPORT_SUCCESS });
+      })
       .catch((err: Error) => {
         logger.error({ err: err.message }, "Failed to write traces to MongoDB");
         resultCallback({ code: EXPORT_FAILED, error: err });
       });
+  }
+
+  /** Keep only the input messages this call added (see `conversation.ts`). */
+  private trimConversation(
+    doc: Record<string, unknown>,
+    tracker: ConversationDeltaTracker,
+  ): Record<string, unknown> {
+    const attributes = doc["attributes"] as Record<string, unknown> | undefined;
+    if (!attributes || !hasInputMessages(attributes)) {
+      return doc;
+    }
+    doc["attributes"] = tracker.trim(
+      attributes,
+      String(doc["trace_id"]),
+      traceStream((doc["resource"] ?? {}) as Record<string, unknown>),
+    );
+    return doc;
   }
 
   shutdown(): Promise<void> {

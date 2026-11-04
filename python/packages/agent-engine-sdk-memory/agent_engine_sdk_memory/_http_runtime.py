@@ -332,6 +332,7 @@ class _HttpMemoryRuntime:
         max_tokens: int | None = None,
         format_style: FormatStyle | str | None = None,
         include_memories: bool = False,
+        collapse_duplicate_content: bool = True,
     ) -> ContextResponse:
         """POST /retrieval/context-from-sources.
 
@@ -355,6 +356,13 @@ class _HttpMemoryRuntime:
             body["format_style"] = format_style
         if include_memories:
             body["include_memories"] = True
+        # The server default is true, so the key is sent only when the caller
+        # disabled the collapse — an older server that predates the field is
+        # then never sent an unknown key by a default-path caller. An explicit
+        # True is dropped too (indistinguishable from unset), which is correct
+        # only while the server default stays true.
+        if not collapse_duplicate_content:
+            body["collapse_duplicate_content"] = False
         resp = self._post(_CONTEXT_FROM_SOURCES_SUFFIX, body)
         return ContextResponse.model_validate(resp.json())
 

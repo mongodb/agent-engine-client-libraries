@@ -1,0 +1,178 @@
+# Connector auth binding cases asserted by both the Python and TypeScript
+# runner-shared suites, so both models accept and refuse the same blocks with
+# the same message. The copies under
+# packages/python/packages/agent-engine-runner-shared/tests/unit/connectors/fixtures/
+# and packages/javascript/packages/agent-engine-runner-shared/tests/unit/connectors/fixtures/
+# must stay identical; the Python suite compares them.
+valid:
+  - name: bearer
+    auth: {bearer: SERVICE_TOKEN}
+  - name: bearer with constant headers
+    auth: {bearer: SERVICE_TOKEN, headers: {X-Api-Version: "2"}}
+  - name: basic
+    auth: {basic: {username: SERVICE_USERNAME, password: SERVICE_PASSWORD}}
+  - name: one api key
+    auth: {api_keys: [{env: SERVICE_KEY, location: header, name: X-API-Key}]}
+  - name: api key with prefix
+    auth: {api_keys: [{env: SERVICE_KEY, location: header, name: Authorization, prefix: "Token "}]}
+  - name: two api keys
+    auth:
+      api_keys:
+        - {env: CLIENT_ID, location: header, name: X-Client-ID}
+        - {env: CLIENT_SECRET, location: query, name: client_secret}
+  - name: provider
+    auth: {provider: github}
+  - name: provider with scopes
+    auth: {provider: github, scopes: [repo, "read:org"]}
+  - name: provider with empty scopes
+    auth: {provider: github, scopes: []}
+
+refused:
+  # Earlier spellings name the key that replaces them.
+  - name: type bearer
+    auth: {type: bearer, env: SERVICE_TOKEN}
+    error: "auth.type is not supported; use bearer: <secret>"
+  - name: type basic
+    auth: {type: basic, username_env: SERVICE_USERNAME, password_env: SERVICE_PASSWORD}
+    error: "auth.type is not supported; use basic: {username: <secret>, password: <secret>}"
+  - name: type api_key
+    auth: {type: api_key, env: SERVICE_KEY, header: X-API-Key}
+    error: "auth.type is not supported; use api_keys: [{env, location, name}]"
+  - name: type api_keys
+    auth:
+      type: api_keys
+      credentials:
+        - {env: CLIENT_ID, location: header, name: X-Client-ID}
+        - {env: CLIENT_SECRET, location: query, name: client_secret}
+    error: "auth.type is not supported; use api_keys: [{env, location, name}]"
+  - name: type oauth
+    auth: {type: oauth, provider: github, scopes: [repo]}
+    error: "auth.type is not supported; use provider: <OAuth app>"
+  - name: type none
+    auth: {type: none}
+    error: "auth.type is not supported; remove the auth block for no credential"
+  - name: unknown type
+    auth: {type: digest}
+    error: "auth.type is not supported; use one of bearer, basic, api_keys or provider"
+  - name: type beside a new key
+    auth: {type: bearer, bearer: SERVICE_TOKEN}
+    error: "auth.type is not supported; use bearer: <secret>"
+  - name: env
+    auth: {env: SERVICE_TOKEN}
+    error: "auth.env is not supported; use bearer: <secret> or api_keys: [{env, location, name}]"
+  - name: header
+    auth: {api_keys: [{env: SERVICE_KEY, location: header, name: X-API-Key}], header: X-API-Key}
+    error: "auth.header is not supported; use api_keys: [{env, location, name}]"
+  - name: location
+    auth: {location: query}
+    error: "auth.location is not supported; use api_keys: [{env, location, name}]"
+  - name: name
+    auth: {name: api_key}
+    error: "auth.name is not supported; use api_keys: [{env, location, name}]"
+  - name: prefix
+    auth: {prefix: "Token "}
+    error: "auth.prefix is not supported; use api_keys: [{env, location, name}]"
+  - name: username_env
+    auth: {username_env: SERVICE_USERNAME}
+    error: "auth.username_env is not supported; use basic: {username: <secret>, password: <secret>}"
+  - name: password_env
+    auth: {password_env: SERVICE_PASSWORD}
+    error: "auth.password_env is not supported; use basic: {username: <secret>, password: <secret>}"
+  - name: credentials
+    auth: {credentials: [{env: SERVICE_KEY, location: header, name: X-API-Key}]}
+    error: "auth.credentials is not supported; use api_keys: [{env, location, name}]"
+  - name: provider_type
+    auth: {provider_type: github, scopes: [repo]}
+    error: "auth.provider_type is not supported; use provider: <OAuth app>"
+  - name: unknown key
+    auth: {bearer: SERVICE_TOKEN, token: SERVICE_TOKEN}
+    error: "auth.token is not supported; use one of bearer, basic, api_keys or provider"
+  - name: unknown key with mixed case
+    auth: {bearer: SERVICE_TOKEN, X-Custom_Key9: SERVICE_TOKEN}
+    error: "auth.X-Custom_Key9 is not supported; use one of bearer, basic, api_keys or provider"
+  - name: unknown key with control bytes
+    auth: {"bad\nkey": SERVICE_TOKEN}
+    error: "auth contains an unsupported key; use one of bearer, basic, api_keys or provider"
+  - name: unknown key over the name limit
+    auth: {bearer: SERVICE_TOKEN, KKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKKK: SERVICE_TOKEN}
+    error: "auth contains an unsupported key; use one of bearer, basic, api_keys or provider"
+
+  # Exactly one credential key.
+  - name: empty block
+    auth: {}
+    error: "auth requires one of bearer, basic, api_keys or provider"
+  - name: headers only
+    auth: {headers: {X-Api-Version: "2"}}
+    error: "auth requires one of bearer, basic, api_keys or provider"
+  - name: bearer and provider
+    auth: {bearer: SERVICE_TOKEN, provider: github}
+    error: "auth takes only one of bearer, basic, api_keys or provider; found bearer, provider"
+  - name: basic and api_keys
+    auth:
+      basic: {username: SERVICE_USERNAME, password: SERVICE_PASSWORD}
+      api_keys: [{env: SERVICE_KEY, location: header, name: X-API-Key}]
+    error: "auth takes only one of bearer, basic, api_keys or provider; found basic, api_keys"
+  - name: scopes without provider
+    auth: {bearer: SERVICE_TOKEN, scopes: [repo]}
+    error: "auth.scopes requires provider"
+
+  # Values each key accepts.
+  - name: bearer names a platform variable
+    auth: {bearer: AGENTIC_API_KEY}
+    error: "auth.bearer must name a workspace secret"
+  - name: bearer is not a secret name
+    auth: {bearer: "not a name"}
+    error: "auth.bearer must name a workspace secret"
+  - name: basic without password
+    auth: {basic: {username: SERVICE_USERNAME}}
+    error: "auth.basic requires username and password secrets"
+  - name: basic with an earlier field
+    auth: {basic: {username_env: SERVICE_USERNAME, password_env: SERVICE_PASSWORD}}
+    error: "auth.basic requires username and password secrets"
+  - name: basic names a platform variable
+    auth: {basic: {username: SERVICE_USERNAME, password: AGENTIC_API_KEY}}
+    error: "auth.basic username and password must name workspace secrets"
+  - name: basic reuses one secret
+    auth: {basic: {username: SERVICE_SECRET, password: SERVICE_SECRET}}
+    error: "auth.basic username and password must be different secrets"
+  - name: no api keys
+    auth: {api_keys: []}
+    error: "auth.api_keys requires at least one key"
+  - name: api key names a platform variable
+    auth: {api_keys: [{env: AGENTIC_API_KEY, location: header, name: X-API-Key}]}
+    error: "credential requires a tenant-owned environment reference"
+  - name: api keys share a destination
+    auth:
+      api_keys:
+        - {env: FIRST_KEY, location: header, name: X-API-Key}
+        - {env: SECOND_KEY, location: header, name: x-api-key}
+    error: "auth.api_keys has duplicate credential destinations"
+  - name: provider with whitespace
+    auth: {provider: "git hub"}
+    error: "auth.provider must name an OAuth app without whitespace"
+  - name: provider with a newline
+    auth: {provider: "github\n"}
+    error: "auth.provider must name an OAuth app without whitespace"
+  - name: empty provider
+    auth: {provider: ""}
+    error: "auth.provider must name an OAuth app without whitespace"
+  - name: repeated scope
+    auth: {provider: github, scopes: [repo, repo]}
+    error: "auth.scopes must be unique OAuth scope tokens"
+  - name: scope with a space
+    auth: {provider: github, scopes: ["repo read"]}
+    error: "auth.scopes must be unique OAuth scope tokens"
+  - name: empty scope
+    auth: {provider: github, scopes: [""]}
+    error: "auth.scopes must be unique OAuth scope tokens"
+  - name: constant header replaces the provider token
+    auth: {provider: github, headers: {Authorization: override}}
+    error: "static auth headers cannot control transport headers"
+  - name: constant header replaces an api key
+    auth:
+      api_keys: [{env: SERVICE_KEY, location: header, name: X-API-Key}]
+      headers: {x-api-key: override}
+    error: "static auth headers collide with credential headers"
+  - name: constant header controls transport
+    auth: {bearer: SERVICE_TOKEN, headers: {Host: evil.example}}
+    error: "static auth headers cannot control transport headers"

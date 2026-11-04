@@ -11,10 +11,15 @@ from pathlib import Path
 from typing import Any, Iterator
 
 import pytest
+import yaml
 
 from agent_engine_runner_shared.connectors import load_tool_defs
-from agent_engine_runner_shared.connectors.definitions import Auth
-from agent_engine_runner_shared.connectors.generate import compile_catalog
+from agent_engine_runner_shared.connectors.generate import (
+    CompileResult,
+    GenerateError,
+    compile_catalog,
+    regenerate_catalog,
+)
 
 CORPUS_DIR = Path(__file__).parent
 MANIFEST = json.loads((CORPUS_DIR / "manifest.json").read_text(encoding="utf-8"))
@@ -31,35 +36,62 @@ PRESENTATIONS = {
     "compound_headers",
 }
 SOURCE_AUTH_CASES = [
-    ("slack-com", {"type": "bearer"}),
-    ("twilio-com-api", {"type": "basic"}),
-    ("sendgrid-com", {"type": "api_key", "location": "header", "name": "Authorization"}),
-    ("nasa-gov-apod", {"type": "api_key", "location": "query", "name": "api_key"}),
+    ("twilio-com-api", {"basic": {}}),
+    ("sendgrid-com", {"api_keys": [{"location": "header", "name": "Authorization"}]}),
+    ("nasa-gov-apod", {"api_keys": [{"location": "query", "name": "api_key"}]}),
 ]
 
 
-def _auth(api: dict[str, Any]) -> Auth | None:
+def _auth(api: dict[str, Any]) -> dict[str, Any] | None:
+    """The tool.yaml auth block a developer writes for the accepted presentation."""
     presentation = api["auth"]["presentation"]
     if presentation == "none":
         return None
     if presentation == "bearer":
-        return Auth(type="bearer", env="CONNECTOR_TOKEN")
-    if presentation.endswith("_api_key"):
-        return Auth(
-            type="api_key",
-            env="CONNECTOR_TOKEN",
-            location=presentation.removesuffix("_api_key"),
-            name=api["auth"].get("name", "api_key"),
-        )
+        return {"bearer": "CONNECTOR_TOKEN"}
     if presentation == "basic":
-        return Auth(type="basic", username_env="CONNECTOR_USER", password_env="CONNECTOR_PASS")
-    return Auth(
-        type="api_keys",
-        credentials=[
+        return {"basic": {"username": "CONNECTOR_USERNAME", "password": "CONNECTOR_PASSWORD"}}
+    if presentation.endswith("_api_key"):
+        location = presentation.removesuffix("_api_key")
+        name = api["auth"].get("name", "api_key")
+        return {"api_keys": [{"env": "CONNECTOR_TOKEN", "location": location, "name": name}]}
+    return {
+        "api_keys": [
             {"env": f"CONNECTOR_SECRET_{index}", "location": "header", "name": f"X-Key-{index}"}
             for index in range(api["auth"]["credential_count"])
-        ],
-    )
+        ]
+    }
+
+
+def _spec(api_id: str) -> Path:
+    spec = SPECS_DIR / f"{api_id}.json"
+    if not spec.is_file():
+        message = f"missing corpus fixture {spec.name}; run fetch_corpus.py"
+        if STRICT:
+            pytest.fail(message)
+        pytest.skip(message)
+    return spec
+
+
+def _compile_with_binding(tmp_path: Path, api: dict[str, Any], spec: Path) -> CompileResult:
+    """Compile through a hand-written tool.yaml, the route for any auth block."""
+    out = tmp_path / api["id"]
+    out.mkdir()
+    authoring: dict[str, Any] = {
+        "name": api["id"],
+        "tool_defs": "tool_defs.yaml",
+        "source": {
+            "type": "openapi",
+            "base_url": api["auth"].get("base_url", "https://api.example.com"),
+            "spec": os.path.relpath(spec, out),
+        },
+        "expose": {"allow_all": True},
+    }
+    auth = _auth(api)
+    if auth is not None:
+        authoring["auth"] = auth
+    (out / "tool.yaml").write_text(yaml.safe_dump(authoring), encoding="utf-8")
+    return regenerate_catalog(out / "tool.yaml", skip_unsupported=True)
 
 
 @contextmanager
@@ -112,12 +144,7 @@ def test_real_source_auth_is_projected(
     tmp_path: Path, api_id: str, expected: dict[str, Any]
 ) -> None:
     """Keep source-auth parsing covered independently from intentional CLI overrides."""
-    spec = SPECS_DIR / f"{api_id}.json"
-    if not spec.is_file():
-        message = f"missing corpus fixture {spec.name}; run fetch_corpus.py"
-        if STRICT:
-            pytest.fail(message)
-        pytest.skip(message)
+    spec = _spec(api_id)
     with _compile_deadline(MANIFEST["compile_timeout_seconds"]):
         result = compile_catalog(
             str(spec),
@@ -132,23 +159,38 @@ def test_real_source_auth_is_projected(
     assert definitions.externalize["auth"] == expected
 
 
-@pytest.mark.parametrize("api", MANIFEST["apis"], ids=lambda api: api["id"])
-def test_api_meets_coverage_floor(tmp_path: Path, api: dict[str, Any]) -> None:
-    spec = SPECS_DIR / f"{api['id']}.json"
-    if not spec.is_file():
-        message = f"missing corpus fixture {spec.name}; run fetch_corpus.py"
-        if STRICT:
-            pytest.fail(message)
-        pytest.skip(message)
+def test_real_oauth_source_needs_a_provider_and_proposes_its_scopes(tmp_path: Path) -> None:
+    spec = _spec("slack-com")
+    with (
+        _compile_deadline(MANIFEST["compile_timeout_seconds"]),
+        pytest.raises(GenerateError, match="authenticate with OAuth"),
+    ):
+        compile_catalog(
+            str(spec), name="slack", skip_unsupported=True, out_dir=tmp_path / "refused"
+        )
+
     with _compile_deadline(MANIFEST["compile_timeout_seconds"]):
         result = compile_catalog(
             str(spec),
-            name=api["id"],
-            base_url=api["auth"].get("base_url", "https://api.example.com"),
-            auth=_auth(api),
+            name="slack",
+            provider="slack",
+            allow=["slack_chat_postMessage", "slack_users_info"],
             skip_unsupported=True,
-            out_dir=tmp_path / api["id"],
+            out_dir=tmp_path / "slack",
         )
+
+    assert result.tool_yaml is not None
+    assert yaml.safe_load(result.tool_yaml.read_text(encoding="utf-8"))["auth"] == {
+        "provider": "slack",
+        "scopes": ["chat:write:bot", "chat:write:user", "users:read"],
+    }
+
+
+@pytest.mark.parametrize("api", MANIFEST["apis"], ids=lambda api: api["id"])
+def test_api_meets_coverage_floor(tmp_path: Path, api: dict[str, Any]) -> None:
+    spec = _spec(api["id"])
+    with _compile_deadline(MANIFEST["compile_timeout_seconds"]):
+        result = _compile_with_binding(tmp_path, api, spec)
     definitions = load_tool_defs(result.catalog)
     assert len(definitions.tools) >= api["minimum"]
     skipped = (definitions.externalize or {}).get("skipped", [])

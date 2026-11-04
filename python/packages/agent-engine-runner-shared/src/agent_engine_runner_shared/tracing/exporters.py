@@ -4,21 +4,35 @@ Span Exporters for Runner SDK.
 Simple exporters that work with OpenInference instrumentation:
 - JSONLSpanExporter: Optional explicit local debugging exporter.
 - MongoDBSpanExporter: Writes to MongoDB collection (when configured).
+- PlatformSpanExporter: Sends spans to the Orchestration Engine, which stores
+  them in the project traces collection.
 - ContentPolicyOTLPSpanExporter: Wraps an OTLP exporter, applying the
   AGENTIC_PLATFORM_OTEL_CONTENT_CAPTURE redaction policy.
 """
 
 from __future__ import annotations
 
+import asyncio
+import concurrent.futures
+import datetime
 import json
 import logging
 import os
+import random
 import threading
+import time
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, Sequence
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, Sequence
 
+import httpx
 from opentelemetry.sdk.trace import Event, ReadableSpan
 from opentelemetry.sdk.trace.export import SpanExporter, SpanExportResult
+
+from agent_engine_runner_shared.tracing.conversation import (
+    ConversationDeltaTracker,
+    has_input_messages,
+    trace_stream,
+)
 
 if TYPE_CHECKING:
     from pymongo.collection import Collection
@@ -95,6 +109,19 @@ def _span_to_dict(span: ReadableSpan) -> Dict[str, Any]:
     return doc
 
 
+def _trim_conversation(doc: Dict[str, Any], tracker: ConversationDeltaTracker) -> Dict[str, Any]:
+    """Keep only the input messages this call added (see tracing.conversation)."""
+    attributes = doc.get("attributes")
+    if not attributes or not has_input_messages(attributes):
+        return doc
+    doc["attributes"] = tracker.trim(
+        attributes,
+        trace_id=doc["trace_id"],
+        stream_id=trace_stream(doc.get("resource") or {}),
+    )
+    return doc
+
+
 class JSONLSpanExporter(SpanExporter):
     """Exports spans to a JSONL file."""
 
@@ -125,6 +152,7 @@ class MongoDBSpanExporter(SpanExporter):
 
     def __init__(self, collection: "Collection"):
         self.collection = collection
+        self._conversations = ConversationDeltaTracker()
 
     def export(self, spans: Sequence[ReadableSpan]) -> SpanExportResult:
         """Insert spans as documents into MongoDB."""
@@ -132,8 +160,12 @@ class MongoDBSpanExporter(SpanExporter):
             return SpanExportResult.SUCCESS
 
         try:
-            docs = [_span_to_dict(span) for span in spans]
+            # Trim on a copy: a failed insert must not advance past messages the
+            # store never received, or later calls would omit them.
+            staged = self._conversations.copy()
+            docs = [_trim_conversation(_span_to_dict(span), staged) for span in spans]
             self.collection.insert_many(docs)
+            self._conversations = staged
             return SpanExportResult.SUCCESS
         except Exception as e:
             logger.error(f"Failed to write traces to MongoDB: {e}", exc_info=True)
@@ -408,3 +440,424 @@ class ContentPolicyOTLPSpanExporter(SpanExporter):
         except Exception:
             logger.error("OTLP exporter force_flush failed", exc_info=True)
             return False
+
+
+# =============================================================================
+# Platform trace exporter (Orchestration Engine /internal/traces)
+#
+# The guest sends OTLP-protobuf batches to the OE, which converts and stores
+# them in the project traces collection. This replaces the guest's direct
+# MongoDB write: it is the platform trace path, independent of customer OTLP
+# export, and carries unredacted spans so the playground can show prompts and
+# outputs as it did from Mongo.
+# =============================================================================
+
+_PLATFORM_TRACE_INGEST_PATH = "/internal/traces"
+_OTLP_PROTOBUF_CONTENT_TYPE = "application/x-protobuf"
+
+# The OE rejects a raw request body over its own configured limit with 413.
+# Chunk under the same default so a large batch is split before it is sent,
+# rather than after a rejection; a single span larger than this is dropped.
+_DEFAULT_PLATFORM_MAX_REQUEST_BYTES = 8 << 20
+
+# Overall deadline for one export() call. export() runs synchronously on the
+# BatchSpanProcessor worker thread, so a bounded deadline keeps an unreachable
+# or slow OE from stalling the export queue behind it.
+_DEFAULT_PLATFORM_EXPORT_TIMEOUT_SECONDS = 10.0
+_PLATFORM_PER_ATTEMPT_TIMEOUT_SECONDS = 3.0
+
+# Retryable: the OE is rolling (404), shedding (503/429), or a gateway hiccup
+# (502/504). Any other status is terminal for the batch.
+_PLATFORM_RETRYABLE_STATUS = frozenset({404, 429, 502, 503, 504})
+
+_PLATFORM_BACKOFF_BASE_SECONDS = 0.5
+_PLATFORM_BACKOFF_MAX_SECONDS = 5.0
+
+
+class _ExportDeadlineExceeded(Exception):
+    """A platform trace POST did not finish within the remaining export budget."""
+
+
+_platform_loop: "asyncio.AbstractEventLoop | None" = None
+_platform_loop_lock = threading.Lock()
+
+
+def _platform_event_loop() -> "asyncio.AbstractEventLoop":
+    """Return the process-wide loop that runs cancellable platform trace POSTs.
+
+    A synchronous httpx request cannot be aborted once it is in flight, so a
+    total wall-clock export deadline can only be enforced by cancelling an async
+    request. One daemon loop serves every exporter and lives for the process.
+    """
+    global _platform_loop
+    with _platform_loop_lock:
+        if _platform_loop is None:
+            loop = asyncio.new_event_loop()
+
+            def _run() -> None:
+                asyncio.set_event_loop(loop)
+                loop.run_forever()
+
+            threading.Thread(target=_run, daemon=True, name="platform-trace-export").start()
+            _platform_loop = loop
+        return _platform_loop
+
+
+def _default_platform_client_factory(base_url: str) -> "Awaitable[httpx.AsyncClient]":
+    """Build the async mTLS client used for platform trace POSTs.
+
+    The async twin of ``get_shared_client``: same platform mTLS and self-span
+    suppression, but cancellable so the export deadline can abort a request.
+    """
+    from agent_engine_runner_shared.tls_client import create_async_httpx_client_with_tls
+    from agent_engine_runner_shared.utils import get_request_timeout
+
+    return create_async_httpx_client_with_tls(base_url, get_request_timeout())
+
+
+class _PlatformTracePoster:
+    """Cancellable transport for platform trace POSTs.
+
+    A synchronous httpx request cannot be aborted once in flight, so the
+    exporter's total wall-clock deadline is enforced by cancelling an async
+    request. The client is cached and rebuilt when the mounted certificates
+    rotate, so keep-alive and certificate rotation match the shared synchronous
+    client.
+    """
+
+    def __init__(
+        self,
+        base_url: str,
+        *,
+        client_factory: Callable[[str], "Awaitable[httpx.AsyncClient]"] | None = None,
+        cert_mtimes: Callable[[], tuple[float, float, float] | None] | None = None,
+    ):
+        self._base_url = base_url
+        self._client_factory = client_factory or _default_platform_client_factory
+        if cert_mtimes is None:
+            from agent_engine_runner_shared.tls_client import _get_cert_mtimes
+
+            cert_mtimes = _get_cert_mtimes
+        self._cert_mtimes = cert_mtimes
+        self._client: httpx.AsyncClient | None = None
+        self._client_cert_mtimes: tuple[float, float, float] | None = None
+
+    async def _client_for_request(self) -> httpx.AsyncClient:
+        current = self._cert_mtimes()
+        if self._client is not None and current is not None and self._client_cert_mtimes != current:
+            await self._client.aclose()
+            self._client = None
+        if self._client is None:
+            self._client = await self._client_factory(self._base_url)
+            self._client_cert_mtimes = current
+        return self._client
+
+    async def _request(
+        self, url: str, body: bytes, headers: dict[str, str], timeout_seconds: float
+    ) -> httpx.Response:
+        client = await self._client_for_request()
+        return await client.post(url, content=body, headers=headers, timeout=timeout_seconds)
+
+    def post(
+        self, url: str, body: bytes, headers: dict[str, str], timeout_seconds: float
+    ) -> httpx.Response:
+        """POST ``body`` and return the response, bounding the whole request.
+
+        Raises ``_ExportDeadlineExceeded`` when the request does not finish
+        within ``timeout_seconds``, cancelling the in-flight request rather than
+        abandoning it. Any other transport failure propagates unchanged.
+        """
+        future = asyncio.run_coroutine_threadsafe(
+            self._request(url, body, headers, timeout_seconds), _platform_event_loop()
+        )
+        try:
+            return future.result(timeout=timeout_seconds)
+        except concurrent.futures.TimeoutError as exc:
+            future.cancel()
+            raise _ExportDeadlineExceeded() from exc
+
+    def close(self) -> None:
+        """Close the cached client, if any (best-effort)."""
+        client = self._client
+        if client is None:
+            return
+        self._client = None
+        try:
+            asyncio.run_coroutine_threadsafe(client.aclose(), _platform_event_loop()).result(
+                timeout=2.0
+            )
+        except Exception:  # noqa: BLE001 - closing is best-effort
+            pass
+
+
+def _retry_after_seconds(value: str | None) -> float | None:
+    """Parse a Retry-After header, accepting delay-seconds or an HTTP-date."""
+    if not value:
+        return None
+    value = value.strip()
+    try:
+        seconds = float(value)
+        return seconds if seconds >= 0 else None
+    except ValueError:
+        pass
+
+    from email.utils import parsedate_to_datetime
+
+    try:
+        when = parsedate_to_datetime(value)
+    except (TypeError, ValueError):
+        return None
+    if when is None:
+        return None
+    # parsedate_to_datetime returns a naive datetime for an HTTP-date with no
+    # timezone; treat it as UTC rather than raising on the subtraction.
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=datetime.timezone.utc)
+    return max(0.0, (when - datetime.datetime.now(datetime.timezone.utc)).total_seconds())
+
+
+class PlatformSpanExporter(SpanExporter):
+    """Export spans to the Orchestration Engine's platform trace endpoint.
+
+    The guest POSTs OTLP-protobuf batches to ``{oe_url}/internal/traces``; the
+    OE converts and stores them. Requests go through the platform async mTLS
+    client (with certificate rotation and self-span suppression), and each is
+    cancellable so the export deadline is a real wall-clock bound.
+
+    Delivery is best-effort: a batch is retried on transport errors and
+    retryable statuses within a bounded deadline, split on 413, and dropped when
+    the OE permanently refuses it. A single span larger than the OE body limit is
+    dropped without failing the rest of its batch.
+    """
+
+    def __init__(
+        self,
+        base_url: str,
+        *,
+        client_factory: Callable[[str], "Awaitable[httpx.AsyncClient]"] | None = None,
+        cert_mtimes: Callable[[], tuple[float, float, float] | None] | None = None,
+        max_request_bytes: int = _DEFAULT_PLATFORM_MAX_REQUEST_BYTES,
+        export_timeout_seconds: float = _DEFAULT_PLATFORM_EXPORT_TIMEOUT_SECONDS,
+        per_attempt_timeout_seconds: float = _PLATFORM_PER_ATTEMPT_TIMEOUT_SECONDS,
+        sleep: Callable[[float], None] = time.sleep,
+        clock: Callable[[], float] = time.monotonic,
+    ):
+        self._base_url = base_url.rstrip("/")
+        self.url = f"{self._base_url}{_PLATFORM_TRACE_INGEST_PATH}"
+        self._poster = _PlatformTracePoster(
+            self._base_url, client_factory=client_factory, cert_mtimes=cert_mtimes
+        )
+        self._max_request_bytes = max_request_bytes
+        self._export_timeout_seconds = export_timeout_seconds
+        self._per_attempt_timeout_seconds = per_attempt_timeout_seconds
+        self._sleep = sleep
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._dropped_spans = 0
+        self._failed_batches = 0
+        self._last_error: str | None = None
+
+    @property
+    def dropped_spans(self) -> int:
+        with self._lock:
+            return self._dropped_spans
+
+    @property
+    def last_error(self) -> str | None:
+        with self._lock:
+            return self._last_error
+
+    def export(self, spans: Sequence[ReadableSpan]) -> SpanExportResult:
+        if not spans:
+            return SpanExportResult.SUCCESS
+
+        deadline = self._clock() + self._export_timeout_seconds
+        dropped_before = self.dropped_spans
+        ok = True
+        for chunk in self._chunk_by_size(list(spans)):
+            if not self._export_chunk(chunk, deadline):
+                ok = False
+
+        if ok:
+            # A partial success drops spans without failing the batch, so only
+            # a clean export clears the last error; /health stays degraded until
+            # then rather than reporting attached while spans are being lost.
+            if self.dropped_spans == dropped_before:
+                with self._lock:
+                    self._last_error = None
+            return SpanExportResult.SUCCESS
+        with self._lock:
+            self._failed_batches += 1
+        return SpanExportResult.FAILURE
+
+    def shutdown(self) -> None:
+        self._poster.close()
+
+    @staticmethod
+    def _encode(spans: Sequence[ReadableSpan]) -> bytes:
+        from opentelemetry.exporter.otlp.proto.common.trace_encoder import encode_spans
+
+        return encode_spans(spans).SerializeToString()
+
+    def _chunk_by_size(self, spans: list[ReadableSpan]) -> list[list[ReadableSpan]]:
+        """Split spans into chunks whose encoded request fits the OE body limit.
+
+        A single span that does not fit on its own is returned alone;
+        _export_chunk drops it rather than sending a request the OE will reject.
+        """
+        if len(spans) <= 1:
+            return [spans]
+        if len(self._encode(spans)) <= self._max_request_bytes:
+            return [spans]
+        mid = len(spans) // 2
+        return self._chunk_by_size(spans[:mid]) + self._chunk_by_size(spans[mid:])
+
+    def _export_chunk(self, chunk: list[ReadableSpan], deadline: float) -> bool:
+        if len(chunk) == 1 and len(self._encode(chunk)) > self._max_request_bytes:
+            # A single span larger than the OE body limit; nothing to split.
+            self._drop_oversized()
+            return False
+        attempt = 0
+        while True:
+            attempt += 1
+            remaining = deadline - self._clock()
+            if remaining <= 0:
+                self._record_error("export deadline exceeded")
+                return False
+            try:
+                # Cap the attempt by the remaining export budget and let the
+                # poster cancel the request at that bound, so the whole export
+                # honours its wall-clock deadline rather than just each httpx
+                # operation.
+                response = self._post(chunk, min(self._per_attempt_timeout_seconds, remaining))
+            except _ExportDeadlineExceeded:
+                # The attempt was cancelled at its own timeout. Retry while the
+                # overall export budget still allows another attempt; fail only
+                # once that budget is exhausted.
+                if not self._backoff(attempt, deadline, None):
+                    self._record_error("export deadline exceeded")
+                    return False
+                continue
+            except Exception as exc:  # noqa: BLE001 - any transport error is retryable
+                if not self._backoff(attempt, deadline, None):
+                    self._record_error(f"transport error: {exc}")
+                    return False
+                continue
+
+            if self._clock() > deadline:
+                # The attempt overran the export budget; a completion past the
+                # deadline is not a timely success.
+                self._record_error("export deadline exceeded")
+                return False
+
+            status = response.status_code
+            if 200 <= status < 300:
+                self._handle_partial_success(response)
+                return True
+            if status == 413:
+                return self._split_and_retry(chunk, deadline)
+            if status in _PLATFORM_RETRYABLE_STATUS:
+                retry_after = _retry_after_seconds(response.headers.get("Retry-After"))
+                if not self._backoff(attempt, deadline, retry_after):
+                    self._record_error(f"status {status} after {attempt} attempt(s)")
+                    return False
+                continue
+
+            self._record_error(f"terminal status {status}")
+            logger.warning(
+                "Trace export: OE returned terminal status %s; dropping batch of %d span(s)",
+                status,
+                len(chunk),
+            )
+            return False
+
+    def _split_and_retry(self, chunk: list[ReadableSpan], deadline: float) -> bool:
+        """Halve a batch the OE rejected as too large and export each half.
+
+        Each half goes back through _export_chunk, so a half still too large is
+        split again, and a single span that cannot be split is dropped.
+        """
+        if len(chunk) <= 1:
+            self._drop_oversized()
+            return False
+        mid = len(chunk) // 2
+        ok = True
+        for half in (chunk[:mid], chunk[mid:]):
+            if not self._export_chunk(half, deadline):
+                ok = False
+        return ok
+
+    def _post(self, chunk: list[ReadableSpan], timeout_seconds: float) -> httpx.Response:
+        return self._poster.post(
+            self.url,
+            self._encode(chunk),
+            {"Content-Type": _OTLP_PROTOBUF_CONTENT_TYPE},
+            timeout_seconds,
+        )
+
+    def _handle_partial_success(self, response: httpx.Response) -> None:
+        content = response.content
+        if not content:
+            return
+        try:
+            from opentelemetry.proto.collector.trace.v1.trace_service_pb2 import (
+                ExportTraceServiceResponse,
+            )
+
+            parsed = ExportTraceServiceResponse()
+            parsed.ParseFromString(content)
+        except Exception:  # noqa: BLE001 - an unparsable body is not actionable
+            return
+        rejected = parsed.partial_success.rejected_spans
+        if not rejected:
+            return
+        # The OE accepted the batch but discarded some spans. Delivery is
+        # best-effort, so the batch is not retried (a retry would duplicate the
+        # spans that were stored), but the loss is recorded so tracing_status()
+        # and /health surface it.
+        message = parsed.partial_success.error_message
+        with self._lock:
+            self._dropped_spans += rejected
+        self._record_error(
+            f"OE rejected {rejected} span(s): {message}"
+            if message
+            else f"OE rejected {rejected} span(s)"
+        )
+        logger.warning(
+            "Trace export: OE rejected %d span(s) as malformed or unstorable%s",
+            rejected,
+            f": {message}" if message else "",
+        )
+
+    def _backoff(self, attempt: int, deadline: float, retry_after: float | None) -> bool:
+        """Sleep before the next attempt, or return False when none is possible.
+
+        Honours Retry-After when the OE sends one; otherwise uses exponential
+        backoff with jitter. Returns False when the delay would run past the
+        export deadline, so a retry is never attempted without time for it.
+        """
+        if retry_after is not None:
+            delay = retry_after
+        else:
+            delay = min(
+                _PLATFORM_BACKOFF_MAX_SECONDS,
+                _PLATFORM_BACKOFF_BASE_SECONDS * (2 ** (attempt - 1)),
+            )
+            delay *= 0.5 + random.random() * 0.5
+        if delay >= deadline - self._clock():
+            return False
+        self._sleep(delay)
+        return True
+
+    def _drop_oversized(self) -> None:
+        with self._lock:
+            self._dropped_spans += 1
+        logger.warning("Trace export: dropping a span larger than the OE body limit")
+        # A dropped span means the export did not fully succeed; record it so
+        # tracing_status() and /health surface the loss.
+        self._record_error("dropped a span larger than the OE body limit")
+
+    def _record_error(self, message: str) -> None:
+        with self._lock:
+            self._last_error = message
+        logger.debug("Trace export failed: %s", message)

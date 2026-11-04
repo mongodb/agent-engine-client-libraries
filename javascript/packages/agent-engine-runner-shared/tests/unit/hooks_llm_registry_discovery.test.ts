@@ -196,6 +196,34 @@ describe("populateLlmRegistryFromEntrypoint on a failed build", () => {
     expect([...snapshotLlmRegistry().keys()]).toEqual(["primary"]);
   });
 
+  it("allows discovery beyond ten minutes when the runner timeout is unset", async () => {
+    vi.stubEnv("RUNNER_EXECUTION_TIMEOUT", undefined);
+    const graphBuilder = {
+      getAgent: vi.fn(),
+      buildGraph: async () => {
+        await new Promise((resolve) => setTimeout(resolve, 11 * 60 * 1000));
+        registerLlm("primary", {});
+        return {};
+      },
+    };
+
+    vi.useFakeTimers();
+    try {
+      const pending = populateLlmRegistryFromEntrypoint(
+        graphBuilder,
+        silentLogger(),
+        warnings,
+        undefined,
+        perExecution,
+      );
+      await vi.advanceTimersByTimeAsync(11 * 60 * 1000);
+      expect(await pending).toBe(true);
+      expect([...snapshotLlmRegistry().keys()]).toEqual(["primary"]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("still populates the registry from a successful build", async () => {
     const graphBuilder = {
       getAgent: vi.fn(),

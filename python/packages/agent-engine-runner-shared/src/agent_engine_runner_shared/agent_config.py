@@ -340,7 +340,20 @@ class RuntimeMCPServerConfig(BaseModel):
         default="streamable_http",
         description="MCP transport used to connect to the server.",
     )
-    url: NonEmptyString = Field(description="Streamable HTTP endpoint for the MCP server.")
+    url: NonEmptyString | None = Field(
+        default=None,
+        description=(
+            "Streamable HTTP endpoint for the MCP server. An entry with no url names "
+            "a project OAuth app with its key, and the app's resource is the endpoint."
+        ),
+    )
+    scopes: list[NonEmptyString] = Field(
+        default_factory=list,
+        description=(
+            "Scopes requested from the OAuth app the entry names, instead of the "
+            "app's defaults. Refused beside a url."
+        ),
+    )
     headers: dict[str, str] = Field(
         default_factory=dict,
         description="Static non-secret HTTP headers sent to the MCP server.",
@@ -361,11 +374,25 @@ class RuntimeMCPServerConfig(BaseModel):
 
     @model_validator(mode="after")
     def validate_server_config(self) -> "RuntimeMCPServerConfig":
-        parsed = urlparse(self.url)
-        if parsed.scheme not in {"http", "https"} or parsed.hostname is None:
-            raise ValueError("mcp server url must be an absolute http(s) URL")
-        if parsed.scheme == "http" and self.auth.type != "none":
-            raise ValueError("mcp server url must be https when auth.type is set")
+        if self.url is None:
+            # The app supplies the credential, so an auth block here could only
+            # disagree with it. auth has a default, so ask whether it was written.
+            if "auth" in self.model_fields_set:
+                raise ValueError(
+                    "mcp server auth is not allowed without url; "
+                    "an entry with no url names an OAuth app"
+                )
+        else:
+            if "scopes" in self.model_fields_set:
+                raise ValueError(
+                    "mcp server scopes is not allowed with url; "
+                    "scopes apply to an entry that names an OAuth app"
+                )
+            parsed = urlparse(self.url)
+            if parsed.scheme not in {"http", "https"} or parsed.hostname is None:
+                raise ValueError("mcp server url must be an absolute http(s) URL")
+            if parsed.scheme == "http" and self.auth.type != "none":
+                raise ValueError("mcp server url must be https when auth.type is set")
 
         forbidden_headers = sorted(
             header for header in self.headers if header.lower() in _FORBIDDEN_MCP_HEADER_KEYS
@@ -452,8 +479,8 @@ class RuntimeAgentConfig(BaseModel):
     a2a: A2AConfig = Field(default_factory=A2AConfig)
     mcp: RuntimeMCPConfig = Field(default_factory=RuntimeMCPConfig)
     required_secrets: SecretsConfig = Field(default_factory=SecretsConfig)
-    # Python/LangGraph only: connector authoring files materialized at startup.
-    # The shared Go parser rejects the key for TypeScript agents.
+    # LangGraph only: connector authoring files materialized at startup.
+    # The shared Go parser rejects the key for other frameworks.
     connectors: list[RuntimeConnectorReference] = Field(default_factory=list)
 
     def feature_enabled(

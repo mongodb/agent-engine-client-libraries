@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import AsyncIterator, Iterator, Sequence
+from collections.abc import AsyncIterator, Iterator, Mapping, Sequence
 from typing import Any, cast
 
 from agent_engine_runner_shared.context import get_current_oe_url
@@ -47,12 +47,15 @@ from agent_engine_runner_shared.workflow.context import (
     record_observed_activity,
 )
 from langchain_core.runnables import RunnableConfig
+from langgraph.channels.delta import DeltaChannel
 from langgraph.checkpoint.base import (
     BaseCheckpointSaver,
     ChannelVersions,
     Checkpoint,
     CheckpointMetadata,
     CheckpointTuple,
+    DeltaChannelHistory,
+    PendingWrite,
     empty_checkpoint,
 )
 from langgraph.checkpoint.memory import InMemorySaver
@@ -199,6 +202,96 @@ class PlatformCheckpointer(BaseCheckpointSaver[str]):
         super().__init__()
         self.native = native
         self._scratch = scratch if scratch is not None else InMemorySaver()
+        self._delta_channels: dict[str, DeltaChannel[Any]] = {}
+
+    def bind_delta_channels(self, channels: Mapping[str, Any]) -> None:
+        """Record which of a graph's channels checkpoints store only as deltas.
+
+        The binding belongs to this checkpointer object, so graphs that share
+        one checkpointer share it and the last graph bound wins. Each SDK-built
+        Deep Agent gets its own view from ``checkpointer_for_deep_agent``.
+        """
+        self._delta_channels = {
+            name: channel
+            for name, channel in channels.items()
+            if isinstance(channel, DeltaChannel)
+        }
+
+    def committed_values(
+        self, checkpoint: Checkpoint, config: RunnableConfig
+    ) -> dict[str, Any]:
+        """Return a stored scratch checkpoint's channel values for OE to commit.
+
+        A checkpoint holds a ``DeltaChannel`` only as a periodic snapshot object
+        and otherwise omits it, leaving LangGraph to replay earlier writes. OE
+        needs the plain value, because it is the next turn's starting state.
+        Other channels stay as stored, so unwritten reducer defaults stay absent.
+        """
+        values = dict(checkpoint.get("channel_values") or {})
+        omitted = [name for name in self._delta_channels if name not in values]
+        histories = self._scratch_delta_history(config, omitted)
+        for name, spec in self._delta_channels.items():
+            if name in histories:
+                history = histories[name]
+                empty = cast(type, spec.typ)()
+                channel = spec.from_checkpoint(history.get("seed", empty))
+                channel.replay_writes(history["writes"])
+            else:
+                channel = spec.from_checkpoint(values[name])
+            values[name] = channel.get()
+        return values
+
+    def _scratch_delta_history(
+        self, config: RunnableConfig, channels: Sequence[str]
+    ) -> dict[str, DeltaChannelHistory]:
+        """Return what rebuilds delta channels at a scratch checkpoint, as live.
+
+        ``InMemorySaver.get_delta_channel_history`` cannot serve here. It drops
+        writes attached to a plain value, which is how a seeded turn holds its
+        previous messages when the new input arrives. It also orders one step's
+        writes by task ID, which changes per attempt, while LangGraph applies
+        them in task-path order and OE compares the result across attempts.
+        """
+        writes: dict[str, list[PendingWrite]] = {name: [] for name in channels}
+        seeds: dict[str, Any] = {}
+        remaining = set(channels)
+        stored = self._scratch.get_tuple(config) if remaining else None
+        cursor = stored.parent_config if stored is not None else None
+        while cursor is not None and remaining:
+            ancestor = self._scratch.get_tuple(cursor)
+            if ancestor is None:
+                break
+            configurable = ancestor.config.get("configurable") or {}
+            step_writes = self._scratch.writes.get(
+                (
+                    configurable["thread_id"],
+                    configurable.get("checkpoint_ns", ""),
+                    configurable["checkpoint_id"],
+                ),
+                {},
+            )
+            ordered = sorted(
+                step_writes.items(), key=lambda item: (item[1][3], item[0][1])
+            )
+            for name in remaining:
+                writes[name][:0] = [
+                    (task_id, channel, self._scratch.serde.loads_typed(value))
+                    for _, (task_id, channel, value, _) in ordered
+                    if channel == name
+                ]
+            # A stored value is the channel before this ancestor's own writes.
+            for name in remaining & ancestor.checkpoint["channel_values"].keys():
+                seeds[name] = ancestor.checkpoint["channel_values"][name]
+            remaining -= seeds.keys()
+            cursor = ancestor.parent_config
+        return {
+            name: (
+                {"writes": writes[name], "seed": seeds[name]}
+                if name in seeds
+                else {"writes": writes[name]}
+            )
+            for name in channels
+        }
 
     # ----- scratch lifecycle -----
 
@@ -271,7 +364,7 @@ class PlatformCheckpointer(BaseCheckpointSaver[str]):
                 "durable execution completed without final application state"
             )
         return channel_values_to_state_snapshot(
-            dict(checkpoint.checkpoint.get("channel_values") or {}),
+            self.committed_values(checkpoint.checkpoint, checkpoint.config),
             include_legacy_source=context.replay_mode,
         )
 
@@ -294,7 +387,7 @@ class PlatformCheckpointer(BaseCheckpointSaver[str]):
         return finalize_current_step_command(
             context,
             channel_values_to_state_snapshot(
-                dict(checkpoint.get("channel_values") or {}),
+                self.committed_values(checkpoint, config),
                 include_legacy_source=context.replay_mode,
             ),
         )
@@ -581,7 +674,7 @@ class PlatformCheckpointer(BaseCheckpointSaver[str]):
         result = self._scratch.put(
             durable_config, checkpoint, durable_metadata, new_versions
         )
-        self._finalize_step_sync(context, checkpoint, durable_metadata, durable_config)
+        self._finalize_step_sync(context, checkpoint, durable_metadata, result)
         return result
 
     def put_writes(
@@ -615,6 +708,28 @@ class PlatformCheckpointer(BaseCheckpointSaver[str]):
         return self._scratch.get_next_version(current, channel)
 
     # ----- BaseCheckpointSaver: async -----
+
+    def get_delta_channel_history(
+        self, *, config: RunnableConfig, channels: Sequence[str]
+    ) -> Mapping[str, DeltaChannelHistory]:
+        context = current_attempt_context()
+        if context is None:
+            return super().get_delta_channel_history(config=config, channels=channels)
+        return self._scratch_delta_history(
+            self._durable_config(config, context), channels
+        )
+
+    async def aget_delta_channel_history(
+        self, *, config: RunnableConfig, channels: Sequence[str]
+    ) -> Mapping[str, DeltaChannelHistory]:
+        context = current_attempt_context()
+        if context is None:
+            return await super().aget_delta_channel_history(
+                config=config, channels=channels
+            )
+        return self._scratch_delta_history(
+            self._durable_config(config, context), channels
+        )
 
     async def aget_tuple(self, config: RunnableConfig) -> CheckpointTuple | None:
         context = current_attempt_context()
@@ -670,9 +785,7 @@ class PlatformCheckpointer(BaseCheckpointSaver[str]):
         result = await self._scratch.aput(
             durable_config, checkpoint, durable_metadata, new_versions
         )
-        await self._finalize_step_async(
-            context, checkpoint, durable_metadata, durable_config
-        )
+        await self._finalize_step_async(context, checkpoint, durable_metadata, result)
         return result
 
     async def aput_writes(

@@ -8,12 +8,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- TypeScript connector execution and Tool Pod registration: the runner now
+  materializes the validated connector bundle at startup, registers one
+  bounded HTTP executor per connector, applies static or delegated auth, and
+  closes pooled transports on shutdown. AER and the server tool mode use the
+  same runtime views, collision preflight, and registration helper.
 - TypeScript connector contract and authoring materializer: validates compiled
   connector catalogs, applies fail-closed exposure and endpoint/credential
-  bindings, and exposes the shared AER and Tool Pod runtime views. Tool
-  registration and execution land in a later change.
+  bindings, and exposes the shared AER and Tool Pod runtime views.
 
 ### Changed
+- **Breaking:** the connector `tool.yaml` `auth` block no longer takes `type`.
+  It names exactly one credential: `bearer: <secret>`, `basic: {username,
+  password}`, `api_keys: [{env, location, name, prefix}]`, or
+  `provider: <OAuth app>` with optional `scopes`, plus optional `headers`; omit
+  the block for no credential. A block that still uses `type` or its fields
+  fails validation with the same message as the Python runner. `AuthSchema`
+  validates the new block, `BasicAuthSchema` and `BasicAuth` are exported, and
+  `authHeaderName`,
+  `authCredentialBindings` and `AuthType` are removed; read `auth.api_keys`.
 - Remote MCP servers now use the MCP TypeScript SDK 2.x
   (`@modelcontextprotocol/client`). Each call negotiates the protocol
   automatically: it probes `server/discover` and falls back to the legacy
@@ -31,6 +44,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   adapter's two-phase model-step/tool-step stamping.
 
 ### Fixed
+- Connector tools now capture the tenant environment for each Tool Pod
+  invocation, so concurrent calls cannot exchange request-scoped secrets.
+  Connector callables invoked outside a Tool Pod invocation now fail closed;
+  wrap direct calls in `withConnectorEnvironment`.
 - Uncaught exceptions and unhandled rejections in agent code now emit a
   filterable `level=ERROR` record. Ordinary stderr writes with no
   associated exception stay `WARNING`. The record is written even when the agent

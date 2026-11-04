@@ -17,7 +17,7 @@ import logging
 import math
 import threading
 import time
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
 from functools import partial
@@ -50,6 +50,9 @@ from agent_engine_runner_shared.generated.workflow.v1.activity_pb2 import (
     ACTIVITY_OUTCOME_KIND_SUSPENDED,
     ActivityContext,
 )
+from agent_engine_runner_shared.generated.workflow.v1.common_pb2 import (
+    WORKFLOW_ERROR_CODE_OUTCOME_UNKNOWN,
+)
 from agent_engine_runner_shared.models import (
     ElicitationInfo,
     GuardrailMeta,
@@ -71,7 +74,9 @@ from agent_engine_runner_shared.tls_client import get_shared_client
 from agent_engine_runner_shared.tool_api_error import (
     ToolAPIError,
     classify_tool_api_error,
+    redact_tool_error_text,
     request_credential_values,
+    request_named_credential_values,
 )
 from agent_engine_runner_shared.tool_memory_ownership import tool_memory_read_ownership
 from agent_engine_runner_shared.utils import (
@@ -102,8 +107,10 @@ from agent_engine_runner_shared.workflow.activity import (
 )
 from agent_engine_runner_shared.workflow.client import ActivityReplay
 from agent_engine_runner_shared.workflow.context import (
+    OwningToolCall,
     activity_requires_reconstruction,
     allocate_activity_position,
+    allocate_tool_effect_position,
     current_operation_path,
     forget_oauth_authorization_wait,
     interrupted_activity_answered,
@@ -343,6 +350,14 @@ class ToolExecutionError(Exception):
         super().__init__(f"Tool execution error: {error}")
 
 
+class ToolOutcomeUnknownError(ToolExecutionError):
+    """The runner was lost while this durable tool call was in flight.
+
+    It may have taken effect and OE did not run it again. ``error`` is OE's
+    message, written for the model reading it.
+    """
+
+
 _TERMINAL_EXECUTION_REASONS = {
     "execution already error": (
         "This execution already ended in error; later tool calls are rejected."
@@ -445,6 +460,8 @@ class _DurableToolActivityFailedError(Exception):
 _DURABLE_TOOL_FAILURE_PREFIX = "__agentic_durable_tool_failure_v1__:"
 _DURABLE_TOOL_FAILURE_FALLBACK = "durable activity failed"
 
+_IN_DURABLE_TOOL_BODY: ContextVar[bool] = ContextVar("in_durable_tool_body", default=False)
+
 
 def _tool_error_message(error: Exception) -> str:
     message = error.error if isinstance(error, ToolExecutionError) else str(error)
@@ -452,9 +469,12 @@ def _tool_error_message(error: Exception) -> str:
 
 
 def _encode_durable_tool_failure(error: Exception) -> str:
+    # OE persists this record and replays its message to the model.
     payload: dict[str, Any] = {
         "kind": "execution",
-        "message": _tool_error_message(error),
+        "message": redact_tool_error_text(
+            _tool_error_message(error), request_named_credential_values()
+        ),
     }
     if isinstance(error, ToolCallTimeoutError):
         payload.update(
@@ -483,8 +503,15 @@ def _encode_durable_tool_failure(error: Exception) -> str:
     )
 
 
-def _decode_durable_tool_failure(message: str) -> ToolExecutionError:
+def _decode_durable_tool_failure(message: str, cause: Exception) -> ToolExecutionError:
     if not message.startswith(_DURABLE_TOOL_FAILURE_PREFIX):
+        # Every failure a runner reports is prefixed, so this one is OE's own.
+        if (
+            isinstance(cause, ReplayedActivityFailedError)
+            and cause.code == WORKFLOW_ERROR_CODE_OUTCOME_UNKNOWN
+            and message
+        ):
+            return ToolOutcomeUnknownError(message)
         return ToolExecutionError(message or _DURABLE_TOOL_FAILURE_FALLBACK)
     try:
         payload = json.loads(message.removeprefix(_DURABLE_TOOL_FAILURE_PREFIX))
@@ -520,6 +547,37 @@ def _decode_durable_tool_failure(message: str) -> ToolExecutionError:
     ):
         return ToolExecutionError(failure_message)
     return ToolCallTimeoutError(tool_name, float(timeout_seconds), float(elapsed_seconds))
+
+
+def _redact_error_in_place(error: BaseException, credentials: Sequence[str]) -> None:
+    """Mask credentials in a tool error that is re-raised to the framework.
+
+    The framework renders the error for the model, so its text must match what
+    was reported to OE. Rewriting the same instance keeps its class, identity,
+    and traceback for framework and author handlers. Arguments and
+    ``ToolExecutionError.error`` are rewritten only when redaction changes
+    them. A non-string argument, such as a dict, renders into ``str()`` and
+    ``repr()``, so one that carries a credential becomes its redacted string.
+    An exception whose ``__str__`` reads other state is left as raised.
+    """
+
+    def redact_arg(arg: object) -> object:
+        if isinstance(arg, str):
+            return redact_tool_error_text(arg, credentials)
+        rendered = str(arg)
+        redacted = redact_tool_error_text(rendered, credentials)
+        return arg if redacted == rendered else redacted
+
+    try:
+        args = tuple(redact_arg(arg) for arg in error.args)
+        if args != error.args:
+            error.args = args
+        if isinstance(error, ToolExecutionError) and isinstance(error.error, str):
+            message = redact_tool_error_text(error.error, credentials)
+            if message != error.error:
+                error.error = message
+    except Exception:  # noqa: BLE001 - never replace the tool's own failure
+        logger.debug("Could not redact a re-raised tool error")
 
 
 class ExternalAPICallError(ToolExecutionError):
@@ -589,7 +647,7 @@ def request_oe_approval(
     is_local: bool = True,
     metadata: Optional[Dict[str, Any]] = None,
     redact_fields: Optional[list[str]] = None,
-    provider_type: Optional[str] = None,
+    provider: Optional[str] = None,
     scopes: Optional[list[str]] = None,
     tool_call_id: Optional[str] = None,
     custom_headers: Optional[Dict[str, str]] = None,
@@ -617,7 +675,7 @@ def request_oe_approval(
             is_local=is_local,
             metadata=metadata,
             redact_fields=redact_fields,
-            provider_type=provider_type,
+            provider=provider,
             scopes=scopes,
             tool_call_id=tool_call_id,
             custom_headers=custom_headers,
@@ -667,7 +725,7 @@ def _request_oe_approval(
     is_local: bool = True,
     metadata: Optional[Dict[str, Any]] = None,
     redact_fields: Optional[list[str]] = None,
-    provider_type: Optional[str] = None,
+    provider: Optional[str] = None,
     scopes: Optional[list[str]] = None,
     tool_call_id: Optional[str] = None,
     custom_headers: Optional[Dict[str, str]] = None,
@@ -694,7 +752,7 @@ def _request_oe_approval(
         kind=kind,
         is_local=is_local,
         redact_fields=redact_fields or [],
-        provider_type=provider_type,
+        provider=provider,
         scopes=scopes or [],
         metadata=metadata or {},
         custom_headers=custom_headers,
@@ -1116,7 +1174,7 @@ class SecureToolWrapper:
         arguments: Dict[str, Any],
         *,
         metadata: Optional[Dict[str, Any]] = None,
-        provider_type: Optional[str] = None,
+        provider: Optional[str] = None,
         scopes: Optional[list[str]] = None,
         tool_call_id: Optional[str] = None,
         raw_on_interrupt: bool = False,
@@ -1126,6 +1184,7 @@ class SecureToolWrapper:
         is_framework_control_flow: Optional[Callable[[BaseException], bool]] = None,
         call_channel_expected: bool = False,
         on_unknown_outcome: Optional[UnknownOutcomePolicy] = None,
+        owning_tool_call: Optional[OwningToolCall] = None,
     ) -> Any:
         """
         Execute a tool call through OE.
@@ -1152,6 +1211,10 @@ class SecureToolWrapper:
             on_unknown_outcome: What a retry does when the runner was lost while
                 this tool was in flight in a durable workflow: ``"rerun"`` runs it
                 again, ``"fail"`` refuses the retry.
+            owning_tool_call: The tool call or subagent this operation is performed
+                for, when it is not itself a tool the model requested. In a durable
+                workflow it runs alongside other activities, at a position derived
+                from that call.
 
         Returns:
             Result from execution or cached result
@@ -1177,7 +1240,7 @@ class SecureToolWrapper:
                 is_local=is_local,
                 local_executor=local_executor,
                 redact_fields=redact_fields,
-                provider_type=provider_type,
+                provider=provider,
                 scopes=scopes,
                 tool_call_id=tool_call_id,
                 raw_on_interrupt=raw_on_interrupt,
@@ -1199,9 +1262,17 @@ class SecureToolWrapper:
         semantic_input: Dict[str, Any] = {"arguments": arguments}
 
         keyed = bool(tool_call_id)
-        tool_path, activity_ordinal = allocate_activity_position(
-            tool_activity_key(tool_call_id) if keyed else None
+        # An operation a tool call performs runs alongside other activities, at a
+        # position its siblings cannot change by arriving in another order. Inside a
+        # recorded tool's body it stays exclusive: the tool replays without running
+        # its body, and OE would refuse a replay that skips a recorded position.
+        owner = None if _IN_DURABLE_TOOL_BODY.get() else owning_tool_call
+        tool_path, activity_ordinal = (
+            allocate_tool_effect_position(owner)
+            if owner is not None
+            else allocate_activity_position(tool_activity_key(tool_call_id) if keyed else None)
         )
+        exclusive = not keyed and owner is None
 
         def _execute(activity_context: Any) -> Any:
             """Dispatch this resource phase or record typed consent before its wait."""
@@ -1232,7 +1303,7 @@ class SecureToolWrapper:
                         is_local=is_local,
                         local_executor=local_executor,
                         redact_fields=redact_fields,
-                        provider_type=provider_type,
+                        provider=provider,
                         scopes=scopes,
                         tool_call_id=tool_call_id,
                         # The sentinel can't be replay-serialized; it is translated
@@ -1283,16 +1354,22 @@ class SecureToolWrapper:
                     _encode_durable_tool_failure(error)
                 ) from error
             return (
-                _OAuthResourceOutcome(result=result).model_dump(mode="json")
-                if provider_type
-                else result
+                _OAuthResourceOutcome(result=result).model_dump(mode="json") if provider else result
             )
+
+        def _execute_body(activity_context: Any) -> Any:
+            """Run ``_execute`` marked as a recorded tool's body."""
+            token = _IN_DURABLE_TOOL_BODY.set(True)
+            try:
+                return _execute(activity_context)
+            finally:
+                _IN_DURABLE_TOOL_BODY.reset(token)
 
         def _synchronize(client: Any, context: Any, outcome: Any) -> None:
             """Project only a resource result; consent contributes no conversation content."""
             if self.durable_memory is None:
                 return
-            if provider_type:
+            if provider:
                 recorded = _oauth_outcome(outcome)
                 if isinstance(recorded, _OAuthChallengeOutcome):
                     self.durable_memory.acknowledge(client, context)
@@ -1347,7 +1424,7 @@ class SecureToolWrapper:
                 callback_ran = True
                 note_activity_reconstruction_id(resumed.activity_id)
                 try:
-                    return _execute(resumed)
+                    return _execute_body(resumed)
                 except DurableActivityInterrupted as control:
                     raise RuntimeError(
                         "a durable local tool cannot raise another native interrupt "
@@ -1382,7 +1459,7 @@ class SecureToolWrapper:
                 execute=resume_callback,
                 on_activity_resolved=acknowledge_phase,
                 operation_path=path,
-                exclusive=not keyed,
+                exclusive=exclusive,
                 on_unknown_outcome=on_unknown_outcome,
             )
 
@@ -1397,16 +1474,16 @@ class SecureToolWrapper:
                     name=tool_name,
                     activity_ordinal=activity_ordinal,
                     semantic_input=semantic_input,
-                    execute=_execute,
+                    execute=_execute_body,
                     on_activity_resolved=_synchronize if self.durable_memory is not None else None,
-                    exclusive=not keyed,
+                    exclusive=exclusive,
                     on_unknown_outcome=on_unknown_outcome,
                     operation_path=operation_path,
                     replay_local_wait=(
                         _replay_local_wait
                         if is_local
                         and local_executor is not None
-                        and not provider_type
+                        and not provider
                         and not scopes
                         and is_framework_control_flow is not None
                         else None
@@ -1419,7 +1496,7 @@ class SecureToolWrapper:
                     raise error.__cause__ from None
                 raise PolicyDeniedException(str(error)) from error
             except (ReplayedActivityFailedError, _DurableToolActivityFailedError) as error:
-                raise _decode_durable_tool_failure(str(error)) from error
+                raise _decode_durable_tool_failure(str(error), error) from error
             except WorkflowClientError:
                 raise
 
@@ -1428,7 +1505,7 @@ class SecureToolWrapper:
             # replay boundary, so both routes coerce identically. Only the marker is
             # restored — a genuine tool result can't collide with it because
             # _execute strips the reserved key before the outcome is recorded.
-            if provider_type:
+            if provider:
                 recorded = _oauth_outcome(result)
                 if isinstance(recorded, _OAuthChallengeOutcome):
                     if authorization_attempt:
@@ -1539,7 +1616,7 @@ class SecureToolWrapper:
         is_local: bool = True,
         local_executor: Optional[Callable[[], Any]] = None,
         redact_fields: Optional[list[str]] = None,
-        provider_type: Optional[str] = None,
+        provider: Optional[str] = None,
         scopes: Optional[list[str]] = None,
         tool_call_id: Optional[str] = None,
         raw_on_interrupt: bool = False,
@@ -1552,7 +1629,7 @@ class SecureToolWrapper:
         Native callers retain their checkpoint hook until the compatibility follow-up.
         Resource results and ordinary rejections keep their existing semantics.
         """
-        effective_is_local = is_local and not provider_type and not scopes
+        effective_is_local = is_local and not provider and not scopes
         effective_local_executor = local_executor if effective_is_local else None
         # 1. Request approval from OE. On a native resume interrupt() returns the
         # Continue answer instead of pausing, so the token gate is asked once more;
@@ -1568,7 +1645,7 @@ class SecureToolWrapper:
                 step=step,
                 is_local=effective_is_local,
                 redact_fields=redact_fields,
-                provider_type=provider_type,
+                provider=provider,
                 scopes=scopes,
                 tool_call_id=tool_call_id,
                 metadata=metadata,
@@ -1786,7 +1863,14 @@ class SecureToolWrapper:
                         error, None, credentials=request_credential_values()
                     )
                 )
-                error_text = classified[1] if classified else f"{type(error).__name__}: {error}"
+                named_credentials = request_named_credential_values()
+                error_text = (
+                    classified[1]
+                    if classified
+                    else redact_tool_error_text(
+                        f"{type(error).__name__}: {error}", named_credentials
+                    )
+                )
                 tool_api_error = classified[0] if classified else None
                 log_tool_result(
                     tool_name,
@@ -1825,6 +1909,8 @@ class SecureToolWrapper:
                     # This call was deliberately stopped: the graph continues
                     # with the stopped-call result instead of unwinding.
                     return _CALL_INTERRUPTED
+                if not is_control_flow:
+                    _redact_error_in_place(error, named_credentials)
                 raise
 
             duration_ms = (time.monotonic() - started) * 1000
@@ -1984,7 +2070,7 @@ def create_secure_tool_function(
     allow_direct: bool = False,
     metadata: Optional[Dict[str, Any]] = None,
     is_local: bool = True,
-    provider_type: Optional[str] = None,
+    provider: Optional[str] = None,
     scopes: Optional[list[str]] = None,
     response_format: Literal["content", "content_and_artifact"] = "content",
     tool_declared_format: Optional[Literal["content", "content_and_artifact"]] = None,
@@ -2091,7 +2177,7 @@ def create_secure_tool_function(
             result = wrapper.execute_tool(
                 tool_name=tool_name,
                 arguments=kwargs,
-                provider_type=provider_type,
+                provider=provider,
                 scopes=scopes,
                 tool_call_id=tool_call_id,
                 metadata=metadata,

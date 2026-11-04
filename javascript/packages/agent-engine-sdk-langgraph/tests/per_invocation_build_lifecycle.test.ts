@@ -297,7 +297,7 @@ describe("a builder that honors the invocation deadline", () => {
       (args) => args[2] === "error",
     );
     expect(errorChunks).toHaveLength(1);
-    expect(errorChunks[0]?.[5]).toEqual({ error_code: "timeout" });
+    expect(errorChunks[0]?.[5]).toEqual({ error_code: "run_timeout" });
 
     await fastify.close();
   }, 20000);
@@ -474,6 +474,53 @@ describe("concurrent model resolution on one Tool Pod", () => {
     // the request would lose the registration its own discovery retained.
     expect(seenAtLookup).toEqual([true, true]);
   });
+});
+
+describe("one streaming request runs a failed discovery once", () => {
+  test("a request re-runs the builder once, not twice, before it streams", async () => {
+    // Discovery fails by design for a register-then-read-context builder, so it
+    // never latches and every request re-runs it. The request has to do that
+    // exactly once. Loading the registry before resolving, and then again
+    // inside resolveLlmForRequest, runs the author's builder and its I/O twice
+    // for a single streamed turn.
+    const { shared, App } = await loadModules(30);
+    const app = new App({ appName: "test-agent" });
+    let builds = 0;
+    app.entrypoint(
+      async () => {
+        builds += 1;
+        app.llm({ invoke: () => undefined } as never, "primary");
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        throw new Error("needs invocation context");
+      },
+      { loadStrategy: "per-execution" },
+    );
+
+    const server = makeToolServer(shared, app) as unknown as {
+      createLlmForPod: (llmId: string) => unknown;
+      loadRegistryThenStreamLlmChunks(
+        request: unknown,
+        signal?: AbortSignal,
+      ): AsyncGenerator<{ content?: string }>;
+    };
+    // Stub the model boundary, not the registry boundary: the resolver and the
+    // population under test stay real.
+    server.createLlmForPod = () => ({
+      stream: async function* () {
+        yield { content: "reply:primary" };
+      },
+    });
+
+    const chunks: Array<{ content?: string }> = [];
+    for await (const chunk of server.loadRegistryThenStreamLlmChunks({
+      arguments: { llm_id: "primary", messages: [], stop_sequences: [] },
+    })) {
+      chunks.push(chunk);
+    }
+
+    expect(builds).toBe(1);
+    expect(JSON.stringify(chunks)).toContain("reply:primary");
+  }, 20000);
 });
 
 describe("fatal withdrawal through the AER route", () => {

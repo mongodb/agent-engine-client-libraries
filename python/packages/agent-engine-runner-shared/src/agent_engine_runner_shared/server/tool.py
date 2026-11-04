@@ -61,6 +61,7 @@ from agent_engine_runner_shared.server.owner_url import resolve_owner_url
 from agent_engine_runner_shared.span_kinds import OPENINFERENCE_SPAN_KIND, OpenInferenceSpanKind
 from agent_engine_runner_shared.tool_api_error import (
     classify_tool_api_error,
+    redact_tool_error_text,
     request_credential_values,
     request_named_credential_values,
 )
@@ -246,20 +247,19 @@ class LLMRegistryLoadError(RuntimeError):
 
 
 class ToolExecution:
-    """Transport-agnostic tool runtime shared by the Tool Pod server and function mode.
+    """Transport-agnostic tool runtime backing the Tool Pod server.
 
     Owns the tool work that is independent of how the invocation arrives:
     registering built-in tools and the named-LLM registry (``prepare``), and
     resolving + running a single tool under execution context (``invoke_tool``).
-    Concrete classes provide ``self.runtime``: ``ToolServer`` via ``BaseServer``,
-    ``ToolFunctionRunner`` (function mode) directly.
+    Concrete classes provide ``self.runtime``: ``ToolServer`` via ``BaseServer``.
     """
 
     runtime: Any  # provided by the concrete class
 
-    # All three provided by the concrete class's __init__ (ToolServer,
-    # ToolFunctionRunner) -- declared here so the registry helpers below
-    # type-check against the base class they are defined on.
+    # All three provided by the concrete class's __init__ (ToolServer) --
+    # declared here so the registry helpers below type-check against the base
+    # class they are defined on.
     _llm_registry_lock: "asyncio.Lock"
     _llm_registry_loaded: bool
     # Why the last entrypoint run failed, or None after a successful load.
@@ -478,11 +478,10 @@ class ToolExecution:
     ) -> ToolPodExecuteResponse:
         """Resolve a tool by name, run it under execution context, and return the result.
 
-        The transport-agnostic invocation core shared by the HTTP ``/execute``
-        route (``ToolServer._handle_execute``) and function mode
-        (``ToolFunctionRunner``). It owns registry lookup, the MCP tool
-        fallback, execution-context setup, and error capture; it never touches
-        the FastAPI request/response cycle.
+        The transport-agnostic invocation core behind the HTTP ``/execute``
+        route (``ToolServer._handle_execute``). It owns registry lookup, the MCP
+        tool fallback, execution-context setup, and error capture; it never
+        touches the FastAPI request/response cycle.
         """
         import socket
 
@@ -546,10 +545,20 @@ class ToolExecution:
                     mcp_tool_name,
                 )
             except MCPConfigError as exc:
-                return ToolPodExecuteResponse(status="error", error=str(exc), pod_name=pod_name)
+                # Resolution interpolates tenant env into server URLs, so the
+                # error text can carry a credential.
+                return ToolPodExecuteResponse(
+                    status="error",
+                    error=redact_tool_error_text(str(exc), request_named_credential_values()),
+                    pod_name=pod_name,
+                )
             except Exception as exc:
-                logger.exception("Unexpected error resolving MCP tool %r", request.tool_name)
-                return ToolPodExecuteResponse(status="error", error=str(exc), pod_name=pod_name)
+                redacted = redact_tool_error_text(str(exc), request_named_credential_values())
+                # No traceback: its final line repeats the unredacted exception text.
+                logger.error(
+                    "Unexpected error resolving MCP tool %r: %s", request.tool_name, redacted
+                )
+                return ToolPodExecuteResponse(status="error", error=redacted, pod_name=pod_name)
             if not func:
                 return ToolPodExecuteResponse(
                     status="error", error=f"Unknown tool: {request.tool_name}", pod_name=pod_name
@@ -635,10 +644,12 @@ class ToolExecution:
         except Exception as e:
             metadata = get_current_execution_metadata()
             tool_def = self.runtime._tool_definitions.get(request.tool_name, {})
-            provider_type = tool_def.get("provider_type") if isinstance(tool_def, dict) else None
+            provider = tool_def.get("provider") if isinstance(tool_def, dict) else None
+            # The fallback is the tool's own exception text, which OE persists
+            # and hands to the model; it can quote a connection string or key.
             tae, err = classify_tool_api_error(
-                e, provider_type, credentials=request_credential_values()
-            ) or (None, str(e))
+                e, provider, credentials=request_credential_values()
+            ) or (None, redact_tool_error_text(str(e), request_named_credential_values()))
             return ToolPodExecuteResponse(
                 status="error",
                 error=err,

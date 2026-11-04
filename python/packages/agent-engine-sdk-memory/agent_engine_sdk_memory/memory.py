@@ -1121,6 +1121,7 @@ class Memory:
         max_tokens: int | None = None,
         format_style: FormatStyle | str | None = None,
         include_memories: bool = False,
+        collapse_duplicate_content: bool = True,
     ) -> ContextResponse:
         """Build a memory context from an explicit, per-source-configured source set.
 
@@ -1147,6 +1148,13 @@ class Memory:
             include_memories: When ``True``, the response's
                 ``selected_memories`` carries the post-budget ``MemoryChunk``
                 list; see :meth:`build_context`.
+            collapse_duplicate_content: When ``True`` (default), collapse
+                duplicate content — exact text matches and near-duplicates —
+                when merging results. Set ``False`` to receive every candidate
+                each source contributed, up to its ``top_k``; a document
+                surfacing from both the vector and text legs is still returned
+                once either way. ``max_tokens`` still applies after merging, so
+                disabling this may require a larger budget to see every row.
 
         Raises:
             ValueError: If ``sources`` is empty or lists a source more than once,
@@ -1172,6 +1180,10 @@ class Memory:
             optional["format_style"] = format_style
         if include_memories:
             optional["include_memories"] = True
+        # Default-true flag: forwarded only when disabled, so runtimes that
+        # predate the parameter never receive it from a default-path caller.
+        if not collapse_duplicate_content:
+            optional["collapse_duplicate_content"] = False
         return self._runtime.build_context_from_sources(
             query=query,
             sources=specs,

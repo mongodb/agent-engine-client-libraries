@@ -580,11 +580,10 @@ describe("tracing setup", () => {
     expect(headers).not.toHaveProperty("baggage");
   });
 
-  test("retry timers are unref'd so a one-shot function-mode process can exit", async () => {
-    // TOOL_FUNCTION runtimes return after one invocation without calling
-    // shutdownTracing (Python uses a daemon retry thread for the same
-    // reason). A referenced retry timer would pin the event loop and keep
-    // the supposedly one-shot Node process alive while the store is down.
+  test("retry timers are unref'd so they never pin the event loop", async () => {
+    // The retry is best-effort background work: a referenced timer would keep
+    // the Node process alive while the store is down (Python uses a daemon
+    // retry thread for the same reason).
     mongo.dbObj.command.mockRejectedValue(new Error("still down"));
     process.env["AGENTIC_TRACE_STORE_RETRY_INTERVAL_SECONDS"] = "0.017";
     const RETRY_MS = 17;

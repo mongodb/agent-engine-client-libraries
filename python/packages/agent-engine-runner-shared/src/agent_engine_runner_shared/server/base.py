@@ -370,6 +370,7 @@ class BaseServer(ABC):
             status = (
                 HealthStatus.DEGRADED
                 if tracing.get("database_exporter") == "degraded"
+                or tracing.get("platform_exporter") == "degraded"
                 else HealthStatus.HEALTHY
             )
             return HealthResponse(

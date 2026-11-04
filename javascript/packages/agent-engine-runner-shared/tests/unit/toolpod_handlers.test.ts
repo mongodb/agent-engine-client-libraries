@@ -500,6 +500,16 @@ describe("shell_execute", () => {
     expect(String(res["output"])).toContain("timed out");
   });
 
+  it("runs a command with a zero timeout under the default", async () => {
+    const { mod } = await loadHandlers();
+    const res = await mod.shellExecute({
+      command: "sleep 0.2; echo ran",
+      timeout: 0,
+    });
+    expect(res["exit_code"]).toBe(0);
+    expect(String(res["output"])).toContain("ran");
+  });
+
   it("does not report a timeout for a signal-killed command", async () => {
     // Regression: only our timeout SIGKILL counts as a timeout. A command that
     // dies from a different signal (here SIGTERM, self-sent) well inside the

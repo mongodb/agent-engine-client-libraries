@@ -126,6 +126,11 @@ export async function resolveMcpAuth(
   serverName: string,
   config: RuntimeMCPServerConfig,
 ): Promise<OAuthClientProvider | undefined> {
+  if (config.url === null) {
+    throw new MCPConfigError(
+      `mcp server '${serverName}' names an OAuth app; OAuth app servers are not available yet`,
+    );
+  }
   if (config.auth.type === "none" || config.auth.type === "bearer_env") {
     return undefined;
   }
@@ -153,7 +158,7 @@ export async function resolveMcpAuth(
 export function mcpServerNetworkHosts(
   config: RuntimeMCPServerConfig,
 ): string[] {
-  const hosts = [new URL(config.url).hostname];
+  const hosts = config.url === null ? [] : [new URL(config.url).hostname];
   if (config.auth.token_url !== null) {
     const tokenHost = new URL(config.auth.token_url).hostname;
     if (!hosts.includes(tokenHost)) hosts.push(tokenHost);
@@ -809,6 +814,9 @@ async function withMcpSession<T>(
 ): Promise<T> {
   const headers = resolveMcpHeaders(serverName, config);
   const authProvider = await resolveMcpAuth(serverName, config);
+  if (config.url === null) {
+    throw new MCPConfigError(`mcp server '${serverName}' has no url`);
+  }
   const isDiscovery = operation === "tools/list";
   const toolLimitState: ToolListLimitState = { listed: 0, exceeded: false };
   const timeoutMs = config.timeout_seconds * 1000;

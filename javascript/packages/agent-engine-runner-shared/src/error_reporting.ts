@@ -34,16 +34,46 @@ const MAX_OUTPUT_TAIL_CHARS = 8 * 1024;
 // caller-supplied `extra` can't drive `redactValue` into a stack overflow.
 const MAX_REDACT_DEPTH = 12;
 
-// `key=value` / `key: value` inline secrets. Case-insensitive; keeps the key
-// and separator, redacts the value up to the next whitespace/comma/semicolon.
+// `key=value` / `key: value` / `"key":"value"` inline secrets.
+// Case-insensitive; keeps the key and separator, and a quoted value keeps its
+// quotes. An unquoted value runs to the next whitespace/comma/semicolon. The
+// quoted forms match the Python runner's `_SECRET_INLINE_PATTERN`.
 const SECRET_INLINE_PATTERN =
-  /\b(api[_-]?key|access[_-]?token|refresh[_-]?token|token|secret|password)(=|:)\s*([^\s,;]+)/gi;
+  /\b(api[_-]?key|access[_-]?token|refresh[_-]?token|token|secret|password)(["']?\s*[=:]\s*)("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|"(?:\\.|[^"\\])*$|'(?:\\.|[^'\\])*$|[^\s,;]+)/gi;
 const BEARER_PATTERN = /\b(bearer)\s+[A-Za-z0-9._\-+/=~]+/gi;
 const URL_USERINFO_PATTERN = /\b([a-z][a-z0-9+.-]*:\/\/)[^:/\s@]+:[^@\s/]+@/gi;
 // Bare-token form (scheme://token@host, no ":" separator) — e.g. a GitHub PAT
 // embedded as `https://ghp_xxx@github.com`. Applied after URL_USERINFO_PATTERN
 // so a user:pass@ pair is never double-matched by this looser pattern.
 const URL_USERINFO_BARE_PATTERN = /\b([a-z][a-z0-9+.-]*:\/\/)[^:/\s@]+@/gi;
+const ATLAS_SERVICE_ACCOUNT_SECRET_PATTERN = /\bmdb_sa_sk_[A-Za-z0-9_-]+/g;
+const API_KEY_PATTERN = /\bsk-[A-Za-z0-9_-]{20,}(?![A-Za-z0-9_-])/g;
+const PEM_KEY_LABEL = "(?:(?:RSA|EC|OPENSSH|ENCRYPTED|DSA) )?PRIVATE KEY";
+
+/**
+ * Redacts PEM private key blocks. A single lazy `BEGIN[\s\S]*?END` regex
+ * rescans to the end of the text for every BEGIN header without an END, which
+ * is quadratic on repeated unmatched headers; tool error text is unbounded.
+ * Once no END follows a header, none follows any later header, so the scan
+ * stops there.
+ */
+function redactPrivateKeys(text: string): string {
+  const begin = new RegExp(`-----BEGIN ${PEM_KEY_LABEL}-----`, "g");
+  const end = new RegExp(`-----END ${PEM_KEY_LABEL}-----`, "g");
+  let out = "";
+  let cursor = 0;
+  for (;;) {
+    const header = begin.exec(text);
+    if (header === null) break;
+    end.lastIndex = header.index + header[0].length;
+    const footer = end.exec(text);
+    if (footer === null) break;
+    out += text.slice(cursor, header.index) + "<redacted>";
+    cursor = footer.index + footer[0].length;
+    begin.lastIndex = cursor;
+  }
+  return out + text.slice(cursor);
+}
 
 function resolveHomeDir(): string {
   try {
@@ -294,12 +324,25 @@ function redactValue(
 /** @internal — exported only for tests; not part of the public API. */
 export function redactText(text: string): string {
   if (!text) return text;
-  let redacted = text;
+  // PEM first: the inline rule would consume `-----BEGIN` from
+  // `secret=-----BEGIN …` and leave the key body without a header to match.
+  let redacted = redactPrivateKeys(text);
   if (homeDir) redacted = redacted.split(homeDir).join("<home>");
   redacted = redacted.replace(URL_USERINFO_PATTERN, "$1<redacted>:<redacted>@");
   redacted = redacted.replace(URL_USERINFO_BARE_PATTERN, "$1<redacted>@");
-  redacted = redacted.replace(SECRET_INLINE_PATTERN, "$1$2<redacted>");
+  redacted = redacted.replace(
+    SECRET_INLINE_PATTERN,
+    (_match, key: string, separator: string, value: string) => {
+      const quote = value[0] === '"' || value[0] === "'" ? value[0] : "";
+      return `${key}${separator}${quote}<redacted>${quote}`;
+    },
+  );
   redacted = redacted.replace(BEARER_PATTERN, "$1 <redacted>");
+  redacted = redacted.replace(
+    ATLAS_SERVICE_ACCOUNT_SECRET_PATTERN,
+    "mdb_sa_sk_<redacted>",
+  );
+  redacted = redacted.replace(API_KEY_PATTERN, "sk-<redacted>");
   return redacted;
 }
 

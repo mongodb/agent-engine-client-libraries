@@ -8,35 +8,13 @@ import httpx
 import pytest
 
 from agent_engine_runner_shared.connectors import ConnectorExecutor, ToolDefinitions, load_tool_defs
-from agent_engine_runner_shared.connectors.definitions import Auth
 from agent_engine_runner_shared.models import ToolAuthorization
 from agent_engine_runner_shared.tool_api_error import classify_tool_api_error
 
 
-@pytest.mark.parametrize(
-    "binding",
-    [
-        {"provider_type": ""},
-        {"provider_type": "github\n"},
-        {"scopes": ["repo read"]},
-        {"scopes": [""]},
-        {"scopes": ["repo", "repo"]},
-        {"env": "SHARED_TOKEN"},
-        {"username_env": "USER"},
-        {"headers": {"Authorization": "override"}},
-    ],
-)
-def test_oauth_rejects_invalid_or_static_binding(binding):
-    """Reject ambiguous provider/scopes and static credential fallback at load time."""
-    with pytest.raises(ValueError):
-        Auth.model_validate(
-            {"type": "oauth", "provider_type": "github", "scopes": ["repo"], **binding}
-        )
-
-
 def test_oauth_delivers_only_the_explicit_request_token(document):
     """A reused executor must not remember tokens or use a tenant bearer fallback."""
-    document["auth"] = {"type": "oauth", "provider_type": "github", "scopes": ["repo"]}
+    document["auth"] = {"provider": "github", "scopes": ["repo"]}
     observed = []
     with ConnectorExecutor(
         ToolDefinitions.model_validate(document),
@@ -186,12 +164,15 @@ def test_jira_read_write_and_roundtrip(document, tmp_path):
 def test_api_key_locations(document, location, source, expected_url, expected_header):
     """Use the configured static key placement even when delegated context is present."""
     document["source"]["base_url"] = source
-    document["auth"] = Auth(
-        type="api_key",
-        env="SERVICE_KEY",
-        location=location,
-        name="X-Service-Key" if location == "header" else "api_key",
-    ).model_dump(exclude_none=True)
+    document["auth"] = {
+        "api_keys": [
+            {
+                "env": "SERVICE_KEY",
+                "location": location,
+                "name": "X-Service-Key" if location == "header" else "api_key",
+            }
+        ]
+    }
     requests = []
     with ConnectorExecutor(
         ToolDefinitions.model_validate(document),
@@ -217,9 +198,7 @@ def test_basic_and_compound_credentials(document):
     """Static Basic and compound keys keep their own secrets and constant headers."""
     requests = []
     document["auth"] = {
-        "type": "basic",
-        "username_env": "SERVICE_USER",
-        "password_env": "SERVICE_PASS",
+        "basic": {"username": "SERVICE_USER", "password": "SERVICE_PASS"},
         "headers": {"API-Version": "2026-01-01"},
     }
     with ConnectorExecutor(
@@ -238,8 +217,7 @@ def test_basic_and_compound_credentials(document):
     assert requests[-1].headers["api-version"] == "2026-01-01"
 
     document["auth"] = {
-        "type": "api_keys",
-        "credentials": [
+        "api_keys": [
             {"env": "CLIENT_ID", "location": "header", "name": "X-Client-ID"},
             {"env": "CLIENT_SECRET", "location": "header", "name": "X-Client-Secret"},
         ],
@@ -390,34 +368,14 @@ def test_required_nullable_json_query_serializes_null(document):
 
 
 def test_static_auth_contract_fails_closed(document):
-    with pytest.raises(ValueError, match="different secrets"):
-        Auth(type="basic", username_env="SAME", password_env="SAME")
-    with pytest.raises(ValueError, match="duplicate credential destinations"):
-        Auth(
-            type="api_keys",
-            credentials=[
-                {"env": "ONE", "location": "header", "name": "X-Key"},
-                {"env": "TWO", "location": "header", "name": "x-key"},
-            ],
-        )
-    document["auth"] = {
-        "type": "api_key",
-        "env": "TOKEN",
-        "location": "path",
-        "name": "token",
-    }
+    document["auth"] = {"api_keys": [{"env": "TOKEN", "location": "path", "name": "token"}]}
     with pytest.raises(ValueError, match="base URL placeholders"):
         ToolDefinitions.model_validate(document)
 
 
 def test_path_credential_cannot_control_the_base_url_host(document):
     document["source"]["base_url"] = "https://{host}/api"
-    document["auth"] = {
-        "type": "api_key",
-        "env": "HOST",
-        "location": "path",
-        "name": "host",
-    }
+    document["auth"] = {"api_keys": [{"env": "HOST", "location": "path", "name": "host"}]}
 
     with pytest.raises(ValueError, match="only in the URL path"):
         ToolDefinitions.model_validate(document)
@@ -426,7 +384,7 @@ def test_path_credential_cannot_control_the_base_url_host(document):
 def test_externalized_path_credential_requires_materialization(document):
     document["source"]["base_url"] = "https://jira.example/bot{token}"
     document["auth"] = None
-    document["externalize"] = {"auth": {"type": "api_key", "location": "path", "name": "token"}}
+    document["externalize"] = {"auth": {"api_keys": [{"location": "path", "name": "token"}]}}
     definitions = ToolDefinitions.model_validate(document)
 
     with pytest.raises(ValueError, match="materialized before execution"):
@@ -436,8 +394,8 @@ def test_externalized_path_credential_requires_materialization(document):
 @pytest.mark.parametrize(
     "change",
     [
-        lambda d: d.update(auth={"type": "oauth"}),
-        lambda d: d["auth"].update(env="AGENTIC_API_KEY"),
+        lambda d: d.update(auth={"bearer": "JIRA_TOKEN", "provider": "github"}),
+        lambda d: d["auth"].update(bearer="AGENTIC_API_KEY"),
         lambda d: d["source"].update(base_url="https://user:pass@jira.example"),
         lambda d: d["tools"].append(d["tools"][0]),
         lambda d: d["tools"][0].update(path="//other.example/path"),
@@ -445,7 +403,7 @@ def test_externalized_path_credential_requires_materialization(document):
         lambda d: d["tools"][0]["inputSchema"]["properties"].update(extra={"type": "string"}),
     ],
     ids=[
-        "oauth",
+        "two-credentials",
         "platform-secret",
         "userinfo",
         "duplicate-name",
@@ -574,8 +532,11 @@ def test_deeply_nested_schema_is_rejected_with_value_error(document):
 @pytest.mark.parametrize(
     "auth,header",
     [
-        ({"type": "bearer", "env": "JIRA_TOKEN"}, "aUtHoRiZaTiOn"),
-        ({"type": "api_key", "env": "JIRA_TOKEN", "header": "X-API-Key"}, "x-api-KEY"),
+        ({"bearer": "JIRA_TOKEN"}, "aUtHoRiZaTiOn"),
+        (
+            {"api_keys": [{"env": "JIRA_TOKEN", "location": "header", "name": "X-API-Key"}]},
+            "x-api-KEY",
+        ),
     ],
 )
 def test_auth_header_cannot_be_a_model_parameter(document, auth, header):
@@ -817,12 +778,7 @@ def test_http_error_drops_an_oversized_provider_body(document):
 
 def test_path_authenticated_request_does_not_follow_redirects(document):
     document["source"]["base_url"] = "https://jira.example/bot/{token}"
-    document["auth"] = {
-        "type": "api_key",
-        "env": "TOKEN",
-        "location": "path",
-        "name": "token",
-    }
+    document["auth"] = {"api_keys": [{"env": "TOKEN", "location": "path", "name": "token"}]}
     requests = []
 
     def handler(request):
@@ -1224,7 +1180,9 @@ def test_wrapped_json_body_preserves_value(document, body):
         expand={"type": "boolean"},
         **{"X-Trace": {"type": "string"}, "session": {"type": "string"}},
     )
-    document["auth"] = {"type": "api_key", "env": "JIRA_TOKEN", "header": "X-API-Key"}
+    document["auth"] = {
+        "api_keys": [{"env": "JIRA_TOKEN", "location": "header", "name": "X-API-Key"}]
+    }
     requests = []
 
     def handler(request):
@@ -1256,7 +1214,7 @@ def test_wrapped_json_body_preserves_value(document, body):
 
 
 def test_no_auth_and_redirect_query_is_not_reapplied(document):
-    document["auth"] = {"type": "none"}
+    document["auth"] = None
     tool = document["tools"][0]
     tool["params"]["query"] = ["startAt"]
     tool["inputSchema"]["properties"]["startAt"] = {"type": "integer"}
@@ -1281,7 +1239,7 @@ def test_duplicate_yaml_keys_are_rejected(document, tmp_path):
     path = tmp_path / "tool_defs.yaml"
     ToolDefinitions.model_validate(document).write(path)
     with path.open("a") as output:
-        output.write("auth: {type: none}\n")
+        output.write("auth: {bearer: JIRA_TOKEN}\n")
     with pytest.raises(ValueError, match="unique"):
         load_tool_defs(path)
 

@@ -173,6 +173,89 @@ def test_load_runtime_agent_config_reads_mcp_servers(monkeypatch, tmp_path: Path
     assert github.timeout_seconds == 45
 
 
+def test_load_runtime_agent_config_reads_mcp_oauth_app_entries(monkeypatch, tmp_path: Path):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "agent.yaml").write_text(
+        "\n".join(
+            [
+                "name: mcp-agent",
+                "mcp:",
+                "  servers:",
+                "    glean:",
+                "      allowed_tools: [search]",
+                "      scopes: [read]",
+                "    github: {}",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    cfg = load_runtime_agent_config()
+
+    glean = cfg.mcp.servers["glean"]
+    assert glean.url is None
+    assert glean.allowed_tools == ["search"]
+    assert glean.scopes == ["read"]
+    assert glean.auth.type == "none"
+    github = cfg.mcp.servers["github"]
+    assert github.url is None
+    assert github.scopes == []
+    assert github.allowed_tools is None
+
+
+@pytest.mark.parametrize(
+    ("server_lines", "message"),
+    [
+        (
+            ["      auth:", "        type: bearer_env", "        token_env: GLEAN_TOKEN"],
+            "auth is not allowed without url",
+        ),
+        (
+            ["      auth:", "        type: none"],
+            "auth is not allowed without url",
+        ),
+        (
+            ["      auth: {}"],
+            "auth is not allowed without url",
+        ),
+        (
+            ["      auth:", "        provider: glean"],
+            "auth is not allowed without url",
+        ),
+        (
+            ["      url: https://mcp.example.com/mcp", "      scopes: [read]"],
+            "scopes is not allowed with url",
+        ),
+        (
+            ["      url: https://mcp.example.com/mcp", "      scopes: []"],
+            "scopes is not allowed with url",
+        ),
+    ],
+    ids=[
+        "auth-mode-without-url",
+        "explicit-none-without-url",
+        "empty-auth-without-url",
+        "removed-provider-without-url",
+        "scopes-with-url",
+        "empty-scopes-with-url",
+    ],
+)
+def test_load_runtime_agent_config_rejects_mixed_mcp_server_forms(
+    monkeypatch,
+    tmp_path: Path,
+    server_lines: list[str],
+    message: str,
+):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "agent.yaml").write_text(
+        "\n".join(["name: mcp-agent", "mcp:", "  servers:", "    glean:", *server_lines]),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match=message):
+        load_runtime_agent_config()
+
+
 def test_load_runtime_agent_config_reads_oauth_mcp_server(monkeypatch, tmp_path: Path):
     monkeypatch.chdir(tmp_path)
     (tmp_path / "agent.yaml").write_text(
@@ -259,28 +342,6 @@ def test_load_runtime_agent_config_rejects_http_client_credentials_token_url(
     )
 
     with pytest.raises(ValueError, match="auth.token_url must be an absolute https URL"):
-        load_runtime_agent_config()
-
-
-def test_load_runtime_agent_config_rejects_mcp_server_without_url(
-    monkeypatch,
-    tmp_path: Path,
-):
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / "agent.yaml").write_text(
-        "\n".join(
-            [
-                "name: mcp-agent",
-                "mcp:",
-                "  servers:",
-                "    github:",
-                "      transport: streamable_http",
-            ]
-        ),
-        encoding="utf-8",
-    )
-
-    with pytest.raises(ValueError, match="url"):
         load_runtime_agent_config()
 
 

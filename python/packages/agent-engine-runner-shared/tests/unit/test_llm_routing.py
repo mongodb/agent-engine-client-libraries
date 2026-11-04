@@ -519,6 +519,87 @@ class TestReasoningTokensSurviveAggregation:
         assert add_token_usage(first, second).reasoning_tokens is None
 
 
+class TestUsageDetails:
+    """Provider detail mappings survive coercion, merging and JSON export.
+
+    Anthropic reports cache reads as ``input_token_details.cache_read`` and
+    folds them into ``input_tokens`` already, so the detail is the only way to
+    tell a cached prompt from an uncached one.
+    """
+
+    def test_coercion_keeps_details(self):
+        usage = coerce_token_usage(
+            {
+                "input_tokens": 9891,
+                "output_tokens": 56,
+                "input_token_details": {"cache_read": 9826, "cache_creation": 63},
+            }
+        )
+        assert usage is not None
+        assert usage.input_tokens == 9891
+        assert usage.model_extra == {
+            "input_token_details": {"cache_read": 9826, "cache_creation": 63}
+        }
+
+    def test_coercion_drops_non_numeric_details(self):
+        usage = coerce_token_usage(
+            {
+                "input_tokens": 10,
+                "input_token_details": {"cache_read": "n/a", "cache_creation": -1},
+            }
+        )
+        assert usage is not None
+        assert usage.model_extra == {}
+
+    def test_merge_lets_the_later_snapshot_win(self):
+        first = LLMTokenUsage(
+            input_tokens=10,
+            output_tokens=2,
+            input_token_details={"cache_read": 0, "cache_creation": 100},
+        )
+        second = LLMTokenUsage(
+            input_tokens=110,
+            output_tokens=3,
+            input_token_details={"cache_read": 100, "cache_creation": 10},
+        )
+        merged = merge_token_usage(first, second)
+        assert merged is not None
+        assert merged.model_extra == {
+            "input_token_details": {"cache_read": 100, "cache_creation": 10}
+        }
+
+    def test_additive_accumulation_sums_detail_deltas(self):
+        first = LLMTokenUsage(input_tokens=10, input_token_details={"cache_read": 0})
+        second = LLMTokenUsage(input_tokens=0, input_token_details={"cache_read": 9})
+        added = add_token_usage(first, second)
+        assert added is not None
+        assert added.model_extra == {"input_token_details": {"cache_read": 9}}
+
+    def test_a_zero_detail_delta_does_not_erase_an_earlier_count(self):
+        first = LLMTokenUsage(input_tokens=10, input_token_details={"cache_read": 10})
+        second = LLMTokenUsage(input_tokens=0, input_token_details={"cache_read": 0})
+        accumulated = accumulate_stream_usage(first, second)
+        assert accumulated is not None
+        assert accumulated.model_extra == {"input_token_details": {"cache_read": 10}}
+
+    def test_additive_accumulation_sums_two_nonzero_deltas(self):
+        first = LLMTokenUsage(input_token_details={"cache_read": 10})
+        second = LLMTokenUsage(input_token_details={"cache_read": 5})
+        added = add_token_usage(first, second)
+        assert added is not None
+        assert added.model_extra == {"input_token_details": {"cache_read": 15}}
+
+    def test_detail_survives_langchain_usage_metadata(self):
+        usage = LLMTokenUsage(
+            input_tokens=9891,
+            output_tokens=56,
+            input_token_details={"cache_read": 9826},
+        )
+        metadata = usage.to_langchain_usage_metadata()
+        assert metadata["input_tokens"] == 9891
+        assert metadata["input_token_details"] == {"cache_read": 9826}
+
+
 class TestAccumulateStreamUsage:
     def test_takes_last_cumulative_snapshot(self):
         first = LLMTokenUsage(input_tokens=10, output_tokens=1, total_tokens=11)

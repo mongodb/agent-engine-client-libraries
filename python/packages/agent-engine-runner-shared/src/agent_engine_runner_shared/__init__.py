@@ -96,6 +96,7 @@ from agent_engine_runner_shared.secure_wrapper import (
     TerminalExecutionError,
     ToolCallTimeoutError,
     ToolExecutionError,
+    ToolOutcomeUnknownError,
     ToolPlatformError,
     extract_usage,
 )
@@ -191,6 +192,7 @@ __all__ = [
     "TerminalExecutionError",
     "ToolCallTimeoutError",
     "ToolExecutionError",
+    "ToolOutcomeUnknownError",
     "ToolPlatformError",
     "ExternalAPICallError",
     # Utilities

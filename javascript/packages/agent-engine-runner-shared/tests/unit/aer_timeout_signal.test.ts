@@ -17,6 +17,7 @@ import {
 } from "../../src/index.js";
 import {
   POLICY_DENIED_ERROR_CODE,
+  RUN_TIMEOUT_ERROR_CODE,
   TIMEOUT_ERROR_CODE,
 } from "../../src/server/chunk_types.js";
 import type { DrainRegistry } from "../../src/server/drain.js";
@@ -128,35 +129,78 @@ describe("AER drain boundary", () => {
   });
 });
 
-describe("AER tool-timeout structured signal", () => {
-  test("a timeout emits ERROR chunk + callback tagged timeout, and 504", async () => {
+describe("AER timeout structured signal", () => {
+  test.each(["slow_tool", "invoke_llm"])(
+    "%s timeout emits ERROR chunk + callback tagged timeout, and 504",
+    async (toolName) => {
+      const server = makeServer();
+      server.executeViaAgentStream = vi.fn(async () => {
+        throw new ToolCallTimeoutError(toolName, 600, 601.4);
+      }) as unknown as typeof server.executeViaAgentStream;
+
+      const err = (await server
+        .doHandleExecute(makeRequest("exec-tool-timeout"))
+        .catch((e: unknown) => e)) as Error & { statusCode?: number };
+
+      // 504, not 500: the caller can reasonably retry or allow more time.
+      expect(err.statusCode).toBe(504);
+      expect(err.message).toContain(toolName);
+
+      const errCalls = server.sendStreamChunk.mock.calls.filter(
+        (c) => c[2] === "error",
+      );
+      expect(errCalls).toHaveLength(1);
+      const meta = errCalls[0]?.[5] as Record<string, unknown>;
+      expect(meta.error_code).toBe(TIMEOUT_ERROR_CODE);
+      expect(meta.tool_name).toBe(toolName);
+      expect(meta.elapsed_seconds).toBeCloseTo(601.4);
+
+      expect(server.reportCallback).toHaveBeenCalledTimes(1);
+      const callbackArgs = server.reportCallback.mock.calls[0]?.[3] as {
+        metadata?: Record<string, unknown>;
+      };
+      expect(callbackArgs.metadata?.error_code).toBe(TIMEOUT_ERROR_CODE);
+      expect(callbackArgs.metadata).toEqual(meta);
+    },
+  );
+
+  test("a run deadline emits a distinct error chunk and callback", async () => {
     const server = makeServer();
-    server.executeViaAgentStream = vi.fn(async () => {
-      throw new ToolCallTimeoutError("slow_tool", 600, 601.4);
-    }) as unknown as typeof server.executeViaAgentStream;
+    server.executeViaAgentStream = vi.fn(
+      (_agent: unknown, ctx: { signal: AbortSignal }) =>
+        new Promise<never>((_resolve, reject) => {
+          ctx.signal.addEventListener(
+            "abort",
+            () => reject(ctx.signal.reason),
+            {
+              once: true,
+            },
+          );
+        }),
+    ) as unknown as typeof server.executeViaAgentStream;
 
-    const err = (await server
-      .doHandleExecute(makeRequest("exec-tool-timeout"))
-      .catch((e: unknown) => e)) as Error & { statusCode?: number };
-
-    // 504, not 500: the caller can reasonably retry or allow more time.
-    expect(err.statusCode).toBe(504);
-    expect(err.message).toContain("slow_tool");
+    vi.useFakeTimers();
+    try {
+      const pending = server
+        .doHandleExecute(makeRequest("exec-run-timeout"))
+        .catch((error: unknown) => error);
+      const timeoutMs =
+        (Number(process.env["RUNNER_EXECUTION_TIMEOUT"]) || 3600) * 1000;
+      await vi.advanceTimersByTimeAsync(timeoutMs + 1);
+      expect(await pending).toMatchObject({ statusCode: 504 });
+    } finally {
+      vi.useRealTimers();
+    }
 
     const errCalls = server.sendStreamChunk.mock.calls.filter(
-      (c) => c[2] === "error",
+      (call) => call[2] === "error",
     );
     expect(errCalls).toHaveLength(1);
-    const meta = errCalls[0]?.[5] as Record<string, unknown>;
-    expect(meta.error_code).toBe(TIMEOUT_ERROR_CODE);
-    expect(meta.tool_name).toBe("slow_tool");
-    expect(meta.elapsed_seconds).toBeCloseTo(601.4);
-
+    expect(errCalls[0]?.[5]).toEqual({ error_code: RUN_TIMEOUT_ERROR_CODE });
     expect(server.reportCallback).toHaveBeenCalledTimes(1);
-    const callbackArgs = server.reportCallback.mock.calls[0]?.[3] as {
-      metadata?: Record<string, unknown>;
-    };
-    expect(callbackArgs.metadata?.error_code).toBe(TIMEOUT_ERROR_CODE);
+    expect(server.reportCallback.mock.calls[0]?.[3]).toMatchObject({
+      metadata: { error_code: RUN_TIMEOUT_ERROR_CODE },
+    });
   });
 
   test("a timeout is not tagged as a policy denial", async () => {

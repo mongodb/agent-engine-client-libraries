@@ -37,6 +37,11 @@ type ToolCallResult = ToolMessage | Command;
 
 const activeTaskCallId = new AsyncLocalStorage<string>();
 
+/** The `task` tool call the current subagent runs under, if any. */
+export function currentDeepAgentTaskCallId(): string | undefined {
+  return activeTaskCallId.getStore();
+}
+
 function messagesFromState(state: unknown): BaseMessage[] {
   if (state === null || typeof state !== "object") return [];
   const messages = (state as { messages?: unknown }).messages;

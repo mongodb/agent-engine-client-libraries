@@ -324,8 +324,8 @@ class ToolExecuteRequest(BaseModel):
         default_factory=list,
         description="Top-level tool argument names to redact from execution logs",
     )
-    provider_type: Optional[str] = Field(
-        default=None, description="Credential provider type for broker token exchange"
+    provider: Optional[str] = Field(
+        default=None, description="Credential provider for broker token exchange"
     )
     scopes: List[str] = Field(
         default_factory=list, description="Requested OAuth scopes for delegated auth"
@@ -845,6 +845,10 @@ _USAGE_INT_KEYS = (
     "completion_tokens",
     "total_tokens",
 )
+# Provider-specific decompositions of the counts above, e.g. Anthropic's
+# ``input_token_details.cache_read``. They are not added to any total: the
+# provider already folds cache reads back into ``input_tokens``.
+_USAGE_DETAIL_KEYS = ("input_token_details", "output_token_details")
 _USAGE_META_KEYS = frozenset({"usage", "token_usage"})
 _JSON_SAFE_DEPTH = 8
 
@@ -864,6 +868,62 @@ def _usage_int(value: Any) -> int | None:
             return None
         return int(value)
     return None
+
+
+def _usage_details(value: Any) -> Dict[str, int] | None:
+    """Return the non-negative integer entries of a usage detail mapping.
+
+    Returns None when nothing usable remains, so an empty or malformed detail
+    blob is omitted rather than stored as noise.
+    """
+    if not isinstance(value, Mapping):
+        return None
+    details: Dict[str, int] = {}
+    for key, raw in value.items():
+        parsed = _usage_int(raw)
+        if isinstance(key, str) and parsed is not None:
+            details[key] = parsed
+    return details or None
+
+
+def _details_of(usage: LLMTokenUsage | None) -> Dict[str, Any]:
+    """Return the usage detail mappings carried as extra fields."""
+    if usage is None:
+        return {}
+    extra = usage.model_extra or {}
+    details: Dict[str, Any] = {}
+    for key in _USAGE_DETAIL_KEYS:
+        parsed = _usage_details(extra.get(key))
+        if parsed is not None:
+            details[key] = parsed
+    return details
+
+
+def _merge_details(prior: LLMTokenUsage | None, incoming: LLMTokenUsage | None) -> Dict[str, Any]:
+    """Merge detail mappings, letting the newer snapshot win per key.
+
+    For cumulative provider snapshots the later value is the running total, so
+    it replaces the earlier one instead of being added to it.
+    """
+    merged: Dict[str, Any] = _details_of(prior)
+    for key, value in _details_of(incoming).items():
+        merged[key] = {**merged.get(key, {}), **value}
+    return merged
+
+
+def _sum_details(prior: LLMTokenUsage | None, incoming: LLMTokenUsage | None) -> Dict[str, Any]:
+    """Add detail mappings key-wise, for additive delta providers.
+
+    A zero delta leaves the earlier count intact, and two non-zero deltas
+    accumulate, matching the token fields this helper sums alongside them.
+    """
+    summed: Dict[str, Any] = _details_of(prior)
+    for key, value in _details_of(incoming).items():
+        merged = dict(summed.get(key, {}))
+        for name, count in value.items():
+            merged[name] = merged.get(name, 0) + count
+        summed[key] = merged
+    return summed
 
 
 def _has_token_counts(usage: LLMTokenUsage) -> bool:
@@ -910,6 +970,10 @@ def _validate_usage_mapping(data: Mapping[str, Any]) -> LLMTokenUsage | None:
         model = data.get("model")
         if isinstance(model, str) and model:
             filtered["model"] = model
+        for key in _USAGE_DETAIL_KEYS:
+            details = _usage_details(data.get(key))
+            if details is not None:
+                filtered[key] = details
         if not filtered:
             return None
         usage = LLMTokenUsage.model_validate(filtered)
@@ -967,7 +1031,11 @@ def _coerce_token_usage_inner(value: Any) -> Optional[LLMTokenUsage]:
 
 def _usage_json(usage: LLMTokenUsage) -> Dict[str, JsonValue]:
     dumped = usage.model_dump(mode="json", exclude_none=True)
-    return {key: dumped[key] for key in (*_USAGE_INT_KEYS, "model") if key in dumped}
+    return {
+        key: dumped[key]
+        for key in (*_USAGE_INT_KEYS, "model", *_USAGE_DETAIL_KEYS)
+        if key in dumped
+    }
 
 
 def _json_safe_value(value: Any, depth: int) -> JsonValue | None:
@@ -1066,6 +1134,7 @@ def add_token_usage(
         total_tokens=total,
         reasoning_tokens=reasoning,
         model=model,
+        **_sum_details(prior, next_usage),
     )
 
 
@@ -1137,6 +1206,7 @@ def merge_token_usage(
         total_tokens=total,
         reasoning_tokens=reasoning,
         model=model,
+        **_merge_details(prior, next_usage),
     )
 
 
@@ -1610,8 +1680,8 @@ class ToolDefinition(BaseModel):
     name: str = Field(..., description="Tool name")
     description: str = Field(default="", description="Tool description")
     is_local: bool = Field(default=True, description="Whether tool runs locally")
-    provider_type: Optional[str] = Field(
-        default=None, description="Credential provider type for delegated auth"
+    provider: Optional[str] = Field(
+        default=None, description="Credential provider key for delegated auth"
     )
     scopes: List[str] = Field(
         default_factory=list, description="Requested OAuth scopes for delegated auth"

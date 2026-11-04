@@ -357,6 +357,81 @@ describe("MCP config — happy paths", () => {
     expect(server?.timeout_seconds).toBe(30);
   });
 
+  test("parses OAuth app entries without a url", () => {
+    writeAgentYaml(
+      [
+        "entrypoint: mcp.agent:app",
+        "mcp:",
+        "  servers:",
+        "    glean:",
+        "      allowed_tools: [search]",
+        "      scopes: [read]",
+        "    github: {}",
+      ].join("\n"),
+    );
+
+    const cfg = loadRuntimeAgentConfig();
+
+    const glean = cfg.mcp.servers["glean"];
+    expect(glean?.url).toBeNull();
+    expect(glean?.allowed_tools).toEqual(["search"]);
+    expect(glean?.scopes).toEqual(["read"]);
+    expect(glean?.auth.type).toBe("none");
+    const github = cfg.mcp.servers["github"];
+    expect(github?.url).toBeNull();
+    expect(github?.scopes).toEqual([]);
+    expect(github?.allowed_tools).toBeNull();
+  });
+
+  test.each([
+    {
+      name: "an auth mode without a url",
+      lines: [
+        "      auth:",
+        "        type: bearer_env",
+        "        token_env: GLEAN_TOKEN",
+      ],
+      message: "auth is not allowed without url",
+    },
+    {
+      name: "an explicit none without a url",
+      lines: ["      auth:", "        type: none"],
+      message: "auth is not allowed without url",
+    },
+    {
+      name: "an empty auth without a url",
+      lines: ["      auth: {}"],
+      message: "auth is not allowed without url",
+    },
+    {
+      name: "the removed provider without a url",
+      lines: ["      auth:", "        provider: glean"],
+      message: "auth is not allowed without url",
+    },
+    {
+      name: "scopes with a url",
+      lines: ["      url: https://mcp.example.com/mcp", "      scopes: [read]"],
+      message: "scopes is not allowed with url",
+    },
+    {
+      name: "empty scopes with a url",
+      lines: ["      url: https://mcp.example.com/mcp", "      scopes: []"],
+      message: "scopes is not allowed with url",
+    },
+  ])("rejects $name", ({ lines, message }) => {
+    writeAgentYaml(
+      [
+        "entrypoint: mcp.agent:app",
+        "mcp:",
+        "  servers:",
+        "    glean:",
+        ...lines,
+      ].join("\n"),
+    );
+
+    expect(() => loadRuntimeAgentConfig()).toThrow(message);
+  });
+
   test("parses bearer_env auth", () => {
     writeAgentYaml(
       [
@@ -664,8 +739,6 @@ function writeConnectorFixture(): void {
       "  base_url: https://jira.example/rest",
       "expose:",
       "  allow_all: true",
-      "auth:",
-      "  type: none",
     ].join("\n"),
     "utf-8",
   );

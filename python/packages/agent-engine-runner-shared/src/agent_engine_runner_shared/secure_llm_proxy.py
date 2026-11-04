@@ -170,6 +170,7 @@ class SecureLLMProxy:
         durable_memory: DurableMemoryState | None = None,
         guardrail_review_protocol: bool = False,
         sdk_handles_guardrail_review_pause: bool = False,
+        within_tool_call: bool = False,
     ):
         self.oe_url = oe_url.rstrip("/")
         self.execution_id = execution_id
@@ -186,6 +187,9 @@ class SecureLLMProxy:
         # follows OE's review protocol instead of pausing inside the call.
         self.guardrail_review_protocol = guardrail_review_protocol
         self.sdk_handles_guardrail_review_pause = sdk_handles_guardrail_review_pause
+        # Set by an adapter for a model call a tool call makes itself: its tool
+        # calls get ordinals but do not position the turn's backend operations.
+        self.within_tool_call = within_tool_call
         # Prefer the wrapper's allocator so tool + LLM share one sequence.
         self.operational_steps = operational_steps or OperationalStepAllocator()
         self.last_duration_ms: float = 0.0
@@ -967,7 +971,7 @@ class SecureLLMProxy:
         if halt is not None:
             yield halt
             return
-        self._preallocate_tool_calls_from_result(result)
+        self._preallocate_tool_calls_from_result(result, within_tool_call=self.within_tool_call)
         llm_response = self._convert_result_to_response(result)
         tool_call_chunks = self._convert_tool_calls_to_stream_chunks(llm_response.tool_calls)
         yield LLMStreamChunk(
@@ -996,11 +1000,11 @@ class SecureLLMProxy:
                 }
             model_chunks.append(chunk)
         payload = self._response_payload_from_chunks(model_chunks)
-        self._preallocate_tool_calls_from_result(payload)
+        self._preallocate_tool_calls_from_result(payload, within_tool_call=self.within_tool_call)
         return payload
 
     @staticmethod
-    def _preallocate_tool_calls_from_result(result: Any) -> None:
+    def _preallocate_tool_calls_from_result(result: Any, *, within_tool_call: bool = False) -> None:
         """Assign ordinals to ToolCall ids in framework list order before fan-out."""
         if not isinstance(result, dict):
             return
@@ -1015,7 +1019,7 @@ class SecureLLMProxy:
             if isinstance(tool_call_id, str) and tool_call_id:
                 keys.append(tool_activity_key(tool_call_id))
         if keys:
-            preallocate_activity_ordinals(keys)
+            preallocate_activity_ordinals(keys, orders_tool_effects=not within_tool_call)
 
     @classmethod
     def _response_payload_from_chunks(cls, chunks: list[LLMStreamChunk]) -> dict[str, Any]:

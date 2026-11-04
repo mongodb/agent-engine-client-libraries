@@ -31,13 +31,16 @@ from .exporters import (
     ContentPolicyOTLPSpanExporter,
     JSONLSpanExporter,
     MongoDBSpanExporter,
+    PlatformSpanExporter,
     get_content_capture_mode,
     get_trace_path,
 )
 from .setup import (
     attach_mongodb_tracing,
+    force_flush_tracing,
     get_current_trace_context,
     get_tracer,
+    platform_trace_exporter_enabled,
     scrub_credentials,
     setup_tracing,
     shutdown_tracing,
@@ -48,6 +51,8 @@ from .setup import (
 __all__ = [
     "setup_tracing",
     "shutdown_tracing",
+    "force_flush_tracing",
+    "platform_trace_exporter_enabled",
     "attach_mongodb_tracing",
     "start_mongodb_tracing_retry",
     "tracing_status",
@@ -58,5 +63,6 @@ __all__ = [
     "scrub_credentials",
     "JSONLSpanExporter",
     "MongoDBSpanExporter",
+    "PlatformSpanExporter",
     "ContentPolicyOTLPSpanExporter",
 ]

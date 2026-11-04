@@ -16,13 +16,13 @@ import sys
 
 from pydantic import ValidationError
 
-from agent_engine_runner_shared.connectors.definitions import Auth
 from agent_engine_runner_shared.connectors.generate import (
     GenerateError,
     compile_catalog,
     regenerate_catalog,
     scaffold_tool_yaml,
 )
+from agent_engine_runner_shared.connectors.generate.authoring import AUTH_CHOICES
 
 __all__ = ["RESULT_PREFIX", "main"]
 
@@ -47,23 +47,21 @@ def _parser() -> argparse.ArgumentParser:
         "--config",
         help="Existing tool.yaml that declares source.spec; regenerates its catalog",
     )
-    parser.add_argument("--name", help="Connector name (compile mode)")
+    parser.add_argument(
+        "name",
+        nargs="?",
+        help="Connector name; required with --spec, defaults to the catalog's with --tool-defs",
+    )
     parser.add_argument("--base-url", help="Tenant API base URL recorded in the authoring file")
     parser.add_argument(
         "--auth",
-        choices=("none", "bearer", "api_key", "oauth"),
-        help="Credential presentation; the authority over the spec's own security schemes",
+        choices=AUTH_CHOICES,
+        help="Credential to present instead of the one the document proposes",
     )
+    parser.add_argument("--provider", help="Project OAuth app whose token each call presents")
     parser.add_argument(
-        "--auth-env", help="Workspace secret environment reference for the credential"
-    )
-    parser.add_argument("--auth-header", help="Header name for API key credentials")
-    parser.add_argument(
-        "--provider-type",
-        help="Credential provider key registered in the project (with --auth oauth)",
-    )
-    parser.add_argument(
-        "--scopes", help="Comma-separated delegated OAuth scopes (with --auth oauth)"
+        "--scopes",
+        help="Comma-separated OAuth scopes (with --provider) instead of the document's",
     )
     parser.add_argument("--allow", help="Comma-separated operation allow list (default: allow_all)")
     parser.add_argument(
@@ -79,36 +77,11 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _auth(args: argparse.Namespace) -> Auth | None:
-    """Build the credential presentation the flags select, or None to let the
-    spec's own security schemes govern. Flag-combination refusals live here;
-    the shared ``Auth`` model validates the values themselves."""
-    if args.auth != "oauth" and (args.provider_type is not None or args.scopes is not None):
-        raise GenerateError("--provider-type and --scopes require --auth oauth")
-    if args.auth == "oauth":
-        if args.auth_env or args.auth_header:
-            raise GenerateError("--auth oauth cannot take --auth-env or --auth-header")
-        if not args.provider_type:
-            raise GenerateError("--auth oauth requires --provider-type")
-        return Auth(type="oauth", provider_type=args.provider_type, scopes=_scopes(args.scopes))
-    if args.auth == "none":
-        if args.auth_env or args.auth_header:
-            raise GenerateError("--auth none cannot take --auth-env or --auth-header")
-        return Auth(type="none")
-    if args.auth is None:
-        if args.auth_env or args.auth_header:
-            raise GenerateError("--auth-env and --auth-header require --auth")
-        return None
-    if not args.auth_env:
-        raise GenerateError(f"--auth {args.auth} requires --auth-env")
-    return Auth(type=args.auth, env=args.auth_env, header=args.auth_header)
-
-
-def _scopes(raw: str | None) -> list[str]:
-    """Split ``--scopes``; omitted means no scopes. An empty entry is refused
-    rather than dropped, so a typo cannot silently narrow the grant."""
+def _scopes(raw: str | None) -> list[str] | None:
+    """Split ``--scopes``; omitted means the document's scopes. An empty entry
+    is refused rather than dropped, so a typo cannot silently narrow the grant."""
     if raw is None:
-        return []
+        return None
     scopes = [scope.strip() for scope in raw.split(",")]
     if not all(scopes):
         raise GenerateError("--scopes must not contain empty entries")
@@ -149,44 +122,40 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_OK if exc.code in (None, 0) else EXIT_FAILED
     skipped: tuple[str, ...] = ()
     try:
-        auth = _auth(args)
+        scopes = _scopes(args.scopes)
         allow = _allow(args.allow)
         if args.config is not None:
             if (
-                args.auth
-                or args.auth_env
-                or args.auth_header
-                or args.provider_type is not None
+                args.name is not None
+                or args.auth
+                or args.provider is not None
                 or args.scopes is not None
                 or args.allow is not None
                 or args.base_url
-                or args.name
                 or args.out_dir
             ):
                 raise GenerateError(
-                    "--config regeneration preserves the authored settings from "
-                    "tool.yaml and writes beside it; --auth, --auth-env, --auth-header, "
-                    "--provider-type, --scopes, --allow, --base-url, --name and --out-dir "
-                    "do not apply"
+                    "--config regeneration keeps the name and settings written in "
+                    "tool.yaml and writes beside it; a name, --auth, --provider, "
+                    "--scopes, --allow, --base-url and --out-dir do not apply"
                 )
             result = regenerate_catalog(args.config, skip_unsupported=args.skip_unsupported)
             written = [str(result.catalog)]
             skipped = result.skipped
         elif args.spec is not None:
             if not args.name:
-                raise GenerateError("--name is required with --spec")
+                raise GenerateError("a connector name is required with --spec")
             if not args.out_dir:
                 raise GenerateError("--out-dir is required with --spec")
-            # The consumer's --auth is the authority over the spec's own
-            # security-scheme definitions: the generator derives the catalog
-            # override from the credential the developer chose (e.g. the
-            # official Jira document declares basic; a DC PAT is Bearer).
-            # An explicit Auth(type="none") is the anonymous override.
+            # --auth and --provider override the document's own security (e.g.
+            # the official Jira document declares basic; a DC PAT is Bearer).
             result = compile_catalog(
                 args.spec,
                 name=args.name,
                 base_url=args.base_url,
-                auth=auth,
+                auth=args.auth,
+                provider=args.provider,
+                scopes=scopes,
                 allow=allow,
                 skip_unsupported=args.skip_unsupported,
                 out_dir=args.out_dir,
@@ -212,8 +181,11 @@ def main(argv: list[str] | None = None) -> int:
                 str(
                     scaffold_tool_yaml(
                         args.tool_defs,
+                        name=args.name,
                         base_url=args.base_url,
-                        auth=auth,
+                        auth=args.auth,
+                        provider=args.provider,
+                        scopes=scopes,
                         allow=allow,
                         out_dir=args.out_dir,
                     )

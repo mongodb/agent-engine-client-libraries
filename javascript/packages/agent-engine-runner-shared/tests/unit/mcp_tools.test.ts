@@ -23,6 +23,7 @@ import {
   normalizeMcpToolAnnotations,
   normalizeMcpToolResult,
   resolveConfiguredMcpToolBinding,
+  resolveMcpAuth,
   resolveMcpHeaders,
 } from "../../src/index.js";
 import { toolsFromPayload } from "../../src/mcp_tool_pages.js";
@@ -140,10 +141,28 @@ describe("resolveMcpHeaders", () => {
 });
 
 // ---------------------------------------------------------------------------
+// resolveMcpAuth
+// ---------------------------------------------------------------------------
+
+describe("resolveMcpAuth", () => {
+  test("reports an OAuth app entry as not available yet", async () => {
+    const config = RuntimeMCPServerConfigSchema.parse({ scopes: ["read"] });
+    await expect(resolveMcpAuth("glean", config)).rejects.toThrow(
+      /'glean' names an OAuth app.*not available yet/,
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
 // mcpServerNetworkHosts
 // ---------------------------------------------------------------------------
 
 describe("mcpServerNetworkHosts", () => {
+  test("is empty for an OAuth app entry", () => {
+    const config = RuntimeMCPServerConfigSchema.parse({});
+    expect(mcpServerNetworkHosts(config)).toEqual([]);
+  });
+
   test("returns the server hostname", () => {
     const config = makeServerConfig({ url: "https://mcp.example.com/github" });
     expect(mcpServerNetworkHosts(config)).toEqual(["mcp.example.com"]);

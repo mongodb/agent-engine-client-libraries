@@ -102,6 +102,7 @@ import {
   LLM_INVOCATION_ERROR_CODE,
   LLM_INVOCATION_ERROR_SOURCE,
   POLICY_DENIED_ERROR_CODE,
+  RUN_TIMEOUT_ERROR_CODE,
   TEXT,
   TIMEOUT_ERROR_CODE,
   TOOL_CREDENTIAL_REJECTED_ERROR_CODE,
@@ -118,10 +119,11 @@ import {
 
 const logger = getLogger("agent_engine_runner_shared.server.aer");
 
-// Whole-turn execution timeout. Matches the platform's stream deadline so a turn
-// is not cut off short of the limit the caller was promised.
+// Whole-turn execution timeout. The platform stamps it in vm-mode; this default
+// covers container mode and local dev. It sits under the 70-minute stream
+// deadline so the runner, not the stream, ends a long turn.
 const EXECUTION_TIMEOUT_MS =
-  getEnvFloat("RUNNER_EXECUTION_TIMEOUT", 600.0) * 1000;
+  getEnvFloat("RUNNER_EXECUTION_TIMEOUT", 3600.0) * 1000;
 
 /** A per-execution build whose caller gave up while it was still running. */
 interface AbandonedBuild {
@@ -572,7 +574,7 @@ export class AERServer extends BaseServer {
         ERROR,
         "",
         errorMsg,
-        { error_code: TIMEOUT_ERROR_CODE },
+        { error_code: RUN_TIMEOUT_ERROR_CODE },
       );
     } catch (chunkErr) {
       logger.error(
@@ -582,7 +584,7 @@ export class AERServer extends BaseServer {
     }
     stageCallback("ERROR", {
       error: errorMsg,
-      metadata: { error_code: TIMEOUT_ERROR_CODE },
+      metadata: { error_code: RUN_TIMEOUT_ERROR_CODE },
     });
     const httpError = new Error(errorMsg) as Error & {
       statusCode: number;
@@ -1598,9 +1600,7 @@ export class AERServer extends BaseServer {
             throw httpError;
           }
           if (err instanceof ToolCallTimeoutError) {
-            // A deadline breach, not a crash: carry the same discriminator as
-            // the whole-turn timeout so a consumer handles both the same way,
-            // and 504 rather than 500 for the same reason.
+            // Per-call timeouts remain retryable independently of the run limit.
             const timeoutMeta: Record<string, string | number> = {
               error_code: TIMEOUT_ERROR_CODE,
               tool_name: err.toolName,

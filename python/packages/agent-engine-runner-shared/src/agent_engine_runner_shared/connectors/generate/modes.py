@@ -25,14 +25,25 @@ from agent_engine_runner_shared.connectors.definitions import (
 from agent_engine_runner_shared.connectors.generate.authoring import (
     _CATALOG_NAME,
     _TOOL_YAML_NAME,
+    _catalog_record,
+    _check_auth_choice,
     _declared_spec_ref,
     _ensure_output,
+    _override_record,
+    _proposed_auth,
     _relative_local,
     _validate_binding,
     _write_tool_yaml,
 )
-from agent_engine_runner_shared.connectors.generate.catalog import _build_catalog
-from agent_engine_runner_shared.connectors.generate.security import _catalog_override
+from agent_engine_runner_shared.connectors.generate.catalog import (
+    _build_catalog,
+    _declared_auth,
+    _override_operations,
+)
+from agent_engine_runner_shared.connectors.generate.security import (
+    _binding_record,
+    _OperationAuth,
+)
 from agent_engine_runner_shared.connectors.generate.spec import (
     GenerateError,
     _generate_error,
@@ -77,16 +88,27 @@ def compile_catalog(
     *,
     name: str,
     base_url: str | None = None,
-    auth: Auth | None = None,
+    auth: str | None = None,
+    provider: str | None = None,
+    scopes: Sequence[str] | None = None,
     allow: Sequence[str] | None = None,
     skip_unsupported: bool = False,
     out_dir: str | Path,
 ) -> CompileResult:
-    """Compile OpenAPI into ``tool_defs.yaml`` and scaffold ``tool.yaml``."""
+    """Compile OpenAPI into ``tool_defs.yaml`` and scaffold ``tool.yaml``.
+
+    The auth block is proposed from the exposed operations' security. ``auth``
+    (one of ``AUTH_CHOICES``) or ``provider`` overrides the proposal and
+    presents that credential on every operation; ``api_keys`` takes its key
+    placement from the operations ``allow`` names, and ``scopes`` replaces the
+    scopes the document requests. A proposal that needs ``provider`` fails
+    before any file is written.
+    """
     try:
         validate_connector_name(name)
     except ValueError as exc:
         raise GenerateError(str(exc)) from None
+    _check_auth_choice(auth, provider, scopes)
     out = Path(out_dir)
     existing_catalog = (out / _CATALOG_NAME).exists()
     existing_authoring = (out / _TOOL_YAML_NAME).exists()
@@ -95,8 +117,20 @@ def compile_catalog(
             f"refusing to overwrite: {_TOOL_YAML_NAME if existing_authoring else _CATALOG_NAME} "
             f"already exists in {_quote(out_dir)}; regenerate with --config instead"
         )
-    out.mkdir(parents=True, exist_ok=True)
     document, root, raw = _load_spec(spec)
+    declared = _declared_auth(document, root, spec)
+    candidates = list(declared.values())
+    if auth == "api_keys" and allow is not None:
+        # An operation --allow excludes must not decide what the exposed
+        # operations send. An allow list matching nothing is reported below,
+        # with the available operations.
+        operations = _override_operations(document, root, spec, name)
+        selected = {operations[tool] for tool in allow if tool in operations}
+        if selected:
+            candidates = [item for operation, item in declared.items() if operation in selected]
+    override = _override_record(
+        auth, provider, (record for item in candidates for record in item.alternatives)
+    )
     catalog, skipped = _build_catalog(
         document,
         root,
@@ -104,7 +138,7 @@ def compile_catalog(
         spec,
         name,
         base_url,
-        _catalog_override(auth),
+        override,
         skip_unsupported=skip_unsupported,
     )
 
@@ -113,7 +147,17 @@ def compile_catalog(
         unmatched = sorted(set(allow) - available)
         if unmatched:
             raise _unmatched_allow_error(unmatched, available)
+    exposed = [
+        declared[(operation.method, operation.path)]
+        for operation in catalog.tools
+        if (allow is None or operation.name in allow)
+        and (operation.method, operation.path) in declared
+    ]
+    binding = _proposed_auth(
+        name, override=override, provider=provider, scopes=scopes, declared=exposed
+    )
 
+    out.mkdir(parents=True, exist_ok=True)
     catalog_path = _ensure_output(out, _CATALOG_NAME)
     catalog.write(catalog_path)
 
@@ -123,7 +167,7 @@ def compile_catalog(
         catalog_ref=_CATALOG_NAME,
         base_url=catalog.source.base_url,
         allow=allow,
-        auth=auth,
+        auth=binding,
         spec_ref=_declared_spec_ref(spec, out),
     )
     return CompileResult(catalog=catalog_path, tool_yaml=tool_yaml_path, skipped=skipped)
@@ -132,8 +176,11 @@ def compile_catalog(
 def scaffold_tool_yaml(
     tool_defs: str | Path,
     *,
+    name: str | None = None,
     base_url: str,
-    auth: Auth | None = None,
+    auth: str | None = None,
+    provider: str | None = None,
+    scopes: Sequence[str] | None = None,
     allow: Sequence[str] | None = None,
     out_dir: str | Path,
 ) -> Path:
@@ -141,8 +188,12 @@ def scaffold_tool_yaml(
 
     The referenced catalog is validated with the runtime loader but never
     rewritten or vendored; the reference stays exactly as declared. No
-    OpenAPI source is declared, so regeneration is not implied.
+    OpenAPI source is declared, so regeneration is not implied. ``name``
+    defaults to the catalog's ``source.name``. The auth block is proposed from
+    the catalog's credential record, as ``compile_catalog`` describes, except
+    that scopes come only from ``scopes``.
     """
+    _check_auth_choice(auth, provider, scopes)
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     target = out / _TOOL_YAML_NAME
@@ -161,19 +212,29 @@ def scaffold_tool_yaml(
         raise GenerateError(
             f"catalog {_quote(reference)} could not be validated: {_quote(exc)}"
         ) from None
-    _validate_binding(catalog.source.name, base_url)
+    connector = catalog.source.name if name is None else name
+    _validate_binding(connector, base_url)
     available = {operation.name for operation in catalog.tools}
     if allow is not None:
         unmatched = sorted(set(allow) - available)
         if unmatched:
             raise _unmatched_allow_error(unmatched, available)
+    record = _catalog_record(catalog.externalize)
+    override = _override_record(auth, provider, [record] if record else [])
+    binding = _proposed_auth(
+        connector,
+        override=override,
+        provider=provider,
+        scopes=scopes,
+        declared=[_OperationAuth(record=record, alternatives=(record,))] if record else [],
+    )
     return _write_tool_yaml(
         out,
-        name=catalog.source.name,
+        name=connector,
         catalog_ref=reference,
         base_url=base_url,
         allow=allow,
-        auth=auth,
+        auth=binding,
         spec_ref=None,
     )
 
@@ -238,12 +299,11 @@ def regenerate_catalog(tool_yaml: str | Path, *, skip_unsupported: bool = False)
         )
     _validate_binding(name, base_url)
 
-    # Regeneration preserves the authoring file's explicit auth override.
+    # Regeneration presents the authored binding on every operation, and no
+    # binding means no credential.
     raw_auth = document.get("auth")
     try:
-        override = _catalog_override(
-            Auth.model_validate(raw_auth) if raw_auth is not None else None
-        )
+        override = _binding_record(Auth.model_validate(raw_auth) if raw_auth is not None else None)
     except ValidationError as exc:
         raise _generate_error(
             exc, f"connector authoring file {_quote(path)}: invalid auth"

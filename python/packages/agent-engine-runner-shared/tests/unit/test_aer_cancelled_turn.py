@@ -279,6 +279,45 @@ async def _drain_to_completion(client: httpx.AsyncClient, reason: str) -> None:
     assert final.json()["outcome"] == "completed"
 
 
+async def test_cancel_when_graph_build_finishes_drains_promptly() -> None:
+    build_finished = asyncio.Event()
+
+    async def build_graph(*args):  # noqa: ANN002, ANN202
+        build_finished.set()
+        return None
+
+    runtime = Mock()
+    runtime.build_graph = build_graph
+    runtime.get_agent.return_value = _HangingAgentWithHook()
+    server = AERServer(runtime)
+    server._start_durable_attempt = AsyncMock(return_value=None)
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=server.create_app()), base_url="http://aer.test"
+    ) as client:
+        execute_task = asyncio.create_task(
+            client.post(
+                "/execute",
+                json={"execution_id": "exec-1", "platform_api_url": "http://oe.invalid"},
+            )
+        )
+        try:
+            # A child-task timeout can lose cancellation between the build's
+            # completion and the handler resuming from that await.
+            async with asyncio.timeout(5):
+                await build_finished.wait()
+            resp = await client.post("/drain", json=_drain_body("execution_cancelled"))
+            assert resp.status_code == 202
+            done, _ = await asyncio.wait({execute_task}, timeout=1)
+            assert execute_task in done, "the first cancellation must stop the execution"
+            assert execute_task.result().status_code == 200
+            assert execute_task.result().json()["status"] == "cancelled"
+            await _drain_to_completion(client, "execution_cancelled")
+        finally:
+            execute_task.cancel()
+            await asyncio.gather(execute_task, return_exceptions=True)
+
+
 async def test_cancel_during_the_routing_probe_still_commits_the_turn() -> None:
     """A cancel landing while the admitted request awaits pre-stream
     preparation is still recorded: the probe resolves native, the latched

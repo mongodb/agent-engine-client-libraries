@@ -56,10 +56,24 @@ import {
 import { getCurrentSessionId } from "../../src/context.js";
 import { RuntimeAgentConfig } from "../../src/agent_config.js";
 import type * as McpToolsModule from "../../src/mcp_tools.js";
+import type * as LauncherModule from "../../src/launcher.js";
 
 const { makeMcpToolCallableMock } = vi.hoisted(() => ({
   makeMcpToolCallableMock: vi.fn(),
 }));
+
+// Mocked so the fatal path can be asserted without exiting the test process.
+const { fatalWithTerminationMock } = vi.hoisted(() => ({
+  fatalWithTerminationMock: vi.fn(async () => undefined),
+}));
+
+vi.mock("../../src/launcher.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof LauncherModule>();
+  return {
+    ...actual,
+    fatalWithTermination: fatalWithTerminationMock,
+  };
+});
 
 // Stubs only makeMcpToolCallable so the "dispatches to MCP resolution" test
 // below never opens a real network connection (flaky under CI DNS/timeout
@@ -77,8 +91,12 @@ vi.mock("../../src/mcp_tools.js", async (importOriginal) => {
 interface MockRuntime {
   tools: Record<string, ServerToolFn>;
   toolDefinitions: Record<string, Record<string, unknown>>;
-  graphBuilder: { getAgent?: () => unknown } | null;
+  graphBuilder: {
+    getAgent?: () => unknown;
+    buildGraph?: (agentInput?: unknown, ctx?: unknown) => Promise<unknown>;
+  } | null;
   getAgentConfig: () => RuntimeAgentConfig;
+  usesPerInvocationBuild?: () => boolean;
 }
 
 function makeMockRuntime(): MockRuntime {
@@ -155,8 +173,45 @@ interface ServerWithRegistryLoad {
 }
 
 describe("ToolServer.ensureLlmRegistryLoaded", () => {
-  beforeEach(() => resetHooks());
+  beforeEach(() => {
+    resetHooks();
+    fatalWithTerminationMock.mockClear();
+  });
   afterEach(() => resetHooks());
+
+  test("a discovery abandoned on timeout withdraws the pod", async () => {
+    // The abandoned build keeps running against the process-global registry, so
+    // the id set is not final and the pod cannot resolve models reliably. It is
+    // replaced rather than left serving from a registry still being written.
+    const previousTimeout = process.env["RUNNER_EXECUTION_TIMEOUT"];
+    process.env["RUNNER_EXECUTION_TIMEOUT"] = "0.02";
+    try {
+      const runtime = makeMockRuntime();
+      runtime.usesPerInvocationBuild = () => true;
+      let releaseBuild: () => void = () => {};
+      const gate = new Promise<void>((resolve) => {
+        releaseBuild = resolve;
+      });
+      const buildGraph = vi.fn(async () => {
+        entrypointScope(() => registerLlm("primary", {}));
+        await gate;
+        return {};
+      });
+      runtime.graphBuilder = { getAgent: () => ({}), buildGraph };
+      const server = makeServer(runtime) as unknown as ServerWithRegistryLoad;
+
+      await server.ensureLlmRegistryLoaded();
+
+      expect(fatalWithTerminationMock).toHaveBeenCalledOnce();
+      releaseBuild();
+    } finally {
+      if (previousTimeout === undefined) {
+        delete process.env["RUNNER_EXECUTION_TIMEOUT"];
+      } else {
+        process.env["RUNNER_EXECUTION_TIMEOUT"] = previousTimeout;
+      }
+    }
+  });
 
   test("first call runs the entrypoint to populate the registry", async () => {
     const runtime = makeMockRuntime();
@@ -1675,7 +1730,7 @@ describe("ToolServer external API error classification", () => {
         throw e;
       },
     };
-    runtime.toolDefinitions = { api_call: { provider_type: "atlas" } };
+    runtime.toolDefinitions = { api_call: { provider: "atlas" } };
 
     const response = await execute(runtime, requestFor("api_call"));
 
@@ -1723,7 +1778,7 @@ describe("ToolServer external API error classification", () => {
     expect(response.error).toBe("something broke");
   });
 
-  test("resolves provider_type from toolDefinitions", async () => {
+  test("resolves provider from toolDefinitions", async () => {
     const runtime = makeMockRuntime();
     runtime.tools = {
       api_call: () => {
@@ -1732,7 +1787,7 @@ describe("ToolServer external API error classification", () => {
         throw e;
       },
     };
-    runtime.toolDefinitions = { api_call: { provider_type: "stripe" } };
+    runtime.toolDefinitions = { api_call: { provider: "stripe" } };
 
     const response = await execute(runtime, requestFor("api_call"));
 

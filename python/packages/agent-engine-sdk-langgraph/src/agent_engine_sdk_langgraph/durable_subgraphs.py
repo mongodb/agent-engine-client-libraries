@@ -34,10 +34,23 @@ from agent_engine_runner_shared.workflow import (
     operation_path_resolver_scope,
 )
 
-__all__ = ["DurableSubgraphResolver", "SendTaskRecorder"]
+__all__ = ["DurableSubgraphResolver", "SendTaskRecorder", "send_task_index"]
 
 # LangGraph's task-path tag for tasks created by ``Send``.
 _PUSH = "__pregel_push"
+
+
+def send_task_index(metadata: dict[str, Any]) -> int | None:
+    """Return a top-level Send task's index in its send list, or None for other tasks."""
+    task_path = metadata.get("langgraph_path")
+    if (
+        not isinstance(task_path, (tuple, list))
+        or len(task_path) < 2
+        or task_path[0] != _PUSH
+        or not _is_index(task_path[1])
+    ):
+        return None
+    return task_path[1]
 
 
 def _send_task_boundary(metadata: dict[str, Any]) -> ChildOperationBoundary | None:
@@ -46,17 +59,11 @@ def _send_task_boundary(metadata: dict[str, Any]) -> ChildOperationBoundary | No
     The superstep keeps successive Send rounds of one graph run apart. Other
     tasks get no segment.
     """
-    task_path = metadata.get("langgraph_path")
+    index = send_task_index(metadata)
     step = metadata.get("langgraph_step")
-    if (
-        not isinstance(task_path, (tuple, list))
-        or len(task_path) < 2
-        or task_path[0] != _PUSH
-        or not _is_index(task_path[1])
-        or not _is_index(step)
-    ):
+    if index is None or not _is_index(step):
         return None
-    name = f"langgraph.task:{_PUSH}:{step}:{task_path[1]}"
+    name = f"langgraph.task:{_PUSH}:{step}:{index}"
     return ChildOperationBoundary(name, name, spawned_task=True)
 
 

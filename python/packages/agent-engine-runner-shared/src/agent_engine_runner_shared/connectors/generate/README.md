@@ -83,18 +83,27 @@ the platform obtains or owns it. `security.py` therefore reduces them to secret-
 presentation metadata:
 
 - no authentication;
-- Bearer tokens, including the presentation of OAuth 2 and OpenID Connect access
-  tokens;
+- Bearer tokens;
+- OAuth 2 and OpenID Connect, which present a delegated token the same way;
 - API keys in a header, query parameter, cookie, or base-URL path placeholder;
 - HTTP Basic authentication;
 - multiple required API-key headers and constant non-secret headers.
 
-An explicit authoring override replaces the document's security choice for the whole
-catalog. The generated `tool.yaml` binds the selected presentation to tenant secret
-environment names. Credential fields are removed from model arguments so the model
-cannot supply or override them.
+The catalog records only the credential kind and API-key placements, and that record
+covers every compiled operation, not only those `--allow` exposes: it can say `provider`
+while the block proposed for the exposed operations is a static token. The generated
+`tool.yaml` proposes the matching `auth` block for the exposed operations: OAuth 2 and
+OpenID Connect become `provider`, which needs the OAuth app from the caller and
+defaults its scopes to those the exposed operations declare; static credentials bind
+secrets named after the connector (`JIRA_TOKEN`, `JIRA_USERNAME`/`JIRA_PASSWORD`,
+`JIRA_<KEY NAME>`). The document and the catalog never choose a secret name. An
+explicit choice replaces the document's security for the whole catalog, and
+regeneration presents the authored block on every operation. An operation whose
+alternatives present differently, such as OAuth or an API key, compiles only with an
+explicit choice, which takes the scopes or key placement of the matching alternative. Credential fields are
+removed from model arguments so the model cannot supply or override them.
 
-Without an override, the first supported authenticated operation selects the catalog
+Without a choice, the first supported authenticated operation selects the catalog
 presentation. Compatibility mode records operations requiring another presentation as
 unsupported; strict mode rejects the document. Anonymous operations remain available
 unless one of their normal parameters would collide with the catalog credential.

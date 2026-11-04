@@ -1,5 +1,7 @@
 import subprocess
 
+import pytest
+
 import agent_engine_runner_shared.error_reporting as error_reporting
 from agent_engine_runner_shared.error_reporting import (
     _before_send,
@@ -263,3 +265,82 @@ def test_redact_text_tolerates_missing_home_dir() -> None:
         error_reporting._HOME_DIR = original_home_dir
 
     assert redacted == "token=<redacted> /tmp/project"
+
+
+# Built by concatenation so secret scanners do not flag the fixtures.
+_PEM_BEGIN = "-----BEGIN " + "RSA PRIVATE KEY-----"
+_PEM_END = "-----END " + "RSA PRIVATE KEY-----"
+_OPENAI_KEY = "sk-" + "proj_Ab3dEf6hIj9kLm2nOp5q"
+_ATLAS_SECRET = "mdb_sa_sk_" + "Zx9-Yw8_Vu7Ts6Rq5"
+
+
+def test_redact_text_masks_pem_private_key_and_keeps_context() -> None:
+    redacted = _redact_text(
+        f"load failed for host db.example.net: {_PEM_BEGIN}\nMIIEow\nIBAAKC\n{_PEM_END} (bad padding)"
+    )
+
+    assert redacted == "load failed for host db.example.net: <redacted> (bad padding)"
+
+
+@pytest.mark.parametrize("label", ["", "RSA ", "EC ", "OPENSSH ", "ENCRYPTED ", "DSA "])
+def test_redact_text_masks_every_pem_private_key_label(label: str) -> None:
+    block = f"-----BEGIN {label}PRIVATE KEY-----\nAAAA\n-----END {label}PRIVATE KEY-----"
+
+    assert _redact_text(f"a {block} b {block} c") == "a <redacted> b <redacted> c"
+
+
+def test_redact_text_masks_block_after_unmatched_header_of_another_label() -> None:
+    # Any label's footer closes a block, so a stray generic header cannot end
+    # the scan before a complete RSA block.
+    stray = "-----BEGIN " + "PRIVATE KEY-----"
+    text = f"a {stray} b {_PEM_BEGIN}\nMIIEow\n{_PEM_END} c"
+
+    redacted = _redact_text(text)
+
+    assert "MIIEow" not in redacted
+    assert redacted == "a <redacted> c"
+
+
+def test_redact_text_unmatched_pem_headers_stay_linear() -> None:
+    import time
+
+    text = _PEM_BEGIN * 10_000
+    started = time.monotonic()
+    redacted = _redact_text(text)
+
+    assert time.monotonic() - started < 1.0
+    assert redacted == text
+
+
+def test_redact_text_masks_openai_style_key_and_keeps_context() -> None:
+    redacted = _redact_text(f"Incorrect API key provided: {_OPENAI_KEY} for api.openai.com")
+
+    assert _OPENAI_KEY not in redacted
+    assert redacted == "Incorrect API key provided: sk-<redacted> for api.openai.com"
+
+
+def test_redact_text_keeps_short_sk_prefixed_words() -> None:
+    assert _redact_text("sk-learn is installed; task-sk-12") == "sk-learn is installed; task-sk-12"
+
+
+def test_redact_text_masks_atlas_service_account_secret() -> None:
+    redacted = _redact_text(f"auth with {_ATLAS_SECRET} rejected by cloud.mongodb.com")
+
+    assert redacted == "auth with mdb_sa_sk_<redacted> rejected by cloud.mongodb.com"
+
+
+def test_redact_text_masks_mongodb_driver_uri_userinfo_and_keeps_host() -> None:
+    redacted = _redact_text(
+        "ServerSelectionTimeoutError: mongodb+srv://app:Pa55w0rd@cluster0.abcde.mongodb.net/?retryWrites=true"
+        " timed out"
+    )
+
+    assert "Pa55w0rd" not in redacted
+    assert "cluster0.abcde.mongodb.net" in redacted
+    assert redacted.startswith("ServerSelectionTimeoutError: mongodb+srv://<redacted>:<redacted>@")
+
+
+def test_redact_text_leaves_benign_driver_error_unchanged() -> None:
+    text = "OperationFailure: Cannot do exclusion on field a in inclusion projection; mixed inclusion and exclusion projection"
+
+    assert _redact_text(text) == text

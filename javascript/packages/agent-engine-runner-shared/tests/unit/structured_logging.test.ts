@@ -1274,7 +1274,6 @@ describe("RUNNER_MODE maps to service identifier and component", () => {
     ["orchestrator", "orchestration-engine"],
     ["aer", "agent-execution-runtime"],
     ["tool", "tool-executor"],
-    ["tool_function", "tool-executor"],
     ["memory-server", "memory-server"],
   ])("mode=%s → service=%s", (mode, expectedService) => {
     vi.stubEnv("RUNNER_MODE", mode);

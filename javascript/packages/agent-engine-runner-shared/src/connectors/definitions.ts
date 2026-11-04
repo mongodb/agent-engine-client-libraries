@@ -378,246 +378,224 @@ export const CredentialSchema = z
   });
 export type Credential = z.infer<typeof CredentialSchema>;
 
-export type AuthType =
-  | "none"
-  | "bearer"
-  | "api_key"
-  | "basic"
-  | "api_keys"
-  | "oauth";
+const CREDENTIAL_KEYS = ["bearer", "basic", "api_keys", "provider"] as const;
+const AUTH_KEYS = new Set<string>([...CREDENTIAL_KEYS, "scopes", "headers"]);
+const ONE_KEY = "one of bearer, basic, api_keys or provider";
+const USE_BEARER = "use bearer: <secret>";
+const USE_BASIC = "use basic: {username: <secret>, password: <secret>}";
+const USE_API_KEYS = "use api_keys: [{env, location, name}]";
+const USE_PROVIDER = "use provider: <OAuth app>";
+// Earlier spellings each name the key that replaces them. There are no
+// aliases: connectors are experimental, so a binding is rewritten rather than
+// translated.
+const REPLACED_TYPES: Readonly<Record<string, string>> = {
+  none: "remove the auth block for no credential",
+  bearer: USE_BEARER,
+  basic: USE_BASIC,
+  api_key: USE_API_KEYS,
+  api_keys: USE_API_KEYS,
+  oauth: USE_PROVIDER,
+};
+const REPLACED_FIELDS: ReadonlyArray<readonly [string, string]> = [
+  ["env", `${USE_BEARER} or api_keys: [{env, location, name}]`],
+  ["header", USE_API_KEYS],
+  ["location", USE_API_KEYS],
+  ["name", USE_API_KEYS],
+  ["prefix", USE_API_KEYS],
+  ["username_env", USE_BASIC],
+  ["password_env", USE_BASIC],
+  ["credentials", USE_API_KEYS],
+  ["provider_type", USE_PROVIDER],
+];
 
-const ALLOWED_AUTH_FIELDS: Record<AuthType, ReadonlySet<string>> = {
-  none: new Set(["type"]),
-  bearer: new Set(["type", "env", "headers"]),
-  api_key: new Set([
-    "type",
-    "env",
-    "header",
-    "location",
-    "name",
-    "prefix",
-    "headers",
-  ]),
-  basic: new Set(["type", "username_env", "password_env", "headers"]),
-  api_keys: new Set(["type", "credentials", "headers"]),
-  oauth: new Set(["type", "provider_type", "scopes", "headers"]),
+/**
+ * Describe the first key an auth block may not contain, naming its
+ * replacement. Mirrors Python's `unsupported_auth_key`: checks run in the
+ * same order and values are never quoted, so a secret pasted where a secret
+ * name belongs cannot reach an error or a log.
+ */
+export function unsupportedAuthKey(
+  auth: Record<string, unknown>,
+): string | null {
+  if (Object.hasOwn(auth, "type")) {
+    const kind = auth["type"];
+    const replacement =
+      typeof kind === "string" && Object.hasOwn(REPLACED_TYPES, kind)
+        ? REPLACED_TYPES[kind]
+        : `use ${ONE_KEY}`;
+    return `auth.type is not supported; ${replacement}`;
+  }
+  for (const [field, replacement] of REPLACED_FIELDS) {
+    if (Object.hasOwn(auth, field)) {
+      return `auth.${field} is not supported; ${replacement}`;
+    }
+  }
+  const unknown = Object.keys(auth)
+    .filter((key) => !AUTH_KEYS.has(key))
+    .sort();
+  if (unknown.length === 0) return null;
+  if (CONNECTOR_NAME_RE.test(unknown[0])) {
+    return `auth.${unknown[0]} is not supported; use ${ONE_KEY}`;
+  }
+  return `auth contains an unsupported key; use ${ONE_KEY}`;
+}
+
+const BASIC_SHAPE = "auth.basic requires username and password secrets";
+
+export const BasicAuthSchema = z
+  .unknown()
+  .superRefine((value, ctx) => {
+    // Refuse any other shape with the shared message instead of a field error.
+    if (
+      !isRecord(value) ||
+      Object.keys(value).length !== 2 ||
+      typeof value["username"] !== "string" ||
+      typeof value["password"] !== "string"
+    ) {
+      ctx.addIssue({ code: "custom", message: BASIC_SHAPE });
+    }
+  })
+  .pipe(
+    z
+      .object({ username: z.string(), password: z.string() })
+      .strict()
+      .superRefine((value, ctx) => {
+        if (
+          !isSecretEnvReference(value.username) ||
+          !isSecretEnvReference(value.password)
+        ) {
+          ctx.addIssue({
+            code: "custom",
+            message:
+              "auth.basic username and password must name workspace secrets",
+          });
+        } else if (value.username === value.password) {
+          ctx.addIssue({
+            code: "custom",
+            message:
+              "auth.basic username and password must be different secrets",
+          });
+        }
+      }),
+  );
+export type BasicAuth = z.infer<typeof BasicAuthSchema>;
+
+type AuthFields = {
+  bearer?: string | null;
+  basic?: BasicAuth | null;
+  api_keys?: Credential[] | null;
+  provider?: string | null;
+  scopes?: string[] | null;
+  headers?: Record<string, string> | null;
 };
 
-export const AuthSchema = z
-  .object({
-    type: z
-      .enum(["none", "bearer", "api_key", "basic", "api_keys", "oauth"])
-      .default("none"),
-    provider_type: z.string().nullable().optional(),
-    scopes: z.array(z.string()).default([]),
-    env: z.string().nullable().optional(),
-    header: z.string().nullable().optional(),
-    location: z
-      .enum(["header", "query", "path", "cookie"])
-      .nullable()
-      .optional(),
-    name: z.string().nullable().optional(),
-    prefix: z.string().default(""),
-    username_env: z.string().nullable().optional(),
-    password_env: z.string().nullable().optional(),
-    credentials: z.array(CredentialSchema).min(2).nullable().optional(),
-    headers: z.record(z.string(), z.string()).nullable().optional(),
-  })
-  .strict()
-  .superRefine((value, ctx) => {
-    const configured = new Set<string>(["type"]);
-    for (const [name, fieldValue] of Object.entries(value)) {
-      if (name === "type" || fieldValue === undefined || fieldValue === null)
-        continue;
-      if (typeof fieldValue === "string" && fieldValue === "") continue;
-      if (Array.isArray(fieldValue) && fieldValue.length === 0) continue;
-      if (isRecord(fieldValue) && Object.keys(fieldValue).length === 0)
-        continue;
-      configured.add(name);
-    }
-    const allowed = ALLOWED_AUTH_FIELDS[value.type];
-    const unexpected = [...configured].filter((name) => !allowed.has(name));
-    if (unexpected.length > 0) {
-      ctx.addIssue({
-        code: "custom",
-        message: `${value.type} auth contains fields for another auth type`,
-      });
-    }
+/** Return the first problem with a parsed auth block, or `null`. */
+function authProblem(auth: AuthFields): string | null {
+  const present = CREDENTIAL_KEYS.filter(
+    (key) => auth[key] !== undefined && auth[key] !== null,
+  );
+  if (present.length === 0) return `auth requires ${ONE_KEY}`;
+  if (present.length > 1) {
+    return `auth takes only ${ONE_KEY}; found ${present.join(", ")}`;
+  }
+  if (auth.scopes != null && auth.provider == null) {
+    return "auth.scopes requires provider";
+  }
 
-    let credentialHeaders = new Set<string>();
-    if (value.type === "oauth") {
-      if (
-        !value.provider_type ||
-        hasControlOrNonAscii(value.provider_type) ||
-        /\s/.test(value.provider_type)
-      ) {
-        ctx.addIssue({
-          code: "custom",
-          message:
-            "OAuth auth requires an explicit provider key without whitespace",
-        });
-      }
-      if (
-        new Set(value.scopes).size !== value.scopes.length ||
-        value.scopes.some((scope) => !OAUTH_SCOPE_RE.test(scope))
-      ) {
-        ctx.addIssue({
-          code: "custom",
-          message: "OAuth scopes must be unique OAuth scope tokens",
-        });
-      }
-      credentialHeaders = new Set(["authorization"]);
-    } else if (value.type === "bearer") {
-      if (!isSecretEnvReference(value.env)) {
-        ctx.addIssue({
-          code: "custom",
-          message: "bearer auth requires one tenant secret env",
-        });
-      }
-      credentialHeaders = new Set(["authorization"]);
-    } else if (value.type === "api_key") {
-      const location = value.location ?? "header";
-      const name = value.name ?? value.header ?? "X-API-Key";
-      if (
-        value.header !== undefined &&
-        value.header !== null &&
-        (location !== "header" ||
-          (value.name !== undefined && value.name !== null))
-      ) {
-        ctx.addIssue({
-          code: "custom",
-          message:
-            "legacy auth.header cannot be combined with location or name",
-        });
-      }
-      if (!isSecretEnvReference(value.env)) {
-        ctx.addIssue({
-          code: "custom",
-          message: "API key auth requires a tenant-owned environment reference",
-        });
-      }
-      if (value.env) {
-        const credential = CredentialSchema.safeParse({
-          env: value.env,
-          location,
-          name,
-          prefix: value.prefix,
-        });
-        if (!credential.success) {
-          for (const issue of credential.error.issues) {
-            ctx.addIssue({ code: "custom", message: issue.message });
-          }
-        }
-      }
-      if (location === "header")
-        credentialHeaders = new Set([name.toLowerCase()]);
-    } else if (value.type === "basic") {
-      if (
-        !isSecretEnvReference(value.username_env) ||
-        !isSecretEnvReference(value.password_env)
-      ) {
-        ctx.addIssue({
-          code: "custom",
-          message:
-            "basic auth requires tenant-owned username and password envs",
-        });
-      }
-      if (value.username_env === value.password_env) {
-        ctx.addIssue({
-          code: "custom",
-          message:
-            "basic auth username and password must use different secrets",
-        });
-      }
-      credentialHeaders = new Set(["authorization"]);
-    } else if (value.type === "api_keys") {
-      if (!value.credentials || value.credentials.length === 0) {
-        ctx.addIssue({
-          code: "custom",
-          message: "multi-key auth requires at least two credentials",
-        });
-      }
-      const identities = (value.credentials ?? []).map(
-        (credential) =>
-          `${credential.location}:${credential.name.toLowerCase()}`,
-      );
-      if (identities.length !== new Set(identities).size) {
-        ctx.addIssue({
-          code: "custom",
-          message: "multi-key auth has duplicate credential destinations",
-        });
-      }
-      credentialHeaders = new Set(
-        (value.credentials ?? [])
-          .filter((credential) => credential.location === "header")
-          .map((credential) => credential.name.toLowerCase()),
-      );
+  let credentialHeaders = new Set(["authorization"]);
+  if (auth.provider != null) {
+    if (
+      !auth.provider ||
+      [...auth.provider].some((character) => {
+        const code = character.codePointAt(0) ?? 0;
+        return code <= 32 || code >= 127;
+      })
+    ) {
+      return "auth.provider must name an OAuth app without whitespace";
     }
-
-    try {
-      validateStaticHeaders(value.headers, credentialHeaders);
-    } catch (error) {
-      ctx.addIssue({
-        code: "custom",
-        message: error instanceof Error ? error.message : String(error),
-      });
+    const scopes = auth.scopes ?? [];
+    if (
+      new Set(scopes).size !== scopes.length ||
+      scopes.some((scope) => !OAUTH_SCOPE_RE.test(scope))
+    ) {
+      return "auth.scopes must be unique OAuth scope tokens";
     }
-  });
-export type Auth = z.infer<typeof AuthSchema>;
-
-/** Return the single generated auth header, when this auth shape has one. */
-export function authHeaderName(auth: Auth | null | undefined): string | null {
-  if (!auth) return null;
-  if (auth.type === "bearer" || auth.type === "oauth") return "Authorization";
-  if (auth.type === "api_key" && (auth.location ?? "header") === "header") {
-    return auth.name ?? auth.header ?? "X-API-Key";
+  } else if (auth.bearer != null) {
+    if (!isSecretEnvReference(auth.bearer)) {
+      return "auth.bearer must name a workspace secret";
+    }
+  } else if (auth.api_keys != null) {
+    if (auth.api_keys.length === 0) {
+      return "auth.api_keys requires at least one key";
+    }
+    const identities = auth.api_keys.map(
+      (key) => `${key.location}:${key.name.toLowerCase()}`,
+    );
+    if (identities.length !== new Set(identities).size) {
+      return "auth.api_keys has duplicate credential destinations";
+    }
+    credentialHeaders = new Set(
+      auth.api_keys
+        .filter((key) => key.location === "header")
+        .map((key) => key.name.toLowerCase()),
+    );
+  }
+  try {
+    validateStaticHeaders(auth.headers, credentialHeaders);
+  } catch (error) {
+    return error instanceof Error ? error.message : String(error);
   }
   return null;
 }
 
+/**
+ * How each request of one connector authenticates. Exactly one credential
+ * key is present, and the key is the mechanism: `bearer`, `basic` and
+ * `api_keys` name workspace secrets read per call, and `provider` names the
+ * project's OAuth app whose token Delegated auth issues per call. Whose
+ * identity a provider call carries comes from the app's grant type, never
+ * from the binding. A key set to `null` is absent.
+ */
+export const AuthSchema = z
+  .unknown()
+  .superRefine((value, ctx) => {
+    // Refuse `type` and its fields before field parsing, naming the
+    // replacement; other shapes fall through to the object's own errors.
+    const message = isRecord(value) ? unsupportedAuthKey(value) : null;
+    if (message) ctx.addIssue({ code: "custom", message });
+  })
+  .pipe(
+    z
+      .object({
+        bearer: z.string().nullish(),
+        basic: BasicAuthSchema.nullish(),
+        api_keys: z.array(CredentialSchema).nullish(),
+        provider: z.string().nullish(),
+        scopes: z.array(z.string()).nullish(),
+        headers: z.record(z.string(), z.string()).nullish(),
+      })
+      .strict()
+      .superRefine((value, ctx) => {
+        const message = authProblem(value);
+        if (message) ctx.addIssue({ code: "custom", message });
+      }),
+  );
+export type Auth = z.infer<typeof AuthSchema>;
+
 /** List auth-controlled headers so model parameters cannot collide with them. */
 export function authHeaderNames(auth: Auth | null | undefined): Set<string> {
   if (!auth) return new Set();
-  let names: Set<string>;
-  if (
-    auth.type === "bearer" ||
-    auth.type === "basic" ||
-    auth.type === "oauth"
-  ) {
-    names = new Set(["authorization"]);
-  } else if (auth.type === "api_key") {
-    const header = authHeaderName(auth);
-    names = header ? new Set([header.toLowerCase()]) : new Set();
-  } else if (auth.type === "api_keys") {
-    names = new Set(
-      (auth.credentials ?? [])
-        .filter((credential) => credential.location === "header")
-        .map((credential) => credential.name.toLowerCase()),
-    );
-  } else {
-    names = new Set();
-  }
+  const names =
+    auth.api_keys != null
+      ? new Set(
+          auth.api_keys
+            .filter((key) => key.location === "header")
+            .map((key) => key.name.toLowerCase()),
+        )
+      : new Set(["authorization"]);
   for (const header of Object.keys(auth.headers ?? {}))
     names.add(header.toLowerCase());
   return names;
-}
-
-/** Normalize single and compound API keys into the executor's common form. */
-export function authCredentialBindings(
-  auth: Auth | null | undefined,
-): Credential[] {
-  if (!auth) return [];
-  if (auth.type === "api_key" && auth.env) {
-    return [
-      {
-        env: auth.env,
-        location: auth.location ?? "header",
-        name: auth.name ?? auth.header ?? "X-API-Key",
-        prefix: auth.prefix,
-      },
-    ];
-  }
-  return [...(auth.credentials ?? [])];
 }
 
 export const ParametersSchema = z
@@ -1047,7 +1025,7 @@ export const ToolDefinitionsSchema = z
         }
       }
     }
-    const credentials = authCredentialBindings(value.auth);
+    const credentials = value.auth?.api_keys ?? [];
     for (const credential of credentials) {
       if (
         credential.location === "query" &&

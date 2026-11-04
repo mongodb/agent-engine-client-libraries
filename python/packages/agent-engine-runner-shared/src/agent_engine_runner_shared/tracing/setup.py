@@ -30,6 +30,7 @@ from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapProp
 from .exporters import (
     ContentPolicyOTLPSpanExporter,
     MongoDBSpanExporter,
+    PlatformSpanExporter,
     get_content_capture_mode,
 )
 
@@ -60,6 +61,27 @@ _retry_thread: Optional[threading.Thread] = None
 # TypeScript `tracingMongoClient` lifecycle, which only closes self-created
 # clients.
 _tracing_mongo_client: Optional["MongoClient"] = None
+
+# Platform trace-exporter state. The exporter is off by default and enabled
+# per workspace with the flag named by `_PLATFORM_TRACE_EXPORTER_ENV`; when on
+# (and OE_URL is set) the guest sends spans to the OE instead of writing
+# MongoDB directly. `_platform_exporter` is retained so /health can report its
+# recent export results and shutdown can reset it.
+_platform_exporter: Optional[PlatformSpanExporter] = None
+_platform_exporter_attached: bool = False
+
+# Feature flag: route runner spans to the OE platform trace endpoint. Off by
+# default, so an unset value keeps the MongoDB trace-store path. Deliberately
+# avoids the reserved tenant-secret prefix, which a workspace secret cannot use
+# (pkg/tenantsecrets), so a workspace can set this one directly.
+_PLATFORM_TRACE_EXPORTER_ENV = "AGENTIC_TRACE_EXPORTER"
+
+# Explicit BatchSpanProcessor sizing for the platform exporter. A larger queue
+# than the OTel default absorbs the burst of spans emitted as a turn finishes,
+# and the 2s schedule delay bounds how long a span waits before export.
+_PLATFORM_BSP_MAX_QUEUE_SIZE = 2048
+_PLATFORM_BSP_MAX_EXPORT_BATCH_SIZE = 512
+_PLATFORM_BSP_SCHEDULE_DELAY_MILLIS = 2000
 
 # Resource attribute -> platform-injected env var. These are process-level
 # identity (set once at pod startup), unlike execution.id/session.id which
@@ -118,6 +140,18 @@ def _otlp_endpoint_configured() -> bool:
     return bool(
         os.getenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT") or os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
     )
+
+
+def platform_trace_exporter_enabled() -> bool:
+    """Whether the OE platform trace exporter is enabled.
+
+    Off by default: the flag gates the rollout, so an unset (or unrecognized)
+    value keeps the MongoDB trace-store path. A workspace enables it by setting
+    the env var named by ``_PLATFORM_TRACE_EXPORTER_ENV`` to ``1`` or ``true``.
+    It is only half the condition — the exporter also needs ``OE_URL`` to know
+    where to send spans.
+    """
+    return os.getenv(_PLATFORM_TRACE_EXPORTER_ENV, "").strip().lower() in ("1", "true")
 
 
 class ExecutionContextSpanProcessor(SpanProcessor):
@@ -200,8 +234,15 @@ def setup_tracing(
 
     provider.add_span_processor(ExecutionContextSpanProcessor())
 
-    # Add the canonical customer trace-store exporter when configured.
-    if mongodb_collection is not None:
+    # Destination: the OE platform trace endpoint when the feature flag is on
+    # and OE_URL is set, otherwise the caller-supplied MongoDB collection. With
+    # the flag on the OE is the platform trace path and takes precedence — a
+    # guest with both must not keep writing MongoDB directly.
+    oe_url = os.getenv("OE_URL", "").strip()
+    otlp_configured = _otlp_endpoint_configured()
+    if oe_url and platform_trace_exporter_enabled():
+        _attach_platform_exporter(provider, oe_url)
+    elif mongodb_collection is not None:
         provider.add_span_processor(BatchSpanProcessor(MongoDBSpanExporter(mongodb_collection)))
         _mongodb_exporter_attached = True
         if take_client_ownership:
@@ -209,6 +250,12 @@ def setup_tracing(
         _mongodb_degraded = False
         logger.info(
             f"Tracing: MongoDB output to {mongodb_collection.database.name}.{mongodb_collection.name}"
+        )
+    elif not otlp_configured:
+        logger.warning(
+            "Tracing: no trace destination configured "
+            "(platform exporter disabled or OE_URL unset, "
+            "no MongoDB collection, no OTLP endpoint)"
         )
 
     # Set as global tracer provider before attempting the OTLP block below —
@@ -221,7 +268,7 @@ def setup_tracing(
     # redaction (AGENTIC_PLATFORM_OTEL_CONTENT_CAPTURE) applies only to this path.
     # Guarded: an accidentally-set OTEL_EXPORTER_OTLP_* env var (or a missing
     # `tracing` extra) must not take down tracing setup entirely.
-    if _otlp_endpoint_configured():
+    if otlp_configured:
         try:
             from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
 
@@ -258,6 +305,23 @@ def setup_tracing(
     _instrument_httpx()
 
     logger.info(f"Tracing enabled for '{service_name}'")
+
+
+def _attach_platform_exporter(provider: TracerProvider, oe_url: str) -> None:
+    """Install the OE platform trace exporter on ``provider``."""
+    global _platform_exporter, _platform_exporter_attached
+    exporter = PlatformSpanExporter(oe_url)
+    provider.add_span_processor(
+        BatchSpanProcessor(
+            exporter,
+            max_queue_size=_PLATFORM_BSP_MAX_QUEUE_SIZE,
+            max_export_batch_size=_PLATFORM_BSP_MAX_EXPORT_BATCH_SIZE,
+            schedule_delay_millis=_PLATFORM_BSP_SCHEDULE_DELAY_MILLIS,
+        )
+    )
+    _platform_exporter = exporter
+    _platform_exporter_attached = True
+    logger.info("Tracing: platform exporter -> %s", exporter.url)
 
 
 def _run_instrumentor() -> None:
@@ -323,21 +387,35 @@ def attach_mongodb_tracing(collection: "Collection") -> bool:
 
 
 def tracing_status() -> dict[str, str]:
-    """Snapshot of the database trace-store exporter for /health.
+    """Snapshot of the trace exporters for /health.
 
-    Returns ``{"database_exporter": "attached" | "degraded" | "disabled"}``:
+    ``database_exporter`` is ``attached`` (a MongoDB span processor is live),
+    ``degraded`` (a store URI was configured but the startup connection failed
+    and the background retry is in progress), or ``disabled`` (no store URI was
+    configured — an intentional configuration, not a degradation).
 
-    * ``attached`` — a MongoDB span processor is live.
-    * ``degraded`` — a store URI was configured but the startup connection
-      failed and the background retry is in progress.
-    * ``disabled`` — no store URI was configured; this is an intentional
-      configuration, not a degradation. OTLP may still be configured.
+    ``platform_exporter`` is ``attached`` (spans are sent to the OE),
+    ``degraded`` (the most recent export did not fully succeed), or
+    ``disabled`` (the feature flag is off or OE_URL unset; OTLP may still be
+    configured).
     """
+    if _platform_exporter_attached:
+        platform = (
+            "degraded"
+            if _platform_exporter is not None and _platform_exporter.last_error is not None
+            else "attached"
+        )
+    else:
+        platform = "disabled"
+
     if _mongodb_exporter_attached:
-        return {"database_exporter": "attached"}
-    if _mongodb_degraded:
-        return {"database_exporter": "degraded"}
-    return {"database_exporter": "disabled"}
+        database = "attached"
+    elif _mongodb_degraded:
+        database = "degraded"
+    else:
+        database = "disabled"
+
+    return {"database_exporter": database, "platform_exporter": platform}
 
 
 # The run is [^"'] (any char except quotes): it still crosses embedded
@@ -461,6 +539,7 @@ def shutdown_tracing() -> None:
     """
     global _tracer_provider, _retry_stop_event, _retry_thread
     global _mongodb_exporter_attached, _mongodb_degraded, _tracing_mongo_client
+    global _platform_exporter, _platform_exporter_attached
 
     # Signal the retry thread to stop, then wait (bounded) for it to exit
     # before tearing down the provider it attaches exporters to. The loop
@@ -498,6 +577,26 @@ def shutdown_tracing() -> None:
     # process (e.g. tests) starts clean.
     _mongodb_exporter_attached = False
     _mongodb_degraded = False
+    _platform_exporter = None
+    _platform_exporter_attached = False
+
+
+def force_flush_tracing(timeout_millis: int = 5000) -> bool:
+    """Flush pending spans to their exporters, bounded by ``timeout_millis``.
+
+    Called from the session-finish path before the OE releases the pod, so a
+    turn's spans are not lost to a zero-grace teardown. Returns True when
+    tracing is not initialized (nothing to flush) or the flush completed within
+    the timeout; False when it timed out or raised.
+    """
+    provider = _tracer_provider
+    if provider is None:
+        return True
+    try:
+        return provider.force_flush(timeout_millis)
+    except Exception:  # noqa: BLE001 - best-effort flush
+        logger.debug("Tracing force_flush failed", exc_info=True)
+        return False
 
 
 def _uninstrument_httpx() -> None:

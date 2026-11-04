@@ -111,6 +111,19 @@ def test_resolve_mcp_headers_leaves_client_credentials_to_sdk_auth_provider():
     assert resolve_mcp_headers("atlas", config) == {"X-MCP-Readonly": "true"}
 
 
+def test_resolve_mcp_auth_reports_an_oauth_app_entry_as_not_available_yet():
+    config = RuntimeMCPServerConfig.model_validate({"scopes": ["read"]})
+
+    with pytest.raises(MCPConfigError, match="'glean' names an OAuth app.*not available yet"):
+        resolve_mcp_auth("glean", config)
+
+
+def test_mcp_server_network_hosts_is_empty_for_an_oauth_app_entry():
+    config = RuntimeMCPServerConfig.model_validate({})
+
+    assert mcp_server_network_hosts(config) == []
+
+
 def test_resolve_mcp_auth_creates_oauth_provider(monkeypatch):
     calls = []
 

@@ -58,7 +58,7 @@ class ToolDefinition(BaseModel):
     args_schema: dict[str, Any]
     callable: Any
     remote: bool = True
-    provider_type: str | None = None
+    provider: str | None = None
     scopes: list[str] = []
     network: list[str] = []
     timeout_seconds: int = 30
@@ -131,8 +131,13 @@ class LLMTokenUsage(MappingCompatModel):
             self.total_tokens = prompt_tokens + completion_tokens
         return self
 
-    def to_langchain_usage_metadata(self) -> dict[str, int]:
-        """Return LangChain's expected usage-metadata keys."""
+    def to_langchain_usage_metadata(self) -> dict[str, Any]:
+        """Return LangChain's expected usage-metadata keys.
+
+        Provider detail mappings (``input_token_details.cache_read`` and
+        friends) ride along unchanged so an agent can read the cache breakdown
+        from the message it already has.
+        """
         input_tokens = (
             self.input_tokens
             if self.input_tokens is not None
@@ -148,11 +153,17 @@ class LLMTokenUsage(MappingCompatModel):
             if self.total_tokens is not None
             else input_tokens + output_tokens
         )
-        return {
+        metadata: dict[str, Any] = {
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
             "total_tokens": total_tokens,
         }
+        extra = self.model_extra or {}
+        for key in ("input_token_details", "output_token_details"):
+            details = extra.get(key)
+            if isinstance(details, dict) and details:
+                metadata[key] = details
+        return metadata
 
 
 class LLMToolCall(MappingCompatModel):

@@ -145,6 +145,7 @@ async def _open_mcp_client(
         auth=auth,
         responses=responses,
     )
+    assert config.url is not None  # An OAuth app entry raises before this point.
     # The transport never closes a caller-owned client, so the session owns it.
     async with http_client:
         client = Client(
@@ -185,6 +186,10 @@ def resolve_mcp_headers(server_name: str, config: RuntimeMCPServerConfig) -> dic
 def resolve_mcp_auth(server_name: str, config: RuntimeMCPServerConfig) -> Any | None:
     """Resolve an MCP SDK auth provider for the configured auth mode."""
 
+    if config.url is None:
+        raise MCPConfigError(
+            f"mcp server {server_name!r} names an OAuth app; OAuth app servers are not available yet"
+        )
     if config.auth.type == "none" or config.auth.type == "bearer_env":
         return None
 
@@ -207,7 +212,7 @@ def resolve_mcp_auth(server_name: str, config: RuntimeMCPServerConfig) -> Any | 
 def mcp_server_network_hosts(config: RuntimeMCPServerConfig) -> list[str]:
     """Return the outbound hosts needed to reach a configured MCP server."""
 
-    hosts = [cast(str, urlparse(config.url).hostname)]
+    hosts = [] if config.url is None else [cast(str, urlparse(config.url).hostname)]
     if config.auth.token_url is not None:
         token_host = cast(str, urlparse(config.auth.token_url).hostname)
         if token_host not in hosts:

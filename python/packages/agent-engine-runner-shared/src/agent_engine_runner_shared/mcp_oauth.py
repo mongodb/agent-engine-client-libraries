@@ -447,6 +447,7 @@ def make_mcp_client_credentials_auth(
 ) -> OAuthClientProvider:
     """Return a client-credentials OAuth provider for a configured MCP server."""
 
+    assert config.url is not None  # Only an entry with a url can set auth.
     auth = config.auth
     client_id = _required_env_value(server_name, "client_id_env", cast(str, auth.client_id_env))
     client_secret = _required_env_value(
@@ -512,6 +513,7 @@ def _make_oauth_provider(
     redirect_handler: Any,
     callback_handler: Any,
 ) -> OAuthClientProvider:
+    assert config.url is not None  # Reached only from an entry with a url.
     storage = FileOAuthTokenStorage(server_name, config.url, cache_dir=cache_dir)
     return CachedOAuthClientProvider(
         server_url=config.url,

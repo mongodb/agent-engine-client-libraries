@@ -90,7 +90,8 @@ happened before, `search_taxonomic` for what a term means,
 Or it can hand the whole job over. `build_context_from_sources` takes one spec
 per source, each declaring its own retrieval mode, filter and candidate count,
 then retrieves from every source on its own terms, ranks and de-duplicates the
-results together, trims them to a token budget, and returns a single block of
+results together (unless `collapse_duplicate_content=False`), trims them to a
+token budget, and returns a single block of
 context to drop into the next prompt. `build_context` does the same with one mode
 and one filter for every source; reach for the per-source form when they need to
 differ.
@@ -189,7 +190,8 @@ Assembled prose, or the records themselves — two different questions.
 
 **`build_context_from_sources(...)`** is the one to reach for by default. You
 give it a query and a token budget; it retrieves across the memory types you
-name, ranks the results together, drops near-duplicates, trims to the budget,
+name, ranks the results together, drops near-duplicates (unless you pass
+`collapse_duplicate_content=False`), trims to the budget,
 and returns something you can put straight into a prompt. It is the whole
 retrieval pipeline behind one call, and it takes one spec per source, so modes
 and filters are set per source rather than once for all of them.
@@ -493,7 +495,13 @@ applies one filter and semantic retrieval to every source, this method lets each
 source declare its own retrieval `mode` (`text`, `semantic`, or `hybrid`),
 `metadata_filter`, and `top_k` via a `SourceSpec`. Results are merged and
 de-duplicated across sources, optionally reordered by a relevance `rerank`, then
-formatted and budgeted like `build_context`. `metadata.ranking_strategy` and
+formatted and budgeted like `build_context`. Pass
+`collapse_duplicate_content=False` to skip the content collapse and receive
+every candidate each source contributed, up to its `top_k` — a document
+surfacing from both the vector and text legs is still returned once either way,
+and `max_tokens` still applies after merging, so disabling the collapse may
+require a larger budget to see every row.
+`metadata.ranking_strategy` and
 `metadata.source_outcomes` report how the final order was produced and how each
 source fared. `sources` must be non-empty and may list each source at most once,
 and each source's `top_k` must be between 1 and 200; `session_id` is only

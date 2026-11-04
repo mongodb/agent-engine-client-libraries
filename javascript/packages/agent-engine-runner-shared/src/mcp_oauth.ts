@@ -315,9 +315,13 @@ class FileBackedOAuthProvider implements OAuthClientProvider {
     redirectUri: string,
     cacheDir?: string,
   ) {
+    const serverUrl = config.url;
+    if (serverUrl === null) {
+      throw new Error("mcp server url is required for the oauth auth type");
+    }
     this.storage = new FileOAuthTokenStorage(
       serverName,
-      config.url,
+      serverUrl,
       cacheDir,
       undefined,
       config.auth.scope ?? undefined,
@@ -458,6 +462,12 @@ class FileBackedClientCredentialsProvider implements OAuthClientProvider {
     clientSecret: string,
     cacheDir?: string,
   ) {
+    const serverUrl = config.url;
+    if (serverUrl === null) {
+      throw new Error(
+        "mcp server url is required for the client_credentials auth type",
+      );
+    }
     this.tokenUrl = config.auth.token_url;
     this.configuredScope = config.auth.scope ?? undefined;
     this.inner = makeInnerClientCredentialsProvider(
@@ -470,7 +480,7 @@ class FileBackedClientCredentialsProvider implements OAuthClientProvider {
     );
     this.storage = new FileOAuthTokenStorage(
       serverName,
-      config.url,
+      serverUrl,
       cacheDir,
       clientId,
       this.configuredScope,

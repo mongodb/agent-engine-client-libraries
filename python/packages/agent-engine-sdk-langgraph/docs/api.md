@@ -188,7 +188,7 @@ Return wrapped, LangGraph-specific tools for ToolNode.
 ```python
 def tool(is_local: bool = True,
          *,
-         provider_type: str | None = None,
+         provider: str | None = None,
          scopes: list[str] | None = None,
          network: list[str] | None = None,
          timeout: int = 30,
@@ -206,7 +206,7 @@ for Tool Pod execution.
 **Arguments**:
 
 - `is_local` - If True, runs in AER; if False, runs in Tool Pod (default: True)
-- `provider_type` - Credential provider type for delegated auth (e.g. "github")
+- `provider` - Credential provider key for delegated auth (e.g. "github")
 - `scopes` - OAuth scopes requested for delegated auth
 - `network` - Allowed network hosts (for tool pod)
 - `timeout` - Execution timeout in seconds

@@ -26,8 +26,7 @@ expose:
     - jiradc_getComments
     - jiradc_addComment
 auth:
-  type: bearer
-  env: JIRA_TOKEN
+  bearer: JIRA_TOKEN
 """
 
 
@@ -55,14 +54,14 @@ class TestMaterializeConnectors:
     def test_oauth_authoring_overrides_catalog_bearer_presentation(self, tmp_path):
         """Materialization keeps the explicit provider binding and scopes for every tool."""
         authored = TOOL_YAML.replace(
-            "type: bearer\n  env: JIRA_TOKEN",
-            "type: oauth\n  provider_type: custom-github\n  scopes: [repo]",
+            "bearer: JIRA_TOKEN",
+            "provider: custom-github\n  scopes: [repo]",
         )
         bundle = _bundle_for(tmp_path, tool_yaml=authored)
         for tool in bundle.tools:
-            assert tool.registration_metadata["provider_type"] == "custom-github"
+            assert tool.registration_metadata["provider"] == "custom-github"
             assert tool.registration_metadata["scopes"] == ["repo"]
-            assert tool.connector.definitions.auth.env is None
+            assert tool.connector.definitions.auth.bearer is None
 
     def test_materializes_bundle_matching_runtime_contract(self, tmp_path):
         bundle = _bundle_for(tmp_path)
@@ -191,44 +190,30 @@ class TestMaterializeConnectors:
             _bundle_for(tmp_path, tool_yaml=tool_yaml)
 
     def test_catalog_credential_binding_never_survives(self, tmp_path):
-        """The catalog carries auth.env (POC format) but must not win: the
+        """The catalog carries a credential binding but must not win: the
         consuming tool.yaml is the only source of credential bindings."""
-        tool_yaml = TOOL_YAML.replace(
-            """auth:
-  type: bearer
-  env: JIRA_TOKEN
-""",
-            "auth:\n  type: none\n",
-        )
+        tool_yaml = TOOL_YAML.replace("auth:\n  bearer: JIRA_TOKEN\n", "")
         bundle = _bundle_for(tmp_path, tool_yaml=tool_yaml)
 
         assert bundle.connectors[0].definitions.auth is None
 
-    def test_auth_env_without_type_fails_loudly(self, tmp_path):
+    @pytest.mark.parametrize(
+        ("auth", "message"),
+        [
+            ("auth:\n  env: JIRA_TOKEN\n", "auth.env is not supported"),
+            ("auth:\n  type: none\n", "remove the auth block for no credential"),
+            ("auth: {}\n", "auth requires one of bearer, basic, api_keys or provider"),
+        ],
+    )
+    def test_unusable_auth_block_fails_loudly(self, tmp_path, auth, message):
         """Silently dropping the binding would register unauthenticated tools
         that only fail with remote 401s."""
-        tool_yaml = TOOL_YAML.replace(
-            """auth:
-  type: bearer
-  env: JIRA_TOKEN
-""",
-            "auth:\n  env: JIRA_TOKEN\n",
-        )
+        tool_yaml = TOOL_YAML.replace("auth:\n  bearer: JIRA_TOKEN\n", auth)
 
-        with pytest.raises(MaterializeError, match="invalid auth"):
+        with pytest.raises(MaterializeError, match="invalid auth") as caught:
             _bundle_for(tmp_path, tool_yaml=tool_yaml)
 
-    def test_auth_none_with_credentials_fails_loudly(self, tmp_path):
-        tool_yaml = TOOL_YAML.replace(
-            """auth:
-  type: bearer
-  env: JIRA_TOKEN
-""",
-            "auth:\n  type: none\n  env: JIRA_TOKEN\n",
-        )
-
-        with pytest.raises(MaterializeError, match="invalid auth"):
-            _bundle_for(tmp_path, tool_yaml=tool_yaml)
+        assert message in str(caught.value)
 
     def test_credential_is_sent_only_to_the_consumer_origin(self, tmp_path):
         """Execution-level proof of the consumer-owned binding: the credential
@@ -261,21 +246,17 @@ class TestMaterializeConnectors:
 
     def test_tool_yaml_api_key_binding_reaches_artifact(self, tmp_path):
         tool_yaml = TOOL_YAML.replace(
+            "auth:\n  bearer: JIRA_TOKEN\n",
             """auth:
-  type: bearer
-  env: JIRA_TOKEN
-""",
-            """auth:
-  type: api_key
-  env: WEATHER_API_KEY
-  header: X-Custom-Key
+  api_keys:
+    - {env: WEATHER_API_KEY, location: header, name: X-Custom-Key}
 """,
         )
         bundle = _bundle_for(tmp_path, tool_yaml=tool_yaml)
 
         definitions = bundle.connectors[0].definitions
         assert definitions.auth is not None
-        assert definitions.auth.header_name() == "X-Custom-Key"
+        assert definitions.auth.header_names() == {"x-custom-key"}
 
     def test_connector_name_becomes_identity_so_traversal_is_rejected(self, tmp_path):
         tool_yaml = TOOL_YAML.replace("name: jira", "name: ../evil")

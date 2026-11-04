@@ -30,10 +30,16 @@ import {
 } from "../hooks.js";
 import {
   isConfiguredMcpSdkToolName,
+  makeMcpSdkToolName,
   makeMcpToolCallable,
   MCPConfigError,
   resolveConfiguredMcpToolBinding,
 } from "../mcp_tools.js";
+import {
+  registerConnectorTools,
+  withConnectorEnvironment,
+  type ConnectorToolRuntime,
+} from "../connectors/index.js";
 import {
   GuardrailCheckRequestSchema,
   LLMPodInvokeRequestSchema,
@@ -52,12 +58,15 @@ import {
   type ToolsListResponse,
 } from "../models.js";
 import { redactText } from "../error_reporting.js";
+import { TimeoutError } from "../timeout.js";
+import { fatalWithTermination } from "../launcher.js";
 import { evaluateGuardrailCheck } from "../guardrails_evaluator/index.js";
 import { evaluateGuardrailCheckTraced } from "./guardrail_span.js";
 import { SecureLLMProxy } from "../secure_llm_proxy.js";
 import { closeAllTLSAgents } from "../tls_client.js";
 import {
   executeErrorResponse,
+  redactToolErrorText,
   requestCredentialValues,
   requestNamedCredentialValues,
 } from "../tool_api_error.js";
@@ -76,6 +85,7 @@ import {
   isRetryableError,
   logToolRequest,
   normalizeToolCallArgs,
+  tenantEnvVars,
   toolRedactFields,
 } from "../utils.js";
 import { BaseServer, type ITenantRuntime, type ServerToolFn } from "./base.js";
@@ -354,48 +364,11 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
   });
 }
 
-/**
- * Promise-chain mutex serializing async work within one ToolServer instance.
- * Mirrors Python's asyncio.Lock on ToolServer._execute_gate.
- * Exported for tests that build a ToolServer without its constructor.
- */
-export class AsyncMutex {
-  private locked: Promise<void> = Promise.resolve();
-
-  private async acquire(): Promise<() => void> {
-    const previous = this.locked;
-    let release!: () => void;
-    this.locked = new Promise<void>((resolve) => {
-      release = resolve;
-    });
-    await previous;
-    return release;
-  }
-
-  async runExclusive<T>(fn: () => Promise<T>): Promise<T> {
-    const release = await this.acquire();
-    try {
-      return await fn();
-    } finally {
-      release();
-    }
-  }
-
-  /**
-   * Generator form of runExclusive: the lock is held for the lifetime of the
-   * iteration and released when it completes, throws, or is closed early.
-   */
-  async *runExclusiveGen<T>(
-    genFactory: () => AsyncGenerator<T>,
-  ): AsyncGenerator<T> {
-    const release = await this.acquire();
-    try {
-      yield* genFactory();
-    } finally {
-      release();
-    }
-  }
-}
+// The class lives in its own module so hooks.ts can take the same lock without
+// importing a server module. Re-exported here because this module's public
+// surface already exposed it, and tests import it from this path.
+import { AsyncMutex } from "../async_mutex.js";
+export { AsyncMutex };
 
 /**
  * Normalize adapter stream output into an LLMStreamChunk shape.
@@ -619,6 +592,7 @@ export class ToolServer extends BaseServer {
   // throwable value: a JavaScript entrypoint may legally `throw null`, and a
   // null initializer would make that failure indistinguishable from success.
   private llmRegistryLoadError: unknown = NO_RECORDED_LOAD_ERROR;
+  private connectorRuntime: ConnectorToolRuntime | null = null;
 
   constructor(runtime: ITenantRuntime) {
     super(runtime);
@@ -660,6 +634,8 @@ export class ToolServer extends BaseServer {
   }
 
   async onStartup(): Promise<void> {
+    const agentConfig = this.runtime.getAgentConfig();
+
     // `features.deep_agent` gates the built-in filesystem + shell handlers.
     // Tenants that don't opt in never get a file/shell attack surface
     // registered on their Tool Pod, so the platform stays agent-type-agnostic
@@ -685,6 +661,33 @@ export class ToolServer extends BaseServer {
       logger.info(
         "Deep-agent built-in tools NOT registered (features.deep_agent is off in agent.yaml).",
       );
+    }
+
+    if (this.connectorRuntime === null) {
+      const reservedNames: string[] = [...BUILTIN_TOOL_NAMES];
+      for (const [serverName, config] of Object.entries(
+        agentConfig?.mcp?.servers ?? {},
+      )) {
+        if (config.allowed_tools !== null) {
+          for (const toolName of config.allowed_tools) {
+            reservedNames.push(makeMcpSdkToolName(serverName, toolName));
+          }
+        }
+      }
+      const connectorRuntime = registerConnectorTools(
+        this.runtime,
+        reservedNames,
+      );
+      if (connectorRuntime !== null) {
+        this.connectorRuntime = connectorRuntime;
+        logger.info(
+          `Registered ${connectorRuntime.registrations.length} connector tool(s): ${JSON.stringify(
+            connectorRuntime.registrations.map(
+              (registration) => registration.tool.operation.name,
+            ),
+          )}`,
+        );
+      }
     }
 
     const tools = Object.keys(this.runtime.tools);
@@ -751,9 +754,24 @@ export class ToolServer extends BaseServer {
     // a later lookup miss is reported as a genuine registration error. The
     // sink only fires on failure, so a success leaves the sentinel in place.
     this.llmRegistryLoadError = loadError;
+    // A discovery the caller abandoned on timeout left its build running
+    // against the process-global registry. The id set is not final, so the pod
+    // cannot resolve models reliably: the next population would reset the
+    // registry under that build and the build would then capture a baseline
+    // from the reset state. A server that cannot serve is replaced rather than
+    // left limping, and its replacement runs discovery again.
+    if (loadError instanceof TimeoutError) {
+      await fatalWithTermination(
+        "the Tool Pod's context-free discovery build did not complete in time; " +
+          "the pod cannot resolve LLM ids from an incomplete registry",
+        loadError,
+      );
+    }
   }
 
   async onShutdown(): Promise<void> {
+    await this.connectorRuntime?.close();
+    this.connectorRuntime = null;
     // Close all cached TLS agents for graceful shutdown (parity with Python)
     closeAllTLSAgents();
   }
@@ -959,12 +977,18 @@ export class ToolServer extends BaseServer {
           payload: request.payload,
         },
         async () => {
+          // Capture the tenant environment after credential isolation has
+          // applied this request's secrets. Concurrent calls must each use
+          // their own captured map, never the live process environment.
+          const connectorEnvironment = tenantEnvVars();
           // Sync tools run on the event loop (no asyncio.to_thread equivalent
           // in TS). This diverges from Python which off-loads sync functions to
           // a thread pool.
           try {
             const maybePromise = runWithCustomerOrigin(() =>
-              func(request.arguments),
+              withConnectorEnvironment(connectorEnvironment, () =>
+                func(request.arguments),
+              ),
             );
             const result =
               maybePromise instanceof Promise
@@ -1040,7 +1064,16 @@ export class ToolServer extends BaseServer {
         const callable = makeMcpToolCallable(binding);
         return { func: (args: Record<string, unknown>) => callable(args) };
       } catch (err) {
-        if (err instanceof MCPConfigError) return { error: err.message };
+        // Resolution interpolates tenant env into server URLs, so the error
+        // text can carry a credential.
+        if (err instanceof MCPConfigError) {
+          return {
+            error: redactToolErrorText(
+              err.message,
+              requestNamedCredentialValues(),
+            ),
+          };
+        }
         throw err;
       }
     }
@@ -1177,9 +1210,13 @@ export class ToolServer extends BaseServer {
   }
 
   /**
-   * ensureLlmRegistryLoaded() then streamLlmChunks(), both inside the
-   * request's credential isolation window. Registry loading is normally a
-   * no-op after startup; the gate still covers the complete stream.
+   * Stream one `/invoke_llm` request, inside its credential isolation window.
+   *
+   * The registry is loaded by registryLoadedLlmChunks, through
+   * resolveLlmForRequest, which holds llmRegistryLock across both the load and
+   * the lookup. Loading it here as well would run a discovery that never
+   * latches twice for one request, and would put the lookup outside the
+   * critical section that keeps it from seeing a registry mid-reset.
    */
   private async *loadRegistryThenStreamLlmChunks(
     request: LLMPodInvokeRequest,

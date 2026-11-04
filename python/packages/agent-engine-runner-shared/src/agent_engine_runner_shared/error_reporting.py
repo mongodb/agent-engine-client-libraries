@@ -82,6 +82,19 @@ _MONGO_URI_USERINFO_GREEDY_PATTERN = re.compile(
 )
 
 
+# Credential formats that carry no key name, so only their own shape marks
+# them: provider API keys and Atlas service-account secrets echoed in an SDK
+# error. The prefix is kept so the reader still learns which credential failed.
+_OPENAI_STYLE_KEY_PATTERN = re.compile(r"\bsk-[A-Za-z0-9_-]{20,}")
+_ATLAS_SERVICE_ACCOUNT_SECRET_PATTERN = re.compile(r"mdb_sa_sk_[A-Za-z0-9_-]+")
+_PEM_PRIVATE_KEY_HEADER = re.compile(
+    r"-----BEGIN (RSA |EC |OPENSSH |ENCRYPTED |DSA )?PRIVATE KEY-----"
+)
+_PEM_PRIVATE_KEY_FOOTER = re.compile(
+    r"-----END (?:RSA |EC |OPENSSH |ENCRYPTED |DSA )?PRIVATE KEY-----"
+)
+
+
 def _resolve_home_dir() -> str:
     try:
         home_dir = str(Path.home())
@@ -231,17 +244,47 @@ def _redact_inline_secret(match: "re.Match[str]") -> str:
     return f"{keyword}{separator}<redacted>"
 
 
+def _redact_pem_private_keys(text: str) -> str:
+    """Replace each PEM private-key block, header through matching footer.
+
+    A header/footer scan rather than a lazy ``[\\s\\S]*?`` regex: a header
+    with no footer after it ends the scan, so text repeating an unmatched
+    header costs one pass instead of one pass per header.
+    """
+    pieces: list[str] = []
+    position = 0
+    while True:
+        header = _PEM_PRIVATE_KEY_HEADER.search(text, position)
+        if header is None:
+            break
+        # Any key type's footer closes the block. Requiring the header's own
+        # type would let an unmatched header end the scan before a complete
+        # block of another type later in the text.
+        footer = _PEM_PRIVATE_KEY_FOOTER.search(text, header.end())
+        if footer is None:
+            break
+        pieces.append(text[position : header.start()])
+        pieces.append("<redacted>")
+        position = footer.end()
+    if not pieces:
+        return text
+    pieces.append(text[position:])
+    return "".join(pieces)
+
+
 def _redact_text(text: str) -> str:
     if not text:
         return text
 
-    redacted = text
+    redacted = _redact_pem_private_keys(text)
     if _is_usable_home_dir(_HOME_DIR):
         redacted = redacted.replace(_HOME_DIR, "<home>")
     redacted = _MONGO_URI_USERINFO_GREEDY_PATTERN.sub(r"\1<redacted>:<redacted>@", redacted)
     redacted = _URL_USERINFO_PATTERN.sub(r"\1<redacted>:<redacted>@", redacted)
     redacted = _SECRET_INLINE_PATTERN.sub(_redact_inline_secret, redacted)
     redacted = _BEARER_PATTERN.sub(r"\1 <redacted>", redacted)
+    redacted = _ATLAS_SERVICE_ACCOUNT_SECRET_PATTERN.sub("mdb_sa_sk_<redacted>", redacted)
+    redacted = _OPENAI_STYLE_KEY_PATTERN.sub("sk-<redacted>", redacted)
     return redacted
 
 

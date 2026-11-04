@@ -111,6 +111,56 @@ export function requestNamedCredentialValues(): string[] {
   return values;
 }
 
+/**
+ * Tool error text with credentials removed. Tool errors reach the model, OE's
+ * execution records and runner logs verbatim, and drivers and providers echo
+ * connection strings and keys into them, so every exit of a tool error passes
+ * through this. `credentials` are matched exactly, longest first, so a shorter
+ * value inside a longer one cannot leave a fragment behind.
+ */
+export function redactToolErrorText(
+  text: string,
+  credentials: readonly string[] = [],
+): string {
+  let redacted = text;
+  const ordered = credentials
+    .filter((value) => value)
+    .sort((a, b) => b.length - a.length);
+  for (const value of ordered) {
+    redacted = redacted.split(value).join("<redacted>");
+  }
+  return redactText(redacted);
+}
+
+/**
+ * The thrown tool error to propagate, with credentials removed from what the
+ * framework shows the model. A thrown object is redacted in place, not
+ * replaced, so its class, identity and `cause` still drive the framework's and
+ * the agent's handling. `ToolNode` reads `message` from any thrown object, not
+ * only an `Error`, and `ToolExecutionError` repeats its text in `error`, so
+ * both string fields are rewritten; a field that cannot be written is left.
+ */
+export function redactThrownToolError(
+  error: unknown,
+  credentials: readonly string[] = [],
+): unknown {
+  if (typeof error === "string") return redactToolErrorText(error, credentials);
+  if (typeof error !== "object" || error === null) return error;
+  const fields = error as Record<string, unknown>;
+  for (const field of ["message", "stack", "error"]) {
+    const value = fields[field];
+    if (typeof value !== "string") continue;
+    const redacted = redactToolErrorText(value, credentials);
+    if (redacted === value) continue;
+    try {
+      fields[field] = redacted;
+    } catch {
+      // A frozen or getter-only field stays as thrown.
+    }
+  }
+  return error;
+}
+
 export const ToolAPIErrorSchema = z.object({
   provider_type: z.string().nullish().describe("Provider identity when known"),
   classification: z
@@ -488,12 +538,12 @@ export async function classifyToolAPIError(
   return undefined;
 }
 
-function providerTypeFromToolDef(toolDef: unknown): string | undefined {
-  const providerType =
+function providerFromToolDef(toolDef: unknown): string | undefined {
+  const provider =
     toolDef && typeof toolDef === "object"
-      ? (toolDef as Record<string, unknown>)["provider_type"]
+      ? (toolDef as Record<string, unknown>)["provider"]
       : undefined;
-  return typeof providerType === "string" ? providerType : undefined;
+  return typeof provider === "string" ? provider : undefined;
 }
 
 /** Error `ToolPodExecuteResponse` for a thrown tool, with classification when recognized. */
@@ -506,16 +556,17 @@ export async function executeErrorResponse(
 ): Promise<ToolPodExecuteResponse> {
   const classified = await classifyToolAPIError(
     error,
-    providerTypeFromToolDef(toolDef),
+    providerFromToolDef(toolDef),
     credentials,
   );
   return {
     status: "error",
     error: classified
       ? classified.message
-      : error instanceof Error
-        ? error.message
-        : String(error),
+      : redactToolErrorText(
+          error instanceof Error ? error.message : String(error),
+          requestNamedCredentialValues(),
+        ),
     pod_name: podName,
     kind: metadata["memory"] ? "memory" : undefined,
     metadata,

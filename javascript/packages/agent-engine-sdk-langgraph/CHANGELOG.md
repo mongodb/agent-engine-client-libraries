@@ -8,6 +8,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- Durable Deep Agent sessions no longer fail with `this attempt already has an
+  in-flight activity` when parallel tool calls or subagents use the Tool Pod
+  backend at the same time. Each operation replays from its own recorded
+  position after a runner restart.
+- Messages from durable agents built with `createAgent` or `createDeepAgent` keep
+  the same IDs when a replacement attempt rebuilds them, including tool results
+  from parallel calls of one model turn.
+- A `timeout` of 0 on the Tool Pod `shell_execute` handler runs the command under
+  the default timeout. It used to kill the command immediately.
 - Durable sessions no longer fail at a human-in-the-loop pause inside a tool
   call with `durable direct interrupt requires a stable LangGraph task path`
   on `@langchain/langgraph` 1.5, which adds a boolean to the task path of
@@ -32,6 +41,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Session-history messages for human-authored turns now report role `"user"` instead of `"human"`, matching the live invoke/stream `Message.role` vocabulary.
 
 ### Added
+- Connector tools from `agent.yaml` now register as remote AER tools in AER
+  mode, with the same schemas, network, timeout, and delegated-auth metadata as
+  the Tool Pod. Connector names are checked against author tools, MCP tools,
+  and built-in tool names before registration.
 - Deep Agent graphs now run on `durable_workflow` sessions. Deep Agent task
   delegation is adapter-owned rather than a compiled child graph, so `createAgentEngineDeepAgent`
   installs a `DurableDeepAgentMiddleware` that attributes subagent work to a deterministic

@@ -61,7 +61,7 @@ describe("connector runtime bundle views", () => {
       name: "jiradc_getComments",
       description: "Returns comments for an issue.",
       is_local: false,
-      provider_type: null,
+      provider: null,
       scopes: [],
       network: ["jira.example"],
       timeout_seconds: 30,
@@ -72,12 +72,12 @@ describe("connector runtime bundle views", () => {
 
   it("keeps delegated OAuth policy outside the model schema", () => {
     const { tools } = bundleFor({
-      auth: { type: "oauth", provider_type: "custom-github", scopes: ["repo"] },
+      auth: { provider: "custom-github", scopes: ["repo"] },
     });
     for (const tool of tools) {
-      expect(tool.registrationMetadata.provider_type).toBe("custom-github");
+      expect(tool.registrationMetadata.provider).toBe("custom-github");
       expect(tool.registrationMetadata.scopes).toEqual(["repo"]);
-      expect(tool.schema).not.toHaveProperty("provider_type");
+      expect(tool.schema).not.toHaveProperty("provider");
       expect(tool.schema.inputSchema["properties"]).not.toHaveProperty(
         "authorization",
       );

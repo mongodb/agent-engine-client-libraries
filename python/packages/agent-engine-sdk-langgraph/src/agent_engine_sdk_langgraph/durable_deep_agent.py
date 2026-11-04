@@ -47,6 +47,11 @@ _ACTIVE_TASK_CALL_ID: ContextVar[str | None] = ContextVar(
 )
 
 
+def in_deep_agent_task() -> bool:
+    """Whether the current work belongs to a subagent a ``task`` call started."""
+    return _ACTIVE_TASK_CALL_ID.get() is not None
+
+
 @contextmanager
 def _deep_agent_task_scope(tool_call_id: str) -> Iterator[None]:
     token = _ACTIVE_TASK_CALL_ID.set(tool_call_id)

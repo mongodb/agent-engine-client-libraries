@@ -1,7 +1,7 @@
 """Unit tests for post_json_with_retries owner-URL fallback and Retry-After.
 
-The retry helper is the single transport policy behind the AER stream-chunk,
-terminal-callback and function-mode tool-result POSTs. These tests pin the
+The retry helper is the single transport policy behind the AER's stream-chunk
+and terminal-callback POSTs. These tests pin the
 owner-preferring behaviour: a single best-effort owner pre-attempt that never
 consumes the trusted service URL's retry budget, falls back to the service URL
 on ANY owner failure (transport error or any non-2xx response), is never

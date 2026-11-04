@@ -91,6 +91,20 @@ def request_named_credential_values() -> list[str]:
     return values
 
 
+def redact_tool_error_text(text: str, credentials: Sequence[str] = ()) -> str:
+    """Tool error text made safe to report, log, persist, and show the model.
+
+    ``credentials`` are exact secret values, normally
+    :func:`request_named_credential_values`; they are replaced longest first so
+    a value containing a shorter one is masked whole. The shared pattern
+    redactor then covers credentials the tool's own text embeds (connection
+    string userinfo, bearer tokens, provider keys, private keys).
+    """
+    for value in sorted((value for value in credentials if value), key=len, reverse=True):
+        text = text.replace(value, "<redacted>")
+    return _redact_text(text)
+
+
 _STATUS_CLASSIFICATIONS: dict[int, tuple[str, bool]] = {
     401: ("AUTH_FAILED", False),
     403: ("AUTH_FAILED", False),

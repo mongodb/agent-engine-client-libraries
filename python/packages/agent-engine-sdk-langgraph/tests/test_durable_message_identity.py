@@ -8,11 +8,12 @@ import pytest
 from deepagents.middleware.patch_tool_calls import PatchToolCallsMiddleware
 from langchain_core.messages import AIMessage, RemoveMessage, ToolMessage
 from langchain_core.tools import tool
-from langgraph.graph import START, MessagesState, StateGraph
+from langgraph.graph import END, START, MessagesState, StateGraph
 from langgraph.prebuilt import ToolNode
-from langgraph.types import Command, Overwrite
+from langgraph.types import Command, Overwrite, Send
 
 from agent_engine_sdk_langgraph.agent import LangGraphBaseAgent
+from agent_engine_sdk_langgraph.durable_message_identity import _identity_runnable
 from agent_engine_runner_shared.generated.workflow.v1.common_pb2 import WorkflowIdentity
 from agent_engine_runner_shared.generated.workflow.v1.runtime_pb2 import AttemptContext
 from agent_engine_runner_shared.workflow import attempt_context_scope
@@ -60,6 +61,63 @@ def test_missing_ai_message_ids_are_stable_and_explicit_ids_are_preserved() -> N
     assert first_messages[0].id != first_messages[1].id
     assert first_messages[0].id.startswith("durable-message:execution-1:1:")
     assert first_messages[2].id == "provider-id"
+
+
+def test_parallel_send_tasks_of_one_node_keep_each_tool_message() -> None:
+    @tool
+    def echo(text: str) -> str:
+        """Return the text."""
+        return text
+
+    calls = [
+        {
+            "id": f"call-{text}",
+            "name": "echo",
+            "args": {"text": text},
+            "type": "tool_call",
+        }
+        for text in ("first", "second")
+    ]
+    builder = StateGraph(MessagesState)
+    builder.add_node(
+        "model", lambda state: {"messages": [AIMessage(content="", tool_calls=calls)]}
+    )
+    builder.add_node("tools", ToolNode([echo]))
+    builder.add_edge(START, "model")
+    builder.add_conditional_edges(
+        "model", lambda state: [Send("tools", [call]) for call in calls], ["tools"]
+    )
+    builder.add_edge("tools", END)
+    graph = builder.compile()
+    LangGraphBaseAgent(graph)
+
+    with attempt_context_scope(_attempt("attempt-1", 1)):
+        result = graph.invoke({"messages": []})
+
+    assert sorted(
+        message.content
+        for message in result["messages"]
+        if isinstance(message, ToolMessage)
+    ) == ["first", "second"]
+
+
+def test_only_a_later_send_task_changes_a_recorded_message_id() -> None:
+    """Parallel Send tasks share a node and path, and a recorded turn keeps its IDs."""
+    runnable = _identity_runnable("tools", frozenset({"messages"}))
+
+    def stamped(task_path: tuple[Any, ...]) -> str:
+        output = {"messages": [ToolMessage(content="ran", tool_call_id="call")]}
+        with attempt_context_scope(_attempt("attempt-1", 1)):
+            result = runnable.invoke(
+                output, {"metadata": {"langgraph_path": task_path}}
+            )
+        return result["messages"][0].id
+
+    outside_send = stamped(("__pregel_pull", "tools"))
+    assert stamped(("__pregel_push", 0)) == outside_send
+    assert stamped(("__pregel_push", 1)) != outside_send
+    assert stamped(("__pregel_push", 1)) == stamped(("__pregel_push", 1))
+    assert stamped(("__pregel_push", 1)) != stamped(("__pregel_push", 2))
 
 
 def test_tuple_message_id_is_stable_across_replacement_attempts() -> None:

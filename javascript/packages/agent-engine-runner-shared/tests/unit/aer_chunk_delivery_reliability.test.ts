@@ -994,7 +994,7 @@ describe("AER doHandleExecute terminal-chunk delivery wrap", () => {
     const errorSpy = vi.spyOn(loggerProto, "error");
 
     const timeoutMs =
-      (Number(process.env["RUNNER_EXECUTION_TIMEOUT"]) || 600) * 1000;
+      (Number(process.env["RUNNER_EXECUTION_TIMEOUT"]) || 3600) * 1000;
 
     vi.useFakeTimers();
     let outcome: { ok: true } | { ok: false; error: unknown };
@@ -1026,6 +1026,15 @@ describe("AER doHandleExecute terminal-chunk delivery wrap", () => {
     expect((fields as { error: string }).error).toContain(
       "Execution timed out",
     );
+    expect(fields).toMatchObject({ metadata: { error_code: "run_timeout" } });
+    expect(
+      server.sendStreamChunk.mock.calls.filter((call) => call[2] === ERROR),
+    ).toHaveLength(1);
+    expect(
+      server.sendStreamChunk.mock.calls.find((call) => call[2] === ERROR)?.[5],
+    ).toEqual({
+      error_code: "run_timeout",
+    });
     // The chunk-delivery failure was logged at ERROR for ops visibility.
     expect(errorSpy).toHaveBeenCalled();
   });

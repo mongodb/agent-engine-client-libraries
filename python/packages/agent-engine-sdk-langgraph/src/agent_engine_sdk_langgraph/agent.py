@@ -11,6 +11,7 @@ import asyncio
 import logging
 from collections.abc import AsyncIterator, Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass, field
 from typing import Any, cast
 from uuid import uuid4
 
@@ -176,6 +177,20 @@ class _InterruptResume(Exception):
         self.command = command
 
 
+@dataclass
+class _TurnStreamState:
+    """Per-turn accumulators shared across interrupt-resume iterations.
+
+    ``custom_event_seen`` records whether the turn produced any custom-event
+    output. A non-conversational agent (``features.use_custom_parser``) can
+    legitimately finish with no chat messages, so it must not be treated as a
+    graph that produced nothing.
+    """
+
+    messages: list[Any] = field(default_factory=list)
+    custom_event_seen: bool = False
+
+
 async def _failed_stream_epilogue(
     tracker: SubagentStreamTracker,
     parser: OutputParser | None,
@@ -290,6 +305,9 @@ class LangGraphBaseAgent(BaseAgent):
             else _default_durable_subgraphs(graph)
         )
         install_durable_message_identity(self._graph)
+        checkpointer = getattr(graph, "checkpointer", None)
+        if isinstance(checkpointer, PlatformCheckpointer):
+            checkpointer.bind_delta_channels(graph.channels)
         # The platform maps live update_state to a new session+thread, not LangGraph
         # same-thread time-travel. See docs/session-fork.md.
         wrap_session_fork_update_state(
@@ -546,7 +564,7 @@ class LangGraphBaseAgent(BaseAgent):
     ) -> AsyncIterator[StreamEvent]:
         """Prepare once, then replay resolved native interrupts in scratch."""
         graph_input, config = await self._prepare_run(ctx, input, session)
-        all_messages: list[Any] = []
+        state = _TurnStreamState()
         tracker = SubagentStreamTracker()
         binding = OutputParserBinding.create(
             self._output_parser, use_custom_parser=self._use_custom_parser
@@ -558,7 +576,7 @@ class LangGraphBaseAgent(BaseAgent):
                     session,
                     graph_input,
                     config,
-                    all_messages,
+                    state,
                     tracker,
                     binding,
                 ):
@@ -574,7 +592,7 @@ class LangGraphBaseAgent(BaseAgent):
         session: ExecutionSession,
         graph_input: Any,
         config: RunnableConfig,
-        all_messages: list[Any],
+        state: _TurnStreamState,
         tracker: SubagentStreamTracker,
         binding: OutputParserBinding,
     ) -> AsyncIterator[StreamEvent]:
@@ -625,6 +643,7 @@ class LangGraphBaseAgent(BaseAgent):
                         payload=payload,
                         ctx=ctx,
                     ):
+                        state.custom_event_seen = True
                         yield event
 
                     if stream_mode == "messages":
@@ -667,19 +686,19 @@ class LangGraphBaseAgent(BaseAgent):
                             ):
                                 for event in tracker.process_add_messages_update(
                                     node_output["messages"],
-                                    all_messages,
+                                    state.messages,
                                 ):
                                     yield event
                             elif isinstance(node_output, Command):
                                 for event in tracker.process_command_update(
-                                    node_output, all_messages
+                                    node_output, state.messages
                                 ):
                                     yield event
                         drain.consider(
                             tracker.is_terminal_agent_update(
                                 namespace,
                                 payload,
-                                all_messages,
+                                state.messages,
                                 captured_interrupts,
                             )
                         )
@@ -702,7 +721,7 @@ class LangGraphBaseAgent(BaseAgent):
                         "suspend_context": error.context,
                     },
                     resumed=is_resume,
-                    messages=lc_messages_to_platform(all_messages),
+                    messages=lc_messages_to_platform(state.messages),
                     metadata={},
                 )
                 return
@@ -718,7 +737,7 @@ class LangGraphBaseAgent(BaseAgent):
             ctx=ctx,
             config=config,
             captured=captured_interrupts,
-            messages=lc_messages_to_platform(all_messages),
+            messages=lc_messages_to_platform(state.messages),
         )
         if isinstance(interrupt, Command):
             raise _InterruptResume(interrupt)
@@ -731,11 +750,13 @@ class LangGraphBaseAgent(BaseAgent):
         for event in tracker.drain_open_tasks():
             yield event
 
-        if not all_messages:
+        # A custom-parser agent may legitimately produce output only as custom
+        # events (no chat messages); treat that as a valid completion.
+        if not state.messages and not state.custom_event_seen:
             raise RuntimeError("Graph completed without producing messages")
 
-        response = find_last_ai_content(all_messages)
-        platform_messages: list[Message] = lc_messages_to_platform(all_messages)
+        response = find_last_ai_content(state.messages)
+        platform_messages: list[Message] = lc_messages_to_platform(state.messages)
 
         await session.complete_execution()
         checkpoint = await session.persisted_checkpoint_coordinate(thread_id)
@@ -745,7 +766,7 @@ class LangGraphBaseAgent(BaseAgent):
                 {
                     "response": response,
                     "messages": [m.model_dump() for m in platform_messages],
-                    "message_count": len(all_messages),
+                    "message_count": len(state.messages),
                     "resumed": is_resume,
                     "metadata": checkpoint_metadata(checkpoint),
                 },

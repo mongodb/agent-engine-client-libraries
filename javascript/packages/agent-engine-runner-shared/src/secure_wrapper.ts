@@ -8,6 +8,7 @@
  *   PolicyDeniedException / ToolExecutionError / LLMInvocationError: exception classes
  */
 
+import { AsyncLocalStorage } from "node:async_hooks";
 import { isDeepStrictEqual } from "node:util";
 
 import { getLogger } from "./logger.js";
@@ -22,7 +23,10 @@ import {
 } from "./models.js";
 import {
   classifyToolAPIError,
+  redactThrownToolError,
+  redactToolErrorText,
   requestCredentialValues,
+  requestNamedCredentialValues,
   ToolAPIErrorSchema,
   type ToolAPIError,
 } from "./tool_api_error.js";
@@ -78,8 +82,10 @@ import {
   ReplayedActivityFailedError,
   WorkflowClient,
   WorkflowClientError,
+  WorkflowErrorCode,
   activityRequiresReconstruction,
   allocateActivityPosition,
+  allocateToolEffectPosition,
   currentAttemptContext,
   runSerialActivity,
   toolActivityKey,
@@ -233,6 +239,18 @@ export class ToolExecutionError extends Error {
 }
 
 /**
+ * The runner was lost while this durable tool call was in flight, so it may
+ * have taken effect and OE did not run it again. `error` is OE's message,
+ * written for the model reading it.
+ */
+export class ToolOutcomeUnknownError extends ToolExecutionError {
+  constructor(error: string, options?: ErrorOptions) {
+    super(error, options);
+    this.name = "ToolOutcomeUnknownError";
+  }
+}
+
+/**
  * Raised when the platform, not the tool, failed a tool call.
  *
  * The tool may already have run, for example when OE rejects or never
@@ -323,6 +341,8 @@ class DurableToolActivityFailedError extends Error {
 }
 
 const DURABLE_TOOL_FAILURE_PREFIX = "__agentic_durable_tool_failure_v1__:";
+
+const durableToolBody = new AsyncLocalStorage<true>();
 const DURABLE_TOOL_FAILURE_FALLBACK = "durable activity failed";
 
 function toolErrorMessage(error: unknown): string {
@@ -338,7 +358,11 @@ function toolErrorMessage(error: unknown): string {
 function encodeDurableToolFailure(error: unknown): string {
   const payload: Record<string, unknown> = {
     kind: "execution",
-    message: toolErrorMessage(error),
+    // Recorded with the durable outcome and replayed to the model on resume.
+    message: redactToolErrorText(
+      toolErrorMessage(error),
+      requestNamedCredentialValues(),
+    ),
   };
   if (error instanceof ToolCallTimeoutError) {
     payload["kind"] = "timeout";
@@ -360,6 +384,14 @@ function decodeDurableToolFailure(
   cause: Error,
 ): ToolExecutionError {
   if (!message.startsWith(DURABLE_TOOL_FAILURE_PREFIX)) {
+    // Every failure a runner reports is prefixed, so this one is OE's own.
+    if (
+      cause instanceof WorkflowClientError &&
+      cause.code === WorkflowErrorCode.OUTCOME_UNKNOWN &&
+      message
+    ) {
+      return new ToolOutcomeUnknownError(message, { cause });
+    }
     return new ToolExecutionError(message || DURABLE_TOOL_FAILURE_FALLBACK, {
       cause,
     });
@@ -456,7 +488,7 @@ export interface RequestOeApprovalArgs {
   isLocal?: boolean;
   /** Top-level tool argument names to redact from execution logs. */
   redactFields?: readonly string[];
-  providerType?: string | null;
+  provider?: string | null;
   scopes?: readonly string[];
   metadata?: Record<string, unknown>;
   /** Stable LLM tool-call id, forwarded to OE for the execution-log join key. */
@@ -529,7 +561,7 @@ async function requestOeApprovalRaw(
     kind,
     isLocal = true,
     redactFields,
-    providerType,
+    provider,
     scopes,
     metadata,
     toolCallId,
@@ -549,7 +581,7 @@ async function requestOeApprovalRaw(
     kind: kind ?? null,
     is_local: isLocal,
     redact_fields: redactFields ?? [],
-    provider_type: providerType ?? null,
+    provider: provider ?? null,
     scopes: scopes ?? [],
     metadata: metadata ?? {},
     custom_headers: customHeaders,
@@ -1007,7 +1039,7 @@ interface ToolActivityInput {
   arguments: Record<string, unknown>;
   is_local: boolean;
   metadata?: Record<string, unknown>;
-  provider_type?: string;
+  provider?: string;
   scopes?: string[];
   tool_call_id?: string;
 }
@@ -1015,7 +1047,7 @@ interface ToolActivityInput {
 function isLocalTool(options: ExecuteToolOptions): boolean {
   return (
     (options.isLocal ?? true) &&
-    !options.providerType &&
+    !options.provider &&
     (options.scopes?.length ?? 0) === 0
   );
 }
@@ -1029,8 +1061,8 @@ function buildToolActivityInput(
     is_local: isLocalTool(options),
   };
   if (options.metadata !== undefined) input.metadata = options.metadata;
-  if (options.providerType != null) {
-    input.provider_type = options.providerType;
+  if (options.provider != null) {
+    input.provider = options.provider;
   }
   if (options.scopes !== undefined && options.scopes.length > 0) {
     input.scopes = [...options.scopes].sort();
@@ -1133,9 +1165,16 @@ export class OperationalStepAllocator implements OperationalStepSource {
  */
 export interface ExecuteToolOptions {
   metadata?: Record<string, unknown> | undefined;
-  providerType?: string | null | undefined;
+  provider?: string | null | undefined;
   scopes?: readonly string[] | undefined;
   toolCallId?: string | undefined;
+  /**
+   * The tool call this call performs an operation for, when the call is not
+   * itself a tool the model requested. In a durable workflow the operation
+   * runs alongside other activities, at a position derived from that tool call.
+   * Unlike `toolCallId`, it does not join the result to a session message.
+   */
+  owningToolCallId?: string | undefined;
   /**
    * When true, an OE `interrupted` status resolves to the raw `CALL_INTERRUPTED`
    * sentinel instead of `{ interrupted: true }`. Only the LangGraph tool-wrapping
@@ -1289,12 +1328,20 @@ export class SecureToolWrapper {
     options: ExecuteToolOptions,
   ): Promise<unknown> {
     const { toolCallId, rawOnInterrupt = false } = options;
+    // A recorded tool replays without running its body, so an operation inside
+    // the body would never be observed again and OE would refuse the replay.
+    // It stays exclusive, which rejects it while the enclosing tool is running.
+    const owningToolCallId =
+      durableToolBody.getStore() === true
+        ? undefined
+        : options.owningToolCallId;
     const durableMemory = this.durableMemory;
     const activityKey = toolCallId ? toolActivityKey(toolCallId) : undefined;
     // A tool its model requested may run in another LangGraph Send task; it
     // still takes the position the model preallocated for its call id.
-    const { operationPath, activityOrdinal } =
-      allocateActivityPosition(activityKey);
+    const { operationPath, activityOrdinal } = owningToolCallId
+      ? allocateToolEffectPosition(owningToolCallId)
+      : allocateActivityPosition(activityKey);
     try {
       const result = await runSerialActivity({
         client: new WorkflowClient(this.oeUrl),
@@ -1304,12 +1351,14 @@ export class SecureToolWrapper {
         operationPath,
         semanticInput: buildToolActivityInput(args, options),
         execute: (context) =>
-          this.executeToolActivity(
-            toolName,
-            args,
-            step,
-            options,
-            context.activityId,
+          durableToolBody.run(true, () =>
+            this.executeToolActivity(
+              toolName,
+              args,
+              step,
+              options,
+              context.activityId,
+            ),
           ),
         onActivityResolved:
           durableMemory === null
@@ -1323,7 +1372,7 @@ export class SecureToolWrapper {
                   toolCallId,
                   toolName,
                 ),
-        exclusive: activityKey === undefined,
+        exclusive: activityKey === undefined && !owningToolCallId,
         onUnknownOutcome: options.onUnknownOutcome,
       });
       return decodeToolActivityResult(result, rawOnInterrupt);
@@ -1426,7 +1475,7 @@ export class SecureToolWrapper {
         step,
         isLocal,
         redactFields: options.redactFields,
-        providerType: options.providerType,
+        provider: options.provider,
         scopes: options.scopes,
         toolCallId: options.toolCallId,
         metadata: options.metadata,
@@ -1457,7 +1506,7 @@ export class SecureToolWrapper {
   ): Promise<unknown> {
     const {
       metadata,
-      providerType,
+      provider,
       scopes,
       toolCallId,
       rawOnInterrupt = false,
@@ -1467,7 +1516,7 @@ export class SecureToolWrapper {
     } = options;
     const effectiveIsLocal = isLocalTool({
       isLocal,
-      providerType,
+      provider,
       scopes,
     });
     const effectiveLocalExecutor = effectiveIsLocal ? localExecutor : undefined;
@@ -1621,7 +1670,9 @@ export class SecureToolWrapper {
         const interrupted =
           isFrameworkControlFlow?.(error) === true ||
           (error instanceof Error && error.name === "AbortError");
-        const propagatedError = error;
+        const propagatedError = interrupted
+          ? error
+          : redactThrownToolError(error, requestNamedCredentialValues());
         const durationMs = performance.now() - startedAt;
         const status = interrupted ? "interrupted" : "error";
         const classified =
@@ -1898,7 +1949,7 @@ export interface SecureToolRunConfig {
  */
 export interface CreateSecureToolFunctionOptions {
   metadata?: Record<string, unknown> | undefined;
-  providerType?: string | null | undefined;
+  provider?: string | null | undefined;
   scopes?: readonly string[] | undefined;
   /** The wire format the caller's StructuredTool is built with. See {@link coerceContentAndArtifact}. */
   responseFormat?: ToolResponseFormat | undefined;
@@ -1946,7 +1997,7 @@ export function createSecureToolFunction(
 ) => Promise<unknown> {
   const {
     metadata,
-    providerType,
+    provider,
     scopes,
     responseFormat = "content",
     toolDeclaredFormat,
@@ -2007,7 +2058,7 @@ export function createSecureToolFunction(
     try {
       const result = await wrapper.executeTool(toolName, kwargs, {
         metadata,
-        providerType,
+        provider,
         scopes,
         toolCallId,
         rawOnInterrupt: true,

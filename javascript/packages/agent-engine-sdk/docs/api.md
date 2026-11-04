@@ -645,10 +645,12 @@ new LLMTokenUsage(data): LLMTokenUsage;
 
 | Parameter | Type |
 | :------ | :------ |
-| `data` | \{ `completion_tokens?`: `number`; `input_tokens?`: `number`; `model?`: `string`; `output_tokens?`: `number`; `prompt_tokens?`: `number`; `reasoning_tokens?`: `number`; `total_tokens?`: `number`; \} |
+| `data` | \{ `completion_tokens?`: `number`; `input_token_details?`: `Record`\<`string`, `number`\>; `input_tokens?`: `number`; `model?`: `string`; `output_token_details?`: `Record`\<`string`, `number`\>; `output_tokens?`: `number`; `prompt_tokens?`: `number`; `reasoning_tokens?`: `number`; `total_tokens?`: `number`; \} |
 | `data.completion_tokens?` | `number` |
+| `data.input_token_details?` | `Record`\<`string`, `number`\> |
 | `data.input_tokens?` | `number` |
 | `data.model?` | `string` |
+| `data.output_token_details?` | `Record`\<`string`, `number`\> |
 | `data.output_tokens?` | `number` |
 | `data.prompt_tokens?` | `number` |
 | `data.reasoning_tokens?` | `number` |
@@ -663,8 +665,10 @@ new LLMTokenUsage(data): LLMTokenUsage;
 | Property | Modifier | Type | Description |
 | :------ | :------ | :------ | :------ |
 | <a id="api-property-completiontokens"></a> `completionTokens?` | `readonly` | `number` | - |
+| <a id="api-property-inputtokendetails"></a> `inputTokenDetails?` | `readonly` | `Record`\<`string`, `number`\> | Provider decomposition of `inputTokens`, e.g. Anthropic's `{cache_read, cache_creation}`. The provider already folds these into `inputTokens`, so they are reported alongside it, never added to it. |
 | <a id="api-property-inputtokens"></a> `inputTokens?` | `readonly` | `number` | - |
 | <a id="api-property-model"></a> `model?` | `readonly` | `string` | - |
+| <a id="api-property-outputtokendetails"></a> `outputTokenDetails?` | `readonly` | `Record`\<`string`, `number`\> | Provider decomposition of `outputTokens`, e.g. `{reasoning}`. |
 | <a id="api-property-outputtokens"></a> `outputTokens?` | `readonly` | `number` | - |
 | <a id="api-property-prompttokens"></a> `promptTokens?` | `readonly` | `number` | - |
 | <a id="api-property-reasoningtokens"></a> `reasoningTokens?` | `readonly` | `number` | Output tokens the model spent reasoning; part of the output count. |
@@ -702,7 +706,9 @@ Returns LangChain's expected usage-metadata keys.
 
 | Name | Type |
 | :------ | :------ |
+| `input_token_details?` | `Record`\<`string`, `number`\> |
 | `input_tokens` | `number` |
+| `output_token_details?` | `Record`\<`string`, `number`\> |
 | `output_tokens` | `number` |
 | `total_tokens` | `number` |
 
@@ -3257,16 +3263,20 @@ Runtime validation schema for LLMResponse wire data. `content` is the only requi
 ```ts
 const LLMTokenUsageSchema: ZodPreprocess<ZodPipe<ZodObject<{
   completion_tokens: ZodOptional<ZodNumber>;
+  input_token_details: ZodOptional<ZodRecord<ZodString, ZodNumber>>;
   input_tokens: ZodOptional<ZodNumber>;
   model: ZodOptional<ZodString>;
+  output_token_details: ZodOptional<ZodRecord<ZodString, ZodNumber>>;
   output_tokens: ZodOptional<ZodNumber>;
   prompt_tokens: ZodOptional<ZodNumber>;
   reasoning_tokens: ZodOptional<ZodNumber>;
   total_tokens: ZodOptional<ZodNumber>;
 }, $strip>, ZodTransform<LLMTokenUsage, {
   completion_tokens?: number;
+  input_token_details?: Record<string, number>;
   input_tokens?: number;
   model?: string;
+  output_token_details?: Record<string, number>;
   output_tokens?: number;
   prompt_tokens?: number;
   reasoning_tokens?: number;
@@ -3746,7 +3756,7 @@ const ToolDefinitionSchema: ZodObject<{
   description: ZodString;
   name: ZodString;
   network: ZodDefault<ZodArray<ZodString>>;
-  provider_type: ZodOptional<ZodString>;
+  provider: ZodOptional<ZodString>;
   redact_fields: ZodDefault<ZodArray<ZodString>>;
   remote: ZodDefault<ZodBoolean>;
   scopes: ZodDefault<ZodArray<ZodString>>;
@@ -3787,13 +3797,13 @@ Constructs a ToolDefinition, applying Python-parity defaults (remote=true, netwo
 
 | Parameter | Type |
 | :------ | :------ |
-| `input` | \{ `args_schema`: `Record`\<`string`, `unknown`\>; `callable`: (...`args`) => `unknown`; `description`: `string`; `name`: `string`; `network?`: `string`[]; `provider_type?`: `string`; `redact_fields?`: `string`[]; `remote?`: `boolean`; `scopes?`: `string`[]; `timeout_seconds?`: `number`; \} |
+| `input` | \{ `args_schema`: `Record`\<`string`, `unknown`\>; `callable`: (...`args`) => `unknown`; `description`: `string`; `name`: `string`; `network?`: `string`[]; `provider?`: `string`; `redact_fields?`: `string`[]; `remote?`: `boolean`; `scopes?`: `string`[]; `timeout_seconds?`: `number`; \} |
 | `input.args_schema` | `Record`\<`string`, `unknown`\> |
 | `input.callable` | (...`args`) => `unknown` |
 | `input.description` | `string` |
 | `input.name` | `string` |
 | `input.network?` | `string`[] |
-| `input.provider_type?` | `string` |
+| `input.provider?` | `string` |
 | `input.redact_fields?` | `string`[] |
 | `input.remote?` | `boolean` |
 | `input.scopes?` | `string`[] |
@@ -3810,7 +3820,7 @@ Constructs a ToolDefinition, applying Python-parity defaults (remote=true, netwo
 | `description` | `string` |
 | `name` | `string` |
 | `network` | `string`[] |
-| `provider_type?` | `string` |
+| `provider?` | `string` |
 | `redact_fields` | `string`[] |
 | `remote` | `boolean` |
 | `scopes` | `string`[] |
