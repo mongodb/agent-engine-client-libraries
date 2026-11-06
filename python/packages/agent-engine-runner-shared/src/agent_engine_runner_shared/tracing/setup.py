@@ -27,6 +27,7 @@ from opentelemetry.sdk.trace import ReadableSpan, Span, SpanProcessor, TracerPro
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
 from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
 
+from .conversation import mark_recorded_by_caller
 from .exporters import (
     ContentPolicyOTLPSpanExporter,
     MongoDBSpanExporter,
@@ -163,6 +164,8 @@ class ExecutionContextSpanProcessor(SpanProcessor):
             get_current_session_id,
             get_current_workspace_id,
         )
+
+        mark_recorded_by_caller(span)
 
         session_id = get_current_session_id()
         attrs = {

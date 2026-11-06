@@ -1585,3 +1585,60 @@ class TestNamedLLMRouting:
         )
         _ = [chunk async for chunk in server._stream_llm_chunks(request)]
         assert captured["llm_id"] == "secondary"
+
+
+class TestCallerRecordedConversation:
+    """The tool pod does not store a prompt the calling agent already stores."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("streaming", [False, True])
+    async def test_the_platform_forwarded_call_marks_its_spans(self, streaming):
+        from agent_engine_runner_shared.tracing.conversation import (
+            ATTR_INPUT_MESSAGES_RECORDED_BY,
+            RECORDED_BY_CALLER,
+            mark_recorded_by_caller,
+        )
+
+        server = _make_tool_server()
+        markers: list[object] = []
+
+        async def provider_stream(*args, **kwargs):
+            # Stands in for the framework instrumentor creating the model span.
+            span = MagicMock()
+            mark_recorded_by_caller(span)
+            markers.append(span.set_attribute.call_args)
+            yield LLMStreamChunk(content="ok")
+
+        request = LLMPodInvokeRequest(
+            execution_id="exec-1",
+            arguments=InvokeLLMRequestArguments(
+                model="gpt-4o",
+                messages=[{"role": "user", "content": "Hi"}],
+            ),
+        )
+        with patch.object(
+            server,
+            "_create_llm_for_pod",
+            return_value=SimpleNamespace(astream=provider_stream),
+        ):
+            if streaming:
+                _ = [frame async for frame in server._handle_invoke_llm_stream(request)]
+            else:
+                await server._handle_invoke_llm(request)
+
+        assert markers == [
+            ((ATTR_INPUT_MESSAGES_RECORDED_BY, RECORDED_BY_CALLER),),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_a_direct_tool_llm_call_is_not_marked(self):
+        from agent_engine_runner_shared.tracing.conversation import (
+            mark_recorded_by_caller,
+        )
+
+        # No platform route wrapped this call: the tool pod is the only
+        # recorder, so it keeps the conversation.
+        span = MagicMock()
+        mark_recorded_by_caller(span)
+
+        span.set_attribute.assert_not_called()

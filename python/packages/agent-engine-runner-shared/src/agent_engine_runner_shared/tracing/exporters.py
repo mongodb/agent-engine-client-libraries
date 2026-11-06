@@ -22,15 +22,18 @@ import random
 import threading
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, Sequence
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, Mapping, Sequence
 
 import httpx
 from opentelemetry.sdk.trace import Event, ReadableSpan
 from opentelemetry.sdk.trace.export import SpanExporter, SpanExportResult
 
 from agent_engine_runner_shared.tracing.conversation import (
+    ATTR_INPUT_MESSAGES_RECORDED_BY,
+    RECORDED_BY_CALLER,
     ConversationDeltaTracker,
     has_input_messages,
+    omit_input_messages,
     trace_stream,
 )
 
@@ -109,16 +112,45 @@ def _span_to_dict(span: ReadableSpan) -> Dict[str, Any]:
     return doc
 
 
+def _conversation_attributes(
+    attributes: Mapping[str, Any],
+    *,
+    trace_id: str,
+    resource: Mapping[str, Any],
+    tracker: ConversationDeltaTracker,
+) -> Dict[str, Any] | None:
+    """Return the attributes to store for one span, or None to keep them as-is.
+
+    Shared by both export destinations so a span's conversation is deduplicated
+    the same way whichever store it reaches.
+    """
+    if attributes.get(ATTR_INPUT_MESSAGES_RECORDED_BY) == RECORDED_BY_CALLER:
+        # The caller's span holds this prompt. Dropping it here and leaving the
+        # tracker alone keeps a later tool-pod span — one that records its own
+        # conversation — starting from a full list rather than a bogus offset.
+        return omit_input_messages(attributes)
+    if not has_input_messages(attributes):
+        return None
+    return tracker.trim(
+        attributes,
+        trace_id=trace_id,
+        stream_id=trace_stream(resource),
+    )
+
+
 def _trim_conversation(doc: Dict[str, Any], tracker: ConversationDeltaTracker) -> Dict[str, Any]:
     """Keep only the input messages this call added (see tracing.conversation)."""
     attributes = doc.get("attributes")
-    if not attributes or not has_input_messages(attributes):
+    if not attributes:
         return doc
-    doc["attributes"] = tracker.trim(
+    trimmed = _conversation_attributes(
         attributes,
         trace_id=doc["trace_id"],
-        stream_id=trace_stream(doc.get("resource") or {}),
+        resource=doc.get("resource") or {},
+        tracker=tracker,
     )
+    if trimmed is not None:
+        doc["attributes"] = trimmed
     return doc
 
 
@@ -370,6 +402,51 @@ def _redact_span(span: ReadableSpan) -> ReadableSpan:
         end_time=span.end_time,
         instrumentation_scope=span.instrumentation_scope,
     )
+
+
+def _with_attributes(span: ReadableSpan, attributes: Dict[str, Any]) -> ReadableSpan:
+    """Return a copy of ``span`` carrying ``attributes`` in place of its own.
+
+    The OTLP encoder reads ``dropped_attributes`` off the container, so a plain
+    dict goes into the same wrapper the redaction path builds.
+    """
+    return _RedactedReadableSpan(
+        dropped_attributes=span.dropped_attributes,
+        dropped_events=span.dropped_events,
+        name=span.name,
+        context=span.context,
+        parent=span.parent,
+        resource=span.resource,
+        attributes=attributes,
+        events=span.events,
+        links=span.links,
+        kind=span.kind,
+        status=span.status,
+        start_time=span.start_time,
+        end_time=span.end_time,
+        instrumentation_scope=span.instrumentation_scope,
+    )
+
+
+def _trim_span(span: ReadableSpan, tracker: ConversationDeltaTracker) -> ReadableSpan | None:
+    """Return ``span`` with only this call's new messages, or None if unchanged.
+
+    The span-level form of ``_trim_conversation``, for destinations that encode
+    the span rather than building a document from it.
+    """
+    attributes = span.attributes
+    if not attributes:
+        return None
+    context = span.get_span_context()
+    trimmed = _conversation_attributes(
+        attributes,
+        trace_id=format(context.trace_id, "032x"),  # type: ignore[union-attr]  # ctx is set by get_span_context()
+        resource=dict(span.resource.attributes) if span.resource else {},
+        tracker=tracker,
+    )
+    if trimmed is None:
+        return None
+    return _with_attributes(span, trimmed)
 
 
 class ContentPolicyOTLPSpanExporter(SpanExporter):
@@ -653,6 +730,7 @@ class PlatformSpanExporter(SpanExporter):
         self._sleep = sleep
         self._clock = clock
         self._lock = threading.Lock()
+        self._conversations = ConversationDeltaTracker()
         self._dropped_spans = 0
         self._failed_batches = 0
         self._last_error: str | None = None
@@ -675,7 +753,17 @@ class PlatformSpanExporter(SpanExporter):
         dropped_before = self.dropped_spans
         ok = True
         for chunk in self._chunk_by_size(list(spans)):
-            if not self._export_chunk(chunk, deadline):
+            # Stage per chunk and commit only what the OE stored, so a batch it
+            # refused does not advance past messages the store never received.
+            staged = self._conversations.copy()
+            trimmed = [_trim_span(span, staged) or span for span in chunk]
+            dropped_before_chunk = self.dropped_spans
+            if self._export_chunk(trimmed, deadline):
+                # A partial success drops spans without naming them, so the
+                # next call restates those messages instead of leaving a gap.
+                if self.dropped_spans == dropped_before_chunk:
+                    self._conversations = staged
+            else:
                 ok = False
 
         if ok:

@@ -2236,6 +2236,7 @@ class TestAuthoringGuidance:
         )
         assert "#   secret   grant WEATHER_TOKEN to the tool sandbox under" in text
         assert "#            sandboxes.tool.secrets (sandboxes requires an agent block)" in text
+        assert "#   tools    list this connector's tools under sandboxes.tool.tools when" in text
         # Guidance is a comment only: the parsed authoring file is unchanged.
         assert yaml.safe_load(text) == {
             "name": "weather",

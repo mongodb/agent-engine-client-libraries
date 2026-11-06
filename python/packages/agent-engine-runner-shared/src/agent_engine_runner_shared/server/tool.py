@@ -66,6 +66,7 @@ from agent_engine_runner_shared.tool_api_error import (
     request_named_credential_values,
 )
 from agent_engine_runner_shared.toolpod_handlers import BUILTIN_TOOL_NAMES
+from agent_engine_runner_shared.tracing.conversation import caller_records_conversation
 from agent_engine_runner_shared.utils import (
     LLM_BACKOFF_MULTIPLIER,
     LLM_INITIAL_BACKOFF,
@@ -1172,11 +1173,15 @@ class ToolServer(ToolExecution, BaseServer):
             trace_id=request.platform_trace_id,
         )
         try:
-            # Usually a no-op after startup; keep any registry load inside the
-            # request's credential isolation, as with model execution below.
-            async with self._credential_isolation():
-                await self._ensure_llm_registry_loaded()
-                chunks = [chunk async for chunk in self._stream_llm_chunks(request)]
+            # The calling agent's span stores this prompt; the model span this
+            # call produces would be a second copy of it.
+            with caller_records_conversation():
+                # Usually a no-op after startup; keep any registry load inside
+                # the request's credential isolation, as with model execution
+                # below.
+                async with self._credential_isolation():
+                    await self._ensure_llm_registry_loaded()
+                    chunks = [chunk async for chunk in self._stream_llm_chunks(request)]
             llm_response = SecureLLMProxy.response_from_stream_chunks(chunks)
             duration_ms = (time.time() - start_time) * 1000
             return LLMPodInvokeResponse(
@@ -1277,24 +1282,27 @@ class ToolServer(ToolExecution, BaseServer):
         )
         try:
             usage = None
-            # See the gate + metadata-env ordering rationale in
-            # _handle_invoke_llm above.
-            async with self._credential_isolation():
-                await self._ensure_llm_registry_loaded()
-                async for stream_chunk in self._stream_llm_chunks(request):
-                    if not _stream_chunk_has_payload(stream_chunk):
-                        if stream_chunk.usage is not None:
-                            usage = stream_chunk.usage
-                        continue
-                    chunk_event = LLMPodStreamEvent(
-                        content=stream_chunk.content,
-                        tool_call_chunks=stream_chunk.tool_calls,
-                        id=stream_chunk.id,
-                        name=stream_chunk.name,
-                        response_metadata=stream_chunk.response_metadata,
-                        additional_kwargs=stream_chunk.additional_kwargs,
-                    )
-                    yield f"data: {chunk_event.model_dump_json(exclude_none=True)}\n\n"
+            # The calling agent's span stores this prompt; the model span this
+            # call produces would be a second copy of it.
+            with caller_records_conversation():
+                # See the gate + metadata-env ordering rationale in
+                # _handle_invoke_llm above.
+                async with self._credential_isolation():
+                    await self._ensure_llm_registry_loaded()
+                    async for stream_chunk in self._stream_llm_chunks(request):
+                        if not _stream_chunk_has_payload(stream_chunk):
+                            if stream_chunk.usage is not None:
+                                usage = stream_chunk.usage
+                            continue
+                        chunk_event = LLMPodStreamEvent(
+                            content=stream_chunk.content,
+                            tool_call_chunks=stream_chunk.tool_calls,
+                            id=stream_chunk.id,
+                            name=stream_chunk.name,
+                            response_metadata=stream_chunk.response_metadata,
+                            additional_kwargs=stream_chunk.additional_kwargs,
+                        )
+                        yield f"data: {chunk_event.model_dump_json(exclude_none=True)}\n\n"
 
             # Final summary event
             duration_ms = (time.time() - start_time) * 1000

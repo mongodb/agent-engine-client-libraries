@@ -96,6 +96,7 @@ import {
 } from "../toolpod_handlers.js";
 import { resolveOeUrl } from "./oe_url.js";
 import { resolveOwnerUrl } from "./owner_url.js";
+import { runAsCallerRecordedConversation } from "../tracing/conversation.js";
 
 const logger = getLogger("agent_engine_runner_shared.server.tool");
 
@@ -460,6 +461,13 @@ interface AdaptedLLM {
   ): AsyncIterable<unknown>;
 }
 
+// A model call's body is its whole conversation, which outgrows Fastify's 1 MiB
+// default in a long session. OE limits a durable conversation to 12 MiB, so it
+// fits the MongoDB document that stores the call. OE re-encodes the call before
+// forwarding it, with its own JSON escaping and fields, so this limit leaves
+// headroom for that growth rather than matching OE's limit exactly.
+const INVOKE_LLM_BODY_LIMIT_BYTES = 16 * 1024 * 1024;
+
 // Bound on the entrypoint-derived text echoed to the caller. The text comes
 // from the agent's own code, which makes it useful, but it is unbounded
 // user-authored input on a caller-facing path.
@@ -809,7 +817,8 @@ export class ToolServer extends BaseServer {
       }
     });
 
-    app.post("/invoke_llm", async (request, reply) => {
+    const invokeLlmRoute = { bodyLimit: INVOKE_LLM_BODY_LIMIT_BYTES };
+    app.post("/invoke_llm", invokeLlmRoute, async (request, reply) => {
       const body = LLMPodInvokeRequestSchema.parse(request.body);
       const drainController = new AbortController();
       this.drainRegistry.beginWork(
@@ -836,7 +845,7 @@ export class ToolServer extends BaseServer {
       }
     });
 
-    app.post("/invoke_llm/stream", async (request, reply) => {
+    app.post("/invoke_llm/stream", invokeLlmRoute, async (request, reply) => {
       const body = LLMPodInvokeRequestSchema.parse(request.body);
       // Checked here so a drained execution gets a 409 rather than an SSE
       // error event after the stream has already started.
@@ -889,7 +898,12 @@ export class ToolServer extends BaseServer {
       }),
     );
 
-    app.post("/guardrails/check", async (request, reply) => {
+    // A check carries text taken from a model call, so it accepts the same size.
+    // Fastify's 1 MiB default would refuse long text before any policy reads it,
+    // and OE blocks a refused check; the policy's own regex text limit decides
+    // instead, as it does in the Python Tool Pod.
+    const guardrailRoute = { bodyLimit: INVOKE_LLM_BODY_LIMIT_BYTES };
+    app.post("/guardrails/check", guardrailRoute, async (request, reply) => {
       const body = GuardrailCheckRequestSchema.parse(request.body);
       // Count-only registration: the evaluation is synchronous and fast, so
       // there is no abort channel to signal; a drain waits it out.
@@ -1149,33 +1163,37 @@ export class ToolServer extends BaseServer {
     const startTime = performance.now();
 
     try {
-      // Usually a no-op after startup; keep any registry load inside the
-      // request's credential isolation, as with model execution below.
-      const chunks = await runWithExecutionContext(
-        {
-          executionId: request.execution_id ?? "",
-          wrapper: null,
-          oeUrl: "",
-          traceId: request.platform_trace_id,
-        },
-        () =>
-          this.withCredentialIsolation(async () => {
-            const invokeArgs = request.arguments;
-            const llm = await this.resolveLlmForRequest(
-              invokeArgs.llm_id,
-              invokeArgs.tools as unknown[],
-              invokeArgs.tool_choice,
-            );
-            const collected: LLMStreamChunk[] = [];
-            for await (const chunk of this.streamLlmChunks(
-              request,
-              signal,
-              llm,
-            )) {
-              collected.push(chunk);
-            }
-            return collected;
-          }),
+      // The calling agent's span stores this prompt; the model span this call
+      // produces would be a second copy of it. Usually a no-op after startup;
+      // keep any registry load inside the request's credential isolation, as
+      // with model execution below.
+      const chunks = await runAsCallerRecordedConversation(() =>
+        runWithExecutionContext(
+          {
+            executionId: request.execution_id ?? "",
+            wrapper: null,
+            oeUrl: "",
+            traceId: request.platform_trace_id,
+          },
+          () =>
+            this.withCredentialIsolation(async () => {
+              const invokeArgs = request.arguments;
+              const llm = await this.resolveLlmForRequest(
+                invokeArgs.llm_id,
+                invokeArgs.tools as unknown[],
+                invokeArgs.tool_choice,
+              );
+              const collected: LLMStreamChunk[] = [];
+              for await (const chunk of this.streamLlmChunks(
+                request,
+                signal,
+                llm,
+              )) {
+                collected.push(chunk);
+              }
+              return collected;
+            }),
+        ),
       );
       const llmResponse = SecureLLMProxy.responseFromStreamChunks(chunks);
       const durationMs = performance.now() - startTime;
@@ -1329,7 +1347,12 @@ export class ToolServer extends BaseServer {
     const gen = this.invokeLlmStreamEvents(request, signal, podName, startTime);
     try {
       while (true) {
-        const step = await runWithExecutionContext(ctx, () => gen.next());
+        // Each step runs the model span inside the request's context, which the
+        // caller-recorded marker scopes: the agent's own span holds this
+        // prompt, so the tool-pod copy is dropped.
+        const step = await runAsCallerRecordedConversation(() =>
+          runWithExecutionContext(ctx, () => gen.next()),
+        );
         if (step.done) {
           return;
         }

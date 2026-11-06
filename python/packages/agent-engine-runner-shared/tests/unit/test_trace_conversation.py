@@ -9,10 +9,14 @@ from opentelemetry.trace import SpanContext, SpanKind, Status, StatusCode, Trace
 
 from agent_engine_runner_shared.tracing.conversation import (
     ATTR_INPUT_MESSAGES_OFFSET,
+    ATTR_INPUT_MESSAGES_RECORDED_BY,
     ATTR_INPUT_MESSAGES_STREAM,
     ATTR_INPUT_MESSAGES_TOTAL,
     ATTR_RUNTIME_MODE,
+    RECORDED_BY_CALLER,
     ConversationDeltaTracker,
+    caller_records_conversation,
+    mark_recorded_by_caller,
 )
 from agent_engine_runner_shared.tracing.exporters import MongoDBSpanExporter
 
@@ -208,3 +212,67 @@ def test_mongodb_exporter_does_not_advance_progress_when_the_write_fails():
     # The failed span never landed, so the retry has to carry the whole prompt.
     assert _stored_contents(retried_attrs) == ["hi", "again"]
     assert retried_attrs[ATTR_INPUT_MESSAGES_OFFSET] == 0
+
+
+def _caller_recorded(attributes: dict[str, object]) -> dict[str, object]:
+    return {**attributes, ATTR_INPUT_MESSAGES_RECORDED_BY: RECORDED_BY_CALLER}
+
+
+def test_mongodb_exporter_drops_a_prompt_the_caller_records():
+    """The agent's span already stores it; the tool-pod copy is redundant."""
+    collection = MagicMock()
+    exporter = MongoDBSpanExporter(collection)
+    attributes = _caller_recorded(
+        {
+            **_messages("hi", "there"),
+            "input.value": '{"messages": [["user", "hi"]]}',
+            "input.mime_type": "application/json",
+        }
+    )
+
+    exporter.export([_span(attributes)])
+
+    stored = collection.insert_many.call_args[0][0][0]["attributes"]
+    assert _stored_contents(stored) == []
+    assert "input.value" not in stored
+    assert "input.mime_type" not in stored
+    # The marker outlives the prompt: it is how a reader finds the stored copy.
+    assert stored[ATTR_INPUT_MESSAGES_RECORDED_BY] == RECORDED_BY_CALLER
+    # No offset is written, so a reader does not replay this span as a slice.
+    assert ATTR_INPUT_MESSAGES_OFFSET not in stored
+
+
+def test_a_dropped_prompt_does_not_advance_the_tracked_conversation():
+    """A later tool-pod span that records its own prompt starts from the whole list."""
+    collection = MagicMock()
+    exporter = MongoDBSpanExporter(collection)
+
+    exporter.export([_span(_caller_recorded(_messages("hi", "there")))])
+    exporter.export([_span(_messages("asked a provider directly"))])
+
+    direct = collection.insert_many.call_args[0][0][0]["attributes"]
+    assert _stored_contents(direct) == ["asked a provider directly"]
+    assert direct[ATTR_INPUT_MESSAGES_OFFSET] == 0
+
+
+def test_mark_recorded_by_caller_marks_only_inside_the_context():
+    outside = MagicMock()
+    mark_recorded_by_caller(outside)
+    outside.set_attribute.assert_not_called()
+
+    inside = MagicMock()
+    with caller_records_conversation():
+        mark_recorded_by_caller(inside)
+
+    inside.set_attribute.assert_called_once_with(
+        ATTR_INPUT_MESSAGES_RECORDED_BY, RECORDED_BY_CALLER
+    )
+
+
+def test_the_caller_recorded_marker_ends_with_the_context():
+    span = MagicMock()
+    with caller_records_conversation():
+        pass
+    mark_recorded_by_caller(span)
+
+    span.set_attribute.assert_not_called()

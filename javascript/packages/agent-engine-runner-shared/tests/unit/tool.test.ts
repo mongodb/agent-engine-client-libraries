@@ -1487,6 +1487,24 @@ describe("ToolServer POST /guardrails/check", () => {
     expect(body.transformed_text).toBe("nothing to see here.");
     await app.close();
   });
+
+  test("a check over 1 MiB reaches the policy instead of being refused", async () => {
+    const app = Fastify();
+    makeServer(makeMockRuntime()).registerRoutes(app);
+
+    const res = await app.inject({
+      method: "POST",
+      url: "/guardrails/check",
+      payload: guardrailsRequestBody("a".repeat(2 * 1024 * 1024)),
+    });
+
+    expect(res.statusCode).toBe(200);
+    const body = res.json();
+    expect(body.allowed).toBe(false);
+    expect(body.triggered_policy_ids).toEqual(["policy-1"]);
+    expect(body.evidence[0].metadata.text_too_long).toBe(true);
+    await app.close();
+  });
 });
 
 describe("ToolServer POST /guardrails/check trace span", () => {

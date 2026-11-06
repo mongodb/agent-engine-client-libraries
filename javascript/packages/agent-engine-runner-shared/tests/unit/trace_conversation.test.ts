@@ -19,16 +19,26 @@ vi.mock("../../src/logger.js", () => ({
   setupLogging: vi.fn(),
 }));
 
-import type { ReadableSpan } from "@opentelemetry/sdk-trace-base";
+import {
+  BasicTracerProvider,
+  SimpleSpanProcessor,
+} from "@opentelemetry/sdk-trace-base";
+import type { ReadableSpan, Span } from "@opentelemetry/sdk-trace-base";
 import type { Collection } from "mongodb";
+
+import { ExecutionContextSpanProcessor } from "../../src/tracing/setup.js";
 
 import { MongoDBSpanExporter } from "../../src/index.js";
 import {
   ATTR_INPUT_MESSAGES_OFFSET,
+  ATTR_INPUT_MESSAGES_RECORDED_BY,
   ATTR_INPUT_MESSAGES_STREAM,
   ATTR_INPUT_MESSAGES_TOTAL,
+  RECORDED_BY_CALLER,
   ConversationDeltaTracker,
   RUNTIME_MODE_ATTRIBUTE,
+  markInputRecordedByCaller,
+  runAsCallerRecordedConversation,
 } from "../../src/tracing/conversation.js";
 
 const TRACE_ID = "12345678123456781234567812345678";
@@ -270,5 +280,141 @@ describe("MongoDBSpanExporter conversation trimming", () => {
         ATTR_INPUT_MESSAGES_OFFSET
       ],
     ).toBe(0);
+  });
+
+  function callerRecorded(
+    attributes: Record<string, unknown>,
+  ): Record<string, unknown> {
+    return {
+      ...attributes,
+      [ATTR_INPUT_MESSAGES_RECORDED_BY]: RECORDED_BY_CALLER,
+    };
+  }
+
+  test("drops a prompt the caller records", async () => {
+    // The agent's span already stores it; the tool-pod copy is redundant.
+    const insertMany = vi.fn().mockResolvedValue(undefined);
+    const exporter = new MongoDBSpanExporter({
+      insertMany,
+    } as unknown as Collection);
+
+    await exportAndWait(exporter, [
+      makeSpan(
+        callerRecorded({
+          ...messages("hi", "there"),
+          "input.value": '{"messages": [["user", "hi"]]}',
+          "input.mime_type": "application/json",
+        }),
+      ),
+    ]);
+
+    const stored = docsOf(insertMany, 0)["attributes"] as Record<
+      string,
+      unknown
+    >;
+    expect(storedContents(stored)).toEqual([]);
+    expect(stored["input.value"]).toBeUndefined();
+    expect(stored["input.mime_type"]).toBeUndefined();
+    // The marker outlives the prompt: it is how a reader finds the stored copy.
+    expect(stored[ATTR_INPUT_MESSAGES_RECORDED_BY]).toBe(RECORDED_BY_CALLER);
+    // No offset is written, so a reader does not replay this span as a slice.
+    expect(stored[ATTR_INPUT_MESSAGES_OFFSET]).toBeUndefined();
+  });
+
+  test("a dropped prompt does not advance the tracked conversation", async () => {
+    // A tool-pod span that records its own prompt starts from the whole list.
+    const insertMany = vi.fn().mockResolvedValue(undefined);
+    const exporter = new MongoDBSpanExporter({
+      insertMany,
+    } as unknown as Collection);
+
+    await exportAndWait(exporter, [
+      makeSpan(callerRecorded(messages("hi", "there"))),
+    ]);
+    await exportAndWait(exporter, [
+      makeSpan(messages("asked a provider directly")),
+    ]);
+
+    const direct = docsOf(insertMany, 1)["attributes"] as Record<
+      string,
+      unknown
+    >;
+    expect(storedContents(direct)).toEqual(["asked a provider directly"]);
+    expect(direct[ATTR_INPUT_MESSAGES_OFFSET]).toBe(0);
+  });
+});
+
+describe("ExecutionContextSpanProcessor", () => {
+  async function storedModelAttributes(
+    callerRecords: boolean,
+  ): Promise<Record<string, unknown>> {
+    const insertMany = vi.fn().mockResolvedValue(undefined);
+    const provider = new BasicTracerProvider({
+      spanProcessors: [
+        new ExecutionContextSpanProcessor(),
+        new SimpleSpanProcessor(
+          new MongoDBSpanExporter({ insertMany } as unknown as Collection),
+        ),
+      ],
+    });
+    const tracer = provider.getTracer("test");
+
+    const start = () => tracer.startSpan("ChatOpenAI");
+    // The marker is read at span start, so the block has to wrap `startSpan`.
+    const span = callerRecords
+      ? runAsCallerRecordedConversation(start)
+      : start();
+    span.setAttribute("llm.input_messages.0.message.role", "user");
+    span.setAttribute("llm.input_messages.0.message.content", "hi");
+    span.setAttribute("input.value", '{"messages": [["user", "hi"]]}');
+    span.end();
+
+    await vi.waitFor(() => expect(insertMany).toHaveBeenCalled());
+    const docs = insertMany.mock.calls[0]?.[0] as Array<
+      Record<string, unknown>
+    >;
+    return docs[0]?.["attributes"] as Record<string, unknown>;
+  }
+
+  test("stores no prompt for a span the processor marked", async () => {
+    const stored = await storedModelAttributes(true);
+
+    expect(storedContents(stored)).toEqual([]);
+    expect(stored["input.value"]).toBeUndefined();
+    expect(stored[ATTR_INPUT_MESSAGES_RECORDED_BY]).toBe(RECORDED_BY_CALLER);
+  });
+
+  test("keeps the prompt when no forwarding route marked the span", async () => {
+    const stored = await storedModelAttributes(false);
+
+    expect(storedContents(stored)).toEqual(["hi"]);
+    expect(stored[ATTR_INPUT_MESSAGES_RECORDED_BY]).toBeUndefined();
+  });
+});
+
+describe("caller-recorded conversation marker", () => {
+  test("marks spans only inside the scoped block", () => {
+    const outside = {
+      setAttribute: vi.fn(),
+    } as unknown as Span;
+    markInputRecordedByCaller(outside);
+    expect(outside.setAttribute).not.toHaveBeenCalled();
+
+    const inside = {
+      setAttribute: vi.fn(),
+    } as unknown as Span;
+    runAsCallerRecordedConversation(() => markInputRecordedByCaller(inside));
+    expect(inside.setAttribute).toHaveBeenCalledWith(
+      ATTR_INPUT_MESSAGES_RECORDED_BY,
+      RECORDED_BY_CALLER,
+    );
+  });
+
+  test("the marker ends with the block", () => {
+    const span = { setAttribute: vi.fn() } as unknown as Span;
+    runAsCallerRecordedConversation(() => undefined);
+    markInputRecordedByCaller(span);
+
+    expect(span.setAttribute).not.toHaveBeenCalled();
   });
 });

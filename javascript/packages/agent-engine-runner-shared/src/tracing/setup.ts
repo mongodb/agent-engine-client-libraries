@@ -37,6 +37,7 @@ import {
   getContentCaptureMode,
   MongoDBSpanExporter,
 } from "./exporters.js";
+import { markInputRecordedByCaller } from "./conversation.js";
 
 const logger = getLogger("agent_engine_runner_shared.tracing");
 
@@ -78,8 +79,10 @@ let retryStopped = false;
 // is unset, `export` is a no-op.
 let lazyMongoExporter: LazyMongoSpanExporter | null = null;
 
-class ExecutionContextSpanProcessor implements SpanProcessor {
+export class ExecutionContextSpanProcessor implements SpanProcessor {
   onStart(span: Span, _parentContext: Context): void {
+    markInputRecordedByCaller(span);
+
     const sessionId = getCurrentSessionId();
     const attributes = {
       "execution.id": getCurrentExecutionId(),

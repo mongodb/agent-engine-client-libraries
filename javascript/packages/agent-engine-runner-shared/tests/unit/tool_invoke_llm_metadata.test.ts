@@ -4,6 +4,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import type { FastifyInstance } from "fastify";
 import { describe, test, expect, vi, beforeEach, afterEach } from "vitest";
 import {
   ToolServer,
@@ -35,6 +36,7 @@ vi.mock("../../src/server/metadata.js", async (importOriginal) => {
 });
 
 interface ServerPrivates {
+  createApp: () => FastifyInstance;
   onStartup: () => Promise<void>;
   doHandleInvokeLlm: (
     request: LLMPodInvokeRequest,
@@ -71,6 +73,72 @@ function makeServer(entrypoint: () => unknown): ServerPrivates {
   };
   return server;
 }
+
+describe("a model call's body limit", () => {
+  const MiB = 1024 * 1024;
+  const callWith = (contentBytes: number) => ({
+    execution_id: "exec-1",
+    arguments: {
+      model: "gpt-4o",
+      messages: [{ role: "user", content: "x".repeat(contentBytes) }],
+    },
+  });
+
+  beforeEach(() => {
+    resetHooks();
+    hoisted.metadataDir = mkdtempSync(join(tmpdir(), "meta-"));
+  });
+
+  afterEach(() => {
+    rmSync(hoisted.metadataDir, { recursive: true, force: true });
+    resetHooks();
+  });
+
+  const appFor = async () => {
+    const app = makeServer(() => {
+      entrypointScope(() => registerLlm("primary", {}));
+      return {};
+    }).createApp();
+    await app.ready();
+    return app;
+  };
+
+  test.each(["/invoke_llm", "/invoke_llm/stream"])(
+    "%s serves a conversation above OE's 12 MiB limit",
+    async (url) => {
+      const app = await appFor();
+      const response = await app.inject({
+        method: "POST",
+        url,
+        payload: callWith(13 * MiB),
+      });
+      expect(response.statusCode).toBe(200);
+    },
+  );
+
+  test.each(["/invoke_llm", "/invoke_llm/stream"])(
+    "%s refuses a body above its limit",
+    async (url) => {
+      const app = await appFor();
+      const response = await app.inject({
+        method: "POST",
+        url,
+        payload: callWith(17 * MiB),
+      });
+      expect(response.statusCode).toBe(413);
+    },
+  );
+
+  test("other routes keep Fastify's default", async () => {
+    const app = await appFor();
+    const response = await app.inject({
+      method: "POST",
+      url: "/execute",
+      payload: callWith(2 * MiB),
+    });
+    expect(response.statusCode).toBe(413);
+  });
+});
 
 describe("prepared registry is independent of request metadata", () => {
   let seenKey: string | undefined;

@@ -35,6 +35,11 @@ from agent_engine_runner_shared.tracing import (
     JSONLSpanExporter,
     MongoDBSpanExporter,
 )
+from agent_engine_runner_shared.tracing.conversation import (
+    ATTR_INPUT_MESSAGES_RECORDED_BY,
+    RECORDED_BY_CALLER,
+    caller_records_conversation,
+)
 from agent_engine_runner_shared.tracing.exporters import get_content_capture_mode
 from agent_engine_runner_shared.tracing.setup import (
     ExecutionContextSpanProcessor,
@@ -198,6 +203,42 @@ def test_execution_context_span_processor_sets_correlation_attributes():
     # off "thread.id".
     span.set_attribute.assert_any_call("thread.id", "child-session")
     span.set_attribute.assert_any_call("workspace.id", "ws-child")
+
+
+def test_execution_context_span_processor_marks_a_prompt_the_caller_records():
+    """A tool pod must not store a prompt the agent's own span already holds."""
+    span = MagicMock()
+    with caller_records_conversation():
+        ExecutionContextSpanProcessor().on_start(span)
+
+    span.set_attribute.assert_any_call(ATTR_INPUT_MESSAGES_RECORDED_BY, RECORDED_BY_CALLER)
+
+
+def test_a_model_span_under_an_invoke_llm_request_stores_no_prompt():
+    """End to end: the processor marks the span, the exporter drops the prompt."""
+    collection = MagicMock()
+    provider = TracerProvider()
+    provider.add_span_processor(ExecutionContextSpanProcessor())
+    provider.add_span_processor(SimpleSpanProcessor(MongoDBSpanExporter(collection)))
+    tracer = provider.get_tracer("test")
+
+    with tracer.start_as_current_span("tool.invoke_llm.stream"):
+        with caller_records_conversation():
+            with tracer.start_as_current_span("ChatOpenAI") as model_span:
+                model_span.set_attribute("llm.input_messages.0.message.role", "user")
+                model_span.set_attribute("llm.input_messages.0.message.content", "hi")
+                model_span.set_attribute("input.value", '{"messages": [["user", "hi"]]}')
+
+    model_docs = [
+        call[0][0][0]
+        for call in collection.insert_many.call_args_list
+        if call[0][0][0]["name"] == "ChatOpenAI"
+    ]
+    assert len(model_docs) == 1
+    attributes = model_docs[0]["attributes"]
+    assert not any(name.startswith("llm.input_messages.") for name in attributes)
+    assert "input.value" not in attributes
+    assert attributes[ATTR_INPUT_MESSAGES_RECORDED_BY] == RECORDED_BY_CALLER
 
 
 def test_mongodb_exporter_handles_empty():

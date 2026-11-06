@@ -12,11 +12,19 @@
  * written before this existed carry no offset and read as a full list, so old
  * and new traces read the same way.
  *
+ * The platform forwards an agent's LLM call to a tool pod that makes the
+ * provider request, and both processes instrument it. The caller's span stores
+ * the conversation for that call, so the tool-pod copy is dropped outright
+ * (`omitInputMessages`) instead of being trimmed a second time.
+ *
  * Mirrors `agent_engine_runner_shared/tracing/conversation.py` — keep the
  * attribute names and the prefix rule identical.
  */
 
+import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash } from "node:crypto";
+
+import type { Span } from "@opentelemetry/sdk-trace-base";
 
 export const ATTR_INPUT_MESSAGES_OFFSET =
   "agent_engine.internal.input_messages.offset";
@@ -24,6 +32,13 @@ export const ATTR_INPUT_MESSAGES_TOTAL =
   "agent_engine.internal.input_messages.total";
 export const ATTR_INPUT_MESSAGES_STREAM =
   "agent_engine.internal.input_messages.stream";
+// Written on a span whose prompt the calling pod stores itself. The platform
+// forwards an agent's LLM call to a tool pod that makes the provider request,
+// so both processes record the same conversation; the tool-pod copy is
+// redundant.
+export const ATTR_INPUT_MESSAGES_RECORDED_BY =
+  "agent_engine.internal.input_messages.recorded_by";
+export const RECORDED_BY_CALLER = "caller";
 
 const INPUT_MESSAGES_PREFIX = "llm.input_messages.";
 const INPUT_MESSAGES_KEY = /^llm\.input_messages\.(\d+)\.(.+)$/;
@@ -60,6 +75,52 @@ export function hasInputMessages(attributes: Record<string, unknown>): boolean {
   return Object.keys(attributes).some((name) =>
     name.startsWith(INPUT_MESSAGES_PREFIX),
   );
+}
+
+// True while the tool pod runs an LLM call the agent made and already records.
+// A span ends — and is exported — before the request span that names the call,
+// so the trace tree cannot say at write time where a prompt is stored; the
+// process that forwards the call is the only one that knows.
+const callerRecorded = new AsyncLocalStorage<boolean>();
+
+/**
+ * Mark spans started inside `fn` as a call the caller already records.
+ *
+ * Scoped to the tool pod's platform-forwarded LLM routes. A prompt recorded
+ * only in the tool pod — a tool that calls a provider itself — stays unmarked
+ * and keeps its messages.
+ */
+export function runAsCallerRecordedConversation<T>(fn: () => T): T {
+  return callerRecorded.run(true, fn);
+}
+
+/**
+ * Attribute a span whose prompt the calling pod already stores.
+ *
+ * Called for every span as it starts; only spans carrying a prompt use the
+ * attribute, which is how the trace store and its readers find the copy.
+ */
+export function markInputRecordedByCaller(span: Span): void {
+  if (callerRecorded.getStore() === true) {
+    span.setAttribute(ATTR_INPUT_MESSAGES_RECORDED_BY, RECORDED_BY_CALLER);
+  }
+}
+
+/** Drop a span's prompt, keeping the marker that says where it lives. */
+export function omitInputMessages(
+  attributes: Record<string, unknown>,
+): Record<string, unknown> {
+  const omitted: Record<string, unknown> = {};
+  for (const [name, value] of Object.entries(attributes)) {
+    if (name.startsWith(INPUT_MESSAGES_PREFIX)) continue;
+    omitted[name] = value;
+  }
+  // OpenInference also serializes the prompt into input.value; leaving it
+  // would store the conversation the marker says is stored elsewhere.
+  delete omitted["input.value"];
+  delete omitted["input.mime_type"];
+  omitted[ATTR_INPUT_MESSAGES_RECORDED_BY] = RECORDED_BY_CALLER;
+  return omitted;
 }
 
 function collectMessages(

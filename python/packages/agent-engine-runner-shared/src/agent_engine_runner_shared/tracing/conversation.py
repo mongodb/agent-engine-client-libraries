@@ -10,6 +10,11 @@ the previous call in the same trace and stream, and records where that slice
 starts. A reader replays the slices to rebuild the full context. Spans
 written before this existed carry no offset and read as a full list, so old
 and new traces read the same way.
+
+The platform forwards an agent's LLM call to a tool pod that makes the
+provider request, and both processes instrument it. The caller's span stores
+the conversation for that call, so the tool-pod copy is dropped outright
+(``omit_input_messages``) instead of being trimmed a second time.
 """
 
 from __future__ import annotations
@@ -18,6 +23,9 @@ import hashlib
 import os
 import re
 from collections import OrderedDict
+from collections.abc import Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import Any, Dict, List, Mapping
 
 # The trace UI reads these; keep the names in sync with
@@ -25,6 +33,11 @@ from typing import Any, Dict, List, Mapping
 ATTR_INPUT_MESSAGES_OFFSET = "agent_engine.internal.input_messages.offset"
 ATTR_INPUT_MESSAGES_TOTAL = "agent_engine.internal.input_messages.total"
 ATTR_INPUT_MESSAGES_STREAM = "agent_engine.internal.input_messages.stream"
+# Written on a span whose prompt the calling pod stores itself. The platform
+# forwards an agent's LLM call to a tool pod that makes the provider request, so
+# both processes record the same conversation; the tool-pod copy is redundant.
+ATTR_INPUT_MESSAGES_RECORDED_BY = "agent_engine.internal.input_messages.recorded_by"
+RECORDED_BY_CALLER = "caller"
 
 # Resource attribute carrying the pod's role. The name predates the product
 # rename and is the contract the runner already emits on every span, not
@@ -38,6 +51,52 @@ _INPUT_MESSAGES_KEY = re.compile(r"^llm\.input_messages\.(\d+)\.(.+)$")
 # serves many traces; eviction only costs compression on a later span, never
 # correctness, since a missing entry reads as "store the full list".
 MAX_TRACKED_CONVERSATIONS = 256
+
+# True while the tool pod runs an LLM call the agent made and already records.
+# A span ends — and is exported — before the request span that names the call,
+# so the trace tree cannot say at write time where a prompt is stored; the
+# process that forwards the call is the only one that knows.
+_CALLER_RECORDED: ContextVar[bool] = ContextVar("caller_recorded_conversation", default=False)
+
+
+@contextmanager
+def caller_records_conversation() -> Iterator[None]:
+    """Mark spans started in this block as a call the caller already stores.
+
+    Scoped to the tool pod's platform-forwarded LLM routes. A prompt recorded
+    only here — a tool that calls a provider itself — stays unmarked and keeps
+    its messages.
+    """
+    token = _CALLER_RECORDED.set(True)
+    try:
+        yield
+    finally:
+        _CALLER_RECORDED.reset(token)
+
+
+def mark_recorded_by_caller(span: Any) -> None:
+    """Attribute a span whose prompt the calling pod already stores.
+
+    Called for every span as it starts; only spans carrying a prompt use the
+    attribute, which is how the trace store and its readers find the copy.
+    """
+    if _CALLER_RECORDED.get():
+        span.set_attribute(ATTR_INPUT_MESSAGES_RECORDED_BY, RECORDED_BY_CALLER)
+
+
+def omit_input_messages(attributes: Mapping[str, Any]) -> Dict[str, Any]:
+    """Drop a span's prompt, keeping the marker that says where it lives."""
+    omitted = {
+        name: value
+        for name, value in attributes.items()
+        if not name.startswith(_INPUT_MESSAGES_PREFIX)
+    }
+    # OpenInference also serializes the prompt into input.value; leaving it
+    # would store the conversation the marker says is stored elsewhere.
+    omitted.pop("input.value", None)
+    omitted.pop("input.mime_type", None)
+    omitted[ATTR_INPUT_MESSAGES_RECORDED_BY] = RECORDED_BY_CALLER
+    return omitted
 
 
 def _fingerprint(message: Mapping[str, Any]) -> bytes:

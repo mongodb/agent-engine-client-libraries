@@ -20,8 +20,11 @@ import type { Collection } from "mongodb";
 import { getLogger } from "../logger.js";
 
 import {
+  ATTR_INPUT_MESSAGES_RECORDED_BY,
+  RECORDED_BY_CALLER,
   ConversationDeltaTracker,
   hasInputMessages,
+  omitInputMessages,
   traceStream,
 } from "./conversation.js";
 
@@ -183,7 +186,17 @@ export class MongoDBSpanExporter implements SpanExporter {
     tracker: ConversationDeltaTracker,
   ): Record<string, unknown> {
     const attributes = doc["attributes"] as Record<string, unknown> | undefined;
-    if (!attributes || !hasInputMessages(attributes)) {
+    if (!attributes) {
+      return doc;
+    }
+    if (attributes[ATTR_INPUT_MESSAGES_RECORDED_BY] === RECORDED_BY_CALLER) {
+      // The caller's span holds this prompt. Dropping it here and leaving the
+      // tracker alone keeps a later tool-pod span — one that records its own
+      // conversation — starting from a full list rather than a bogus offset.
+      doc["attributes"] = omitInputMessages(attributes);
+      return doc;
+    }
+    if (!hasInputMessages(attributes)) {
       return doc;
     }
     doc["attributes"] = tracker.trim(

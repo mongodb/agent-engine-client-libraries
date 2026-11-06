@@ -10,6 +10,7 @@ import threading
 from unittest.mock import MagicMock
 
 import pytest
+from opentelemetry import trace
 from opentelemetry.proto.collector.trace.v1.trace_service_pb2 import (
     ExportTraceServiceRequest,
     ExportTraceServiceResponse,
@@ -124,6 +125,193 @@ def test_export_empty_span_list_is_a_noop():
 
     assert exporter.export([]) == SpanExportResult.SUCCESS
     assert client.requests == []
+
+
+def _conversation_spans(attribute_sets):
+    """Finished model spans that share one trace, so they form one stream."""
+    provider = TracerProvider()
+    exporter = InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    tracer = provider.get_tracer("test")
+    parent = tracer.start_span("run")
+    context = trace.set_span_in_context(parent)
+    for attributes in attribute_sets:
+        span = tracer.start_span("call", context=context)
+        for key, value in attributes.items():
+            span.set_attribute(key, value)
+        span.end()
+    parent.end()
+    return [span for span in exporter.get_finished_spans() if span.name == "call"]
+
+
+def _attribute_value(item) -> object:
+    value = item.value
+    if value.HasField("string_value"):
+        return value.string_value
+    if value.HasField("int_value"):
+        return value.int_value
+    if value.HasField("bool_value"):
+        return value.bool_value
+    return None
+
+
+def _sent_attributes(body: bytes) -> list[dict[str, object]]:
+    """Attributes of each span in the posted batch, in batch order."""
+    request = ExportTraceServiceRequest()
+    request.ParseFromString(body)
+    return [
+        {item.key: _attribute_value(item) for item in span.attributes}
+        for resource in request.resource_spans
+        for scope in resource.scope_spans
+        for span in scope.spans
+    ]
+
+
+def _sent_contents(attributes: dict[str, object]) -> list[str]:
+    contents = [
+        value
+        for key, value in attributes.items()
+        if key.startswith("llm.input_messages.") and key.endswith(".message.content")
+    ]
+    return sorted(str(value) for value in contents)
+
+
+def test_export_drops_a_prompt_the_caller_stores():
+    """The caller's span holds it, so the OE copy would be the duplicate."""
+    spans = _conversation_spans(
+        [
+            {
+                "llm.input_messages.0.message.role": "user",
+                "llm.input_messages.0.message.content": "hello",
+                "input.value": "hello",
+                "input.mime_type": "application/json",
+                "agent_engine.internal.input_messages.recorded_by": "caller",
+            }
+        ]
+    )
+    exporter, client = _exporter(lambda _body: _Response(200))
+
+    assert exporter.export(spans) == SpanExportResult.SUCCESS
+
+    sent = _sent_attributes(client.requests[0]["content"])[0]
+    assert _sent_contents(sent) == []
+    assert "input.value" not in sent
+    assert "input.mime_type" not in sent
+    # The marker is how the reader finds the copy the caller stored.
+    assert sent["agent_engine.internal.input_messages.recorded_by"] == "caller"
+
+
+def test_export_keeps_a_conversation_a_tool_records_itself():
+    spans = _conversation_spans(
+        [
+            {
+                "llm.input_messages.0.message.role": "user",
+                "llm.input_messages.0.message.content": "asked a provider directly",
+            }
+        ]
+    )
+    exporter, client = _exporter(lambda _body: _Response(200))
+
+    assert exporter.export(spans) == SpanExportResult.SUCCESS
+
+    sent = _sent_attributes(client.requests[0]["content"])[0]
+    assert _sent_contents(sent) == ["asked a provider directly"]
+    assert sent["agent_engine.internal.input_messages.offset"] == 0
+
+
+def test_export_does_not_advance_progress_when_delivery_fails():
+    """A refused batch must not make later spans omit messages it never stored."""
+    spans = _conversation_spans(
+        [
+            {
+                "llm.input_messages.0.message.role": "user",
+                "llm.input_messages.0.message.content": "hi",
+            },
+            {
+                "llm.input_messages.0.message.role": "user",
+                "llm.input_messages.0.message.content": "hi",
+                "llm.input_messages.1.message.role": "user",
+                "llm.input_messages.1.message.content": "again",
+            },
+        ]
+    )
+
+    def handler(_body):
+        return _Response(400) if len(client.requests) == 1 else _Response(200)
+
+    exporter, client = _exporter(handler)
+
+    assert exporter.export([spans[0]]) == SpanExportResult.FAILURE
+    assert exporter.export([spans[1]]) == SpanExportResult.SUCCESS
+
+    retried = _sent_attributes(client.requests[1]["content"])[0]
+    # The refused span never reached the store, so the next one carries the
+    # whole prompt the reader would otherwise be missing.
+    assert _sent_contents(retried) == ["again", "hi"]
+    assert retried["agent_engine.internal.input_messages.offset"] == 0
+
+
+def test_export_does_not_advance_progress_when_the_oe_drops_spans():
+    """The OE answers 200 while discarding a span; the next call restates it."""
+    spans = _conversation_spans(
+        [
+            {
+                "llm.input_messages.0.message.role": "user",
+                "llm.input_messages.0.message.content": "hi",
+            },
+            {
+                "llm.input_messages.0.message.role": "user",
+                "llm.input_messages.0.message.content": "hi",
+                "llm.input_messages.1.message.role": "user",
+                "llm.input_messages.1.message.content": "again",
+            },
+        ]
+    )
+    partial = ExportTraceServiceResponse()
+    partial.partial_success.rejected_spans = 1
+    calls = {"n": 0}
+
+    def handler(_body):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return _Response(200, content=partial.SerializeToString())
+        return _Response(200)
+
+    exporter, client = _exporter(handler)
+
+    assert exporter.export([spans[0]]) == SpanExportResult.SUCCESS
+    assert exporter.export([spans[1]]) == SpanExportResult.SUCCESS
+
+    retried = _sent_attributes(client.requests[1]["content"])[0]
+    # The dropped span never reached the store, so the next one carries the
+    # whole prompt rather than the tail of a stream the reader cannot follow.
+    assert _sent_contents(retried) == ["again", "hi"]
+    assert retried["agent_engine.internal.input_messages.offset"] == 0
+
+
+def test_export_sends_only_the_messages_each_call_added():
+    spans = _conversation_spans(
+        [
+            {
+                "llm.input_messages.0.message.role": "user",
+                "llm.input_messages.0.message.content": "hi",
+            },
+            {
+                "llm.input_messages.0.message.role": "user",
+                "llm.input_messages.0.message.content": "hi",
+                "llm.input_messages.1.message.role": "user",
+                "llm.input_messages.1.message.content": "again",
+            },
+        ]
+    )
+    exporter, client = _exporter(lambda _body: _Response(200))
+
+    assert exporter.export(spans) == SpanExportResult.SUCCESS
+
+    first, second = _sent_attributes(client.requests[0]["content"])
+    assert _sent_contents(first) == ["hi"]
+    assert _sent_contents(second) == ["again"]
+    assert second["agent_engine.internal.input_messages.offset"] == 1
 
 
 @pytest.mark.parametrize("status", [404, 429, 502, 503, 504])

@@ -44,6 +44,12 @@ import {
   type LLMPodInvokeResponse,
 } from "../../src/index.js";
 import { AsyncMutex } from "../../src/server/tool.js";
+import type { Span } from "@opentelemetry/sdk-trace-base";
+import {
+  ATTR_INPUT_MESSAGES_RECORDED_BY,
+  RECORDED_BY_CALLER,
+  markInputRecordedByCaller,
+} from "../../src/tracing/conversation.js";
 
 // ---------------------------------------------------------------------------
 // Test scaffolding
@@ -650,5 +656,67 @@ describe("ToolServer.doHandleInvokeLlm", () => {
     expect(response.error).toMatch(/Rate limit/);
     expect(response.pod_name).toBeDefined();
     expect(response.duration_ms ?? 0).toBeGreaterThanOrEqual(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Caller-recorded conversation
+// ---------------------------------------------------------------------------
+
+describe("caller-recorded conversation", () => {
+  // Stands in for the framework instrumentor creating the model span: only a
+  // call the platform forwarded is inside the marker's scope.
+  function recordMarkers(): {
+    adapter: {
+      stream: () => AsyncIterable<LLMStreamChunk>;
+    };
+    markers: unknown[][];
+  } {
+    const markers: unknown[][] = [];
+    return {
+      adapter: {
+        stream: () => {
+          const setAttribute = vi.fn();
+          markInputRecordedByCaller({ setAttribute } as unknown as Span);
+          markers.push(setAttribute.mock.calls);
+          return asyncGenFromArray([{ content: "ok" } as LLMStreamChunk]);
+        },
+      },
+      markers,
+    };
+  }
+
+  const expected = [[ATTR_INPUT_MESSAGES_RECORDED_BY, RECORDED_BY_CALLER]];
+
+  test("marks the model span of a platform-forwarded call", async () => {
+    const server = makeToolServer();
+    const { adapter, markers } = recordMarkers();
+    spyCreateLlmForPod(server, adapter);
+
+    const response = await server.doHandleInvokeLlm(makeRequest());
+
+    expect(response.status).toBe("success");
+    expect(markers).toEqual([expected]);
+  });
+
+  test("marks the model span of a platform-forwarded stream", async () => {
+    const server = makeToolServer();
+    const { adapter, markers } = recordMarkers();
+    spyCreateLlmForPod(server, adapter);
+
+    for await (const _ of server.handleInvokeLlmStream(makeRequest())) {
+      // Drain the stream.
+    }
+
+    expect(markers).toEqual([expected]);
+  });
+
+  test("leaves a direct tool LLM call unmarked", () => {
+    // No platform route wrapped it: the tool pod is the only recorder, so it
+    // keeps the conversation.
+    const setAttribute = vi.fn();
+    markInputRecordedByCaller({ setAttribute } as unknown as Span);
+
+    expect(setAttribute).not.toHaveBeenCalled();
   });
 });

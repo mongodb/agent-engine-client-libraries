@@ -269,17 +269,17 @@ def _egress_target(base_url: str) -> tuple[str, int]:
 def _guidance_comment(base_url: str, auth: Auth | None) -> str:
     """Report the agent.yaml policy this connector needs, as a file comment.
 
-    Platform policy stays explicit and developer-owned: nothing here writes or
-    derives agent.yaml. The egress hint is a command so it adapts to whichever
-    egress shape the manifest already uses, and every interpolated value passes
-    the generator's control-byte sanitizer so no value can escape the comment.
+    The generator never edits agent.yaml; the CLI's create-tool does that after it
+    returns. The egress hint is a command so it adapts to whichever egress shape
+    the manifest already uses, and every interpolated value passes the generator's
+    control-byte sanitizer so no value can escape the comment.
     """
     host, port = _egress_target(base_url)
     envs = auth.secret_names() if auth is not None else []
     target = f"{_quote(host)}:{port}"
     lines = [
-        "# Connector operations execute in the tool sandbox; this file enables no",
-        "# platform policy. Declare the connector's requirements in agent.yaml:",
+        "# Connector operations execute in the tool sandbox. agent.yaml needs these;",
+        "# agentengine agent create-tool and agent validate --fix can add them:",
         f"#   egress   allow {target} from the tool sandbox, e.g.",
         f"#            agentengine agent egress add --component tool {shlex.quote(target)}",
     ]
@@ -297,6 +297,8 @@ def _guidance_comment(base_url: str, auth: Auth | None) -> str:
         lines.append("#   secret   none required in the tool sandbox; tokens are request-local")
     else:
         lines.append("#   secret   none required; this connector authenticates anonymously")
+    lines.append("#   tools    list this connector's tools under sandboxes.tool.tools when")
+    lines.append("#            agent.yaml has a sandboxes block")
     return "\n".join(lines) + "\n"
 
 
