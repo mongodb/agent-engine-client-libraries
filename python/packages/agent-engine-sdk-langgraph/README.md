@@ -112,7 +112,7 @@ conventions change.
 
 **Migrating from the pre-facade surface**
 
-- **Return types / truthiness / metadata / `build_context`:** writes return typed
+- Return types / truthiness / metadata / `build_context`: writes return typed
   results (`CreateSemanticResult`, `CreateEpisodicResult`, etc.) with
   `acknowledged` — not bare `bool`/dicts. Prefer `if result.acknowledged:` (not
   `if result:` — Pydantic models are always truthy). Similarity searches return
@@ -124,10 +124,10 @@ conventions change.
   the return value as a string.
 - **Write helpers are keyword-only** (`save_semantic(text=..., label=..., …)`).
   Positional calls raise `TypeError`.
-- **Reads with `visibility="private"` keep the ambient user filter** (previously
+- Reads with `visibility="private"` keep the ambient user filter (previously
   passing any `visibility` argument dropped it): private-visibility searches now
   return only the current user's memories unless an explicit `user_id` is passed.
-- **`top_k`:** per-source `search_semantic` / `search_episodes` / `search_taxonomic`
+- `top_k`: per-source `search_semantic` / `search_episodes` / `search_taxonomic`
   default to `top_k=50` (was often `10`). `discover_procedures` still defaults to
   `10`. Unified `Memory.search()` still defaults to `top_k=10`. Public
   `build_context` has no `top_k` parameter. Use `max_tokens` for a gross

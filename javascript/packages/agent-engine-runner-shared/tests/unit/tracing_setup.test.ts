@@ -216,11 +216,15 @@ describe("tracing setup", () => {
     resetHooks();
     delete process.env["AGENTIC_TRACE_STORE_RETRY_INTERVAL_SECONDS"];
     delete process.env["AGENTIC_OBSERVABILITY_DIR"];
+    delete process.env["OE_URL"];
   });
 
   test("disabled when no store URI is configured", async () => {
     await setupTracing({ serviceName: "svc-no-store" });
-    expect(tracingStatus()).toEqual({ database_exporter: "disabled" });
+    expect(tracingStatus()).toEqual({
+      database_exporter: "disabled",
+      platform_exporter: "disabled",
+    });
   });
 
   test("does not write local trace JSONL", async () => {
@@ -242,7 +246,10 @@ describe("tracing setup", () => {
       mongodbUri: URI,
       mongodbDatabaseName: "testdb",
     });
-    expect(tracingStatus()).toEqual({ database_exporter: "attached" });
+    expect(tracingStatus()).toEqual({
+      database_exporter: "attached",
+      platform_exporter: "disabled",
+    });
   });
 
   test("attaches request-local execution identity to every span", async () => {
@@ -302,7 +309,10 @@ describe("tracing setup", () => {
     expect(mocks.logger.warn).toHaveBeenCalledWith(
       "Cannot attach MongoDB tracing: no store URI was configured at setup",
     );
-    expect(tracingStatus()).toEqual({ database_exporter: "disabled" });
+    expect(tracingStatus()).toEqual({
+      database_exporter: "disabled",
+      platform_exporter: "disabled",
+    });
   });
 
   test("attachMongoTracing is idempotent once attached", async () => {
@@ -312,13 +322,19 @@ describe("tracing setup", () => {
       mongodbUri: URI,
       mongodbDatabaseName: "testdb",
     });
-    expect(tracingStatus()).toEqual({ database_exporter: "attached" });
+    expect(tracingStatus()).toEqual({
+      database_exporter: "attached",
+      platform_exporter: "disabled",
+    });
 
     const other = {
       insertMany: vi.fn().mockResolvedValue({ insertedCount: 1 }),
     };
     expect(() => attachMongoTracing(other as never)).not.toThrow();
-    expect(tracingStatus()).toEqual({ database_exporter: "attached" });
+    expect(tracingStatus()).toEqual({
+      database_exporter: "attached",
+      platform_exporter: "disabled",
+    });
     expect(other.insertMany).not.toHaveBeenCalled();
   });
 
@@ -335,7 +351,10 @@ describe("tracing setup", () => {
       mongodbDatabaseName: "testdb",
     });
 
-    expect(tracingStatus()).toEqual({ database_exporter: "degraded" });
+    expect(tracingStatus()).toEqual({
+      database_exporter: "degraded",
+      platform_exporter: "disabled",
+    });
     const errorMsg = mocks.logger.error.mock.calls[0]?.[0] ?? "";
     expect(String(errorMsg)).toMatch(/Trace store unavailable at startup/);
     expect(String(errorMsg)).toMatch(/:\/\/\*\*\*@/);
@@ -382,7 +401,10 @@ describe("tracing setup", () => {
       mongodbDatabaseName: "testdb",
     });
 
-    expect(tracingStatus()).toEqual({ database_exporter: "degraded" });
+    expect(tracingStatus()).toEqual({
+      database_exporter: "degraded",
+      platform_exporter: "disabled",
+    });
     const errorMsg = String(mocks.logger.error.mock.calls[0]?.[0] ?? "");
     expect(errorMsg).toMatch(/Trace store unavailable at startup/);
     expect(errorMsg).toContain("mongodb://***@atlas-host.mongodb.net/db");
@@ -401,7 +423,10 @@ describe("tracing setup", () => {
       mongodbDatabaseName: "testdb",
     });
 
-    expect(tracingStatus()).toEqual({ database_exporter: "degraded" });
+    expect(tracingStatus()).toEqual({
+      database_exporter: "degraded",
+      platform_exporter: "disabled",
+    });
     // Sync on the retry attempts themselves instead of wall time: each failed
     // attempt re-pings the store, so waiting for several pings proves the
     // loop is firing while the status stays degraded.
@@ -411,7 +436,10 @@ describe("tracing setup", () => {
         startupPings + 3,
       );
     });
-    expect(tracingStatus()).toEqual({ database_exporter: "degraded" });
+    expect(tracingStatus()).toEqual({
+      database_exporter: "degraded",
+      platform_exporter: "disabled",
+    });
   });
 
   test("shutdown during an in-flight retry stops further retries", async () => {
@@ -438,7 +466,10 @@ describe("tracing setup", () => {
       mongodbUri: URI,
       mongodbDatabaseName: "testdb",
     });
-    expect(tracingStatus()).toEqual({ database_exporter: "degraded" });
+    expect(tracingStatus()).toEqual({
+      database_exporter: "degraded",
+      platform_exporter: "disabled",
+    });
 
     // Fire the scheduled retry; it suspends mid-attempt on the deferred ping
     // (connect is called once at startup, once by the retry).
@@ -483,7 +514,10 @@ describe("tracing setup", () => {
       mongodbUri: URI,
       mongodbDatabaseName: "testdb",
     });
-    expect(tracingStatus()).toEqual({ database_exporter: "degraded" });
+    expect(tracingStatus()).toEqual({
+      database_exporter: "degraded",
+      platform_exporter: "disabled",
+    });
 
     const startupConnects = mongo.instance.connect.mock.calls.length;
     await vi.advanceTimersByTimeAsync(10);
@@ -521,7 +555,10 @@ describe("tracing setup", () => {
       mongodbDatabaseName: "testdb",
     });
 
-    expect(tracingStatus()).toEqual({ database_exporter: "attached" });
+    expect(tracingStatus()).toEqual({
+      database_exporter: "attached",
+      platform_exporter: "disabled",
+    });
   });
 
   test("OTLP endpoint configured: OTLP leg added without breaking Mongo setup", async () => {
@@ -541,7 +578,10 @@ describe("tracing setup", () => {
       }),
     ).resolves.toBeUndefined();
 
-    expect(tracingStatus()).toEqual({ database_exporter: "attached" });
+    expect(tracingStatus()).toEqual({
+      database_exporter: "attached",
+      platform_exporter: "disabled",
+    });
     delete process.env["OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"];
   });
 
@@ -606,7 +646,10 @@ describe("tracing setup", () => {
         mongodbUri: URI,
         mongodbDatabaseName: "testdb",
       });
-      expect(tracingStatus()).toEqual({ database_exporter: "degraded" });
+      expect(tracingStatus()).toEqual({
+        database_exporter: "degraded",
+        platform_exporter: "disabled",
+      });
 
       // Let several attempts fire so both the initial schedule and the
       // reschedules are covered. Tolerance on the interval match dodges

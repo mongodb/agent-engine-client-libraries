@@ -110,7 +110,7 @@ import {
 import { resolveOeUrl } from "./oe_url.js";
 import { resolveOwnerUrl } from "./owner_url.js";
 import { discardResponseBody, postWithRetries } from "./http_retry.js";
-import { getTracer } from "../tracing/index.js";
+import { forceFlushTracing, getTracer } from "../tracing/index.js";
 import {
   AER_BUILD_AGENT,
   OPENINFERENCE_SPAN_KIND,
@@ -153,6 +153,10 @@ const CAPABILITY_ADVERTISE_TIMEOUT_MS = 10_000;
 // Bounded wait for queued Memory writes before asking OE to release a finished
 // session. Mirrors the Python AER contract.
 const SESSION_FINISH_MEMORY_DRAIN_TIMEOUT_MS = 10_000;
+// Bound on the trace flush before the finish POST. /finish triggers a
+// zero-grace teardown, so queued spans must reach the OE first; the bound keeps
+// an unreachable OE from delaying the release indefinitely.
+const SESSION_FINISH_TRACE_FLUSH_TIMEOUT_MS = 5_000;
 const CANCELLED_HISTORY_TIMEOUT_MS = 3_000;
 
 // Bound on the cancelled-turn checkpoint write during drain teardown. The OE's
@@ -2057,6 +2061,22 @@ export class AERServer extends BaseServer {
     ) {
       logger.warn(
         `Session finish: ${writer.pendingWrites} memory write(s) still pending after 10s; releasing anyway`,
+      );
+    }
+
+    // Flush trace spans before the OE frees this pod: /finish triggers a
+    // zero-grace teardown, so spans still queued in the BatchSpanProcessor
+    // would otherwise be lost. Best-effort and bounded.
+    try {
+      if (!(await forceFlushTracing(SESSION_FINISH_TRACE_FLUSH_TIMEOUT_MS))) {
+        logger.warn(
+          "Trace flush before session release timed out; some spans may be lost",
+        );
+      }
+    } catch (e) {
+      logger.debug(
+        { err: (e as Error).message },
+        "Trace flush before session release failed",
       );
     }
 

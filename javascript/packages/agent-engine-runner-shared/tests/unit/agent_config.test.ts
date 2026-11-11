@@ -705,6 +705,8 @@ describe("isPlatformEnvVar membership", () => {
     expect(isPlatformEnvVar("MDB_AGENTIC_STORE_DB")).toBe(true);
     expect(isPlatformEnvVar("SHUTDOWN_GRACE_PERIOD_MS")).toBe(true);
     expect(isPlatformEnvVar("AGENT_ENGINE_ENVIRONMENT")).toBe(true);
+    expect(isPlatformEnvVar("MDBAE_LOCAL_MODE")).toBe(true);
+    expect(isPlatformEnvVar("MDBAE_LOCAL_PORT")).toBe(true);
     expect(isPlatformEnvVar("MY_API_TOKEN")).toBe(false);
   });
 });

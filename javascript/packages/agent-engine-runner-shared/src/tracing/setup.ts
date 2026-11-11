@@ -36,6 +36,7 @@ import {
   ContentPolicyOTLPSpanExporter,
   getContentCaptureMode,
   MongoDBSpanExporter,
+  PlatformSpanExporter,
 } from "./exporters.js";
 import { markInputRecordedByCaller } from "./conversation.js";
 
@@ -78,6 +79,13 @@ let retryStopped = false;
 // `attachMongoTracing` once the store recovers. While the collection
 // is unset, `export` is a no-op.
 let lazyMongoExporter: LazyMongoSpanExporter | null = null;
+
+let platformExporter: PlatformSpanExporter | null = null;
+
+// The larger queue absorbs the burst of spans emitted as a turn finishes.
+const PLATFORM_BSP_MAX_QUEUE_SIZE = 2048;
+const PLATFORM_BSP_MAX_EXPORT_BATCH_SIZE = 512;
+const PLATFORM_BSP_SCHEDULE_DELAY_MILLIS = 2000;
 
 export class ExecutionContextSpanProcessor implements SpanProcessor {
   onStart(span: Span, _parentContext: Context): void {
@@ -316,34 +324,71 @@ export async function setupTracing(args: SetupTracingArgs = {}): Promise<void> {
   return setupPromise;
 }
 
+/**
+ * Opt-out for the OE platform trace exporter. Unset means on. `"0"` or
+ * `"false"` keeps the MongoDB trace-store path: the OE never sees those spans,
+ * so PII redaction cannot apply to them. Any other value, including an
+ * unrecognized one, keeps the exporter on so a typo cannot route spans past the
+ * OE. Mirrors Python's `platform_trace_exporter_enabled`; the name avoids the
+ * reserved tenant-secret prefix so a workspace can set it directly.
+ */
+export const PLATFORM_TRACE_EXPORTER_ENV = "AGENTIC_TRACE_EXPORTER";
+
+export function platformTraceExporterEnabled(
+  env: NodeJS.ProcessEnv = process.env,
+): boolean {
+  const value = (env[PLATFORM_TRACE_EXPORTER_ENV] ?? "").trim().toLowerCase();
+  return value !== "0" && value !== "false";
+}
+
 async function doSetupTracing(args: SetupTracingArgs): Promise<void> {
   const serviceName = args.serviceName ?? "runner-sdk";
   const spanProcessors: SpanProcessor[] = [new ExecutionContextSpanProcessor()];
 
-  const { collection, errorMessage } = await resolveTracingCollection(args);
-  if (args.mongodbUri) {
-    // A store URI was configured — register the lazy Mongo exporter up front
-    // (the provider is built once, below, with it in the processor list). If
-    // the store was reachable at startup, wire the collection in immediately;
-    // otherwise leave it unset and retry in the background.
-    const lazy = new LazyMongoSpanExporter();
-    lazyMongoExporter = lazy;
-    spanProcessors.push(new BatchSpanProcessor(lazy));
-    if (collection) {
-      lazy.setCollection(collection);
-      mongodbExporterAttached = true;
-      mongodbDegraded = false;
-      logger.info(
-        { db: collection.dbName, collection: collection.collectionName },
-        "Tracing: MongoDB output enabled",
+  // OE_URL takes precedence so live guests never write traces directly to
+  // MongoDB.
+  const oeUrl = (process.env["OE_URL"] ?? "").trim();
+  const otlpConfigured = otlpEndpointConfigured();
+  const usePlatform = oeUrl !== "" && platformTraceExporterEnabled();
+  if (oeUrl && !usePlatform) {
+    logger.warn(
+      `Tracing: ${PLATFORM_TRACE_EXPORTER_ENV} disables the platform trace ` +
+        "exporter; spans go to the trace store without PII redaction",
+    );
+  }
+  if (usePlatform) {
+    attachPlatformExporter(spanProcessors, oeUrl);
+  } else {
+    const { collection, errorMessage } = await resolveTracingCollection(args);
+    if (args.mongodbUri) {
+      // A store URI was configured — register the lazy Mongo exporter up front
+      // (the provider is built once, below, with it in the processor list). If
+      // the store was reachable at startup, wire the collection in immediately;
+      // otherwise leave it unset and retry in the background.
+      const lazy = new LazyMongoSpanExporter();
+      lazyMongoExporter = lazy;
+      spanProcessors.push(new BatchSpanProcessor(lazy));
+      if (collection) {
+        lazy.setCollection(collection);
+        mongodbExporterAttached = true;
+        mongodbDegraded = false;
+        logger.info(
+          { db: collection.dbName, collection: collection.collectionName },
+          "Tracing: MongoDB output enabled",
+        );
+      } else {
+        mongodbDegraded = true;
+        const intervalSec = getRetryIntervalSeconds();
+        logger.error(
+          `Trace store unavailable at startup; will retry every ${intervalSec}s. Error: ${errorMessage ?? "unknown"}`,
+        );
+        startMongoRetry(args);
+      }
+    } else if (!otlpConfigured) {
+      logger.warn(
+        "Tracing: no trace destination configured " +
+          "(platform exporter disabled or OE_URL unset, no MongoDB collection, no OTLP endpoint)",
       );
-    } else {
-      mongodbDegraded = true;
-      const intervalSec = getRetryIntervalSeconds();
-      logger.error(
-        `Trace store unavailable at startup; will retry every ${intervalSec}s. Error: ${errorMessage ?? "unknown"}`,
-      );
-      startMongoRetry(args);
     }
   }
 
@@ -374,6 +419,22 @@ async function doSetupTracing(args: SetupTracingArgs): Promise<void> {
 
   runInstrumentor();
   logger.info({ serviceName }, "Tracing enabled");
+}
+
+function attachPlatformExporter(
+  spanProcessors: SpanProcessor[],
+  oeUrl: string,
+): void {
+  const exporter = new PlatformSpanExporter(oeUrl);
+  spanProcessors.push(
+    new BatchSpanProcessor(exporter, {
+      maxQueueSize: PLATFORM_BSP_MAX_QUEUE_SIZE,
+      maxExportBatchSize: PLATFORM_BSP_MAX_EXPORT_BATCH_SIZE,
+      scheduledDelayMillis: PLATFORM_BSP_SCHEDULE_DELAY_MILLIS,
+    }),
+  );
+  platformExporter = exporter;
+  logger.info({ url: exporter.url }, "Tracing: platform exporter enabled");
 }
 
 export function runInstrumentor(): void {
@@ -427,18 +488,93 @@ export async function shutdownTracing(): Promise<void> {
   mongodbExporterAttached = false;
   mongodbDegraded = false;
   lazyMongoExporter = null;
+  platformExporter = null;
 }
 
 /**
- * Snapshot of the database trace-store exporter for /health. Mirrors Python's
- * `tracing_status`: `"attached"` (MongoDB span processor live), `"degraded"`
- * (store URI configured but unreachable at startup, retrying), or `"disabled"`
- * (no store URI configured, not a degradation).
+ * Drain buffered spans and wait for in-flight platform exports, bounded by
+ * `timeoutMillis`.
+ *
+ * Called from the session-finish path before the OE releases the pod, so a
+ * turn's spans are not lost to a zero-grace teardown. Returns true when tracing
+ * is not initialized or the flush completed within the timeout; false when it
+ * timed out or raised.
  */
-export function tracingStatus(): { database_exporter: string } {
-  if (mongodbExporterAttached) return { database_exporter: "attached" };
-  if (mongodbDegraded) return { database_exporter: "degraded" };
-  return { database_exporter: "disabled" };
+export async function forceFlushTracing(
+  timeoutMillis = 5000,
+): Promise<boolean> {
+  const provider = tracerProvider;
+  if (provider === null) return true;
+  try {
+    const providerFlushed = provider.forceFlush();
+    const exportsDrained = platformExporter?.forceFlush() ?? Promise.resolve();
+    // A failed provider flush must not abandon an in-flight export that still
+    // has budget to finish, so join both to settlement and report failure only
+    // once neither can make progress.
+    const settled = Promise.allSettled([providerFlushed, exportsDrained]);
+    if (
+      !(await raceWithTimeout(
+        settled.then(() => undefined),
+        timeoutMillis,
+      ))
+    ) {
+      return false;
+    }
+    return (await settled).every((result) => result.status === "fulfilled");
+  } catch (err) {
+    logger.debug({ err: (err as Error).message }, "Tracing force flush failed");
+    return false;
+  }
+}
+
+function raceWithTimeout(
+  promise: Promise<void>,
+  timeoutMillis: number,
+): Promise<boolean> {
+  return new Promise<boolean>((resolve) => {
+    const timer = setTimeout(() => resolve(false), timeoutMillis);
+    if (typeof timer.unref === "function") timer.unref();
+    promise.then(
+      () => {
+        clearTimeout(timer);
+        resolve(true);
+      },
+      () => {
+        clearTimeout(timer);
+        resolve(false);
+      },
+    );
+  });
+}
+
+/**
+ * Exporter states reported by `/health`.
+ *
+ * `database_exporter` is `"attached"` when a MongoDB processor is live,
+ * `"degraded"` while a configured store is unreachable and retrying, or
+ * `"disabled"` when no store URI was configured.
+ *
+ * `platform_exporter` is `"attached"` when traces are sent to the OE,
+ * `"degraded"` after an incomplete export, or `"disabled"` when the opt-out is
+ * set or `OE_URL` is unset. OTLP may still be configured in the disabled state.
+ */
+export function tracingStatus(): {
+  database_exporter: string;
+  platform_exporter: string;
+} {
+  const platform =
+    platformExporter === null
+      ? "disabled"
+      : platformExporter.lastError !== null
+        ? "degraded"
+        : "attached";
+
+  let database: string;
+  if (mongodbExporterAttached) database = "attached";
+  else if (mongodbDegraded) database = "degraded";
+  else database = "disabled";
+
+  return { database_exporter: database, platform_exporter: platform };
 }
 
 /**

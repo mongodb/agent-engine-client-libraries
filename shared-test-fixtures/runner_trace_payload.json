@@ -1,0 +1,29 @@
+{
+  "comment": "Decoded OTLP payload the Python and TypeScript runners send to POST /internal/traces for one fixed span. Both runner test suites assert against this file; the fields are the ones the OE converter reads (otlp_converter.go). All values are fake.",
+  "spans": [
+    {
+      "trace_id": "0af7651916cd43dd8448eb211c80319c",
+      "span_id": "b7ad6b7169203331",
+      "parent_span_id": "00f067aa0ba902b7",
+      "name": "agent.run",
+      "kind": "SPAN_KIND_INTERNAL",
+      "start_time_unix_nano": "1700000000000000001",
+      "end_time_unix_nano": "1700000001500000002",
+      "status_code": "STATUS_CODE_OK",
+      "attributes": {
+        "session.id": "sess-1",
+        "execution.id": "exec-1",
+        "thread.id": "sess-1",
+        "workspace.id": "ws-1",
+        "llm.token_count.total": 42,
+        "custom.flag": true,
+        "ratio": 0.5,
+        "user.note": "contact jane@x.com"
+      },
+      "resource": {
+        "service.name": "runner-sdk",
+        "agentic_platform.project_id": "proj-1"
+      }
+    }
+  ]
+}

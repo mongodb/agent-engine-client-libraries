@@ -63,16 +63,17 @@ _retry_thread: Optional[threading.Thread] = None
 # clients.
 _tracing_mongo_client: Optional["MongoClient"] = None
 
-# Platform trace-exporter state. The exporter is off by default and enabled
-# per workspace with the flag named by `_PLATFORM_TRACE_EXPORTER_ENV`; when on
-# (and OE_URL is set) the guest sends spans to the OE instead of writing
-# MongoDB directly. `_platform_exporter` is retained so /health can report its
-# recent export results and shutdown can reset it.
+# Platform trace-exporter state. The exporter is on whenever OE_URL is set; the
+# flag named by `_PLATFORM_TRACE_EXPORTER_ENV` only turns it off. When on, the
+# guest sends spans to the OE instead of writing MongoDB directly.
+# `_platform_exporter` is retained so /health can report its recent export
+# results and shutdown can reset it.
 _platform_exporter: Optional[PlatformSpanExporter] = None
 _platform_exporter_attached: bool = False
 
-# Feature flag: route runner spans to the OE platform trace endpoint. Off by
-# default, so an unset value keeps the MongoDB trace-store path. Deliberately
+# Opt-out for routing runner spans to the OE platform trace endpoint. Unset
+# means on. Setting it to "0" or "false" keeps the MongoDB trace-store path: the
+# OE never sees those spans, so PII redaction cannot apply to them. Deliberately
 # avoids the reserved tenant-secret prefix, which a workspace secret cannot use
 # (pkg/tenantsecrets), so a workspace can set this one directly.
 _PLATFORM_TRACE_EXPORTER_ENV = "AGENTIC_TRACE_EXPORTER"
@@ -146,13 +147,12 @@ def _otlp_endpoint_configured() -> bool:
 def platform_trace_exporter_enabled() -> bool:
     """Whether the OE platform trace exporter is enabled.
 
-    Off by default: the flag gates the rollout, so an unset (or unrecognized)
-    value keeps the MongoDB trace-store path. A workspace enables it by setting
-    the env var named by ``_PLATFORM_TRACE_EXPORTER_ENV`` to ``1`` or ``true``.
-    It is only half the condition — the exporter also needs ``OE_URL`` to know
-    where to send spans.
+    On unless the env var named by ``_PLATFORM_TRACE_EXPORTER_ENV`` is ``0`` or
+    ``false``. Any other value, including an unrecognized one, keeps it on so a
+    typo cannot silently route spans past the OE. It is only half the
+    condition — the exporter also needs ``OE_URL`` to know where to send spans.
     """
-    return os.getenv(_PLATFORM_TRACE_EXPORTER_ENV, "").strip().lower() in ("1", "true")
+    return os.getenv(_PLATFORM_TRACE_EXPORTER_ENV, "").strip().lower() not in ("0", "false")
 
 
 class ExecutionContextSpanProcessor(SpanProcessor):
@@ -237,13 +237,20 @@ def setup_tracing(
 
     provider.add_span_processor(ExecutionContextSpanProcessor())
 
-    # Destination: the OE platform trace endpoint when the feature flag is on
-    # and OE_URL is set, otherwise the caller-supplied MongoDB collection. With
-    # the flag on the OE is the platform trace path and takes precedence — a
-    # guest with both must not keep writing MongoDB directly.
+    # Destination: the OE platform trace endpoint whenever OE_URL is set,
+    # otherwise the caller-supplied MongoDB collection. The OE is the platform
+    # trace path and takes precedence — a guest with both must not keep writing
+    # MongoDB directly.
     oe_url = os.getenv("OE_URL", "").strip()
     otlp_configured = _otlp_endpoint_configured()
-    if oe_url and platform_trace_exporter_enabled():
+    use_platform = bool(oe_url) and platform_trace_exporter_enabled()
+    if oe_url and not use_platform:
+        logger.warning(
+            "Tracing: %s disables the platform trace exporter; spans go to the "
+            "trace store without PII redaction",
+            _PLATFORM_TRACE_EXPORTER_ENV,
+        )
+    if use_platform:
         _attach_platform_exporter(provider, oe_url)
     elif mongodb_collection is not None:
         provider.add_span_processor(BatchSpanProcessor(MongoDBSpanExporter(mongodb_collection)))
@@ -399,7 +406,7 @@ def tracing_status() -> dict[str, str]:
 
     ``platform_exporter`` is ``attached`` (spans are sent to the OE),
     ``degraded`` (the most recent export did not fully succeed), or
-    ``disabled`` (the feature flag is off or OE_URL unset; OTLP may still be
+    ``disabled`` (the opt-out is set or OE_URL unset; OTLP may still be
     configured).
     """
     if _platform_exporter_attached:

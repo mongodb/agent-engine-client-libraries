@@ -188,7 +188,7 @@ What this means for an agent:
 
 Assembled prose, or the records themselves — two different questions.
 
-**`build_context_from_sources(...)`** is the one to reach for by default. You
+`build_context_from_sources(...)` is the one to reach for by default. You
 give it a query and a token budget; it retrieves across the memory types you
 name, ranks the results together, drops near-duplicates (unless you pass
 `collapse_duplicate_content=False`), trims to the budget,
@@ -202,10 +202,10 @@ that *mean* the same; `text` matches words and finds things that *say* the same;
 vector search alone misses exact identifiers and rare words, text search alone
 misses paraphrases.
 
-**`build_context(...)`** is the simpler builder: same pipeline, but one mode and
+`build_context(...)` is the simpler builder: same pipeline, but one mode and
 one filter apply to every source it reads.
 
-**`search(...)`** and the per-type searches (`search_semantic`, `search_episodes`
+`search(...)` and the per-type searches (`search_semantic`, `search_episodes`
 and so on) return ranked records instead of assembled prose, for when you want to
 inspect or post-process them yourself.
 
@@ -239,7 +239,7 @@ Memory is stored per project, so a project boundary is not something visibility
 can cross — `org` is a historical name, and it means "not restricted to one
 user", not "visible to other projects".
 
-> **⚠️ `shared` is deprecated and will be removed in a future release.** Use
+> ⚠️ `shared` is deprecated and will be removed in a future release. Use
 > `org` for knowledge meant to reach beyond a single user, and `private` for
 > anything scoped to its owner. Because both `shared` and `org` already resolve
 > to the same reach, switching an existing record from `shared` to `org` does
@@ -465,11 +465,11 @@ context = session.build_context(
 `bind(ctx)` returns a new handle scoped to `ctx` without mutating the original,
 so one `Memory` can serve many users and sessions concurrently.
 
-**`build_context` default sources.** Omitted `enabled_sources` defaults to
+`build_context` default sources. Omitted `enabled_sources` defaults to
 `episodic` and `semantic`; `stm`, `taxonomic`, and `procedural` require an
 explicit set.
 
-**`max_tokens`.** Optional positive gross context-construction budget. It is not
+`max_tokens`. Optional positive gross context-construction budget. It is not
 a fetch cost or a promised output size: after retrieval and ranking, the server
 subtracts a 500-token formatting reserve, then greedily selects whole memory
 chunks that fit in the remainder. Positive values at or below 500 leave no budget for
@@ -477,7 +477,7 @@ memories. Values above 500 can still yield empty context when no chunk fits.
 `metadata.token_count` reports formatted output only and excludes the reserve.
 Omit `max_tokens` to keep prior behavior.
 
-**`format_style` and `include_memories`.** `build_context` and
+`format_style` and `include_memories`. `build_context` and
 `build_context_from_sources` accept two response-shaping options. `format_style`
 (`"openai"`, `"claude"`, or `"jinja2"`; the `FormatStyle` enum is exported for
 type annotations) selects the format of `formatted_context`, and invalid values
@@ -490,7 +490,7 @@ verbatim only on servers with an OpenAI-family model configured; `"claude"` and
 exactly which memories were selected. Both require a hosted or direct HTTP
 connection; app-bound mode raises `MemoryNotSupportedError` when either is set.
 
-**Per-source context — `build_context_from_sources`.** Where `build_context`
+Per-source context — `build_context_from_sources`. Where `build_context`
 applies one filter and semantic retrieval to every source, this method lets each
 source declare its own retrieval `mode` (`text`, `semantic`, or `hybrid`),
 `metadata_filter`, and `top_k` via a `SourceSpec`. Results are merged and
@@ -718,7 +718,7 @@ operations (`record_turn`, `build_context`, the searches) and the `get_*` /
 `list_*` reads do not enforce identity locally; they forward whatever resolves
 to the backend, which may reject the request as a transport error.
 
-**`session_id` is scoped by operation.** It identifies a conversation, so it is
+`session_id` is scoped by operation. It identifies a conversation, so it is
 inherited (from `bind`/runtime) only for conversation I/O: `record_turn` and the
 short-term-memory leg of `build_context`. Episodic and semantic search do **not**
 inherit it — `search_episodes`, `list_episodes`, and the episodic leg of

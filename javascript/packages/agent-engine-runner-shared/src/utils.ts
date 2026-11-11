@@ -103,6 +103,10 @@ const PLATFORM_ENV_VARS: ReadonlySet<string> = new Set([
   // Operator-stamped MaaS observability identity (keep in sync with
   // utils.py's `_PLATFORM_ENV_VARS`).
   "AGENT_ENGINE_ENVIRONMENT",
+  // Debug-mode state stamped by the operator's local-only debug mode. Platform
+  // plumbing that tenant-config interpolation must not see or substitute.
+  "MDBAE_LOCAL_MODE",
+  "MDBAE_LOCAL_PORT",
   // Platform LLM provider credentials. Read by the standalone memory server
   // for extraction-pipeline provider detection, but potentially present in
   // any runtime container.

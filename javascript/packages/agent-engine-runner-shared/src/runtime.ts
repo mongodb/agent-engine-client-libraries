@@ -16,6 +16,8 @@
  *     MongoClient before exit.
  */
 
+import inspector from "node:inspector";
+
 import type { RuntimeAgentConfig } from "./agent_config.js";
 import { loadRuntimeAgentConfig } from "./agent_config.js";
 import { getCurrentSessionId, getCurrentUserId } from "./context.js";
@@ -61,6 +63,28 @@ const logger = getLogger("agent_engine_runner_shared.runtime");
  */
 export function resolveListenHost(): string {
   return process.env["APP_HOST"] || "0.0.0.0";
+}
+
+/**
+ * Local-Kind-only debug hook. Port of Python's `_maybe_start_debugger`.
+ *
+ * A no-op unless `MDBAE_LOCAL_MODE=true`, which agentic-operator only stamps
+ * when its local-only `DebugModeEnabled` flag is on. Unlike debugpy, the V8
+ * inspector is built into Node, so no debug image is needed.
+ *
+ * Non-blocking (`wait=false`): the server starts and serves whether or not a
+ * debugger ever attaches, so the cluster-wide flag cannot hang pods. Loopback
+ * only: `kubectl port-forward` connects inside the pod's network namespace,
+ * and the inspector has no authentication of its own.
+ */
+export function maybeStartDebugger(): void {
+  if (!getEnvBool("MDBAE_LOCAL_MODE")) return;
+  if (inspector.url() !== undefined) return;
+  const port = getEnvInt("MDBAE_LOCAL_PORT", 5678);
+  inspector.open(port, "127.0.0.1", false);
+  logger.info(
+    `inspector listening on port ${port} (non-blocking -- the server starts normally; attach at any time to set breakpoints)`,
+  );
 }
 
 /** Resolve the server drain budget without changing the existing Tool policy. */
@@ -385,6 +409,7 @@ export class TenantRuntime implements ITenantRuntime {
     graphBuilder?: GraphBuilderLike | null,
     options: RegisterAndRunOptions = {},
   ): Promise<void> {
+    maybeStartDebugger();
     if (graphBuilder) {
       this.graphBuilder = graphBuilder;
       logger.info("Graph builder registered");

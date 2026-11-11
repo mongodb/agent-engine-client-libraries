@@ -228,7 +228,8 @@ export abstract class BaseServer {
       // startup while the pod keeps serving traffic.
       const tracing = tracingStatus();
       const status =
-        tracing.database_exporter === "degraded"
+        tracing.database_exporter === "degraded" ||
+        tracing.platform_exporter === "degraded"
           ? HealthStatus.DEGRADED
           : HealthStatus.HEALTHY;
       return {

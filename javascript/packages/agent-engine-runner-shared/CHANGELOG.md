@@ -8,6 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `AGENTIC_TRACE_EXPORTER=0` (or `false`) opts out of the platform trace
+  endpoint and keeps the direct MongoDB path, as in the Python runner. Spans
+  stored that way are not redacted. Without it, spans already go to
+  `POST /internal/traces` whenever `OE_URL` is set; `0.11.13` is the first
+  version that does this, and earlier versions write spans straight to MongoDB
+  without redaction.
+- Local debug mode for TypeScript agents: when the operator's local-only debug
+  mode stamps `MDBAE_LOCAL_MODE=true`, the runtime opens Node's built-in
+  inspector on `127.0.0.1:${MDBAE_LOCAL_PORT:-5678}` without waiting for a
+  client, matching the Python runner's debugpy hook.
 - TypeScript connector execution and Tool Pod registration: the runner now
   materializes the validated connector bundle at startup, registers one
   bounded HTTP executor per connector, applies static or delegated auth, and
