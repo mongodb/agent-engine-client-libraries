@@ -324,8 +324,9 @@ def test_tool_pod_provider_contract(monkeypatch: pytest.MonkeyPatch):
 
     # /invoke_llm/stream handshake: the real route returns a StreamingResponse
     # (200 + text/event-stream); stub the body generator so the handshake is
-    # produced without a live LLM.
-    async def _fake_stream_response(self, request):  # type: ignore[no-untyped-def]
+    # produced without a live LLM. The route hands the boundary span to the
+    # handler, so the stub accepts (and ignores) it.
+    async def _fake_stream_response(self, request, _boundary_span=None):  # type: ignore[no-untyped-def]
         yield "data: {}\n\n"
 
     monkeypatch.setattr(

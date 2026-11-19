@@ -60,7 +60,6 @@ def test_later_call_keeps_only_the_new_messages():
     assert _stored_contents(trimmed) == ["there", "again"]
     assert trimmed[ATTR_INPUT_MESSAGES_OFFSET] == 1
     assert trimmed[ATTR_INPUT_MESSAGES_TOTAL] == 3
-    # Renumbered so the reader sees a list starting at message zero.
     assert trimmed["llm.input_messages.0.message.content"] == "there"
 
 
@@ -145,8 +144,6 @@ def test_copy_is_independent_of_the_original():
     staged = tracker.copy()
     staged.trim(_messages("hi", "there"), trace_id=TRACE_ID, stream_id="aer")
 
-    # The staged write is invisible to the original, which has only stored
-    # "hi", so the same prompt still reports one message of progress.
     after = tracker.trim(_messages("hi", "there"), trace_id=TRACE_ID, stream_id="aer")
     assert after[ATTR_INPUT_MESSAGES_OFFSET] == 1
 
@@ -209,7 +206,6 @@ def test_mongodb_exporter_does_not_advance_progress_when_the_write_fails():
     assert exporter.export([_span(_messages("hi", "again"))]).name == "SUCCESS"
 
     retried_attrs = collection.insert_many.call_args[0][0][0]["attributes"]
-    # The failed span never landed, so the retry has to carry the whole prompt.
     assert _stored_contents(retried_attrs) == ["hi", "again"]
     assert retried_attrs[ATTR_INPUT_MESSAGES_OFFSET] == 0
 
@@ -236,9 +232,7 @@ def test_mongodb_exporter_drops_a_prompt_the_caller_records():
     assert _stored_contents(stored) == []
     assert "input.value" not in stored
     assert "input.mime_type" not in stored
-    # The marker outlives the prompt: it is how a reader finds the stored copy.
     assert stored[ATTR_INPUT_MESSAGES_RECORDED_BY] == RECORDED_BY_CALLER
-    # No offset is written, so a reader does not replay this span as a slice.
     assert ATTR_INPUT_MESSAGES_OFFSET not in stored
 
 

@@ -1,17 +1,7 @@
-/**
- * Span exporters for the Runner SDK tracing pipeline.
- *
- * Ported from `agent_engine_runner_shared/tracing/exporters.py`. Two exporters:
- *   - `JSONLSpanExporter` — optional explicit local debugging exporter.
- *   - `MongoDBSpanExporter` — inserts spans as documents into a Mongo collection.
- *
- * Both implement the `@opentelemetry/sdk-trace-base` `SpanExporter` interface.
- */
-
 import { appendFileSync, mkdirSync, renameSync, statSync } from "node:fs";
 import { dirname, join } from "node:path";
 
-import type { Attributes } from "@opentelemetry/api";
+import { SpanKind, SpanStatusCode, type Attributes } from "@opentelemetry/api";
 import type { ExportResult } from "@opentelemetry/core";
 import {
   ProtobufTraceSerializer,
@@ -36,10 +26,10 @@ import {
 
 const logger = getLogger("agent_engine_runner_shared.tracing");
 
-const EXPORT_SUCCESS = 0; // ExportResultCode.SUCCESS
-const EXPORT_FAILED = 1; // ExportResultCode.FAILED
+const EXPORT_SUCCESS = 0;
+const EXPORT_FAILED = 1;
 
-const MAX_TRACE_FILE_BYTES = 50 * 1024 * 1024; // 50 MB
+const MAX_TRACE_FILE_BYTES = 50 * 1024 * 1024;
 
 function rotateIfNeeded(path: string): void {
   try {
@@ -48,7 +38,7 @@ function rotateIfNeeded(path: string): void {
       renameSync(path, path + ".1");
     }
   } catch {
-    // best-effort — a failed rotation is better than crashing the exporter
+    return;
   }
 }
 
@@ -76,12 +66,12 @@ function spanToDoc(span: ReadableSpan): Record<string, unknown> {
     trace_id: ctx.traceId,
     span_id: ctx.spanId,
     name: span.name,
-    kind: String(span.kind),
+    kind: SpanKind[span.kind] ?? String(span.kind),
     start_time_ns: hrtimeToNs(span.startTime),
     end_time_ns: hrtimeToNs(span.endTime),
     duration_ns: hrtimeDurationNs(span.startTime, span.endTime),
     status: {
-      code: String(span.status.code),
+      code: SpanStatusCode[span.status.code] ?? String(span.status.code),
       description: span.status.message ?? null,
     },
     attributes,
@@ -100,6 +90,14 @@ function spanToDoc(span: ReadableSpan): Record<string, unknown> {
       name: e.name,
       timestamp_ns: hrtimeToNs(e.time),
       attributes: { ...(e.attributes ?? {}) },
+    }));
+  }
+
+  if (span.links && span.links.length > 0) {
+    doc["links"] = span.links.map((l) => ({
+      trace_id: l.context.traceId,
+      span_id: l.context.spanId,
+      attributes: { ...(l.attributes ?? {}) },
     }));
   }
 
@@ -157,12 +155,6 @@ export class JSONLSpanExporter implements SpanExporter {
   }
 }
 
-/**
- * Return the attributes to store for one span, or null to keep them as-is.
- *
- * Shared by the MongoDB and platform exporters so a span's conversation is
- * deduplicated the same way whichever store it reaches.
- */
 function conversationAttributes(
   attributes: Record<string, unknown>,
   tracker: ConversationDeltaTracker,
@@ -170,9 +162,6 @@ function conversationAttributes(
   resource: Record<string, unknown>,
 ): Record<string, unknown> | null {
   if (attributes[ATTR_INPUT_MESSAGES_RECORDED_BY] === RECORDED_BY_CALLER) {
-    // The caller's span holds this prompt. Dropping it here and leaving the
-    // tracker alone keeps a later tool-pod span — one that records its own
-    // conversation — starting from a full list rather than a bogus offset.
     return omitInputMessages(attributes);
   }
   if (!hasInputMessages(attributes)) {
@@ -183,6 +172,13 @@ function conversationAttributes(
 
 export class MongoDBSpanExporter implements SpanExporter {
   private conversations = new ConversationDeltaTracker();
+  /**
+   * Inserts this exporter started but has not finished. `BatchSpanProcessor`
+   * ships on a timer and does not track the export it already started, so its
+   * `forceFlush()` can resolve while one of these is still pending; see
+   * {@link drain}.
+   */
+  private readonly inFlight = new Set<Promise<void>>();
 
   constructor(private readonly collection: Collection) {}
 
@@ -194,11 +190,9 @@ export class MongoDBSpanExporter implements SpanExporter {
       resultCallback({ code: EXPORT_SUCCESS });
       return;
     }
-    // Trim on a copy: a failed insert must not advance past messages the store
-    // never received, or later calls would omit them.
     const staged = this.conversations.copy();
     const docs = spans.map((s) => this.trimConversation(spanToDoc(s), staged));
-    this.collection
+    const write = this.collection
       .insertMany(docs)
       .then(() => {
         this.conversations = staged;
@@ -208,9 +202,28 @@ export class MongoDBSpanExporter implements SpanExporter {
         logger.error({ err: err.message }, "Failed to write traces to MongoDB");
         resultCallback({ code: EXPORT_FAILED, error: err });
       });
+    this.inFlight.add(write);
+    void write.finally(() => {
+      this.inFlight.delete(write);
+    });
   }
 
-  /** Keep only the input messages this call added (see `conversation.ts`). */
+  /**
+   * Await every insert this exporter started but has not finished.
+   *
+   * `BatchSpanProcessor.forceFlush()` drains only the spans still buffered: an
+   * export its timer already started is invisible to it, so the flush can
+   * resolve while that insert is still pending. A caller about to make the
+   * process disappear (a session-finish release) awaits this so it does not
+   * release on a flush that only looked complete. Best-effort and never
+   * rejects — a failed insert is already reported through its result callback.
+   */
+  async drain(): Promise<void> {
+    while (this.inFlight.size > 0) {
+      await Promise.allSettled([...this.inFlight]);
+    }
+  }
+
   private trimConversation(
     doc: Record<string, unknown>,
     tracker: ConversationDeltaTracker,
@@ -240,28 +253,11 @@ export class MongoDBSpanExporter implements SpanExporter {
   }
 }
 
-// =============================================================================
-// Content-capture policy
-//
-// Mongo stays unredacted (customer's own BYOC DB, canonical for the
-// playground). This policy applies only to the OTLP path, which leaves the
-// process bound for a third-party tool. Ported from
-// `agent_engine_runner_shared/tracing/exporters.py` — keep `REDACTED_KEY_FRAGMENTS` in
-// sync with that module's `_REDACTED_KEY_FRAGMENTS`; a drifted copy either
-// leaks content this list was meant to block, or over-redacts metadata.
-// =============================================================================
-
 const CONTENT_CAPTURE_ENV = "AGENTIC_PLATFORM_OTEL_CONTENT_CAPTURE";
 const CONTENT_CAPTURE_FULL = "full";
 const CONTENT_CAPTURE_METADATA_ONLY = "metadata-only";
 
-// Substrings matched case-insensitively against attribute keys. OpenInference
-// flattens nested/indexed fields (e.g. "llm.input_messages.0.message.content"),
-// so this is fragment matching, not an exact-key set. See exporters.py for the
-// full rationale (allowlist deliberately deferred, etc.) — this list must stay
-// identical to Python's.
 const REDACTED_KEY_FRAGMENTS: readonly string[] = [
-  // Prompts / completions
   "input.value",
   "output.value",
   "llm.input_messages",
@@ -274,35 +270,27 @@ const REDACTED_KEY_FRAGMENTS: readonly string[] = [
   "message.function_call_arguments_json",
   "tool_call.function.arguments",
   "llm.function_call",
-  // Tool args/results
   "tool.parameters",
   "llm.tools",
-  // Retrieved docs
   "retrieval.documents",
   "document.content",
   "reranker.query",
-  // Embeddings
   "embedding.embeddings",
   "embedding.text",
   "embedding.vector",
   "embedding.invocation_parameters",
-  // Memory contents
   "memory.content",
   "memory.value",
-  // Real end-user identifier
   "user.id",
-  // Free-form metadata / exceptions
   "metadata",
   "exception.message",
   "exception.stacktrace",
-  // Network / infra
   "http.url",
   "url.full",
   "net.peer",
   "server.address",
   "net.sock.peer",
   "db.connection_string",
-  // Secrets
   "secret",
   "password",
   "credential",
@@ -341,19 +329,6 @@ function redactAttributes(attributes: Attributes | undefined): Attributes {
   return redacted;
 }
 
-/**
- * Return a copy of `span` with content-bearing attributes (and event
- * attributes) stripped.
- *
- * A real SDK `Span` exposes `spanContext()` (and other members) as methods
- * on its prototype, not as own enumerable properties — a plain `{ ...span }`
- * spread silently drops them, so anything downstream that calls
- * `span.spanContext()` (e.g. the OTLP transformer) throws
- * "span.spanContext is not a function". `Object.create(span)` instead makes
- * `span` itself the new object's prototype: every unlisted member (methods
- * and data alike) falls through the prototype chain to the original span
- * unchanged, and only `attributes`/`events` are shadowed as own properties.
- */
 function redactSpan(span: ReadableSpan): ReadableSpan {
   const redacted = Object.create(span) as ReadableSpan;
   Object.defineProperty(redacted, "attributes", {
@@ -367,11 +342,20 @@ function redactSpan(span: ReadableSpan): ReadableSpan {
     })),
     enumerable: true,
   });
+  Object.defineProperty(redacted, "status", {
+    value: { code: span.status.code },
+    enumerable: true,
+  });
+  Object.defineProperty(redacted, "links", {
+    value: (span.links ?? []).map((l) => ({
+      ...l,
+      attributes: redactAttributes(l.attributes),
+    })),
+    enumerable: true,
+  });
   return redacted;
 }
 
-// Keep the SDK span as the prototype: its methods live there, and a spread
-// copy would lose them.
 function withAttributes(
   span: ReadableSpan,
   attributes: Record<string, unknown>,
@@ -393,6 +377,14 @@ function withAttributes(
  */
 export class ContentPolicyOTLPSpanExporter implements SpanExporter {
   private readonly contentCaptureMode: string;
+  /**
+   * Exports this wrapper started but has not finished. The wrapped exporter
+   * reports completion through its result callback; the `BatchSpanProcessor`
+   * around it ships on a timer and does not track the export it already
+   * started, so its `forceFlush()` can resolve while one of these is still in
+   * flight; see {@link drain}.
+   */
+  private readonly inFlight = new Set<Promise<void>>();
 
   constructor(
     private readonly inner: SpanExporter,
@@ -441,11 +433,40 @@ export class ContentPolicyOTLPSpanExporter implements SpanExporter {
     spans: ReadableSpan[],
     resultCallback: (result: ExportResult) => void,
   ): void {
+    let settle!: () => void;
+    const done = new Promise<void>((resolve) => {
+      settle = resolve;
+    });
+    this.inFlight.add(done);
+    void done.finally(() => {
+      this.inFlight.delete(done);
+    });
+    const tracked = (result: ExportResult): void => {
+      settle();
+      resultCallback(result);
+    };
     try {
-      this.inner.export(spans, resultCallback);
+      this.inner.export(spans, tracked);
     } catch (err) {
       logger.error({ err: (err as Error).message }, "OTLP export failed");
+      settle();
       resultCallback({ code: EXPORT_FAILED, error: err as Error });
+    }
+  }
+
+  /**
+   * Await every export this wrapper started but has not finished.
+   *
+   * `BatchSpanProcessor.forceFlush()` drains only the spans still buffered: an
+   * export its timer already started is invisible to it, so the flush can
+   * resolve while that export is still in flight. A caller about to make the
+   * process disappear (a session-finish release) awaits this so it does not
+   * release on a flush that only looked complete. Best-effort and never
+   * rejects — a failed export is already reported through its result callback.
+   */
+  async drain(): Promise<void> {
+    while (this.inFlight.size > 0) {
+      await Promise.allSettled([...this.inFlight]);
     }
   }
 
@@ -463,28 +484,14 @@ export class ContentPolicyOTLPSpanExporter implements SpanExporter {
   }
 }
 
-// Platform trace exporter (Orchestration Engine /internal/traces).
-// The guest sends OTLP-protobuf batches to the OE, which converts and stores
-// them in the project traces collection. This replaces the guest's direct
-// MongoDB write: it is the platform trace path, independent of customer OTLP
-// export, and carries unredacted spans so the playground can show prompts and
-// outputs as it did from Mongo.
-
 const PLATFORM_TRACE_INGEST_PATH = "/internal/traces";
 const OTLP_PROTOBUF_CONTENT_TYPE = "application/x-protobuf";
 
-// The OE rejects a raw request body over its own configured limit with 413.
-// Chunk at that limit before sending; an oversized single span cannot be split.
 const DEFAULT_PLATFORM_MAX_REQUEST_BYTES = 8 << 20;
 
-// Overall deadline for one export() call. The BatchSpanProcessor worker calls
-// export() and waits for the callback, so a bounded deadline keeps an
-// unreachable or slow OE from stalling the export queue behind it.
 const DEFAULT_PLATFORM_EXPORT_TIMEOUT_SECONDS = 10.0;
 const PLATFORM_PER_ATTEMPT_TIMEOUT_SECONDS = 3.0;
 
-// Retryable: the OE is rolling (404), shedding (503/429), or a gateway hiccup
-// (502/504). Any other status is terminal for the batch.
 const PLATFORM_RETRYABLE_STATUS: ReadonlySet<number> = new Set([
   404, 429, 502, 503, 504,
 ]);
@@ -493,20 +500,11 @@ const PLATFORM_BACKOFF_BASE_SECONDS = 0.5;
 const PLATFORM_BACKOFF_MAX_SECONDS = 5.0;
 
 export interface PlatformSpanExporterOptions {
-  /** Overrides the global fetch (tests). */
   fetchImpl?: typeof fetch;
-  /**
-   * Request options carrying mTLS for `url`, applied on every attempt.
-   * `fetchPlatform` alone does not configure mTLS.
-   */
   tlsOptions?: (url: string) => RequestInit | undefined;
-  /** OTLP request serializer. Defaults to the protobuf serializer. */
   serializer?: ISerializer<ReadableSpan[], IExportTraceServiceResponse>;
-  /** Bodies larger than this are chunked; a single larger span is dropped. */
   maxRequestBytes?: number;
-  /** Overall deadline for one export() call, in seconds. */
   exportTimeoutSeconds?: number;
-  /** Per-attempt request timeout, capped by the remaining export budget. */
   perAttemptTimeoutSeconds?: number;
   sleep?: (seconds: number) => Promise<void>;
   clock?: () => number;
@@ -520,10 +518,6 @@ function defaultSleep(seconds: number): Promise<void> {
   });
 }
 
-/**
- * Parse a Retry-After header, accepting delay-seconds or an HTTP-date.
- * Returns undefined for a missing or unparsable value.
- */
 function retryAfterSeconds(value: string | null): number | undefined {
   if (!value) return undefined;
   const trimmed = value.trim();
@@ -620,10 +614,7 @@ export class PlatformSpanExporter implements SpanExporter {
     this.pendingExports.add(promise);
     void promise
       .finally(() => this.pendingExports.delete(promise))
-      .catch(() => {
-        // The result callback reports failures; prevent an unhandled rejection
-        // from the cleanup chain.
-      });
+      .catch(() => {});
   }
 
   /**
@@ -658,16 +649,12 @@ export class PlatformSpanExporter implements SpanExporter {
       const droppedBefore = this.droppedSpansCount;
       let ok = true;
       for (const chunk of this.chunkBySize(spans)) {
-        // Stage per chunk and commit only what the OE stored, so a batch it
-        // refused does not advance past messages the store never received.
         const staged = this.conversations.copy();
         const trimmed = chunk.map(
           (span) => this.trimSpan(span, staged) ?? span,
         );
         const droppedBeforeChunk = this.droppedSpansCount;
         if (await this.exportChunk(trimmed, deadline, controller.signal)) {
-          // A partial success drops spans without naming them, so the next
-          // call restates those messages instead of leaving a gap.
           if (this.droppedSpansCount === droppedBeforeChunk) {
             this.conversations = staged;
           }
@@ -676,9 +663,6 @@ export class PlatformSpanExporter implements SpanExporter {
         }
       }
       if (ok) {
-        // A partial success drops spans without failing the batch, so only a
-        // clean export clears the last error; /health stays degraded until a
-        // later export delivers everything.
         if (this.droppedSpansCount === droppedBefore) {
           this.lastErrorValue = null;
         }
@@ -689,13 +673,6 @@ export class PlatformSpanExporter implements SpanExporter {
     }
   }
 
-  /**
-   * Return `span` with only this call's new input messages, or null when the
-   * span carries no conversation to trim (see `conversation.ts`).
-   *
-   * The span-level twin of `MongoDBSpanExporter.trimConversation`, for the OTLP
-   * path that encodes the span itself rather than building a document.
-   */
   private trimSpan(
     span: ReadableSpan,
     tracker: ConversationDeltaTracker,
@@ -750,8 +727,6 @@ export class PlatformSpanExporter implements SpanExporter {
       }
       let response: Response;
       try {
-        // Cap the attempt by the remaining export budget so the whole export
-        // honours its wall-clock deadline rather than just each attempt.
         response = await this.post(
           chunk,
           Math.min(this.perAttemptTimeoutSeconds, remaining),
@@ -826,7 +801,6 @@ export class PlatformSpanExporter implements SpanExporter {
   ): Promise<Response> {
     const signals = [overallSignal];
     if (timeoutSeconds > 0) {
-      // AbortSignal.timeout requires an integer millisecond delay.
       signals.push(
         AbortSignal.timeout(Math.max(1, Math.round(timeoutSeconds * 1000))),
       );
@@ -839,8 +813,6 @@ export class PlatformSpanExporter implements SpanExporter {
       {
         method: "POST",
         headers: { "Content-Type": OTLP_PROTOBUF_CONTENT_TYPE },
-        // A Uint8Array is a valid BodyInit at runtime; the cast narrows the
-        // ArrayBufferLike backing to the ArrayBuffer that BodyInit accepts.
         body: this.encode(chunk) as unknown as BodyInit,
         signal,
         ...tlsOptions,
@@ -861,10 +833,6 @@ export class PlatformSpanExporter implements SpanExporter {
       const parsed = this.serializer.deserializeResponse(bytes);
       const rejected = parsed.partialSuccess?.rejectedSpans ?? 0;
       if (rejected > 0) {
-        // The OE accepted the batch but discarded some spans. Delivery is
-        // best-effort, so the batch is not retried (a retry would duplicate
-        // the spans that were stored), but the loss is recorded so
-        // tracingStatus() and /health surface it.
         this.droppedSpansCount += rejected;
         const message = parsed.partialSuccess?.errorMessage;
         this.recordError(
@@ -878,16 +846,10 @@ export class PlatformSpanExporter implements SpanExporter {
         );
       }
     } catch {
-      // An unparsable response body is not actionable.
+      return;
     }
   }
 
-  /**
-   * Sleep before the next attempt, or return false when none is possible.
-   * Honours Retry-After when the OE sends one; otherwise uses exponential
-   * backoff with jitter. Returns false when the delay would run past the export
-   * deadline, so a retry is never attempted without time for it.
-   */
   private async backoff(
     attempt: number,
     deadline: number,
@@ -911,7 +873,6 @@ export class PlatformSpanExporter implements SpanExporter {
   private dropOversized(): void {
     this.droppedSpansCount += 1;
     logger.warn("Trace export: dropping a span larger than the OE body limit");
-    // A dropped span must keep /health degraded until a later clean export.
     this.recordError("dropped a span larger than the OE body limit");
   }
 

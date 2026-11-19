@@ -63,20 +63,11 @@ _retry_thread: Optional[threading.Thread] = None
 # clients.
 _tracing_mongo_client: Optional["MongoClient"] = None
 
-# Platform trace-exporter state. The exporter is on whenever OE_URL is set; the
-# flag named by `_PLATFORM_TRACE_EXPORTER_ENV` only turns it off. When on, the
+# Platform trace-exporter state. The exporter is on whenever OE_URL is set: the
 # guest sends spans to the OE instead of writing MongoDB directly.
 # `_platform_exporter` is retained so /health can report its recent export
 # results and shutdown can reset it.
 _platform_exporter: Optional[PlatformSpanExporter] = None
-_platform_exporter_attached: bool = False
-
-# Opt-out for routing runner spans to the OE platform trace endpoint. Unset
-# means on. Setting it to "0" or "false" keeps the MongoDB trace-store path: the
-# OE never sees those spans, so PII redaction cannot apply to them. Deliberately
-# avoids the reserved tenant-secret prefix, which a workspace secret cannot use
-# (pkg/tenantsecrets), so a workspace can set this one directly.
-_PLATFORM_TRACE_EXPORTER_ENV = "AGENTIC_TRACE_EXPORTER"
 
 # Explicit BatchSpanProcessor sizing for the platform exporter. A larger queue
 # than the OTel default absorbs the burst of spans emitted as a turn finishes,
@@ -142,17 +133,6 @@ def _otlp_endpoint_configured() -> bool:
     return bool(
         os.getenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT") or os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
     )
-
-
-def platform_trace_exporter_enabled() -> bool:
-    """Whether the OE platform trace exporter is enabled.
-
-    On unless the env var named by ``_PLATFORM_TRACE_EXPORTER_ENV`` is ``0`` or
-    ``false``. Any other value, including an unrecognized one, keeps it on so a
-    typo cannot silently route spans past the OE. It is only half the
-    condition — the exporter also needs ``OE_URL`` to know where to send spans.
-    """
-    return os.getenv(_PLATFORM_TRACE_EXPORTER_ENV, "").strip().lower() not in ("0", "false")
 
 
 class ExecutionContextSpanProcessor(SpanProcessor):
@@ -243,14 +223,7 @@ def setup_tracing(
     # MongoDB directly.
     oe_url = os.getenv("OE_URL", "").strip()
     otlp_configured = _otlp_endpoint_configured()
-    use_platform = bool(oe_url) and platform_trace_exporter_enabled()
-    if oe_url and not use_platform:
-        logger.warning(
-            "Tracing: %s disables the platform trace exporter; spans go to the "
-            "trace store without PII redaction",
-            _PLATFORM_TRACE_EXPORTER_ENV,
-        )
-    if use_platform:
+    if oe_url:
         _attach_platform_exporter(provider, oe_url)
     elif mongodb_collection is not None:
         provider.add_span_processor(BatchSpanProcessor(MongoDBSpanExporter(mongodb_collection)))
@@ -264,8 +237,7 @@ def setup_tracing(
     elif not otlp_configured:
         logger.warning(
             "Tracing: no trace destination configured "
-            "(platform exporter disabled or OE_URL unset, "
-            "no MongoDB collection, no OTLP endpoint)"
+            "(OE_URL unset, no MongoDB collection, no OTLP endpoint)"
         )
 
     # Set as global tracer provider before attempting the OTLP block below —
@@ -319,7 +291,7 @@ def setup_tracing(
 
 def _attach_platform_exporter(provider: TracerProvider, oe_url: str) -> None:
     """Install the OE platform trace exporter on ``provider``."""
-    global _platform_exporter, _platform_exporter_attached
+    global _platform_exporter
     exporter = PlatformSpanExporter(oe_url)
     provider.add_span_processor(
         BatchSpanProcessor(
@@ -330,7 +302,6 @@ def _attach_platform_exporter(provider: TracerProvider, oe_url: str) -> None:
         )
     )
     _platform_exporter = exporter
-    _platform_exporter_attached = True
     logger.info("Tracing: platform exporter -> %s", exporter.url)
 
 
@@ -406,17 +377,14 @@ def tracing_status() -> dict[str, str]:
 
     ``platform_exporter`` is ``attached`` (spans are sent to the OE),
     ``degraded`` (the most recent export did not fully succeed), or
-    ``disabled`` (the opt-out is set or OE_URL unset; OTLP may still be
-    configured).
+    ``disabled`` (OE_URL unset; OTLP may still be configured).
     """
-    if _platform_exporter_attached:
-        platform = (
-            "degraded"
-            if _platform_exporter is not None and _platform_exporter.last_error is not None
-            else "attached"
-        )
-    else:
+    if _platform_exporter is None:
         platform = "disabled"
+    elif _platform_exporter.last_error is not None:
+        platform = "degraded"
+    else:
+        platform = "attached"
 
     if _mongodb_exporter_attached:
         database = "attached"
@@ -549,7 +517,7 @@ def shutdown_tracing() -> None:
     """
     global _tracer_provider, _retry_stop_event, _retry_thread
     global _mongodb_exporter_attached, _mongodb_degraded, _tracing_mongo_client
-    global _platform_exporter, _platform_exporter_attached
+    global _platform_exporter
 
     # Signal the retry thread to stop, then wait (bounded) for it to exit
     # before tearing down the provider it attaches exporters to. The loop
@@ -588,7 +556,6 @@ def shutdown_tracing() -> None:
     _mongodb_exporter_attached = False
     _mongodb_degraded = False
     _platform_exporter = None
-    _platform_exporter_attached = False
 
 
 def force_flush_tracing(timeout_millis: int = 5000) -> bool:

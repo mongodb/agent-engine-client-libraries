@@ -31,6 +31,7 @@ _FACADE_NAMES = {
     "MemoryNotProvisionedError",
     "MemoryNotSupportedError",
     "MemoryRouteNotFoundError",
+    "MemorySearchWarning",
     "MemoryServerError",
 }
 

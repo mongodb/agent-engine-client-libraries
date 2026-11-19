@@ -27,6 +27,7 @@ from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, Mapping, Seque
 import httpx
 from opentelemetry.sdk.trace import Event, ReadableSpan
 from opentelemetry.sdk.trace.export import SpanExporter, SpanExportResult
+from opentelemetry.trace import Link, Status
 
 from agent_engine_runner_shared.tracing.conversation import (
     ATTR_INPUT_MESSAGES_RECORDED_BY,
@@ -107,6 +108,16 @@ def _span_to_dict(span: ReadableSpan) -> Dict[str, Any]:
                 "attributes": dict(e.attributes) if e.attributes else {},
             }
             for e in span.events
+        ]
+
+    if span.links:
+        doc["links"] = [
+            {
+                "trace_id": format(link.context.trace_id, "032x"),
+                "span_id": format(link.context.span_id, "016x"),
+                "attributes": dict(link.attributes) if link.attributes else {},
+            }
+            for link in span.links
         ]
 
     return doc
@@ -379,12 +390,23 @@ def _redact_events(events: Any) -> tuple[Event, ...]:
     )
 
 
+def _redact_links(links: Any) -> tuple[Link, ...]:
+    if not links:
+        return ()
+    return tuple(Link(link.context, _redact_attributes(link.attributes)) for link in links)
+
+
 def _redact_span(span: ReadableSpan) -> ReadableSpan:
     """Return a copy of ``span`` with content-bearing attributes stripped.
 
-    Event attributes (e.g. an exception event that echoes a bad tool call's
-    arguments) are redacted the same way as span attributes — an event is
+    Event and link attributes (e.g. an exception event that echoes a bad tool
+    call's arguments) are redacted the same way as span attributes — each is
     just another place a content-bearing key could show up.
+
+    ``status.description`` is free-form text the SDK copies the thrown
+    exception into, so it can echo request content — the same class the
+    ``exception.message`` fragment covers. Keep ``status_code`` so a backend
+    still classifies the span; drop the description.
     """
     return _RedactedReadableSpan(
         dropped_attributes=span.dropped_attributes,
@@ -395,9 +417,9 @@ def _redact_span(span: ReadableSpan) -> ReadableSpan:
         resource=span.resource,
         attributes=_redact_attributes(span.attributes),
         events=_redact_events(span.events),
-        links=span.links,
+        links=_redact_links(span.links),
         kind=span.kind,
-        status=span.status,
+        status=Status(status_code=span.status.status_code),
         start_time=span.start_time,
         end_time=span.end_time,
         instrumentation_scope=span.instrumentation_scope,

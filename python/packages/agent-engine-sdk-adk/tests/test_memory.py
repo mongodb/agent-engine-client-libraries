@@ -6,6 +6,7 @@ from typing import Any
 from unittest.mock import MagicMock, patch
 
 from agent_engine_sdk_memory import Memory
+from agent_engine_sdk_memory.models import CreateSemanticResult
 
 from agent_engine_runner_shared import RuntimeMode
 from agent_engine_runner_shared.memory_appbound import (
@@ -49,26 +50,28 @@ class TestAppMemory:
         assert app.memory._runtime._runtime is app._runtime
         assert app.memory._client._runtime is app._runtime
 
-    def test_save_semantic_acknowledged_mapping(self) -> None:
+    def test_save_semantic_returns_the_accepted_operation(self) -> None:
         app = _make_app()
-        app._runtime.save_semantic.return_value = True
+        accepted = CreateSemanticResult(
+            id=None,
+            label="contact_pref",
+            has_embedding=False,
+            operation_id="op-1",
+            operation_status="queued",
+        )
+        app._runtime.create_semantic.return_value = accepted
 
         result = app.memory.save_semantic(
             text="User prefers email", label="contact_pref", user_id="u1"
         )
 
-        assert result.acknowledged is True
-        assert result.label == "contact_pref"
-
-    def test_save_semantic_failure_not_acknowledged(self) -> None:
-        app = _make_app()
-        app._runtime.save_semantic.return_value = False
-
-        result = app.memory.save_semantic(
-            text="User prefers email", label="contact_pref", user_id="u1"
+        assert result == accepted
+        sent = app._runtime.create_semantic.call_args.kwargs
+        assert (sent["text"], sent["label"], sent["user_id"]) == (
+            "User prefers email",
+            "contact_pref",
+            "u1",
         )
-
-        assert result.acknowledged is False
 
     def test_search_semantic_returns_chunks(self) -> None:
         app = _make_app()

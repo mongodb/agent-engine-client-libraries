@@ -15,6 +15,7 @@ import {
 } from "@langchain/core/messages";
 import type { RunnableConfig } from "@langchain/core/runnables";
 import {
+  DeltaChannel,
   END,
   MemorySaver,
   MessagesAnnotation,
@@ -22,6 +23,7 @@ import {
   Send,
   START,
   StateGraph,
+  messagesDeltaReducer,
   type CompiledStateGraph,
 } from "@langchain/langgraph";
 import type { AgentInput, RequestContext } from "@mongodb-js/agent-engine-sdk";
@@ -36,7 +38,9 @@ import {
   CANCELLED_TURN_MESSAGE_ID_METADATA_KEY,
   CANCELLED_TURN_MESSAGE_IDS_METADATA_KEY,
   CANCELLED_TURN_METADATA_KEY,
+  type CancelledTurnSaver,
   commitCancelledTurnCheckpoint,
+  materializeDeltaChannels,
 } from "../src/cancelled_turn.js";
 import {
   completedRootCheckpoint,
@@ -94,6 +98,10 @@ class RecordingSaver {
 
   getNextVersion(current: number | undefined): number {
     return current === undefined ? 1 : current + 1;
+  }
+
+  async getDeltaChannelHistory(): Promise<Record<string, never>> {
+    return {};
   }
 }
 
@@ -1179,5 +1187,191 @@ describe("real LangGraph graphs", () => {
     expect(
       (await tipMetadata(saver))[CANCELLED_TURN_MESSAGE_ID_METADATA_KEY],
     ).toBe(messages[0]?.id);
+  });
+});
+
+describe("conversation in a DeltaChannel", () => {
+  // deepagents keeps `messages` in a DeltaChannel, which a checkpoint stores
+  // as deltas rather than as a value. The cancelled-turn marker must
+  // reconstruct it; copying the stored values truncates the session to the
+  // stopped turn's opener.
+
+  function deltaGraph(saver: MemorySaver, seen: string[][]) {
+    const builder = new StateGraph(MessagesAnnotation);
+    builder.channels["messages"] = new DeltaChannel(messagesDeltaReducer);
+    return builder
+      .addNode("reply", async (state: typeof MessagesAnnotation.State) => {
+        seen.push(state.messages.map((message) => String(message.content)));
+        return {
+          messages: [
+            new AIMessage(`re: ${String(state.messages.at(-1)?.content)}`),
+          ],
+        };
+      })
+      .addEdge(START, "reply")
+      .addEdge("reply", END)
+      .compile({ checkpointer: saver });
+  }
+
+  function deltaAgent(saver: MemorySaver, seen: string[][]) {
+    return new LangGraphBaseAgent(
+      deltaGraph(saver, seen) as never,
+      [],
+      (input) => ({
+        messages: [
+          new HumanMessage({
+            content: String(
+              (input.payload as { message?: unknown })?.message ?? "",
+            ),
+          }),
+        ],
+      }),
+    );
+  }
+
+  test("a cancelled turn keeps the earlier conversation", async () => {
+    const saver = new MemorySaver();
+    const seen: string[][] = [];
+    const agent = deltaAgent(saver, seen);
+    const ctx = {
+      sessionId: "sess-1",
+      workspaceId: "ws-1",
+    } as RequestContext;
+
+    await agent.invoke(ctx, { payload: { message: "my name is Max" } });
+    await agent.invoke(ctx, { payload: { message: "what is my name?" } });
+    // The precondition for the bug: the tip stores messages as deltas only.
+    const tip = await saver.getTuple({
+      configurable: { thread_id: "sess-1:ws-1" },
+    });
+    expect("messages" in (tip?.checkpoint.channel_values ?? {})).toBe(false);
+
+    // A fresh context models the drain teardown: no opener id was captured,
+    // so the commit appends the stopped turn's message itself.
+    const cancelCtx = {
+      sessionId: "sess-1",
+      workspaceId: "ws-1",
+    } as RequestContext;
+    await agent.commitCancelledTurn(cancelCtx, {
+      payload: { message: "and now?" },
+    });
+
+    const earlier = [
+      "my name is Max",
+      "re: my name is Max",
+      "what is my name?",
+      "re: what is my name?",
+    ];
+    expect((await tipMessages(saver)).map((m) => m.content)).toEqual([
+      ...earlier,
+      "and now?",
+    ]);
+
+    await agent.invoke(ctx, { payload: { message: "still there?" } });
+    expect(seen.at(-1)).toEqual([...earlier, "and now?", "still there?"]);
+  });
+
+  test("a captured opener id is matched, not appended twice", async () => {
+    // The same context stashes the opener id at input build, so the commit
+    // must find that message in the reconstructed history. An unreconstructed
+    // marker would hold only the stored values and append a duplicate.
+    const saver = new MemorySaver();
+    const seen: string[][] = [];
+    const agent = deltaAgent(saver, seen);
+    const ctx = {
+      sessionId: "sess-1",
+      workspaceId: "ws-1",
+    } as RequestContext;
+
+    await agent.invoke(ctx, { payload: { message: "my name is Max" } });
+    await agent.commitCancelledTurn(ctx, {
+      payload: { message: "my name is Max" },
+    });
+
+    expect((await tipMessages(saver)).map((m) => m.content)).toEqual([
+      "my name is Max",
+      "re: my name is Max",
+    ]);
+  });
+
+  test("a mid-run cancel leaves the interrupted writes out", async () => {
+    // The delta history walk starts at the tip's parent, so a task's
+    // half-written message on the stopped super-step never reaches the marker
+    // — nor the model on the next turn.
+    const saver = new MemorySaver();
+    const seen: string[][] = [];
+    const agent = deltaAgent(saver, seen);
+    const ctx = {
+      sessionId: "sess-1",
+      workspaceId: "ws-1",
+    } as RequestContext;
+
+    await agent.invoke(ctx, { payload: { message: "my name is Max" } });
+    await agent.invoke(ctx, { payload: { message: "what is my name?" } });
+    const tip = await saver.getTuple({
+      configurable: { thread_id: "sess-1:ws-1" },
+    });
+    await saver.putWrites(
+      {
+        configurable: {
+          thread_id: "sess-1:ws-1",
+          checkpoint_ns: "",
+          checkpoint_id: String(tip?.checkpoint.id),
+        },
+      },
+      [["messages", [new AIMessage("partial answer")]]],
+      "reply",
+    );
+
+    const cancelCtx = {
+      sessionId: "sess-1",
+      workspaceId: "ws-1",
+    } as RequestContext;
+    await agent.commitCancelledTurn(cancelCtx, {
+      payload: { message: "and now?" },
+    });
+
+    const earlier = [
+      "my name is Max",
+      "re: my name is Max",
+      "what is my name?",
+      "re: what is my name?",
+    ];
+    expect((await tipMessages(saver)).map((m) => m.content)).toEqual([
+      ...earlier,
+      "and now?",
+    ]);
+  });
+
+  test("a stored checkpoint value is not replaced by history", async () => {
+    // A delta channel the checkpoint already stores (its periodic snapshot) is
+    // read as stored; replaying history over it would truncate the session at
+    // the snapshot boundary.
+    const historyChannels: string[][] = [];
+    const saver = {
+      getDeltaChannelHistory: async ({
+        channels,
+      }: {
+        channels: string[];
+      }): Promise<Record<string, never>> => {
+        historyChannels.push(channels);
+        return {};
+      },
+    } as unknown as CancelledTurnSaver;
+    const stored = [new HumanMessage("earlier")];
+
+    const values = await materializeDeltaChannels(
+      saver,
+      { configurable: { thread_id: "sess-1:ws-1" } },
+      { messages: stored },
+      {
+        messages: new DeltaChannel(
+          messagesDeltaReducer,
+        ) as unknown as DeltaChannel,
+      },
+    );
+
+    expect(values["messages"]).toBe(stored);
+    expect(historyChannels).toEqual([]);
   });
 });

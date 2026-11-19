@@ -3,8 +3,15 @@
  * `llm.call` span; LangChain's auto-instrumentation already covers it.
  */
 
+export const AER_EXECUTE = "aer.execute";
 export const AER_BUILD_AGENT = "aer.build_agent";
 export const GRAPH_BUILD = "graph.build";
+
+// Tool-pod request boundaries. Shared with the Python tool pod so both runners
+// render one span per routed tool or LLM call, nested under the invocation.
+export const TOOL_EXECUTE = "tool.execute";
+export const TOOL_INVOKE_LLM = "tool.invoke_llm";
+export const TOOL_INVOKE_LLM_STREAM = "tool.invoke_llm.stream";
 
 // Children of the existing LangChain auto-instrumented span.
 export const MODEL_REQUEST_PREPARE = "request.prepare";
@@ -35,3 +42,6 @@ export const OpenInferenceSpanKind = {
   CHAIN: "CHAIN",
   TOOL: "TOOL",
 } as const;
+
+export type OpenInferenceSpanKind =
+  (typeof OpenInferenceSpanKind)[keyof typeof OpenInferenceSpanKind];

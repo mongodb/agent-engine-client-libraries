@@ -562,7 +562,33 @@ def test_non_json_error_body():
     rt = _gateway_runtime(handler)
     with pytest.raises(MemoryServerError) as exc:
         rt.search_semantic(query="q", user_id="u1")
-    assert "plain text crash" in exc.value.message
+    assert exc.value.message == "memory server error (HTTP 500)"
+    assert exc.value.response_text == "plain text crash"
+
+
+def test_server_error_message_leaves_out_the_server_detail():
+    # The memory server puts str(exception) into a 5xx detail; agents log the
+    # error message, so it must not carry that text.
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            500, json={"detail": "write failed: mongodb://svc:hunter2@db.internal/x"}
+        )
+
+    rt = _gateway_runtime(handler)
+    with pytest.raises(MemoryServerError) as exc:
+        rt.search_semantic(query="q", user_id="u1")
+    assert str(exc.value) == "memory server error (HTTP 500)"
+    assert exc.value.response_text is None
+
+
+def test_bad_request_keeps_the_server_message():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(422, json={"detail": "label must not be empty"})
+
+    rt = _gateway_runtime(handler)
+    with pytest.raises(MemoryBadRequestError) as exc:
+        rt.search_semantic(query="q", user_id="u1")
+    assert exc.value.message == "label must not be empty"
 
 
 def test_context_manager_closes():

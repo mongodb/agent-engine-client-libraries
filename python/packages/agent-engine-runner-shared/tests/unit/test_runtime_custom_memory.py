@@ -1,7 +1,8 @@
 """TenantRuntime custom-type memory ops delegate to the HTTP MemoryClient.
 
-Unlike the legacy log-and-degrade helpers, custom-type ops raise when memory
-is disabled: silent None would break the SDK facade's typed return contract.
+Unlike the typed semantic, episodic and taxonomic helpers, custom-type ops
+also raise when memory is disabled: silent None would break the SDK facade's
+typed return contract.
 """
 
 from unittest.mock import Mock

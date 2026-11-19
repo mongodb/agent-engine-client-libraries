@@ -79,6 +79,10 @@ class MemoryConnectionError(MemoryAPIError):
     """Raised when the transport fails to reach the memory backend (connect/timeout)."""
 
 
+class MemorySearchWarning(UserWarning):
+    """Emitted when ``Memory.search`` leaves out a source that failed on the server."""
+
+
 __all__ = [
     "MemoryAPIError",
     "MemoryAuthError",
@@ -90,4 +94,5 @@ __all__ = [
     "MemoryNotSupportedError",
     "MemoryRouteNotFoundError",
     "MemoryServerError",
+    "MemorySearchWarning",
 ]

@@ -79,6 +79,13 @@ export interface ExecutionStore {
    * worker thread mutates the shared object, not a reassigned store field.
    */
   suspendRequest: { payload: Record<string, unknown> | null };
+  /**
+   * Request-scoped sink for in-process progress emits (`emit` / `emitStep`).
+   * The AER installs one for a journaled turn so a local tool's step is
+   * sequenced and recorded on the turn's journal like every other chunk. Null
+   * everywhere else, where progress keeps its own best-effort transport.
+   */
+  emitChunk: ((event: string, data: string) => Promise<void>) | null;
 }
 
 export interface OwnerUrlFailureState {
@@ -107,6 +114,7 @@ const EMPTY_STORE: ExecutionStore = Object.freeze({
   authorization: null,
   payload: null,
   signal: null,
+  emitChunk: null,
   // closed: true — nothing outside a run can finish.
   sessionFinish: Object.freeze({ requested: false, closed: true }),
   suspendRequest: Object.freeze({ payload: null }),
@@ -134,6 +142,8 @@ export interface SetExecutionContextArgs {
   authorization?: ToolAuthorization | null;
   payload?: Record<string, unknown> | null;
   signal?: AbortSignal | null;
+  /** Journal-aware sink for in-process progress emits (see `ExecutionStore`). */
+  emitChunk?: ((event: string, data: string) => Promise<void>) | null;
 }
 
 function buildStore(args: SetExecutionContextArgs): ExecutionStore {
@@ -159,6 +169,7 @@ function buildStore(args: SetExecutionContextArgs): ExecutionStore {
     authorization: args.authorization ?? null,
     payload: args.payload ?? null,
     signal: args.signal ?? null,
+    emitChunk: args.emitChunk ?? null,
     sessionFinish: { requested: false, closed: false },
     suspendRequest: { payload: null },
   };
@@ -198,6 +209,16 @@ export function getCurrentWrapper(): unknown | null {
 
 export function getCurrentOeUrl(): string | null {
   return current().oeUrl;
+}
+
+/**
+ * The request-scoped progress sink for the current execution, or null when
+ * progress should use its own best-effort transport.
+ */
+export function getCurrentEmitChunk():
+  | ((event: string, data: string) => Promise<void>)
+  | null {
+  return current().emitChunk;
 }
 
 /**

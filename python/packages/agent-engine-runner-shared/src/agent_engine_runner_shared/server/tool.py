@@ -16,7 +16,7 @@ import json
 import logging
 import time
 from contextlib import asynccontextmanager
-from typing import TYPE_CHECKING, Any, AsyncGenerator, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, AsyncGenerator, Callable, Dict, List, Optional
 
 from agent_engine_sdk.models import LLMStreamChunk, LLMToolSchema, Message, ToolCallChunk
 from fastapi import FastAPI, Request
@@ -826,7 +826,17 @@ class ToolServer(ToolExecution, BaseServer):
         await self.prepare()
 
     async def on_shutdown(self) -> None:
-        """Close connector transports after the server has drained requests."""
+        """Flush tracing, then close connector transports, after draining."""
+        # The Tool pod ends the tool.* boundary spans and is torn down with a
+        # bounded grace, so flush them (off the event loop) before the pod
+        # exits. Mirrors the AER's on_shutdown and the TS runtime's SIGTERM
+        # flush; without it the pod's buffered spans die with it.
+        try:
+            from agent_engine_runner_shared.tracing import shutdown_tracing
+
+            await asyncio.to_thread(shutdown_tracing)
+        except Exception:
+            logger.debug("Tracing shutdown failed", exc_info=True)
         await self.close_connector_runtime()
 
     def get_health_details(self) -> Dict[str, Any]:
@@ -929,7 +939,10 @@ class ToolServer(ToolExecution, BaseServer):
                         "tool.invoke_llm.stream",
                         OpenInferenceSpanKind.CHAIN,
                         http_request.headers,
-                        server._handle_invoke_llm_stream(request),
+                        # The boundary span is threaded in so a mid-stream
+                        # provider failure — surfaced as an error frame, never
+                        # thrown — can mark it ERROR.
+                        lambda span: server._handle_invoke_llm_stream(request, span),
                     ):
                         yield chunk
                 finally:
@@ -988,6 +1001,7 @@ class ToolServer(ToolExecution, BaseServer):
         receiving it can classify the call instead of showing no kind.
         """
         try:
+            from opentelemetry.trace import Status, StatusCode
             from opentelemetry.trace.propagation.tracecontext import (
                 TraceContextTextMapPropagator,
             )
@@ -1006,15 +1020,22 @@ class ToolServer(ToolExecution, BaseServer):
                 span_name,
                 context=parent_context,
                 attributes={OPENINFERENCE_SPAN_KIND: span_kind.value},
-            ):
-                return await handler()
+            ) as span:
+                result = await handler()
+                # The route handlers catch tool/LLM failures and return an
+                # ``error`` status rather than rethrowing, so mark the boundary
+                # from the outcome; a finished UNSET span renders as OK while
+                # the caller sees a failure. The response contract is unchanged.
+                if getattr(result, "status", None) == "error":
+                    span.set_status(Status(StatusCode.ERROR))
+                return result
 
     async def _stream_with_inbound_trace_context(
         self,
         span_name: str,
         span_kind: OpenInferenceSpanKind,
         headers: "Headers",
-        chunks: "AsyncIterator[str]",
+        chunks: "Callable[[Optional[Any]], AsyncIterator[str]]",
     ) -> "AsyncIterator[str]":
         """Streaming variant of :meth:`_run_with_inbound_trace_context`.
 
@@ -1024,6 +1045,10 @@ class ToolServer(ToolExecution, BaseServer):
         exhausted, errors, or the client disconnects.
 
         ``span_kind`` is declared on the span as in the non-streaming variant.
+        ``chunks`` is a factory handed the boundary span (``None`` when tracing
+        is not installed), mirroring the non-streaming handler: a generator that
+        converts a failure into an in-band ``error`` frame rather than throwing
+        can then mark its own boundary ERROR.
         """
         try:
             from opentelemetry import trace as otel_trace
@@ -1033,7 +1058,7 @@ class ToolServer(ToolExecution, BaseServer):
 
             from agent_engine_runner_shared.tracing import get_tracer
         except Exception:
-            async for chunk in chunks:
+            async for chunk in chunks(None):
                 yield chunk
             return
 
@@ -1047,7 +1072,7 @@ class ToolServer(ToolExecution, BaseServer):
                 attributes={OPENINFERENCE_SPAN_KIND: span_kind.value},
             )
             with otel_trace.use_span(span, end_on_exit=True):
-                async for chunk in chunks:
+                async for chunk in chunks(span):
                     yield chunk
 
     @with_metrics("tool_pod_guardrails_check", record_errors=False)
@@ -1262,9 +1287,14 @@ class ToolServer(ToolExecution, BaseServer):
         raise RuntimeError("Failed to create LLM stream")
 
     async def _handle_invoke_llm_stream(
-        self, request: LLMPodInvokeRequest
+        self, request: LLMPodInvokeRequest, boundary_span: Optional[Any] = None
     ) -> AsyncGenerator[str, None]:
-        """Stream LLM response as SSE events."""
+        """Stream LLM response as SSE events.
+
+        ``boundary_span`` is the ``tool.invoke_llm.stream`` span the wrapper
+        opened, handed in so an in-band ``error`` frame can mark it ERROR (the
+        failure is never rethrown, so the wrapper cannot see it).
+        """
         import socket
 
         from agent_engine_runner_shared.context import (
@@ -1315,6 +1345,12 @@ class ToolServer(ToolExecution, BaseServer):
             yield f"data: {summary.model_dump_json(exclude_none=True)}\n\n"
 
         except Exception as e:
+            # The failure is surfaced as an in-band frame, not a throw, so the
+            # boundary span must be marked here or it would render as OK.
+            if boundary_span is not None:
+                from opentelemetry.trace import Status, StatusCode
+
+                boundary_span.set_status(Status(StatusCode.ERROR))
             error_event = LLMPodStreamEvent(
                 error=format_llm_error(e),
                 error_code=_llm_failure_error_code(e),

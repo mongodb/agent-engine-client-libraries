@@ -31,7 +31,9 @@ export const WriteTurnResultSchema = z.object({
 export type WriteTurnResult = z.infer<typeof WriteTurnResultSchema>;
 
 export const CreateSemanticResultSchema = z.object({
-  id: z.string(),
+  id: z.string().nullable(),
+  operation_id: z.string().nullable().optional(),
+  operation_status: z.string().nullable().optional(),
   label: z.string(),
   has_embedding: z.boolean(),
   acknowledged: z.boolean().default(true),

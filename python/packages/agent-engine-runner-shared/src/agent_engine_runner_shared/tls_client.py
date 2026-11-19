@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 # Cache for written cert paths (VM mode only).
 # Write-once, never invalidated: VM mode rotation intentionally requires pod restart.
 # SecretKeyRef injects TLS_*_PEM env vars once at pod startup; Kubernetes does not
-# update env vars on Secret changes. Container mode (TLS_*_PATH) uses Secret volume
+# update env vars on Secret changes. File-based TLS (TLS_*_PATH) uses Secret volume
 # mounts which Kubelet propagates on cert-manager rotation, enabling mtime-based
 # detection. VM mode cannot detect rotation via mtime, so _get_cert_mtimes() in
 # progress.py/aer.py returns None for PEM mode, skipping rotation checks.
@@ -90,8 +90,8 @@ def _get_cert_path_from_env(cert_type: str) -> str:
     """
     Get certificate path from environment, writing PEM content to temp file if needed.
 
-    For container mode, reads TLS_*_PATH directly.
-    For VM mode, reads TLS_*_PEM (raw PEM from SecretKeyRef), writes to /tmp.
+    For file-based TLS, reads TLS_*_PATH directly.
+    For PEM-based TLS, reads TLS_*_PEM (raw PEM from SecretKeyRef), writes to /tmp.
 
     Args:
         cert_type: One of "CERT", "KEY", or "CA_CERT"
@@ -99,7 +99,7 @@ def _get_cert_path_from_env(cert_type: str) -> str:
     Returns:
         Path to the certificate file, or empty string if not available
     """
-    # Check for direct path first (container mode)
+    # Check for direct path first (file-based TLS)
     path_env = f"TLS_{cert_type}_PATH"
     if path := os.environ.get(path_env, ""):
         return path
@@ -218,7 +218,7 @@ def create_httpx_client_with_tls(
 
     # HTTPS URLs require mTLS configuration for AER→OE communication.
     # Fail-closed: if the URL is HTTPS, we must have client certificates.
-    # Support both direct paths (container mode) and PEM env content (VM mode).
+    # Support both direct paths (file-based TLS) and PEM env content (VM mode).
     cert_path = _get_cert_path_from_env("CERT")
     key_path = _get_cert_path_from_env("KEY")
     ca_path = _get_cert_path_from_env("CA_CERT")
@@ -353,7 +353,7 @@ if hasattr(os, "register_at_fork"):  # POSIX only; Windows has no fork
 def _get_cert_mtimes() -> Optional[tuple[float, float, float]]:
     """Return mtimes of the mounted TLS files, or None when rotation is undetectable.
 
-    Container mode (TLS_*_PATH) mounts a Secret volume that kubelet rewrites
+    File-based TLS (TLS_*_PATH) mounts a Secret volume that kubelet rewrites
     on cert-manager rotation, so mtimes are a complete change signal. VM mode
     (TLS_*_PEM) materialises env vars once and needs a pod restart, so it
     returns None and callers skip rotation checks.
@@ -527,7 +527,7 @@ async def create_async_httpx_client_with_tls(
 
     # HTTPS URLs require mTLS configuration for AER→OE communication.
     # Fail-closed: if the URL is HTTPS, we must have client certificates.
-    # Support both direct paths (container mode) and PEM env content (VM mode).
+    # Support both direct paths (file-based TLS) and PEM env content (VM mode).
     cert_path = _get_cert_path_from_env("CERT")
     key_path = _get_cert_path_from_env("KEY")
     ca_path = _get_cert_path_from_env("CA_CERT")

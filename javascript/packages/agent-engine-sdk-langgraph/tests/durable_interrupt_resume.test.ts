@@ -42,7 +42,10 @@ import { z } from "zod";
 
 import { LangGraphBaseAgent } from "../src/agent.js";
 import type { DurableSession } from "../src/durable_session.js";
-import { withDurableToolResultIdentity } from "../src/durable_tools.js";
+import {
+  withDurableOAuthTask,
+  withDurableToolResultIdentity,
+} from "../src/durable_tools.js";
 import { PlatformCheckpointer } from "../src/platform_checkpointer.js";
 import { SecureWrappedLLM } from "../src/secure_llm.js";
 import { executionSession } from "../src/session_factory.js";
@@ -2594,5 +2597,680 @@ describe("durable streamed LLM abandonment", () => {
     );
     expect(abandoned).toHaveLength(1);
     expect(outcomes).toHaveLength(2);
+  });
+});
+
+describe("durable delegated OAuth consent", () => {
+  // Own attempt ids: an earlier test parks an activity on "attempt-1" for the
+  // life of the process, and activity slots are per attempt id.
+  const CHALLENGE = {
+    proceed: false,
+    status: "suspend",
+    elicitation: {
+      elicitation_id: "elicitation-1",
+      authorization_url: "https://example.com/authorize",
+    },
+  };
+
+  /** A provider tool as the runtime builds it: OE runs it with a credential. */
+  function oauthTool(name = "list_repositories") {
+    const secure = createSecureToolFunction(
+      { invoke: () => Promise.reject(new Error("OE runs provider tools")) },
+      name,
+      false,
+      {
+        isLocal: false,
+        provider: "github",
+        scopes: ["repo"],
+        responseFormat: "content_and_artifact",
+        isFrameworkControlFlow: isGraphBubbleUp,
+      },
+    );
+    return lcTool(
+      withDurableToolResultIdentity(
+        withDurableOAuthTask(secure, name),
+        name,
+      ) as never,
+      {
+        name,
+        description: `${name} tool`,
+        schema: z.object({ owner: z.string() }),
+        responseFormat: "content_and_artifact",
+      },
+    );
+  }
+
+  /** OE: activities keep their id and outcome by position across attempts. */
+  function consentOe(respond: (body: Record<string, unknown>) => unknown) {
+    const ids = new Map<string, string>();
+    /** Each settled activity's outcome as the runner reported it. */
+    const recorded = new Map<string, Record<string, unknown>>();
+    /** Consent answers by wait activity id. */
+    const answers = new Map<string, JsonValue>();
+    const toolExecutes: Record<string, unknown>[] = [];
+    const idFor = (position: unknown): [string, string] => {
+      const key = JSON.stringify(position);
+      const id = ids.get(key) ?? `activity-${ids.size + 1}`;
+      ids.set(key, id);
+      return [key, id];
+    };
+    const outcome = (
+      body: Record<string, unknown>,
+      activityId: string,
+      result: unknown,
+    ) => ({
+      workflow_identity: body["workflow_identity"],
+      activity_id: activityId,
+      attempt_id: body["attempt_id"],
+      fencing_token: body["fencing_token"],
+      ...(result === undefined
+        ? { outcome_kind: "ACTIVITY_OUTCOME_KIND_SUSPENDED" }
+        : { outcome_kind: "ACTIVITY_OUTCOME_KIND_COMPLETED", result }),
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (request: string | URL | Request, init?: RequestInit) => {
+        const url = String(request);
+        const body = wireBody(init);
+        if (url.endsWith("/executor/activity/start")) {
+          const [key, id] = idFor(body["position"]);
+          const settled = recorded.get(key);
+          if (settled !== undefined) {
+            return jsonResponse({
+              outcome: { ...outcome(body, id, null), ...settled },
+            });
+          }
+          const answer = answers.get(id);
+          if (answer !== undefined) {
+            return jsonResponse({ outcome: outcome(body, id, answer) });
+          }
+          return jsonResponse({
+            activity_context: {
+              workflow_identity: body["workflow_identity"],
+              activity_id: id,
+              attempt_id: body["attempt_id"],
+              fencing_token: body["fencing_token"],
+            },
+          });
+        }
+        if (url.endsWith("/executor/activity/outcome")) {
+          const key = [...ids].find(([, id]) => id === body["activity_id"]);
+          if (key === undefined) throw new Error("unknown activity outcome");
+          recorded.set(
+            key[0],
+            body["outcome_kind"] === "ACTIVITY_OUTCOME_KIND_FAILED"
+              ? { outcome_kind: body["outcome_kind"], error: body["error"] }
+              : { result: body["result"] ?? null },
+          );
+          return jsonResponse({});
+        }
+        if (url.endsWith("/tool/execute")) {
+          toolExecutes.push(body);
+          return jsonResponse(respond(body));
+        }
+        if (url.endsWith("/tool/result")) return jsonResponse({});
+        if (url.endsWith("/executor/step/finalize")) {
+          const finalize = body as FinalizeBody;
+          return jsonResponse({
+            entries: (finalize.suspensions ?? []).map((suspension) => {
+              const [, id] = idFor(suspension.position);
+              return {
+                position: suspension.position,
+                outcome: outcome(body, id, answers.get(id)),
+              };
+            }),
+          });
+        }
+        throw new Error(`unexpected URL: ${url}`);
+      }),
+    );
+    return { answers, toolExecutes };
+  }
+
+  /** OE asks each call for consent once, then returns its repositories. */
+  function consentOnce(body: Record<string, unknown>, seen: unknown[]) {
+    const owner = String(
+      (body["arguments"] as Record<string, unknown>)["owner"],
+    );
+    if (!seen.includes(owner)) {
+      seen.push(owner);
+      return CHALLENGE;
+    }
+    return {
+      proceed: true,
+      status: "success",
+      result: { repos: [`${owner}-repo`] },
+    };
+  }
+
+  function consentAgent(
+    saver: PlatformCheckpointer,
+    tools: ReturnType<typeof oauthTool>[],
+    calls: readonly { name: string; owner: string; id: string }[],
+  ) {
+    const graph = new StateGraph(MessagesAnnotation)
+      .addNode("plan", () => ({
+        messages: [
+          new AIMessage({
+            content: "",
+            id: "assistant-plan",
+            tool_calls: calls.map(({ name, owner, id }) => ({
+              name,
+              args: { owner },
+              id,
+            })),
+          }),
+        ],
+      }))
+      .addNode("tools", new ToolNode(tools))
+      .addEdge(START, "plan")
+      .addEdge("plan", "tools")
+      .addEdge("tools", END)
+      .compile({ checkpointer: saver as never });
+    return new LangGraphBaseAgent(graph as never);
+  }
+
+  function toolResults(messages: BaseMessage[]): Record<string, unknown> {
+    return Object.fromEntries(
+      messages
+        .filter((message) => message instanceof ToolMessage)
+        .map((message) => [
+          (message as ToolMessage).tool_call_id,
+          JSON.parse(String(message.content)),
+        ]),
+    );
+  }
+
+  it.each(["invoke", "stream"] as const)(
+    "pauses for consent and runs the resource once after OE answers (%s)",
+    async (call) => {
+      registerSuspendHandler(((payload: unknown) =>
+        interrupt(payload as never)) as never);
+      const clients = platformClients();
+      const saver = new PlatformCheckpointer({
+        native: null,
+        clientFactory: clients.factory,
+      });
+      const wrapper = new SecureToolWrapper("http://oe", "execution");
+      const seen: unknown[] = [];
+      const oe = consentOe((body) => consentOnce(body, seen));
+      const agent = consentAgent(
+        saver,
+        [oauthTool()],
+        [{ name: "list_repositories", owner: "teal", id: "call-a" }],
+      );
+      const run = (
+        context: RequestContext,
+      ): Promise<AgentOutput | StreamEvent[]> =>
+        call === "invoke"
+          ? agent.invoke(context, input)
+          : collect(agent.stream(context, input));
+
+      const suspended = await inToolAttempt(
+        attempt("consent-attempt-1"),
+        wrapper,
+        () => run(baseContext),
+      );
+      const [pause] = suspendedData(suspended)["interrupts"] as {
+        id: string;
+        value: Record<string, unknown>;
+      }[];
+      expect(pause?.value).toMatchObject({
+        suspend_reason: "authorization_required",
+        suspend_context: { elicitation_id: "elicitation-1" },
+      });
+      expect(oe.toolExecutes).toHaveLength(1);
+
+      const waitId = present(pause).id;
+      oe.answers.set(waitId, { authorized: true });
+      await inToolAttempt(attempt("consent-attempt-2", true), wrapper, () =>
+        run({
+          ...baseContext,
+          resume: true,
+          resumeData: { [waitId]: { authorized: true } },
+        } as RequestContext),
+      );
+
+      expect(oe.toolExecutes).toHaveLength(2);
+      expect(clients.completeExecution).toHaveBeenCalledOnce();
+      expect(toolResults(publishedMessages(clients.completeExecution))).toEqual(
+        { "call-a": { repos: ["teal-repo"] } },
+      );
+      await expectScratchReleased(saver, attempt("consent-attempt-2", true));
+    },
+  );
+
+  it("does not answer a later application pause with the consent answer", async () => {
+    registerSuspendHandler(((payload: unknown) =>
+      interrupt(payload as never)) as never);
+    const clients = platformClients();
+    const saver = new PlatformCheckpointer({
+      native: null,
+      clientFactory: clients.factory,
+    });
+    const wrapper = new SecureToolWrapper("http://oe", "execution");
+    const seen: unknown[] = [];
+    const oe = consentOe((body) => consentOnce(body, seen));
+    const reviewAnswers: unknown[] = [];
+    const lookup = oauthTool();
+    // The node pauses on its own right after the call, in the same step that
+    // the consent wait continues.
+    const graph = new StateGraph(MessagesAnnotation)
+      .addNode("lookup", async () => {
+        const repos = (await lookup.invoke({
+          name: "list_repositories",
+          args: { owner: "teal" },
+          id: "call-a",
+          type: "tool_call",
+        })) as BaseMessage;
+        reviewAnswers.push(interrupt({ question: "keep these repositories?" }));
+        return {
+          messages: [new AIMessage({ content: String(repos.content) })],
+        };
+      })
+      .addEdge(START, "lookup")
+      .addEdge("lookup", END)
+      .compile({ checkpointer: saver as never });
+    const agent = new LangGraphBaseAgent(graph as never);
+
+    const consent = await inToolAttempt<AgentOutput>(
+      attempt("consent-attempt-1"),
+      wrapper,
+      () => agent.invoke(baseContext, input),
+    );
+    const [wait] = suspendedData(consent)["interrupts"] as { id: string }[];
+    const waitId = present(wait).id;
+    oe.answers.set(waitId, { authorized: true });
+    const review = await inToolAttempt<AgentOutput>(
+      attempt("consent-attempt-2", true),
+      wrapper,
+      () =>
+        agent.invoke(
+          {
+            ...baseContext,
+            resume: true,
+            resumeData: { [waitId]: { authorized: true } },
+          } as RequestContext,
+          input,
+        ),
+    );
+
+    // The resource ran, and the node paused for its own answer.
+    expect(oe.toolExecutes).toHaveLength(2);
+    expect(reviewAnswers).toEqual([]);
+    expect(suspendedData(review)["interrupts"]).toEqual([
+      {
+        id: expect.not.stringMatching(waitId),
+        value: { question: "keep these repositories?" },
+      },
+    ]);
+    expect(clients.completeExecution).not.toHaveBeenCalled();
+  });
+
+  it("refuses an OAuth call without a tool call id in a durable run", async () => {
+    const clients = platformClients();
+    const saver = new PlatformCheckpointer({
+      native: null,
+      clientFactory: clients.factory,
+    });
+    const wrapper = new SecureToolWrapper("http://oe", "execution");
+    const oe = consentOe((body) => consentOnce(body, []));
+    const lookup = oauthTool();
+    const graph = new StateGraph(MessagesAnnotation)
+      .addNode("lookup", async () => {
+        const repos = await lookup.invoke({ owner: "teal" });
+        return { messages: [new AIMessage({ content: String(repos) })] };
+      })
+      .addEdge(START, "lookup")
+      .addEdge("lookup", END)
+      .compile({ checkpointer: saver as never });
+    const agent = new LangGraphBaseAgent(graph as never);
+
+    await expect(
+      inToolAttempt(attempt("consent-attempt-1"), wrapper, () =>
+        agent.invoke(baseContext, input),
+      ),
+    ).rejects.toThrow("must be invoked with a tool call");
+    expect(oe.toolExecutes).toHaveLength(0);
+  });
+
+  it("settles parallel consent waits in one batch as one frontier", async () => {
+    registerSuspendHandler(((payload: unknown) =>
+      interrupt(payload as never)) as never);
+    const clients = platformClients();
+    const saver = new PlatformCheckpointer({
+      native: null,
+      clientFactory: clients.factory,
+    });
+    const wrapper = new SecureToolWrapper("http://oe", "execution");
+    const seen: unknown[] = [];
+    const oe = consentOe((body) => consentOnce(body, seen));
+    const agent = consentAgent(
+      saver,
+      [oauthTool()],
+      [
+        { name: "list_repositories", owner: "teal", id: "call-a" },
+        { name: "list_repositories", owner: "plum", id: "call-b" },
+      ],
+    );
+
+    const suspended = await inToolAttempt<AgentOutput>(
+      attempt("consent-attempt-1"),
+      wrapper,
+      () => agent.invoke(baseContext, input),
+    );
+    const pauses = suspendedData(suspended)["interrupts"] as { id: string }[];
+    expect(pauses).toHaveLength(2);
+
+    const resumeData = Object.fromEntries(
+      pauses.map(({ id }) => [id, { authorized: true }]),
+    );
+    for (const id of Object.keys(resumeData)) {
+      oe.answers.set(id, { authorized: true });
+    }
+    await inToolAttempt(attempt("consent-attempt-2", true), wrapper, () =>
+      agent.invoke(
+        { ...baseContext, resume: true, resumeData } as RequestContext,
+        input,
+      ),
+    );
+
+    expect(oe.toolExecutes).toHaveLength(4);
+    expect(toolResults(publishedMessages(clients.completeExecution))).toEqual({
+      "call-a": { repos: ["teal-repo"] },
+      "call-b": { repos: ["plum-repo"] },
+    });
+  });
+
+  it("fails closed when a consent wait pauses beside an application pause", async () => {
+    registerSuspendHandler(((payload: unknown) =>
+      interrupt(payload as never)) as never);
+    const clients = platformClients();
+    const saver = new PlatformCheckpointer({
+      native: null,
+      clientFactory: clients.factory,
+    });
+    const seen: unknown[] = [];
+    consentOe((body) =>
+      body["is_local"] === true
+        ? { proceed: true, route_to: "callback" }
+        : consentOnce(body, seen),
+    );
+    const reviewSecure = createSecureToolFunction(
+      {
+        invoke: ({ owner }: Record<string, unknown>) =>
+          interrupt({ owner, question: "review?" }),
+      },
+      "review_owner",
+      false,
+      {
+        isLocal: true,
+        responseFormat: "content_and_artifact",
+        isFrameworkControlFlow: isGraphBubbleUp,
+      },
+    );
+    const reviewTool = lcTool(
+      withDurableToolResultIdentity(reviewSecure, "review_owner") as never,
+      {
+        name: "review_owner",
+        description: "review_owner tool",
+        schema: z.object({ owner: z.string() }),
+        responseFormat: "content_and_artifact",
+      },
+    );
+    const agent = consentAgent(
+      saver,
+      [oauthTool(), reviewTool],
+      [
+        { name: "list_repositories", owner: "teal", id: "call-a" },
+        { name: "review_owner", owner: "plum", id: "call-b" },
+      ],
+    );
+
+    await expect(
+      inToolAttempt(
+        attempt("consent-attempt-1"),
+        new SecureToolWrapper("http://oe", "execution"),
+        () => agent.invoke(baseContext, input),
+      ),
+    ).rejects.toThrow("cannot pause in the same step as another pause");
+    expect(clients.completeExecution).not.toHaveBeenCalled();
+  });
+
+  it("reports a delegated tool's own failure to the model", async () => {
+    const clients = platformClients();
+    const saver = new PlatformCheckpointer({
+      native: null,
+      clientFactory: clients.factory,
+    });
+    const wrapper = new SecureToolWrapper("http://oe", "execution");
+    consentOe(() => ({
+      proceed: true,
+      status: "error",
+      error: "repository not found",
+    }));
+    const seen: string[] = [];
+    const graph = new StateGraph(MessagesAnnotation)
+      .addNode("plan", () => ({
+        messages: [
+          new AIMessage({
+            content: "",
+            id: "assistant-plan",
+            tool_calls: [
+              {
+                name: "list_repositories",
+                args: { owner: "teal" },
+                id: "call-a",
+              },
+            ],
+          }),
+        ],
+      }))
+      .addNode("tools", new ToolNode([oauthTool()]))
+      .addNode("respond", (state: typeof MessagesAnnotation.State) => {
+        seen.push(String(state.messages.at(-1)?.content));
+        return { messages: [new AIMessage({ content: "no such repository" })] };
+      })
+      .addEdge(START, "plan")
+      .addEdge("plan", "tools")
+      .addEdge("tools", "respond")
+      .addEdge("respond", END)
+      .compile({ checkpointer: saver as never });
+
+    await inToolAttempt(attempt("consent-attempt-1"), wrapper, () =>
+      new LangGraphBaseAgent(graph as never).invoke(baseContext, input),
+    );
+
+    expect(seen).toHaveLength(1);
+    expect(seen[0]).toContain("repository not found");
+    expect(clients.completeExecution).toHaveBeenCalledOnce();
+  });
+
+  /**
+   * A node that calls the tool itself: teal's connected call, then plum's call
+   * that waits for consent. Its third run is the pass that continues after OE
+   * answers, which reuses the earlier pass's task results by task order;
+   * `continuation` gives that pass's calls.
+   */
+  function directAgent(
+    saver: PlatformCheckpointer,
+    continuation: readonly { owner: string; id: string }[],
+  ) {
+    const lookup = oauthTool();
+    let runs = 0;
+    const graph = new StateGraph(MessagesAnnotation)
+      .addNode("lookup", async () => {
+        runs += 1;
+        const calls =
+          runs === 3
+            ? continuation
+            : [
+                { owner: "teal", id: "call-a" },
+                { owner: "plum", id: "call-b" },
+              ];
+        const messages: BaseMessage[] = [];
+        for (const { owner, id } of calls) {
+          messages.push(
+            (await lookup.invoke({
+              name: "list_repositories",
+              args: { owner },
+              id,
+              type: "tool_call",
+            })) as BaseMessage,
+          );
+        }
+        return { messages };
+      })
+      .addEdge(START, "lookup")
+      .addEdge("lookup", END)
+      .compile({ checkpointer: saver as never });
+    return new LangGraphBaseAgent(graph as never);
+  }
+
+  /** Run a turn whose second call waits for consent, then answer and resume it. */
+  async function connectedThenConsent(
+    agent: LangGraphBaseAgent,
+    wrapper: SecureToolWrapper,
+    oe: ReturnType<typeof consentOe>,
+  ) {
+    const suspended = await inToolAttempt<AgentOutput>(
+      attempt("consent-attempt-1"),
+      wrapper,
+      () => agent.invoke(baseContext, input),
+    );
+    const pauses = suspendedData(suspended)["interrupts"] as { id: string }[];
+    expect(pauses).toHaveLength(1);
+    const waitId = present(pauses[0]).id;
+    oe.answers.set(waitId, { authorized: true });
+    return inToolAttempt(attempt("consent-attempt-2", true), wrapper, () =>
+      agent.invoke(
+        {
+          ...baseContext,
+          resume: true,
+          resumeData: { [waitId]: { authorized: true } },
+        } as RequestContext,
+        input,
+      ),
+    );
+  }
+
+  it("keeps a connected call's result while its sibling waits for consent", async () => {
+    registerSuspendHandler(((payload: unknown) =>
+      interrupt(payload as never)) as never);
+    const clients = platformClients();
+    const saver = new PlatformCheckpointer({
+      native: null,
+      clientFactory: clients.factory,
+    });
+    const wrapper = new SecureToolWrapper("http://oe", "execution");
+    // Teal's account is already connected; plum's needs consent.
+    const seen: unknown[] = ["teal"];
+    const oe = consentOe((body) => consentOnce(body, seen));
+    const agent = consentAgent(
+      saver,
+      [oauthTool()],
+      [
+        { name: "list_repositories", owner: "teal", id: "call-a" },
+        { name: "list_repositories", owner: "plum", id: "call-b" },
+      ],
+    );
+
+    await connectedThenConsent(agent, wrapper, oe);
+
+    // Teal once, plum's challenge, plum's resource.
+    expect(oe.toolExecutes).toHaveLength(3);
+    expect(toolResults(publishedMessages(clients.completeExecution))).toEqual({
+      "call-a": { repos: ["teal-repo"] },
+      "call-b": { repos: ["plum-repo"] },
+    });
+  });
+
+  it("reports a call's failure beside a sibling that waits for consent", async () => {
+    registerSuspendHandler(((payload: unknown) =>
+      interrupt(payload as never)) as never);
+    const clients = platformClients();
+    const saver = new PlatformCheckpointer({
+      native: null,
+      clientFactory: clients.factory,
+    });
+    const wrapper = new SecureToolWrapper("http://oe", "execution");
+    const seen: unknown[] = [];
+    const oe = consentOe((body) =>
+      (body["arguments"] as Record<string, unknown>)["owner"] === "teal"
+        ? { proceed: true, status: "error", error: "repository not found" }
+        : consentOnce(body, seen),
+    );
+    const agent = consentAgent(
+      saver,
+      [oauthTool()],
+      [
+        { name: "list_repositories", owner: "teal", id: "call-a" },
+        { name: "list_repositories", owner: "plum", id: "call-b" },
+      ],
+    );
+
+    await connectedThenConsent(agent, wrapper, oe);
+
+    const messages = publishedMessages(clients.completeExecution).filter(
+      (message) => message instanceof ToolMessage,
+    ) as ToolMessage[];
+    const content = Object.fromEntries(
+      messages.map((message) => [
+        message.tool_call_id,
+        String(message.content),
+      ]),
+    );
+    expect(content["call-a"]).toContain("repository not found");
+    expect(JSON.parse(content["call-b"] ?? "null")).toEqual({
+      repos: ["plum-repo"],
+    });
+  });
+
+  it("gives each call its own result when calls reach their tasks in another order", async () => {
+    registerSuspendHandler(((payload: unknown) =>
+      interrupt(payload as never)) as never);
+    const clients = platformClients();
+    const saver = new PlatformCheckpointer({
+      native: null,
+      clientFactory: clients.factory,
+    });
+    const wrapper = new SecureToolWrapper("http://oe", "execution");
+    const seen: unknown[] = ["teal"];
+    const oe = consentOe((body) => consentOnce(body, seen));
+    // Plum reaches the first task, which holds teal's result.
+    const agent = directAgent(saver, [
+      { owner: "plum", id: "call-b" },
+      { owner: "teal", id: "call-a" },
+    ]);
+
+    await connectedThenConsent(agent, wrapper, oe);
+
+    expect(oe.toolExecutes).toHaveLength(3);
+    expect(toolResults(publishedMessages(clients.completeExecution))).toEqual({
+      "call-a": { repos: ["teal-repo"] },
+      "call-b": { repos: ["plum-repo"] },
+    });
+  });
+
+  it("refuses a cached result whose arguments changed under the same call id", async () => {
+    registerSuspendHandler(((payload: unknown) =>
+      interrupt(payload as never)) as never);
+    const clients = platformClients();
+    const saver = new PlatformCheckpointer({
+      native: null,
+      clientFactory: clients.factory,
+    });
+    const wrapper = new SecureToolWrapper("http://oe", "execution");
+    const seen: unknown[] = ["teal"];
+    const oe = consentOe((body) => consentOnce(body, seen));
+    const agent = directAgent(saver, [
+      { owner: "navy", id: "call-a" },
+      { owner: "plum", id: "call-b" },
+    ]);
+
+    await expect(connectedThenConsent(agent, wrapper, oe)).rejects.toThrow(
+      "OAuth tool arguments changed during checkpoint replay",
+    );
+    expect(clients.completeExecution).not.toHaveBeenCalled();
   });
 });

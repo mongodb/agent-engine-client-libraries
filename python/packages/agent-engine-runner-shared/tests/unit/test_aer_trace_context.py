@@ -137,9 +137,6 @@ class TestExecuteWithInboundTraceContext:
         server._handle_execute = fake_handle_execute
 
         caller_trace_id = "0af7651916cd43dd8448eb211c80319c"
-        # httpx.Headers is already case-insensitive; a plain dict with an
-        # unusual casing exercises the same normalization the FastAPI route
-        # relies on Starlette's Headers for.
         headers = httpx.Headers({"Traceparent": f"00-{caller_trace_id}-b7ad6b7169203331-01"})
 
         response = await server._execute_with_inbound_trace_context(_make_request(), headers)
@@ -151,10 +148,6 @@ class TestExecuteWithInboundTraceContext:
     async def test_falls_back_to_untraced_execution_when_opentelemetry_unavailable(
         self, monkeypatch
     ):
-        # Simulate the optional `tracing` extra not being installed by
-        # forcing the module import inside the try block to fail, without
-        # touching the real (already-imported) opentelemetry package used by
-        # the rest of this test module.
         monkeypatch.setitem(sys.modules, "opentelemetry.trace.propagation.tracecontext", None)
 
         server = _make_server()

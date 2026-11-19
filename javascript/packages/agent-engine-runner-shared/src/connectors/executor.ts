@@ -18,7 +18,11 @@ import { pipeline } from "node:stream/promises";
 import { rootCertificates } from "node:tls";
 import { createBrotliDecompress, createGunzip, createInflate } from "node:zlib";
 
-import { Ajv2020 } from "ajv/dist/2020.js";
+import {
+  Ajv2020,
+  type ErrorObject,
+  type ValidateFunction,
+} from "ajv/dist/2020.js";
 import { Agent, request as undiciRequest } from "undici";
 
 import {
@@ -47,6 +51,22 @@ const AJV = new Ajv2020({
   // The catalog compiler accepts identity escapes in generated patterns.
   unicodeRegExp: false,
 });
+
+/**
+ * Say which argument failed which rule, without echoing the argument's value.
+ *
+ * The text returns to the model so it can correct the call. Ajv messages name
+ * the rule, never the data, so a large or sensitive argument is not copied in.
+ */
+function describeSchemaError(
+  errors: readonly ErrorObject[] | null | undefined,
+): string {
+  const error = errors?.[0];
+  if (error === undefined) return "arguments: must match the schema";
+  const location =
+    error.instancePath.split("/").slice(1).join(".") || "arguments";
+  return `${location}: ${error.message ?? `must satisfy the schema's ${error.keyword} rule`}`;
+}
 
 /** One request handed to a transport, after validation and serialization. */
 export interface ConnectorTransportRequest {
@@ -368,7 +388,7 @@ async function readBoundedBody(
 export class ConnectorExecutor {
   private readonly definitions: ToolDefinitions;
   private readonly operations: Map<string, Operation>;
-  private readonly validators: Map<string, (value: unknown) => boolean>;
+  private readonly validators: Map<string, ValidateFunction>;
   private readonly agent: Agent | null;
   private readonly transport: ConnectorTransport;
   private readonly timeoutSeconds: number;
@@ -402,7 +422,7 @@ export class ConnectorExecutor {
     this.validators = new Map(
       this.definitions.tools.map((tool) => [
         tool.name,
-        AJV.compile(tool.inputSchema) as (value: unknown) => boolean,
+        AJV.compile(tool.inputSchema),
       ]),
     );
     this.timeoutSeconds = timeoutSeconds;
@@ -517,20 +537,31 @@ export class ConnectorExecutor {
     const properties = isRecord(tool.inputSchema["properties"])
       ? tool.inputSchema["properties"]
       : {};
-    const filtered = Object.fromEntries(
-      Object.keys(properties)
-        .filter((key) => key in arguments_)
-        .map((key) => [key, arguments_[key]]),
-    );
+    const unexpected = Object.keys(arguments_)
+      .filter((key) => !Object.hasOwn(properties, key))
+      .sort();
+    if (unexpected.length > 0) {
+      // Dropping them instead would turn a misshaped write into an empty
+      // request that the provider accepts as a successful no-op.
+      throw new Error(
+        `unexpected arguments: ${unexpected.join(", ")}; ` +
+          `accepted arguments: ${Object.keys(properties).sort().join(", ")}`,
+      );
+    }
     const validate = this.validators.get(tool.name);
-    if (validate === undefined || !validate(filtered)) {
+    if (validate === undefined) {
       throw new Error("arguments do not match the compiled input schema");
     }
-    assertJsonValue(filtered);
+    if (!validate(arguments_)) {
+      throw new Error(
+        `arguments do not match the compiled input schema: ${describeSchemaError(validate.errors)}`,
+      );
+    }
+    assertJsonValue(arguments_);
 
     let path = tool.path;
     for (const key of tool.params.path) {
-      const value = this._paramValue(filtered, key);
+      const value = this._paramValue(arguments_, key);
       const rendered = Array.isArray(value)
         ? value.map((item) => quote(validateSegment(item), false)).join(",")
         : quote(validateSegment(value), false);
@@ -539,8 +570,8 @@ export class ConnectorExecutor {
 
     const query: Array<[string, string]> = [];
     for (const key of tool.params.query) {
-      if (!(key in filtered)) continue;
-      const raw = filtered[key];
+      if (!(key in arguments_)) continue;
+      const raw = arguments_[key];
       const encoding = tool.params.query_style[key] ?? "repeat";
       if (encoding === "json") {
         query.push([key, JSON.stringify(raw)]);
@@ -551,7 +582,7 @@ export class ConnectorExecutor {
         query.push(...this._bracketPairs(key, raw));
         continue;
       }
-      const value = this._paramValue(filtered, key);
+      const value = this._paramValue(arguments_, key);
       if (Array.isArray(value) && encoding === "comma") {
         query.push([key, value.join(",")]);
       } else if (Array.isArray(value) && encoding === "brackets") {
@@ -565,19 +596,19 @@ export class ConnectorExecutor {
 
     const headers: Record<string, string> = {};
     for (const key of tool.params.header) {
-      if (!(key in filtered) || filtered[key] === null) continue;
-      const value = this._paramValue(filtered, key);
+      if (!(key in arguments_) || arguments_[key] === null) continue;
+      const value = this._paramValue(arguments_, key);
       headers[key] = Array.isArray(value) ? value.join(",") : value;
     }
     if (tool.params.cookie.length > 0) {
       const pairs = tool.params.cookie
-        .filter((key) => key in filtered && filtered[key] !== null)
-        .map((key) => `${key}=${quote(this._scalar(filtered[key]), false)}`);
+        .filter((key) => key in arguments_ && arguments_[key] !== null)
+        .map((key) => `${key}=${quote(this._scalar(arguments_[key]), false)}`);
       if (pairs.length > 0) headers["Cookie"] = pairs.join("; ");
     }
 
     const auth = this._applyAuth(headers, query, env, authorization);
-    const body = this._requestBody(tool, filtered);
+    const body = this._requestBody(tool, arguments_);
     if (body.contentType !== undefined) {
       headers["Content-Type"] = body.contentType;
     }

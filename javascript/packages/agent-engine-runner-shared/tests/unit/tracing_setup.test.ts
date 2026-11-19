@@ -1,21 +1,12 @@
-/**
- * Unit tests for tracing setup: trace-store retry / attach / degraded status.
- *
- * Mirrors the trace-store retry tests in Python's tests/unit/test_tracing_exporter.py.
- * When the tenant store DB is unreachable at AER pod startup, a background
- * retry re-connects and wires the MongoDB collection into the lazy exporter
- * once the store recovers — without a pod restart. The
- * failure surfaces via tracingStatus() (-> /health DEGRADED) rather than a
- * single swallowed warning.
- */
-
 import { describe, test, expect, vi, beforeEach, afterEach } from "vitest";
 import {
   ROOT_CONTEXT,
   TraceFlags,
+  context,
   propagation,
   trace,
 } from "@opentelemetry/api";
+import { AsyncLocalStorageContextManager } from "@opentelemetry/context-async-hooks";
 import { existsSync, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -47,7 +38,8 @@ const mongo = vi.hoisted(() => {
     db: vi.fn(() => dbObj),
     close: vi.fn().mockResolvedValue(undefined),
   };
-  return { instance, dbObj, collection };
+  const ctorArgs: unknown[][] = [];
+  return { instance, dbObj, collection, ctorArgs };
 });
 
 vi.mock("../../src/logger.js", () => ({
@@ -56,7 +48,8 @@ vi.mock("../../src/logger.js", () => ({
 }));
 
 vi.mock("mongodb", () => ({
-  MongoClient: function () {
+  MongoClient: function (...args: unknown[]) {
+    mongo.ctorArgs.push(args);
     return mongo.instance;
   },
 }));
@@ -71,14 +64,12 @@ import {
   runWithExecutionContext,
   scrubCredentials,
 } from "../../src/index.js";
+import { forceFlushTracing } from "../../src/tracing/setup.js";
 
 const URI = "mongodb://user:pass@host:27017";
+const MONGO_APP_NAME = "Agent Engine";
 
 describe("scrubCredentials", () => {
-  // The scrub runs on Mongo driver error messages, which echo the raw
-  // connection string. Every credential-bearing case must end with the whole
-  // userinfo masked — a password containing an unescaped '@' or whitespace
-  // defeated the old first-'@' regex and leaked to the centralized log sink.
   const cases: Array<[string, string, string]> = [
     [
       "normal password",
@@ -159,8 +150,6 @@ describe("scrubCredentials", () => {
   }
 
   test("tolerates non-string input instead of throwing", () => {
-    // Error paths hand scrubCredentials whatever a rejection carried —
-    // a throw here would turn a degraded trace store into a startup failure.
     expect(scrubCredentials(undefined)).toBe("undefined");
     expect(scrubCredentials(null)).toBe("null");
     expect(scrubCredentials(42)).toBe("42");
@@ -202,15 +191,12 @@ describe("tracing setup", () => {
     mongo.dbObj.collection.mockReturnValue(mongo.collection);
     mongo.dbObj.command.mockReset();
     mongo.collection.insertMany.mockClear();
+    mongo.ctorArgs.length = 0;
   });
 
   afterEach(async () => {
     vi.useRealTimers();
     await shutdownTracing();
-    // shutdownTracing resets module state but cannot unregister the global
-    // provider — the OTel API rejects duplicate registration, so without
-    // disable() an earlier test's provider shadows this test's and spans
-    // emitted via getTracer() route to a shut-down provider.
     trace.disable();
     propagation.disable();
     resetHooks();
@@ -226,6 +212,161 @@ describe("tracing setup", () => {
       platform_exporter: "disabled",
     });
   });
+
+  test("forceFlushTracing is a no-op when tracing is not set up", async () => {
+    expect(await forceFlushTracing(10)).toBe(true);
+  });
+
+  test("forceFlushTracing ships a batched span before it resolves", async () => {
+    mongo.dbObj.command.mockResolvedValue({ ok: 1 });
+    await setupTracing({
+      serviceName: "svc-flush",
+      mongodbUri: URI,
+      mongodbDatabaseName: "testdb",
+    });
+
+    let releaseExport!: () => void;
+    mongo.collection.insertMany.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          releaseExport = () => resolve({ insertedCount: 1 });
+        }),
+    );
+    getTracer("test").startSpan("flush-me").end();
+
+    let settled = false;
+    const flushed = forceFlushTracing(5_000).then((ok) => {
+      settled = true;
+      return ok;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(settled).toBe(false);
+
+    releaseExport();
+    await expect(flushed).resolves.toBe(true);
+    const docs = mongo.collection.insertMany.mock.calls.flatMap(
+      (call) => call[0] as Array<{ name: string }>,
+    );
+    expect(docs.some((doc) => doc.name === "flush-me")).toBe(true);
+  });
+
+  test("forceFlushTracing waits for an export the batch timer already started", async () => {
+    mongo.dbObj.command.mockResolvedValue({ ok: 1 });
+    await setupTracing({
+      serviceName: "svc-flush-inflight",
+      mongodbUri: URI,
+      mongodbDatabaseName: "testdb",
+    });
+
+    let releaseExport!: () => void;
+    mongo.collection.insertMany.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          releaseExport = () => resolve({ insertedCount: 1 });
+        }),
+    );
+    getTracer("test").startSpan("in-flight").end();
+
+    const first = forceFlushTracing(5_000);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(mongo.collection.insertMany).toHaveBeenCalledTimes(1);
+
+    let settled = false;
+    const second = forceFlushTracing(5_000).then((ok) => {
+      settled = true;
+      return ok;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(settled).toBe(false);
+
+    releaseExport();
+    await expect(first).resolves.toBe(true);
+    await expect(second).resolves.toBe(true);
+  });
+
+  test("shutdownTracing joins an export the batch timer already started", async () => {
+    mongo.dbObj.command.mockResolvedValue({ ok: 1 });
+    await setupTracing({
+      serviceName: "svc-shutdown",
+      mongodbUri: URI,
+      mongodbDatabaseName: "testdb",
+    });
+
+    let releaseExport!: () => void;
+    mongo.collection.insertMany.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          releaseExport = () => resolve({ insertedCount: 1 });
+        }),
+    );
+    getTracer("test").startSpan("shutdown-in-flight").end();
+
+    const started = forceFlushTracing(5_000);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(mongo.collection.insertMany).toHaveBeenCalledTimes(1);
+
+    let settled = false;
+    const shutdown = shutdownTracing().then(() => {
+      settled = true;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(settled).toBe(false);
+
+    releaseExport();
+    await started;
+    await shutdown;
+    expect(settled).toBe(true);
+    const docs = mongo.collection.insertMany.mock.calls.flatMap(
+      (call) => call[0] as Array<{ name: string }>,
+    );
+    expect(docs.some((doc) => doc.name === "shutdown-in-flight")).toBe(true);
+  });
+
+  test("forceFlushTracing returns false when the export does not complete in time", async () => {
+    mongo.dbObj.command.mockResolvedValue({ ok: 1 });
+    await setupTracing({
+      serviceName: "svc-flush-timeout",
+      mongodbUri: URI,
+      mongodbDatabaseName: "testdb",
+    });
+
+    let releaseExport!: () => void;
+    mongo.collection.insertMany.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          releaseExport = () => resolve({ insertedCount: 1 });
+        }),
+    );
+    getTracer("test").startSpan("stuck-flush").end();
+
+    await expect(forceFlushTracing(30)).resolves.toBe(false);
+    releaseExport();
+  });
+
+  test.each(["throw", "reject"])(
+    "a cleanup %s preserves the degraded startup result",
+    async (failure) => {
+      mongo.dbObj.command.mockRejectedValue(
+        new Error("trace store unavailable"),
+      );
+      const closesBefore = mongo.instance.close.mock.calls.length;
+      mongo.instance.close.mockImplementationOnce(() => {
+        if (failure === "throw") throw new Error("cleanup failed");
+        return Promise.reject(new Error("cleanup failed"));
+      });
+      process.env["AGENTIC_TRACE_STORE_RETRY_INTERVAL_SECONDS"] = "999";
+
+      await expect(
+        setupTracing({ serviceName: "svc-cleanup-failure", mongodbUri: URI }),
+      ).resolves.toBeUndefined();
+
+      expect(mongo.instance.close.mock.calls.length).toBe(closesBefore + 1);
+      expect(tracingStatus().database_exporter).toBe("degraded");
+      const errorMessage = String(mocks.logger.error.mock.calls[0]?.[0] ?? "");
+      expect(errorMessage).toContain("trace store unavailable");
+      expect(errorMessage).not.toContain("cleanup failed");
+    },
+  );
 
   test("does not write local trace JSONL", async () => {
     const observabilityDir = mkdtempSync(join(tmpdir(), "tracing-test-"));
@@ -250,6 +391,20 @@ describe("tracing setup", () => {
       database_exporter: "attached",
       platform_exporter: "disabled",
     });
+  });
+
+  test("sets the handshake appName on the trace-store client", async () => {
+    mongo.dbObj.command.mockResolvedValue({ ok: 1 });
+    await setupTracing({
+      serviceName: "svc-appname",
+      mongodbUri: URI,
+      mongodbDatabaseName: "testdb",
+    });
+
+    expect(mongo.ctorArgs[0]).toEqual([
+      URI,
+      expect.objectContaining({ appName: MONGO_APP_NAME }),
+    ]);
   });
 
   test("attaches request-local execution identity to every span", async () => {
@@ -368,11 +523,6 @@ describe("tracing setup", () => {
     );
     expect(mongo.instance.connect).toHaveBeenCalled();
 
-    // Post-recovery persistence is the ticket's acceptance criterion: a span
-    // emitted now must reach the store, proving the LazyMongoSpanExporter got
-    // wired in — the internal "attached" flag alone can't show that. Emit via
-    // the framework's getTracer path (bound to THIS test's provider thanks to
-    // afterEach's trace.disable()), then flush with an explicit shutdown.
     const span = getTracer("test").startSpan("recovered-span");
     span.end();
     await shutdownTracing();
@@ -385,9 +535,6 @@ describe("tracing setup", () => {
   });
 
   test("startup error log masks credentials when the password contains '@' or space", async () => {
-    // Regression: the old scrub stopped at the first '@' and could not cross
-    // whitespace, so a driver error echoing this URI shape leaked the
-    // password tail (or the full userinfo) into the centralized log sink.
     mongo.dbObj.command.mockRejectedValue(
       new Error(
         "Invalid connection string: mongodb://admin:p@ss word@atlas-host.mongodb.net/db",
@@ -427,9 +574,6 @@ describe("tracing setup", () => {
       database_exporter: "degraded",
       platform_exporter: "disabled",
     });
-    // Sync on the retry attempts themselves instead of wall time: each failed
-    // attempt re-pings the store, so waiting for several pings proves the
-    // loop is firing while the status stays degraded.
     const startupPings = mongo.dbObj.command.mock.calls.length;
     await vi.waitFor(() => {
       expect(mongo.dbObj.command.mock.calls.length).toBeGreaterThanOrEqual(
@@ -443,13 +587,6 @@ describe("tracing setup", () => {
   });
 
   test("shutdown during an in-flight retry stops further retries", async () => {
-    // Startup command fails → degraded, retry scheduled. The retry's command
-    // hangs on a deferred so the attempt is in-flight when shutdown runs.
-    // Releasing it after shutdown must not reschedule a new retry — the
-    // pre-fix bug let retries continue post-shutdown because the in-flight
-    // attempt reschedules based on `mongodbExporterAttached`, which shutdown
-    // resets to false. Fake timers make the "never rescheduled" negative
-    // check deterministic — no wall-clock settle.
     vi.useFakeTimers();
     let rejectRetry!: (err: unknown) => void;
     mongo.dbObj.command
@@ -471,8 +608,6 @@ describe("tracing setup", () => {
       platform_exporter: "disabled",
     });
 
-    // Fire the scheduled retry; it suspends mid-attempt on the deferred ping
-    // (connect is called once at startup, once by the retry).
     const startupConnects = mongo.instance.connect.mock.calls.length;
     await vi.advanceTimersByTimeAsync(10);
     await vi.waitFor(() => {
@@ -483,9 +618,8 @@ describe("tracing setup", () => {
     const connectsBeforeShutdown = mongo.instance.connect.mock.calls.length;
 
     await shutdownTracing();
-    rejectRetry(new Error("still down")); // unblock the in-flight attempt
+    rejectRetry(new Error("still down"));
 
-    // A rescheduled retry (10ms interval) would fire within this window.
     await vi.advanceTimersByTimeAsync(1000);
     expect(mongo.instance.connect.mock.calls.length).toBe(
       connectsBeforeShutdown,
@@ -493,11 +627,6 @@ describe("tracing setup", () => {
   });
 
   test("shutdown during an in-flight retry closes the client it opened", async () => {
-    // Same race, but the in-flight attempt SUCCEEDS after shutdown.
-    // resolveTracingCollection assigns a fresh client to tracingMongoClient
-    // after shutdown already closed the old one — without the fix that
-    // client's pool leaks (attachMongoTracing bails on a null lazy exporter,
-    // so nothing ever closes it). The fix closes it in the retryStopped branch.
     vi.useFakeTimers();
     let resolveRetry!: (v: { ok: number }) => void;
     mongo.dbObj.command
@@ -530,11 +659,8 @@ describe("tracing setup", () => {
     const closesBeforeShutdown = mongo.instance.close.mock.calls.length;
 
     await shutdownTracing();
-    resolveRetry({ ok: 1 }); // the in-flight attempt succeeds post-shutdown
+    resolveRetry({ ok: 1 });
 
-    // Advancing past the retry interval flushes the continuation (which must
-    // close the client it opened — no leak) and fires any would-be
-    // rescheduled retry (there must be none).
     await vi.advanceTimersByTimeAsync(1000);
     expect(mongo.instance.close.mock.calls.length).toBe(
       closesBeforeShutdown + 1,
@@ -562,11 +688,6 @@ describe("tracing setup", () => {
   });
 
   test("OTLP endpoint configured: OTLP leg added without breaking Mongo setup", async () => {
-    // The OTLPTraceExporter constructor itself never throws on a bad host —
-    // that only surfaces at export time — so this pins the wiring (setup
-    // still succeeds, Mongo status unaffected) rather than transport failure.
-    // buildOtlpSpanProcessor's try/catch (dependency import, constructor)
-    // still guards setupTracing as a whole, mirroring Python's try/except.
     process.env["OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"] = "http://bad-host:4318";
     mongo.dbObj.command.mockResolvedValue({ ok: 1 });
 
@@ -586,14 +707,6 @@ describe("tracing setup", () => {
   });
 
   test("global propagator is trace-context only — baggage never crosses", async () => {
-    // Mirrors Python's set_global_textmap(TraceContextTextMapPropagator()):
-    // the API's own composite-propagator default (once anything registers
-    // one) also propagates Baggage, which would leak arbitrary unredacted
-    // key/value pairs onto any outbound call that goes through the global
-    // propagator. AER/Tool-Pod -> OE calls already sidestep this via
-    // tls_client.ts's own local propagator instance (see tls_client.test.ts),
-    // but this test pins the global registration setupTracing performs for
-    // any other caller of the global propagation API.
     await setupTracing({ serviceName: "svc-propagator" });
 
     const contextWithBaggage = propagation.setBaggage(
@@ -620,10 +733,43 @@ describe("tracing setup", () => {
     expect(headers).not.toHaveProperty("baggage");
   });
 
+  test("registers an async context manager so startActiveSpan nests", async () => {
+    await setupTracing({ serviceName: "svc-context-manager" });
+
+    const tracer = getTracer("test");
+    let parentTraceId = "";
+    let childTraceId = "";
+    let activeInsideChild: unknown = null;
+    tracer.startActiveSpan("parent", (parent) => {
+      parentTraceId = parent.spanContext().traceId;
+      tracer.startActiveSpan("child", (child) => {
+        activeInsideChild = trace.getActiveSpan();
+        childTraceId = child.spanContext().traceId;
+        child.end();
+      });
+      parent.end();
+    });
+
+    expect(activeInsideChild).not.toBeNull();
+    expect(childTraceId).toBe(parentTraceId);
+  });
+
+  test("keeps a pre-existing context manager instead of replacing it", async () => {
+    const existing = new AsyncLocalStorageContextManager();
+    existing.enable();
+    context.setGlobalContextManager(existing);
+    try {
+      await setupTracing({ serviceName: "svc-existing-context-manager" });
+
+      expect(mocks.logger.debug).toHaveBeenCalledWith(
+        "A global context manager is already registered; keeping the existing one",
+      );
+    } finally {
+      context.disable();
+    }
+  });
+
   test("retry timers are unref'd so they never pin the event loop", async () => {
-    // The retry is best-effort background work: a referenced timer would keep
-    // the Node process alive while the store is down (Python uses a daemon
-    // retry thread for the same reason).
     mongo.dbObj.command.mockRejectedValue(new Error("still down"));
     process.env["AGENTIC_TRACE_STORE_RETRY_INTERVAL_SECONDS"] = "0.017";
     const RETRY_MS = 17;
@@ -651,9 +797,6 @@ describe("tracing setup", () => {
         platform_exporter: "disabled",
       });
 
-      // Let several attempts fire so both the initial schedule and the
-      // reschedules are covered. Tolerance on the interval match dodges
-      // float imprecision in seconds→ms conversion.
       const startupPings = mongo.dbObj.command.mock.calls.length;
       await vi.waitFor(() => {
         expect(mongo.dbObj.command.mock.calls.length).toBeGreaterThanOrEqual(

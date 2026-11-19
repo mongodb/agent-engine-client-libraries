@@ -1,12 +1,3 @@
-/**
- * Distinguish an inbound caller trace from a root a runner created.
- *
- * A propagated local root arrives as a valid remote span context. W3C
- * traceparent cannot say who created that root, so runners add
- * `agentengine=root` to tracestate when they create the trace. Guardrail
- * content is recorded only when that marker is absent.
- */
-
 import {
   context,
   createContextKey,
@@ -17,7 +8,6 @@ import {
   type SpanContext,
 } from "@opentelemetry/api";
 
-/** Simple W3C tracestate member set when a runner creates the trace root. */
 export const RUNNER_ROOT_TRACESTATE_KEY = "agentengine";
 export const RUNNER_ROOT_TRACESTATE_VALUE = "root";
 
@@ -34,7 +24,6 @@ export function traceStateMarksRunnerRoot(
   );
 }
 
-/** True when this span context was extracted from an inbound caller trace. */
 export function inboundCallerSpanContext(
   spanContext: SpanContext | undefined,
 ): boolean {
@@ -85,13 +74,6 @@ function parentSpanContext(span: Span): SpanContext | undefined {
   return candidate.parentSpanContext ?? candidate.parent;
 }
 
-/**
- * True when the active trace was created by a runner.
- *
- * An explicit binding from the span that joined or rooted the trace wins.
- * Otherwise a remote parent without the marker is an inbound caller, and a
- * local root (or a child of one) is not.
- */
 export function activeTraceIsRunnerRooted(
   active: Context = context.active(),
 ): boolean {

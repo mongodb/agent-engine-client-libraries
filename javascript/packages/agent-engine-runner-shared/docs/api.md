@@ -63,6 +63,7 @@
   - [ConnectorToolRuntime](#api-connectortoolruntime)
     - [close()](#api-close-2)
   - [ContentPolicyOTLPSpanExporter](#api-contentpolicyotlpspanexporter)
+    - [drain()](#api-drain)
     - [export()](#api-export)
     - [forceFlush()](#api-forceflush)
     - [shutdown()](#api-shutdown)
@@ -104,6 +105,7 @@
     - [recordLatency()](#api-recordlatency)
     - [reset()](#api-reset)
   - [MongoDBSpanExporter](#api-mongodbspanexporter)
+    - [drain()](#api-drain-1)
     - [export()](#api-export-2)
     - [forceFlush()](#api-forceflush-2)
     - [shutdown()](#api-shutdown-2)
@@ -291,6 +293,7 @@
   - [LLMPodStreamEvent](#api-llmpodstreamevent)
   - [MemoryWrite](#api-memorywrite)
   - [OnUnknownOutcome](#api-onunknownoutcome)
+  - [OpenInferenceSpanKind](#api-openinferencespankind)
   - [Operation](#api-operation)
   - [OperationPath](#api-operationpath)
   - [OperationPathResolver](#api-operationpathresolver)
@@ -341,6 +344,7 @@
   - [ActivityPositionSchema](#api-activitypositionschema)
   - [ActivitySuspensionSchema](#api-activitysuspensionschema)
   - [AER\_BUILD\_AGENT](#api-aer_build_agent)
+  - [AER\_EXECUTE](#api-aer_execute)
   - [AERExecuteResponseSchema](#api-aerexecuteresponseschema)
   - [AgentFeatureConfigSchema](#api-agentfeatureconfigschema)
   - [AgentResumeRequestSchema](#api-agentresumerequestschema)
@@ -424,12 +428,13 @@
   - [MessageRoleSchema](#api-messageroleschema)
   - [MODEL\_REQUEST\_PREPARE](#api-model_request_prepare)
   - [MODEL\_RESPONSE\_PROCESS](#api-model_response_process)
+  - [OAUTH\_AUTHORIZATION\_ACTIVITY\_NAME](#api-oauth_authorization_activity_name)
   - [OE\_DISPATCH\_RETRY\_MAX\_WAIT\_MS](#api-oe_dispatch_retry_max_wait_ms)
   - [OE\_DISPATCH\_TAKEOVER\_RETRY\_DELAY\_MS](#api-oe_dispatch_takeover_retry_delay_ms)
   - [OE\_RETRYABLE\_MAX\_ATTEMPTS](#api-oe_retryable_max_attempts)
   - [oeStreamRetry](#api-oestreamretry)
   - [OPENINFERENCE\_SPAN\_KIND](#api-openinference_span_kind)
-  - [OpenInferenceSpanKind](#api-openinferencespankind)
+  - [OpenInferenceSpanKind](#api-openinferencespankind-1)
   - [OperationPathSchema](#api-operationpathschema)
   - [OperationPathSegmentSchema](#api-operationpathsegmentschema)
   - [OperationSchema](#api-operationschema)
@@ -449,6 +454,9 @@
   - [StreamingResultSchema](#api-streamingresultschema)
   - [SuspendPayloadSchema](#api-suspendpayloadschema)
   - [TenantScopeSchema](#api-tenantscopeschema)
+  - [TOOL\_EXECUTE](#api-tool_execute)
+  - [TOOL\_INVOKE\_LLM](#api-tool_invoke_llm)
+  - [TOOL\_INVOKE\_LLM\_STREAM](#api-tool_invoke_llm_stream)
   - [ToolAPIErrorSchema](#api-toolapierrorschema)
   - [ToolAuthorizationSchema](#api-toolauthorizationschema)
   - [ToolDefinitionSchema](#api-tooldefinitionschema)
@@ -493,6 +501,7 @@
   - [completeExecutionCommand()](#api-completeexecutioncommand-1)
   - [createSecureToolFunction()](#api-createsecuretoolfunction)
   - [currentAttemptContext()](#api-currentattemptcontext)
+  - [currentOperationBoundaries()](#api-currentoperationboundaries)
   - [currentOperationPath()](#api-currentoperationpath)
   - [currentPendingChildOperationBatch()](#api-currentpendingchildoperationbatch)
   - [currentStepOrdinal()](#api-currentstepordinal)
@@ -531,6 +540,7 @@
   - [getContentCaptureMode()](#api-getcontentcapturemode)
   - [getCurrentAuthorization()](#api-getcurrentauthorization)
   - [getCurrentCustomHeaders()](#api-getcurrentcustomheaders)
+  - [getCurrentEmitChunk()](#api-getcurrentemitchunk)
   - [getCurrentExecutionId()](#api-getcurrentexecutionid)
   - [getCurrentExecutionMetadata()](#api-getcurrentexecutionmetadata)
   - [getCurrentLogOrigin()](#api-getcurrentlogorigin)
@@ -569,6 +579,7 @@
   - [inSpawnedTask()](#api-inspawnedtask)
   - [installStructuredLogging()](#api-installstructuredlogging)
   - [interruptedActivities()](#api-interruptedactivities)
+  - [interruptedActivityAnswered()](#api-interruptedactivityanswered)
   - [isConfiguredMcpSdkToolName()](#api-isconfiguredmcpsdktoolname)
   - [isExecutionAborted()](#api-isexecutionaborted)
   - [isGuardrailReviewWait()](#api-isguardrailreviewwait)
@@ -612,7 +623,6 @@
   - [noteGuardrailReviewWait()](#api-noteguardrailreviewwait)
   - [observedActivityPositions()](#api-observedactivitypositions)
   - [oeStreamRetryDelayMs()](#api-oestreamretrydelayms)
-  - [platformTraceExporterEnabled()](#api-platformtraceexporterenabled)
   - [preallocateActivityOrdinals()](#api-preallocateactivityordinals)
   - [preallocateChildOperationOrdinals()](#api-preallocatechildoperationordinals)
   - [projectScopingRequired()](#api-projectscopingrequired)
@@ -720,6 +730,21 @@ const CUSTOM_EVENT: "custom_event" = "custom_event";
 ```ts
 const DONE: "done" = "done";
 ```
+
+***
+
+<a id="namespace-chunkTypes-api-durable_ack_incomplete_error_code"></a>
+
+##### DURABLE\_ACK\_INCOMPLETE\_ERROR\_CODE
+
+```ts
+const DURABLE_ACK_INCOMPLETE_ERROR_CODE: "durable_ack_incomplete" = "durable_ack_incomplete";
+```
+
+Machine-readable discriminator set on `metadata.error_code` of an ERROR
+chunk/callback when the turn's stream chunks could not be durably
+acknowledged within the turn budget, so the turn is failed instead of being
+presented as complete. A resume can retry.
 
 ***
 
@@ -1173,6 +1198,23 @@ get modeName(): string;
 BaseServer.modeName
 ```
 
+<a id="api-streamjournal"></a>
+
+##### streamJournal
+
+**Get Signature**
+
+```ts
+get streamJournal(): StreamJournalManager;
+```
+
+Runner-wide stream journal, lazily created so a harness that skips the
+constructor still gets a working store.
+
+**Returns**
+
+`StreamJournalManager`
+
 #### Methods
 
 <a id="api-close"></a>
@@ -1546,8 +1588,10 @@ MemoryCrudClient.createProcedural
 createSemantic(args): Promise<{
   acknowledged: boolean;
   has_embedding: boolean;
-  id: string;
+  id: string | null;
   label: string;
+  operation_id?: string | null;
+  operation_status?: string | null;
 }>;
 ```
 
@@ -1555,8 +1599,9 @@ createSemantic(args): Promise<{
 
 | Parameter | Type |
 | :------ | :------ |
-| `args` | \{ `agentId?`: `string` \| `null`; `label`: `string`; `metadata?`: `Record`\<`string`, `unknown`\> \| `null`; `source?`: `string`; `text`: `string`; `upsert?`: `boolean`; `userId`: `string`; `visibility?`: `string`; \} |
+| `args` | \{ `agentId?`: `string` \| `null`; `idempotencyKey?`: `string` \| `null`; `label`: `string`; `metadata?`: `Record`\<`string`, `unknown`\> \| `null`; `source?`: `string`; `text`: `string`; `upsert?`: `boolean`; `userId`: `string`; `visibility?`: `string`; \} |
 | `args.agentId?` | `string` \| `null` |
+| `args.idempotencyKey?` | `string` \| `null` |
 | `args.label` | `string` |
 | `args.metadata?` | `Record`\<`string`, `unknown`\> \| `null` |
 | `args.source?` | `string` |
@@ -1570,8 +1615,10 @@ createSemantic(args): Promise<{
 `Promise`\<\{
   `acknowledged`: `boolean`;
   `has_embedding`: `boolean`;
-  `id`: `string`;
+  `id`: `string` \| `null`;
   `label`: `string`;
+  `operation_id?`: `string` \| `null`;
+  `operation_status?`: `string` \| `null`;
 \}\>
 
 **Implementation of**
@@ -2686,6 +2733,27 @@ new ContentPolicyOTLPSpanExporter(inner, contentCaptureMode?): ContentPolicyOTLP
 [`ContentPolicyOTLPSpanExporter`](#api-contentpolicyotlpspanexporter)
 
 #### Methods
+
+<a id="api-drain"></a>
+
+##### drain()
+
+```ts
+drain(): Promise<void>;
+```
+
+Await every export this wrapper started but has not finished.
+
+`BatchSpanProcessor.forceFlush()` drains only the spans still buffered: an
+export its timer already started is invisible to it, so the flush can
+resolve while that export is still in flight. A caller about to make the
+process disappear (a session-finish release) awaits this so it does not
+release on a flush that only looked complete. Best-effort and never
+rejects — a failed export is already reported through its result callback.
+
+**Returns**
+
+`Promise`\<`void`\>
 
 <a id="api-export"></a>
 
@@ -3887,6 +3955,27 @@ new MongoDBSpanExporter(collection): MongoDBSpanExporter;
 [`MongoDBSpanExporter`](#api-mongodbspanexporter)
 
 #### Methods
+
+<a id="api-drain-1"></a>
+
+##### drain()
+
+```ts
+drain(): Promise<void>;
+```
+
+Await every insert this exporter started but has not finished.
+
+`BatchSpanProcessor.forceFlush()` drains only the spans still buffered: an
+export its timer already started is invisible to it, so the flush can
+resolve while that insert is still pending. A caller about to make the
+process disappear (a session-finish release) awaits this so it does not
+release on a flush that only looked complete. Best-effort and never
+rejects — a failed insert is already reported through its result callback.
+
+**Returns**
+
+`Promise`\<`void`\>
 
 <a id="api-export-2"></a>
 
@@ -6261,6 +6350,7 @@ The subset of a response the executor needs from a transport.
 | :------ | :------ | :------ |
 | <a id="api-property-authorization"></a> `authorization` | \| \{ `expires_at?`: `number` \| `null`; `token`: `string`; \} \| `null` | Delegated credential injected by OE for tool execution. |
 | <a id="api-property-customheaders-1"></a> `customHeaders` | `Record`\<`string`, `string`\> \| `null` | - |
+| <a id="api-property-emitchunk"></a> `emitChunk` | ((`event`, `data`) => `Promise`\<`void`\>) \| `null` | Request-scoped sink for in-process progress emits (`emit` / `emitStep`). The AER installs one for a journaled turn so a local tool's step is sequenced and recorded on the turn's journal like every other chunk. Null everywhere else, where progress keeps its own best-effort transport. |
 | <a id="api-property-executionid-2"></a> `executionId` | `string` \| `null` | - |
 | <a id="api-property-executionmetadata"></a> `executionMetadata` | `Record`\<`string`, `unknown`\> \| `null` | - |
 | <a id="api-property-oeownerurl-1"></a> `oeOwnerUrl` | `string` \| `null` | Validated replica-specific OE owner callback URL, or null when the request carried none / it failed validation. Owner-preferring transports (e.g. module:progress) send here first and fall back to `oeUrl` on any owner failure. Already validated against `oeUrl` by the caller (see `server/owner_url.ts`), so consumers trust it as-is. |
@@ -6919,6 +7009,7 @@ Public options for `registerAndRun`.
 | :------ | :------ | :------ |
 | <a id="api-property-authorization-1"></a> `authorization?` | \| \{ `expires_at?`: `number` \| `null`; `token`: `string`; \} \| `null` | - |
 | <a id="api-property-customheaders-3"></a> `customHeaders?` | `Record`\<`string`, `string`\> \| `null` | - |
+| <a id="api-property-emitchunk-1"></a> `emitChunk?` | ((`event`, `data`) => `Promise`\<`void`\>) \| `null` | Journal-aware sink for in-process progress emits (see `ExecutionStore`). |
 | <a id="api-property-executionid-6"></a> `executionId` | `string` | - |
 | <a id="api-property-oeownerurl-2"></a> `oeOwnerUrl?` | `string` \| `null` | Validated replica-specific OE owner callback URL. |
 | <a id="api-property-oeurl-6"></a> `oeUrl` | `string` | - |
@@ -7941,6 +8032,18 @@ type OnUnknownOutcome = "fail" | "rerun";
 
 ***
 
+<a id="api-openinferencespankind"></a>
+
+### OpenInferenceSpanKind
+
+```ts
+type OpenInferenceSpanKind = typeof OpenInferenceSpanKind[keyof typeof OpenInferenceSpanKind];
+```
+
+OpenInference span kinds, matching the Python SDK's `OpenInferenceSpanKind`.
+
+***
+
 <a id="api-operation"></a>
 
 ### Operation
@@ -8662,6 +8765,16 @@ Use `create(ActivitySuspensionSchema)` to create a new message.
 const AER_BUILD_AGENT: "aer.build_agent" = "aer.build_agent";
 ```
 
+***
+
+<a id="api-aer_execute"></a>
+
+### AER\_EXECUTE
+
+```ts
+const AER_EXECUTE: "aer.execute" = "aer.execute";
+```
+
 Stable span names for the first-invoke lifecycle. There is no manual
 `llm.call` span; LangChain's auto-instrumentation already covers it.
 
@@ -9065,6 +9178,8 @@ const ExecuteRequestSchema: ZodObject<{
   resume_data: ZodOptional<ZodRecord<ZodString, ZodUnknown>>;
   resume_from_step: ZodOptional<ZodNumber>;
   session_id: ZodOptional<ZodString>;
+  stream_generation: ZodDefault<ZodNumber>;
+  stream_journal_enabled: ZodDefault<ZodBoolean>;
   suspend_generation: ZodOptional<ZodPipe<ZodNullable<ZodNumber>, ZodTransform<number | undefined, number | null>>>;
   user_id: ZodOptional<ZodString>;
   workspace_id: ZodOptional<ZodString>;
@@ -10315,6 +10430,18 @@ const MODEL_RESPONSE_PROCESS: "response.process" = "response.process";
 
 ***
 
+<a id="api-oauth_authorization_activity_name"></a>
+
+### OAUTH\_AUTHORIZATION\_ACTIVITY\_NAME
+
+```ts
+const OAUTH_AUTHORIZATION_ACTIVITY_NAME: "oauth.authorization" = "oauth.authorization";
+```
+
+Name of the durable activity that records one OAuth consent wait.
+
+***
+
 <a id="api-oe_dispatch_retry_max_wait_ms"></a>
 
 ### OE\_DISPATCH\_RETRY\_MAX\_WAIT\_MS
@@ -10379,7 +10506,7 @@ const OPENINFERENCE_SPAN_KIND: "openinference.span.kind" = openinferenceSpanKind
 
 ***
 
-<a id="api-openinferencespankind"></a>
+<a id="api-openinferencespankind-1"></a>
 
 ### OpenInferenceSpanKind
 
@@ -10893,6 +11020,36 @@ const TenantScopeSchema: GenMessage<TenantScope>;
 
 Describes the message mongodb.agentic.workflow.v1.TenantScope.
 Use `create(TenantScopeSchema)` to create a new message.
+
+***
+
+<a id="api-tool_execute"></a>
+
+### TOOL\_EXECUTE
+
+```ts
+const TOOL_EXECUTE: "tool.execute" = "tool.execute";
+```
+
+***
+
+<a id="api-tool_invoke_llm"></a>
+
+### TOOL\_INVOKE\_LLM
+
+```ts
+const TOOL_INVOKE_LLM: "tool.invoke_llm" = "tool.invoke_llm";
+```
+
+***
+
+<a id="api-tool_invoke_llm_stream"></a>
+
+### TOOL\_INVOKE\_LLM\_STREAM
+
+```ts
+const TOOL_INVOKE_LLM_STREAM: "tool.invoke_llm.stream" = "tool.invoke_llm.stream";
+```
 
 ***
 
@@ -11560,7 +11717,7 @@ function attemptStartRequestFromExecute(
 
 | Parameter | Type | Default value | Description |
 | :------ | :------ | :------ | :------ |
-| `request` | \{ `custom_headers?`: `Record`\<`string`, `string`\>; `durable_ack_enabled`: `boolean`; `execution_id`: `string`; `message`: `string`; `metadata?`: `Record`\<`string`, `unknown`\>; `org_id?`: `string`; `payload?`: `Record`\<`string`, `unknown`\>; `platform_api_owner_url?`: `string` \| `null`; `platform_api_url`: `string`; `platform_trace_id?`: `string` \| `null`; `previous_execution_cancelled`: `boolean`; `project_id?`: `string`; `resume`: `boolean`; `resume_data?`: `Record`\<`string`, `unknown`\>; `resume_from_step?`: `number`; `session_id?`: `string`; `suspend_generation?`: `number`; `user_id?`: `string`; `workspace_id?`: `string`; \} | `undefined` | - |
+| `request` | \{ `custom_headers?`: `Record`\<`string`, `string`\>; `durable_ack_enabled`: `boolean`; `execution_id`: `string`; `message`: `string`; `metadata?`: `Record`\<`string`, `unknown`\>; `org_id?`: `string`; `payload?`: `Record`\<`string`, `unknown`\>; `platform_api_owner_url?`: `string` \| `null`; `platform_api_url`: `string`; `platform_trace_id?`: `string` \| `null`; `previous_execution_cancelled`: `boolean`; `project_id?`: `string`; `resume`: `boolean`; `resume_data?`: `Record`\<`string`, `unknown`\>; `resume_from_step?`: `number`; `session_id?`: `string`; `stream_generation`: `number`; `stream_journal_enabled`: `boolean`; `suspend_generation?`: `number`; `user_id?`: `string`; `workspace_id?`: `string`; \} | `undefined` | - |
 | `request.custom_headers?` | `Record`\<`string`, `string`\> | `...` | Caller-provided custom headers. |
 | `request.durable_ack_enabled` | `boolean` | `...` | True when the OE acknowledges a stream-chunk POST only after the chunk is durably persisted: the runner may batch chunks per POST and must retry unacknowledged chunks in order within the turn budget. False keeps one chunk per POST and today's retry semantics. |
 | `request.execution_id` | `string` | `...` | Unique execution identifier. |
@@ -11577,6 +11734,8 @@ function attemptStartRequestFromExecute(
 | `request.resume_data?` | `Record`\<`string`, `unknown`\> | `...` | Structured data to inject on resume. |
 | `request.resume_from_step?` | `number` | `...` | Step to resume from. |
 | `request.session_id?` | `string` | `...` | Session ID; the AER adapter uses this as the LangGraph thread_id. |
+| `request.stream_generation?` | `number` | `...` | Generation this dispatch opened for the stream journal. The runner stamps it on every chunk and keys the journal by it, so a resume leg carries a higher generation and addresses a separate body. 0/absent disables journaling even when `stream_journal_enabled` is set. |
+| `request.stream_journal_enabled?` | `boolean` | `...` | True when the turn's chunks are recorded in the runner's own stream journal, which — not live delivery — is the durable copy: live delivery becomes best effort, so a full queue or an exhausted retry budget drops chunks instead of blocking producers, and settlement does not wait for delivery to drain. Takes precedence over `durable_ack_enabled` when both are set. Absent/false leaves the chunk path untouched. |
 | `request.suspend_generation?` | `number` | `...` | Suspension generation expected by this dispatch. |
 | `request.user_id?` | `string` | `...` | User ID for personalization. |
 | `request.workspace_id?` | `string` | `...` | Workspace identifier for cost tracking. |
@@ -11952,6 +12111,31 @@ function currentAttemptContext(): AttemptContext | null;
 #### Returns
 
 [`AttemptContext`](#api-attemptcontext) \| `null`
+
+***
+
+<a id="api-currentoperationboundaries"></a>
+
+### currentOperationBoundaries()
+
+```ts
+function currentOperationBoundaries():
+  | readonly ChildOperationBoundary[]
+  | undefined;
+```
+
+The operation boundaries the current scope resolves to, or undefined when
+no framework resolver is bound.
+
+A framework adapter captures them before entering a nested framework unit
+that its resolver cannot place, such as a LangGraph functional task, and
+rebinds them inside with `runWithOperationPathResolver` so activities there
+keep the enclosing graph's position.
+
+#### Returns
+
+  \| readonly [`ChildOperationBoundary`](#api-childoperationboundary)[]
+  \| `undefined`
 
 ***
 
@@ -12814,13 +12998,19 @@ function flushErrorReporting(timeoutMs?): Promise<void>;
 function forceFlushTracing(timeoutMillis?): Promise<boolean>;
 ```
 
-Drain buffered spans and wait for in-flight platform exports, bounded by
+Drain buffered spans and wait for in-flight exporter work, bounded by
 `timeoutMillis`.
 
 Called from the session-finish path before the OE releases the pod, so a
-turn's spans are not lost to a zero-grace teardown. Returns true when tracing
-is not initialized or the flush completed within the timeout; false when it
-timed out or raised.
+turn's spans are not lost to a zero-grace teardown. `provider.forceFlush()`
+drains each processor's buffer, but a batch processor ships on a timer and
+does not track an export it already started: a span it removed from the
+buffer and is still shipping is invisible to it, so the flush can resolve
+before that write lands. Await each exporter's own in-flight work too — the
+platform exporter, the Mongo store, and (when configured) OTLP — so the
+caller does not release on a false flush. Returns true when tracing is not
+initialized or the flush completed within the timeout; false when it timed
+out or raised.
 
 #### Parameters
 
@@ -12991,6 +13181,23 @@ call [getAllCustomHeaders](#api-getallcustomheaders) instead.
 #### Returns
 
 `Record`\<`string`, `string`\>
+
+***
+
+<a id="api-getcurrentemitchunk"></a>
+
+### getCurrentEmitChunk()
+
+```ts
+function getCurrentEmitChunk(): ((event, data) => Promise<void>) | null;
+```
+
+The request-scoped progress sink for the current execution, or null when
+progress should use its own best-effort transport.
+
+#### Returns
+
+((`event`, `data`) => `Promise`\<`void`\>) \| `null`
 
 ***
 
@@ -13305,7 +13512,7 @@ Performance: checks the agent cache BEFORE reading certificate files to avoid
 blocking the event loop on filesystem I/O for every request. Certificate files
 are only read once per base URL when creating the agent, not on every fetch.
 
-Certificate rotation: In container mode (TLS_*_PATH), automatically detects
+Certificate rotation: In file-based TLS (TLS_*_PATH), automatically detects
 cert-manager rotation by comparing file mtimes and invalidates the cached agent
 so the next request picks up renewed certificates. In VM mode (TLS_*_PEM), the
 env vars are static for the pod's lifetime, so rotation requires a pod restart.
@@ -13731,6 +13938,28 @@ so only the pauses still waiting may claim that id.
 #### Returns
 
 [`InterruptedActivity`](#api-interruptedactivity)[]
+
+***
+
+<a id="api-interruptedactivityanswered"></a>
+
+### interruptedActivityAnswered()
+
+```ts
+function interruptedActivityAnswered(position): boolean;
+```
+
+Whether this attempt settled the pause at `position` with its answer.
+
+#### Parameters
+
+| Parameter | Type |
+| :------ | :------ |
+| `position` | [`ActivityPosition`](#api-activityposition) |
+
+#### Returns
+
+`boolean`
 
 ***
 
@@ -14898,26 +15127,6 @@ Honor a server-provided SSE retry_after_ms, capped. Absent means retry immediate
 
 ***
 
-<a id="api-platformtraceexporterenabled"></a>
-
-### platformTraceExporterEnabled()
-
-```ts
-function platformTraceExporterEnabled(env?): boolean;
-```
-
-#### Parameters
-
-| Parameter | Type | Default value |
-| :------ | :------ | :------ |
-| `env` | `ProcessEnv` | `process.env` |
-
-#### Returns
-
-`boolean`
-
-***
-
 <a id="api-preallocateactivityordinals"></a>
 
 ### preallocateActivityOrdinals()
@@ -15812,8 +16021,8 @@ function resolveListenHost(): string;
 Resolve the listen host from `APP_HOST`, defaulting to `"0.0.0.0"`.
 
 Matches Python's `_resolve_listen_host`: ECP stamps `APP_HOST` per
-executor type at deploy time (`"::"` for vm-mode, `"0.0.0.0"` for
-container-mode). Empty string normalises to the default — a shell that
+deploy time (`"::"` for the cell's IPv6-first pod network).
+Empty string normalises to the default — a shell that
 exports `APP_HOST=""` must not bind to `""`.
 
 #### Returns
@@ -16812,8 +17021,8 @@ Exporter states reported by `/health`.
 `"disabled"` when no store URI was configured.
 
 `platform_exporter` is `"attached"` when traces are sent to the OE,
-`"degraded"` after an incomplete export, or `"disabled"` when the opt-out is
-set or `OE_URL` is unset. OTLP may still be configured in the disabled state.
+`"degraded"` after an incomplete export, or `"disabled"` when `OE_URL` is
+unset. OTLP may still be configured in the disabled state.
 
 #### Returns
 
@@ -17094,7 +17303,7 @@ cause of the crash survives past this process's own stdout into
 platform's crash diagnostics read, and from there into the
 customer-facing deploy timeline.
 
-This is customer code (container mode), so unlike the platform's own
+This is customer code, so unlike the platform's own
 components the design intentionally keeps the full exception name,
 message, and stack — redacted, not summarized away — since that detail is
 what the customer needs to fix their own agent. Best-effort: if the write

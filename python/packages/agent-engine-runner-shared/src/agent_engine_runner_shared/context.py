@@ -37,7 +37,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, Optional, Tuple
 
 from agent_engine_runner_shared.error_reporting import _redact_text
 
@@ -52,6 +52,13 @@ current_oe_url: ContextVar[Optional[str]] = ContextVar("current_oe_url", default
 # only when the request supplied a valid owner URL; None otherwise. Consumed by
 # the Tool Pod / in-process progress and custom-event emitters.
 current_oe_owner_url: ContextVar[Optional[str]] = ContextVar("current_oe_owner_url", default=None)
+# Request-scoped sink for in-process progress emits (``emit`` / ``emit_step``).
+# The AER installs one for a journaled turn so a local tool's progress chunk is
+# sequenced and recorded on the turn's journal like every other chunk. It stays
+# unset everywhere else, where progress uses its own best-effort transport.
+current_local_chunk_sink: ContextVar[Optional[Callable[[str, str], None]]] = ContextVar(
+    "current_local_chunk_sink", default=None
+)
 
 
 @dataclass

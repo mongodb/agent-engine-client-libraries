@@ -11,12 +11,16 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { isDeepStrictEqual } from "node:util";
 
+import { create } from "@bufbuild/protobuf";
+
 import { getLogger } from "./logger.js";
 import { ownerDelivered } from "./owner_callback.js";
 import {
+  ElicitationInfoSchema,
   SuspendPayloadSchema,
   ToolExecuteResponseSchema,
   coerceTokenUsage,
+  type ElicitationInfo,
   type GuardrailMeta,
   type ToolExecuteResponse,
   type ToolResultRequest,
@@ -71,14 +75,19 @@ import {
   waitForRetry,
 } from "./server/http_retry.js";
 import { SpanStatusCode } from "@opentelemetry/api";
-import { ZodError } from "zod";
+import { ZodError, z } from "zod";
 import { getCurrentTraceContext, getTracer } from "./tracing/setup.js";
 import { runWithToolMemoryReadOwnership } from "./tool_memory_ownership.js";
 import {
+  ActivityContextSchema,
   ActivityKind,
+  ActivityOutcomeKind,
+  ActivityReplay,
   DurableActivityDeniedError,
   DurableActivityInterrupted,
   type DurableMemoryState,
+  OperationPathSchema,
+  OperationPathSegmentSchema,
   ReplayedActivityFailedError,
   WorkflowClient,
   WorkflowClientError,
@@ -86,10 +95,16 @@ import {
   activityRequiresReconstruction,
   allocateActivityPosition,
   allocateToolEffectPosition,
+  buildActivityCommand,
   currentAttemptContext,
+  interruptedActivityAnswered,
+  recordInterruptedActivity,
+  recordObservedActivity,
   runSerialActivity,
   toolActivityKey,
+  unwrapActivityOutcome,
   type OnUnknownOutcome,
+  type OperationPath,
   validateOnUnknownOutcome,
 } from "./workflow/index.js";
 import { semanticInputFromJson, valueToJson } from "./workflow/activity.js";
@@ -1042,6 +1057,8 @@ interface ToolActivityInput {
   provider?: string;
   scopes?: string[];
   tool_call_id?: string;
+  /** Set for OAuth tools, whose recorded results are typed outcome envelopes. */
+  oauth_outcome?: 1;
 }
 
 function isLocalTool(options: ExecuteToolOptions): boolean {
@@ -1063,6 +1080,9 @@ function buildToolActivityInput(
   if (options.metadata !== undefined) input.metadata = options.metadata;
   if (options.provider != null) {
     input.provider = options.provider;
+    // OE compares a tool's input exactly on replay, so a history recorded
+    // before typed OAuth outcomes is refused before its result is decoded.
+    input.oauth_outcome = 1;
   }
   if (options.scopes !== undefined && options.scopes.length > 0) {
     input.scopes = [...options.scopes].sort();
@@ -1101,6 +1121,70 @@ function assertDurableToolResultJsonSafe(value: unknown): void {
   if (!isDeepStrictEqual(value, roundTripped)) {
     throw new TypeError(DURABLE_TOOL_RESULT_JSON_ERROR);
   }
+}
+
+/** Name of the durable activity that records one OAuth consent wait. */
+export const OAUTH_AUTHORIZATION_ACTIVITY_NAME = "oauth.authorization";
+
+const OAUTH_STILL_REQUIRED =
+  "OAuth authorization is still required after continuation";
+
+/**
+ * The recorded outcome of one OAuth tool phase. A resource result is nested
+ * under `result`, so a tool's own data can never read as a consent challenge.
+ */
+const OAuthOutcomeSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("result"), result: z.unknown() }).strict(),
+  z
+    .object({
+      kind: z.literal("authorization_required"),
+      elicitation: ElicitationInfoSchema,
+      // The recorded challenge activity: it names this wait even when the
+      // credential broker coalesces several calls into one consent flow.
+      activity_id: z.string().min(1),
+      // Operational-step watermark OE reported before the wait.
+      step: z.number().int().min(1),
+    })
+    .strict(),
+]);
+type OAuthChallenge = Extract<
+  z.infer<typeof OAuthOutcomeSchema>,
+  { kind: "authorization_required" }
+>;
+
+function parseOAuthOutcome(value: unknown): z.infer<typeof OAuthOutcomeSchema> {
+  const parsed = OAuthOutcomeSchema.safeParse(value);
+  // The parse error would echo the recorded result, so it is not attached.
+  if (!parsed.success) {
+    throw new ToolExecutionError("Invalid recorded OAuth tool outcome");
+  }
+  return parsed.data;
+}
+
+/**
+ * Thrown inside a durable Tool activity when OE asks for consent, so the
+ * activity records the challenge instead of pausing in the middle of itself.
+ */
+class OAuthAuthorizationRequired extends Error {
+  constructor(
+    readonly elicitation: ElicitationInfo,
+    readonly step: number,
+  ) {
+    super("OAuth authorization is required");
+  }
+}
+
+function childOperationPath(
+  path: OperationPath,
+  name: string,
+  ordinal: number,
+): OperationPath {
+  return create(OperationPathSchema, {
+    segments: [
+      ...path.segments,
+      create(OperationPathSegmentSchema, { name, ordinal: BigInt(ordinal) }),
+    ],
+  });
 }
 
 function decodeToolActivityResult(
@@ -1321,6 +1405,17 @@ export class SecureToolWrapper {
     }
   }
 
+  /**
+   * Run one tool call as durable activities.
+   *
+   * An ordinary tool is one activity. An OAuth tool (one with a provider)
+   * records a typed outcome: when OE asks for consent, the activity records
+   * the challenge, a separate `oauth.authorization` activity waits for the
+   * answer, and the call runs again under a child position derived from the
+   * call's own. A second challenge after the answer fails the call. The
+   * consent answer only wakes the call: it never becomes the tool's result or
+   * Memory content.
+   */
   private async executeToolDurably(
     toolName: string,
     args: Record<string, unknown>,
@@ -1328,6 +1423,7 @@ export class SecureToolWrapper {
     options: ExecuteToolOptions,
   ): Promise<unknown> {
     const { toolCallId, rawOnInterrupt = false } = options;
+    const oauth = Boolean(options.provider);
     // A recorded tool replays without running its body, so an operation inside
     // the body would never be observed again and OE would refuse the replay.
     // It stays exclusive, which rejects it while the enclosing tool is running.
@@ -1339,63 +1435,203 @@ export class SecureToolWrapper {
     const activityKey = toolCallId ? toolActivityKey(toolCallId) : undefined;
     // A tool its model requested may run in another LangGraph Send task; it
     // still takes the position the model preallocated for its call id.
-    const { operationPath, activityOrdinal } = owningToolCallId
+    const position = owningToolCallId
       ? allocateToolEffectPosition(owningToolCallId)
       : allocateActivityPosition(activityKey);
-    try {
-      const result = await runSerialActivity({
-        client: new WorkflowClient(this.oeUrl),
-        kind: ActivityKind.TOOL,
-        name: toolName,
-        activityOrdinal,
-        operationPath,
-        semanticInput: buildToolActivityInput(args, options),
-        execute: (context) =>
-          durableToolBody.run(true, () =>
-            this.executeToolActivity(
-              toolName,
-              args,
-              step,
-              options,
-              context.activityId,
+    let { operationPath, activityOrdinal } = position;
+    let phaseStep = step;
+    for (const continuation of [false, true]) {
+      const currentStep = phaseStep;
+      let result: unknown;
+      try {
+        result = await runSerialActivity({
+          client: new WorkflowClient(this.oeUrl),
+          kind: ActivityKind.TOOL,
+          name: toolName,
+          activityOrdinal,
+          operationPath,
+          semanticInput: buildToolActivityInput(args, options),
+          execute: (context) =>
+            durableToolBody.run(true, () =>
+              this.executeToolActivity(
+                toolName,
+                args,
+                currentStep,
+                options,
+                context.activityId,
+                continuation,
+              ),
             ),
-          ),
-        onActivityResolved:
-          durableMemory === null
-            ? undefined
-            : (client, context, value) =>
-                durableMemory.synchronizeTool(
-                  client as WorkflowClient,
-                  context,
-                  value,
-                  getCurrentUserId(),
-                  toolCallId,
-                  toolName,
-                ),
-        exclusive: activityKey === undefined && !owningToolCallId,
-        onUnknownOutcome: options.onUnknownOutcome,
-      });
-      return decodeToolActivityResult(result, rawOnInterrupt);
-    } catch (error) {
-      if (error instanceof DurableActivityDeniedError) {
-        if (error.cause instanceof PolicyDeniedException) throw error.cause;
-        throw new PolicyDeniedException(error.message, null, {
-          cause: error,
+          onActivityResolved:
+            durableMemory === null
+              ? undefined
+              : (client, context, value) => {
+                  let toolResult = value;
+                  if (oauth) {
+                    const recorded = parseOAuthOutcome(value);
+                    if (recorded.kind === "authorization_required") {
+                      // A challenge adds nothing to the conversation.
+                      return durableMemory.acknowledge(
+                        client as WorkflowClient,
+                        context,
+                      );
+                    }
+                    toolResult = recorded.result;
+                  }
+                  return durableMemory.synchronizeTool(
+                    client as WorkflowClient,
+                    context,
+                    toolResult,
+                    getCurrentUserId(),
+                    toolCallId,
+                    toolName,
+                  );
+                },
+          exclusive: activityKey === undefined && !owningToolCallId,
+          onUnknownOutcome: options.onUnknownOutcome,
         });
+      } catch (error) {
+        if (error instanceof DurableActivityDeniedError) {
+          if (error.cause instanceof PolicyDeniedException) throw error.cause;
+          throw new PolicyDeniedException(error.message, null, {
+            cause: error,
+          });
+        }
+        if (error instanceof ReplayedActivityFailedError) {
+          throw decodeDurableToolFailure(error.message, error);
+        }
+        if (error instanceof DurableToolActivityFailedError) {
+          throw decodeDurableToolFailure(error.message, error);
+        }
+        if (error instanceof WorkflowClientError) {
+          // OE's workflow API failed around the call, possibly after the tool
+          // ran, e.g. while recording its outcome.
+          throw new ToolPlatformError(error.message, { cause: error });
+        }
+        throw error;
       }
-      if (error instanceof ReplayedActivityFailedError) {
-        throw decodeDurableToolFailure(error.message, error);
+      if (!oauth) return decodeToolActivityResult(result, rawOnInterrupt);
+      const recorded = parseOAuthOutcome(result);
+      if (recorded.kind === "result") {
+        return decodeToolActivityResult(recorded.result, rawOnInterrupt);
       }
-      if (error instanceof DurableToolActivityFailedError) {
-        throw decodeDurableToolFailure(error.message, error);
-      }
+      if (continuation) throw new ToolExecutionError(OAUTH_STILL_REQUIRED);
+      this.observeOperationalStep(recorded.step);
+      await this.awaitOAuthAuthorization(
+        recorded,
+        operationPath,
+        activityOrdinal,
+        options.isFrameworkControlFlow,
+      );
+      // The resource phase takes a child of the call's own position. A shared
+      // next ordinal would let sibling calls that pass consent in another
+      // order on a later attempt swap their recorded results.
+      operationPath = childOperationPath(
+        operationPath,
+        "oauth:resource",
+        activityOrdinal,
+      );
+      activityOrdinal = 1;
+      phaseStep = this.nextOperationalStep();
+    }
+    throw new ToolExecutionError(OAUTH_STILL_REQUIRED);
+  }
+
+  /**
+   * Wait for the answer to one recorded consent challenge.
+   *
+   * The wait is its own `oauth.authorization` activity under the call's
+   * position. It pauses the graph through the framework's suspend handler;
+   * the session settles it with OE, which owns the answer. Once this attempt
+   * has settled the wait, the call continues without pausing again. A wait OE
+   * already answered in an earlier attempt still pauses once per attempt, so
+   * the session reproduces the same suspension frontier before continuing.
+   */
+  private async awaitOAuthAuthorization(
+    challenge: OAuthChallenge,
+    toolPath: OperationPath,
+    activityOrdinal: number,
+    isFrameworkControlFlow: ((error: unknown) => boolean) | undefined,
+  ): Promise<void> {
+    const interrupt = getSuspendHandler();
+    if (interrupt == null) {
+      throw new ToolExecutionError(
+        "No suspend handler registered for OAuth authorization",
+      );
+    }
+    const value = {
+      suspend_reason: "authorization_required",
+      suspend_context: challenge.elicitation,
+      oauth_authorization_wait: challenge.activity_id,
+    };
+    const attempt = currentAttemptContext();
+    if (attempt === null) {
+      throw new ToolPlatformError(
+        "OAuth authorization requires a durable attempt",
+      );
+    }
+    const command = buildActivityCommand({
+      attempt,
+      kind: ActivityKind.TOOL,
+      name: OAUTH_AUTHORIZATION_ACTIVITY_NAME,
+      activityOrdinal: 1,
+      operationPath: childOperationPath(
+        toolPath,
+        "oauth:authorization",
+        activityOrdinal,
+      ),
+      semanticInput: { value },
+    });
+    const position = command.position;
+    if (position === undefined) {
+      throw new ToolPlatformError("OAuth authorization requires a position");
+    }
+    const client = new WorkflowClient(this.oeUrl);
+    let started;
+    try {
+      started = await client.startActivity(command);
+    } catch (error) {
       if (error instanceof WorkflowClientError) {
-        // OE's workflow API failed around the call, possibly after the tool
-        // ran, e.g. while recording its outcome.
         throw new ToolPlatformError(error.message, { cause: error });
       }
       throw error;
     }
+    recordObservedActivity(position);
+    if (
+      started instanceof ActivityReplay &&
+      started.outcome.outcomeKind !== ActivityOutcomeKind.SUSPENDED
+    ) {
+      // Throws for a wait OE recorded as failed or denied.
+      unwrapActivityOutcome(started.outcome);
+      const outcome = started.outcome;
+      try {
+        await this.durableMemory?.acknowledge(
+          client,
+          create(ActivityContextSchema, {
+            workflowIdentity: outcome.workflowIdentity,
+            activityId: outcome.activityId,
+            attemptId: outcome.attemptId,
+            fencingToken: outcome.fencingToken,
+          }),
+        );
+      } catch (error) {
+        if (error instanceof WorkflowClientError) {
+          throw new ToolPlatformError(error.message, { cause: error });
+        }
+        throw error;
+      }
+      if (interruptedActivityAnswered(position)) return;
+    }
+    try {
+      interrupt(value);
+    } catch (control) {
+      if (isFrameworkControlFlow?.(control) === true) {
+        recordInterruptedActivity(command, control);
+      }
+      throw control;
+    }
+    // A suspend handler that returns, as outside a framework pause, only
+    // wakes the call: the credential gate is still asked again.
   }
 
   private async executeToolActivity(
@@ -1404,6 +1640,7 @@ export class SecureToolWrapper {
     step: number,
     options: ExecuteToolOptions,
     activityId: string,
+    oauthContinuation: boolean,
   ): Promise<unknown> {
     try {
       if (
@@ -1438,8 +1675,25 @@ export class SecureToolWrapper {
         { ...options, rawOnInterrupt: true },
         "reject",
       );
-      return encodeToolActivityResult(result);
+      const encoded = encodeToolActivityResult(result);
+      return options.provider ? { kind: "result", result: encoded } : encoded;
     } catch (error) {
+      if (error instanceof OAuthAuthorizationRequired) {
+        if (oauthContinuation) {
+          throw new DurableToolActivityFailedError(
+            encodeDurableToolFailure(
+              new ToolExecutionError(OAUTH_STILL_REQUIRED),
+            ),
+            { cause: error },
+          );
+        }
+        return {
+          kind: "authorization_required",
+          elicitation: error.elicitation,
+          activity_id: activityId,
+          step: error.step,
+        };
+      }
       if (error instanceof PolicyDeniedException) {
         throw new DurableActivityDeniedError(error.reason, { cause: error });
       }
@@ -1530,9 +1784,16 @@ export class SecureToolWrapper {
     );
     if (response.elicitation) {
       if (interruptMode === "reject") {
-        throw new ToolPlatformError(
-          "durable Tool activities support terminal outcomes only; " +
-            "the framework adapter must own authorization interrupts",
+        if (!provider) {
+          throw new ToolPlatformError(
+            "durable Tool activities support terminal outcomes only; " +
+              "the framework adapter must own authorization interrupts",
+          );
+        }
+        // A durable activity records the challenge; its caller waits.
+        throw new OAuthAuthorizationRequired(
+          response.elicitation,
+          Math.max(step, response.latest_step_number ?? step),
         );
       }
       const interrupt = getSuspendHandler();

@@ -169,6 +169,7 @@ class MemoryCrudClient(Protocol):
         agent_id: str | None = None,
         metadata: dict[str, Any] | None = None,
         upsert: bool = False,
+        idempotency_key: str | None = None,
     ) -> CreateSemanticResult: ...
 
     def get_semantic(

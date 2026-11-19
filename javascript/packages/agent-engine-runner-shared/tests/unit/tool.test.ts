@@ -20,7 +20,14 @@
  */
 
 import Fastify from "fastify";
-import { ROOT_CONTEXT, trace, type Context } from "@opentelemetry/api";
+import {
+  ROOT_CONTEXT,
+  SpanStatusCode,
+  context,
+  trace,
+  type Context,
+} from "@opentelemetry/api";
+import { AsyncLocalStorageContextManager } from "@opentelemetry/context-async-hooks";
 import { W3CTraceContextPropagator } from "@opentelemetry/core";
 import { injectPlatformTraceHeaders } from "../../src/tls_client.js";
 import {
@@ -50,10 +57,12 @@ import {
   LLMRegistryLoadError,
   type ITenantRuntime,
   type ServerToolFn,
+  OpenInferenceSpanKind,
   type ToolPodExecuteRequest,
   type ToolPodExecuteResponse,
 } from "../../src/index.js";
 import { getCurrentSessionId } from "../../src/context.js";
+import { streamWithInboundTraceContext } from "../../src/server/inbound_trace_span.js";
 import { RuntimeAgentConfig } from "../../src/agent_config.js";
 import type * as McpToolsModule from "../../src/mcp_tools.js";
 import type * as LauncherModule from "../../src/launcher.js";
@@ -1512,6 +1521,7 @@ describe("ToolServer POST /guardrails/check trace span", () => {
   const TRACEPARENT = `00-${CALLER_TRACE_ID}-b7ad6b7169203331-01`;
   let exporter: InMemorySpanExporter;
   let provider: BasicTracerProvider;
+  let contextManager: AsyncLocalStorageContextManager;
 
   beforeEach(() => {
     exporter = new InMemorySpanExporter();
@@ -1519,11 +1529,16 @@ describe("ToolServer POST /guardrails/check trace span", () => {
       spanProcessors: [new SimpleSpanProcessor(exporter)],
     });
     trace.setGlobalTracerProvider(provider);
+    // Real context manager, matching setupTracing: `startActiveSpan` nests.
+    contextManager = new AsyncLocalStorageContextManager();
+    contextManager.enable();
+    context.setGlobalContextManager(contextManager);
   });
 
   afterEach(async () => {
     await provider.shutdown();
     trace.disable();
+    context.disable();
   });
 
   function guardrailSpan() {
@@ -1688,23 +1703,386 @@ describe("ToolServer POST /guardrails/check trace span", () => {
     expect(input.text).toBe("Acme is mentioned here.");
   });
 
-  // The unit context manager is a no-op, so build the active context explicitly.
-  // Production propagation reads the same context fetchPlatform passes in.
+  // Production propagation reads the context `startActiveSpan` makes current.
   function headersFromNestedSpan(parent: Context): Record<string, string> {
     const tracer = provider.getTracer("test");
-    const root = tracer.startSpan("aer.execute", {}, parent);
-    const rootContext = trace.setSpan(parent, root);
-    const child = tracer.startSpan("llm.call", {}, rootContext);
-    const childContext = trace.setSpan(rootContext, child);
-    const headers: Record<string, string> = {};
-    try {
-      injectPlatformTraceHeaders(headers, childContext);
-    } finally {
-      child.end();
-      root.end();
-    }
-    return headers;
+    return context.with(parent, () =>
+      tracer.startActiveSpan("aer.execute", (root) =>
+        tracer.startActiveSpan("llm.call", (child) => {
+          const headers: Record<string, string> = {};
+          try {
+            injectPlatformTraceHeaders(headers);
+          } finally {
+            child.end();
+            root.end();
+          }
+          return headers;
+        }),
+      ),
+    );
   }
+});
+
+describe("ToolServer inbound trace context", () => {
+  const CALLER_TRACE_ID = "0af7651916cd43dd8448eb211c80319c";
+  const INBOUND_SPAN_ID = "b7ad6b7169203331";
+  const TRACEPARENT = `00-${CALLER_TRACE_ID}-${INBOUND_SPAN_ID}-01`;
+  let exporter: InMemorySpanExporter;
+  let provider: BasicTracerProvider;
+  let contextManager: AsyncLocalStorageContextManager;
+
+  beforeEach(() => {
+    resetHooks();
+    exporter = new InMemorySpanExporter();
+    provider = new BasicTracerProvider({
+      spanProcessors: [new SimpleSpanProcessor(exporter)],
+    });
+    trace.setGlobalTracerProvider(provider);
+    // Real context manager, matching setupTracing: `startActiveSpan` nests.
+    contextManager = new AsyncLocalStorageContextManager();
+    contextManager.enable();
+    context.setGlobalContextManager(contextManager);
+  });
+
+  afterEach(async () => {
+    await provider.shutdown();
+    trace.disable();
+    context.disable();
+    resetHooks();
+  });
+
+  function spanNamed(name: string) {
+    const span = exporter
+      .getFinishedSpans()
+      .find((candidate) => candidate.name === name);
+    if (!span) throw new Error(`no ${name} span was exported`);
+    return span;
+  }
+
+  /** A nested span created while work runs; it must parent under the boundary. */
+  function nestChildSpan(name: string): void {
+    trace.getTracer("test").startActiveSpan(name, (child) => child.end());
+  }
+
+  function executeBody(toolName: string) {
+    return {
+      execution_id: "exec-1",
+      tool_name: toolName,
+      arguments: {},
+      session_id: "session-1",
+      metadata: {},
+    };
+  }
+
+  function llmBody() {
+    return {
+      execution_id: "exec-1",
+      arguments: {
+        model: "test-model",
+        llm_id: "primary",
+        messages: [{ role: "user", content: "Hi" }],
+      },
+    };
+  }
+
+  /** Register a named LLM whose adapter emits `childSpanName` per call. */
+  function registerStreamingLlm(childSpanName: string): void {
+    entrypointScope(() => registerLlm("primary", { name: "mock-llm" }));
+    registerLLMAdapterFactory(
+      () =>
+        ({
+          stream: async function* () {
+            nestChildSpan(childSpanName);
+            yield { content: "hi" };
+          },
+        }) as never,
+    );
+  }
+
+  /** Register a named LLM whose adapter fails mid-stream. */
+  function registerFailingLlm(): void {
+    entrypointScope(() => registerLlm("primary", { name: "mock-llm" }));
+    registerLLMAdapterFactory(
+      () =>
+        ({
+          stream: async function* () {
+            // Yield once before failing so the failure is not treated as a
+            // pre-stream transient worth retrying — the retry path would
+            // otherwise swallow it and the test would time out.
+            yield { content: "partial" };
+            throw new Error("provider exploded");
+          },
+        }) as never,
+    );
+  }
+
+  test("POST /execute joins the inbound trace and nests the tool's spans", async () => {
+    const runtime = makeMockRuntime();
+    runtime.tools = {
+      traced_tool: () => {
+        nestChildSpan("tool.child");
+        return { ok: true };
+      },
+    };
+    runtime.toolDefinitions = { traced_tool: {} };
+    const app = Fastify();
+    makeServer(runtime).registerRoutes(app);
+
+    const res = await app.inject({
+      method: "POST",
+      url: "/execute",
+      headers: { traceparent: TRACEPARENT },
+      payload: executeBody("traced_tool"),
+    });
+    await app.close();
+
+    expect(res.statusCode).toBe(200);
+    const boundary = spanNamed("tool.execute");
+    expect(boundary.spanContext().traceId).toBe(CALLER_TRACE_ID);
+    expect(boundary.parentSpanContext?.spanId).toBe(INBOUND_SPAN_ID);
+    expect(boundary.attributes["openinference.span.kind"]).toBe("TOOL");
+    // The boundary opens before the execution context exists, so identity is
+    // carried on the spec: without it the boundary is dropped from
+    // session/execution-scoped trace views while its children still appear.
+    expect(boundary.attributes["execution.id"]).toBe("exec-1");
+    expect(boundary.attributes["session.id"]).toBe("session-1");
+    expect(boundary.attributes["thread.id"]).toBe("session-1");
+    const child = spanNamed("tool.child");
+    expect(child.spanContext().traceId).toBe(CALLER_TRACE_ID);
+    expect(child.parentSpanContext?.spanId).toBe(boundary.spanContext().spanId);
+  });
+
+  test("POST /invoke_llm joins the inbound trace and nests provider spans", async () => {
+    registerStreamingLlm("llm.provider");
+    const app = Fastify();
+    makeServer(makeMockRuntime()).registerRoutes(app);
+
+    const res = await app.inject({
+      method: "POST",
+      url: "/invoke_llm",
+      headers: { traceparent: TRACEPARENT },
+      payload: llmBody(),
+    });
+    await app.close();
+
+    expect(res.statusCode).toBe(200);
+    const boundary = spanNamed("tool.invoke_llm");
+    expect(boundary.spanContext().traceId).toBe(CALLER_TRACE_ID);
+    expect(boundary.parentSpanContext?.spanId).toBe(INBOUND_SPAN_ID);
+    expect(boundary.attributes["openinference.span.kind"]).toBe("CHAIN");
+    expect(boundary.attributes["execution.id"]).toBe("exec-1");
+    const providerSpan = spanNamed("llm.provider");
+    expect(providerSpan.spanContext().traceId).toBe(CALLER_TRACE_ID);
+    expect(providerSpan.parentSpanContext?.spanId).toBe(
+      boundary.spanContext().spanId,
+    );
+  });
+
+  test("POST /invoke_llm/stream joins the inbound trace across the streamed body", async () => {
+    registerStreamingLlm("llm.provider.stream");
+    const app = Fastify();
+    makeServer(makeMockRuntime()).registerRoutes(app);
+
+    const res = await app.inject({
+      method: "POST",
+      url: "/invoke_llm/stream",
+      headers: { traceparent: TRACEPARENT },
+      payload: llmBody(),
+    });
+    await app.close();
+
+    expect(res.statusCode).toBe(200);
+    const boundary = spanNamed("tool.invoke_llm.stream");
+    expect(boundary.spanContext().traceId).toBe(CALLER_TRACE_ID);
+    expect(boundary.parentSpanContext?.spanId).toBe(INBOUND_SPAN_ID);
+    expect(boundary.attributes["openinference.span.kind"]).toBe("CHAIN");
+    expect(boundary.attributes["execution.id"]).toBe("exec-1");
+    const providerSpan = spanNamed("llm.provider.stream");
+    expect(providerSpan.spanContext().traceId).toBe(CALLER_TRACE_ID);
+    expect(providerSpan.parentSpanContext?.spanId).toBe(
+      boundary.spanContext().spanId,
+    );
+  });
+
+  test("POST /execute marks the boundary ERROR when the handler encodes a failure", async () => {
+    // The handler catches the tool's throw and returns an `error` status
+    // rather than rethrowing, so the boundary must be marked from the outcome
+    // or a failed call renders as OK.
+    const runtime = makeMockRuntime();
+    runtime.tools = {
+      bad_tool: () => {
+        throw new Error("tool exploded");
+      },
+    };
+    runtime.toolDefinitions = { bad_tool: {} };
+    const app = Fastify();
+    makeServer(runtime).registerRoutes(app);
+
+    const res = await app.inject({
+      method: "POST",
+      url: "/execute",
+      headers: { traceparent: TRACEPARENT },
+      payload: executeBody("bad_tool"),
+    });
+    await app.close();
+
+    expect(res.statusCode).toBe(200);
+    expect(res.json().status).toBe("error");
+    const boundary = spanNamed("tool.execute");
+    expect(boundary.spanContext().traceId).toBe(CALLER_TRACE_ID);
+    expect(boundary.status.code).toBe(SpanStatusCode.ERROR);
+  });
+
+  test("POST /invoke_llm marks the boundary ERROR when the provider fails", async () => {
+    registerFailingLlm();
+    const app = Fastify();
+    makeServer(makeMockRuntime()).registerRoutes(app);
+
+    const res = await app.inject({
+      method: "POST",
+      url: "/invoke_llm",
+      headers: { traceparent: TRACEPARENT },
+      payload: llmBody(),
+    });
+    await app.close();
+
+    expect(res.statusCode).toBe(200);
+    expect(res.json().status).toBe("error");
+    const boundary = spanNamed("tool.invoke_llm");
+    expect(boundary.spanContext().traceId).toBe(CALLER_TRACE_ID);
+    expect(boundary.status.code).toBe(SpanStatusCode.ERROR);
+  });
+
+  test("POST /invoke_llm/stream marks the boundary ERROR on an error frame", async () => {
+    // A mid-stream provider failure is delivered as an SSE error frame, never
+    // thrown past the boundary, so the wrapper cannot see it — the handler must
+    // mark the span it was handed.
+    registerFailingLlm();
+    const app = Fastify();
+    makeServer(makeMockRuntime()).registerRoutes(app);
+
+    const res = await app.inject({
+      method: "POST",
+      url: "/invoke_llm/stream",
+      headers: { traceparent: TRACEPARENT },
+      payload: llmBody(),
+    });
+    await app.close();
+
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toContain('"error"');
+    const boundary = spanNamed("tool.invoke_llm.stream");
+    expect(boundary.spanContext().traceId).toBe(CALLER_TRACE_ID);
+    expect(boundary.status.code).toBe(SpanStatusCode.ERROR);
+  });
+
+  test("no traceparent roots a fresh boundary span per call", async () => {
+    const runtime = makeMockRuntime();
+    runtime.tools = { plain_tool: () => "ok" };
+    runtime.toolDefinitions = { plain_tool: {} };
+    const app = Fastify();
+    makeServer(runtime).registerRoutes(app);
+
+    await app.inject({
+      method: "POST",
+      url: "/execute",
+      payload: executeBody("plain_tool"),
+    });
+    await app.close();
+
+    const boundary = spanNamed("tool.execute");
+    expect(boundary.parentSpanContext).toBeUndefined();
+    expect(boundary.spanContext().traceId).toMatch(/^[0-9a-f]{32}$/);
+  });
+
+  test("streaming source cleanup stays in the boundary trace on early cancel", async () => {
+    // A consumer that disconnects mid-stream triggers the source's finally
+    // blocks. Spans the source emits while unwinding must still join the
+    // invocation, not root a disconnected trace.
+    let cleanupRan = false;
+    async function* source(): AsyncGenerator<string> {
+      try {
+        yield "first";
+        yield "second";
+      } finally {
+        // An async step before the cleanup span, as a real adapter's unwind has.
+        await Promise.resolve();
+        nestChildSpan("stream.cleanup");
+        cleanupRan = true;
+      }
+    }
+
+    const wrapped = streamWithInboundTraceContext(
+      {
+        name: "tool.invoke_llm.stream",
+        kind: OpenInferenceSpanKind.CHAIN,
+        tracerName: "agent-engine-runner-shared.tool",
+      },
+      { traceparent: TRACEPARENT },
+      () => source(),
+    );
+
+    const chunks: string[] = [];
+    for await (const chunk of wrapped) {
+      chunks.push(chunk);
+      break; // consumer disconnects after the first chunk
+    }
+
+    expect(chunks).toEqual(["first"]);
+    expect(cleanupRan).toBe(true);
+    const boundary = spanNamed("tool.invoke_llm.stream");
+    expect(boundary.spanContext().traceId).toBe(CALLER_TRACE_ID);
+    const cleanup = spanNamed("stream.cleanup");
+    expect(cleanup.spanContext().traceId).toBe(CALLER_TRACE_ID);
+    expect(cleanup.parentSpanContext?.spanId).toBe(
+      boundary.spanContext().spanId,
+    );
+  });
+
+  test("a source that throws after yielding records ERROR and still nests unwind spans", async () => {
+    // The LLM adapter erroring mid-stream: the source yields a chunk, then
+    // throws. The boundary must surface the failure (reject the consumer and
+    // end the span with ERROR) while a span the source emits as it unwinds
+    // still nests under the boundary rather than rooting a disconnected trace.
+    async function* source(): AsyncGenerator<string> {
+      try {
+        yield "first";
+        throw new Error("llm adapter failed mid-stream");
+      } finally {
+        await Promise.resolve();
+        nestChildSpan("stream.unwind");
+      }
+    }
+
+    const wrapped = streamWithInboundTraceContext(
+      {
+        name: "tool.invoke_llm.stream",
+        kind: OpenInferenceSpanKind.CHAIN,
+        tracerName: "agent-engine-runner-shared.tool",
+      },
+      { traceparent: TRACEPARENT },
+      () => source(),
+    );
+
+    const chunks: string[] = [];
+    await expect(
+      (async () => {
+        for await (const chunk of wrapped) {
+          chunks.push(chunk);
+        }
+      })(),
+    ).rejects.toThrow("llm adapter failed mid-stream");
+
+    expect(chunks).toEqual(["first"]);
+    const boundary = spanNamed("tool.invoke_llm.stream");
+    expect(boundary.spanContext().traceId).toBe(CALLER_TRACE_ID);
+    expect(boundary.status.code).toBe(SpanStatusCode.ERROR);
+    const unwind = spanNamed("stream.unwind");
+    expect(unwind.spanContext().traceId).toBe(CALLER_TRACE_ID);
+    expect(unwind.parentSpanContext?.spanId).toBe(
+      boundary.spanContext().spanId,
+    );
+  });
 });
 
 function traceIdFrom(traceparent: string | undefined): string {

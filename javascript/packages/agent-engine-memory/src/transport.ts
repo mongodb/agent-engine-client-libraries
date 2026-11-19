@@ -136,6 +136,7 @@ export interface MemoryCrudClient {
     agentId?: string | null;
     metadata?: Record<string, unknown> | null;
     upsert?: boolean;
+    idempotencyKey?: string | null;
   }): Promise<CreateSemanticResult>;
 
   getSemantic(args: {

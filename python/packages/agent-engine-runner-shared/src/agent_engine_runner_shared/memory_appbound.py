@@ -430,10 +430,10 @@ class AppBoundCrudClient:
     """``MemoryCrudClient`` over a ``TenantRuntime``, mapping its CRUD returns
     into the typed ``Create*Result`` models.
 
-    ``has_embedding`` is reported ``False`` for ops where TenantRuntime surfaces
-    no embedding status (it returns only ``bool`` / doc-id), and ``id`` defaults
-    to the empty string where TenantRuntime gives no document id — these are the
-    honest mappings of the platform backend's coarser return shapes.
+    ``has_embedding`` is reported ``False`` where TenantRuntime surfaces no
+    embedding status. Semantic writes preserve the operation reference returned
+    by the service.
+    Other writes use the runtime's document ID or boolean acknowledgement.
     """
 
     def __init__(self, runtime: TenantRuntime) -> None:
@@ -450,8 +450,9 @@ class AppBoundCrudClient:
         agent_id: str | None = None,
         metadata: dict[str, Any] | None = None,
         upsert: bool = False,
+        idempotency_key: str | None = None,
     ) -> CreateSemanticResult:
-        saved = self._runtime.save_semantic(
+        return self._runtime.create_semantic(
             text=text,
             label=label,
             user_id=user_id,
@@ -460,12 +461,7 @@ class AppBoundCrudClient:
             metadata=metadata,
             upsert=upsert,
             agent_id=agent_id,
-        )
-        return CreateSemanticResult(
-            id="",
-            label=label,
-            has_embedding=False,
-            acknowledged=saved,
+            idempotency_key=idempotency_key,
         )
 
     def get_semantic(

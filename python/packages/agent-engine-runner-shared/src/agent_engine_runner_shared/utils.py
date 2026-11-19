@@ -290,6 +290,8 @@ _PLATFORM_ENV_VARS: frozenset[str] = frozenset(
         "USE_MEMORY_CLIENT",
         "AGENT_STREAM_TERMINAL_DRAIN_TIMEOUT",
         "SHUTDOWN_GRACE_PERIOD_MS",
+        # Runner-owned directory for stream journal bodies.
+        "AGENTENGINE_STREAM_JOURNAL_DIR",
         # Runner launcher entrypoint baked into the Dockerfile ENV by ECP
         "AGENT_ENTRYPOINT",
         # Platform persistence

@@ -145,6 +145,79 @@ def is_retryable_callback_error(exc: BaseException) -> bool:
     )
 
 
+class RetryBudgetExhausted(Exception):
+    """Raised when a deadline-bounded retry loop runs out of budget.
+
+    The caller must treat the payload as not delivered: the loop stopped
+    retrying before any attempt succeeded.
+    """
+
+
+async def post_json_with_retries_until(
+    client: httpx.AsyncClient,
+    url: str,
+    payload: Dict[str, Any],
+    *,
+    deadline: float,
+    base_delay: float = DEFAULT_BASE_DELAY_S,
+    max_delay: float,
+    owner_url: Optional[str] = None,
+    on_owner_failure: Optional[Callable[[], None]] = None,
+    is_retryable: Optional[Callable[[BaseException], bool]] = None,
+) -> None:
+    """POST ``payload`` to ``url``, retrying retryable failures until ``deadline``.
+
+    Same owner-first policy and retry classification as
+    :func:`post_json_with_retries` — the difference is the budget: instead of a
+    bounded attempt count, retryable failures are retried until the monotonic
+    ``deadline`` passes, so a caller whose payload must not be dropped (the
+    ordered durable chunk stream) can ride out a long outage. A 4xx response is
+    never retried (a caller bug, not a transient condition). Raises the last
+    retryable failure, or :class:`RetryBudgetExhausted` when the deadline
+    passed before an attempt succeeded.
+    """
+    if owner_url is not None:
+        if await _owner_delivered(client, owner_url, url, payload):
+            return
+        if on_owner_failure is not None:
+            on_owner_failure()
+
+    retryable_error = is_retryable or _is_default_retryable_http_error
+    backoff_s = base_delay
+    last_exc: Optional[BaseException] = None
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RetryBudgetExhausted(
+                f"retry budget exhausted before {url} acknowledged the payload"
+            ) from last_exc
+        retry_after_s: Optional[float] = None
+        try:
+            response = await _post_without_reading_response_body(client, url, payload)
+            response.raise_for_status()
+            return
+        except httpx.HTTPError as e:
+            if not retryable_error(e):
+                raise
+            last_exc = e
+            if isinstance(e, httpx.HTTPStatusError) and e.response.status_code == 503:
+                retry_after_s = parse_retry_after_seconds(e.response.headers.get("Retry-After"))
+        # Doubling a running cap (rather than ``base * 2**attempt``) keeps the
+        # exponent from overflowing on a long outage. An honored Retry-After is
+        # capped like the bounded helper's (and the TypeScript twin's): a
+        # cooperative 503 hint is worth a short pause, never the whole turn
+        # budget without another attempt.
+        wait_s = (
+            min(retry_after_s, RETRY_AFTER_MAX_WAIT_S) if retry_after_s is not None else backoff_s
+        )
+        backoff_s = min(backoff_s * 2, max_delay)
+        # Never sleep past the deadline: the loop re-checks it on wake and
+        # raises instead of overshooting the caller's budget.
+        wait_s = min(wait_s, max(0.0, deadline - time.monotonic()))
+        if wait_s > 0:
+            await asyncio.sleep(wait_s)
+
+
 async def post_json_with_retries(
     client: httpx.AsyncClient,
     url: str,

@@ -62,6 +62,7 @@ interface AerServerPrivates {
   reportCallback: ReturnType<typeof vi.fn>;
   doHandleExecute: (request: ExecuteRequest) => Promise<unknown>;
   chunkSeq: Map<string, number>;
+  durableAckSenders: Map<string, unknown>;
 }
 
 interface QueryServerPrivates {
@@ -89,6 +90,7 @@ function makeAerServer(agent: LangGraphBaseAgent): AerServerPrivates {
   server.sendStreamChunk = vi.fn().mockResolvedValue(undefined);
   server.reportCallback = vi.fn().mockResolvedValue(undefined);
   server.chunkSeq = new Map();
+  server.durableAckSenders = new Map();
   return server;
 }
 
@@ -202,6 +204,8 @@ describe.skipIf(TEST_MONGO_URI === "")(
           resume: false,
           previous_execution_cancelled: false,
           durable_ack_enabled: false,
+          stream_journal_enabled: false,
+          stream_generation: 0,
           session_id: sessionId,
           user_id: "user-custom",
           workspace_id: "workspace-custom",
@@ -223,6 +227,8 @@ describe.skipIf(TEST_MONGO_URI === "")(
           resume: true,
           previous_execution_cancelled: false,
           durable_ack_enabled: false,
+          stream_journal_enabled: false,
+          stream_generation: 0,
           resume_data: { decision: "approve" },
           metadata,
           session_id: sessionId,
@@ -264,6 +270,8 @@ describe.skipIf(TEST_MONGO_URI === "")(
           resume: false,
           previous_execution_cancelled: false,
           durable_ack_enabled: false,
+          stream_journal_enabled: false,
+          stream_generation: 0,
           session_id: sessionId,
           user_id: "user-default",
           workspace_id: workspaceId,
@@ -291,6 +299,8 @@ describe.skipIf(TEST_MONGO_URI === "")(
           resume: true,
           previous_execution_cancelled: false,
           durable_ack_enabled: false,
+          stream_journal_enabled: false,
+          stream_generation: 0,
           resume_data: { decision: "approve" },
           metadata,
           session_id: sessionId,

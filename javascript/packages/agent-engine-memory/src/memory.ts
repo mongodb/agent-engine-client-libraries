@@ -10,7 +10,11 @@
 
 import { randomUUID } from "node:crypto";
 
-import { MemoryIdentityError, MemoryNotSupportedError } from "./errors.js";
+import {
+  MemoryIdentityError,
+  MemoryNotSupportedError,
+  MemoryServerError,
+} from "./errors.js";
 import { MemoryClientAdapter } from "./http/client_adapter.js";
 import { resolveIdentity, type ResolvedIdentity } from "./identity.js";
 import {
@@ -82,6 +86,18 @@ const DEFAULT_SEARCH_SOURCES: readonly SearchSource[] = [
 ];
 
 /** Resolve requested sources to a deduped, order-preserving list. */
+const RETRYABLE_SERVER_STATUSES = new Set([502, 503, 504]);
+
+function isSourceLocalFault(err: MemoryServerError): boolean {
+  const status = err.status;
+  return (
+    status !== null &&
+    status >= 500 &&
+    status < 600 &&
+    !RETRYABLE_SERVER_STATUSES.has(status)
+  );
+}
+
 function normalizeSources(
   sources:
     | SearchSource
@@ -379,6 +395,7 @@ export class Memory {
     metadata?: Record<string, unknown> | null;
     upsert?: boolean;
     agentId?: string | null;
+    idempotencyKey?: string | null;
   }): Promise<CreateSemanticResult> {
     const resolved = this.resolve({
       userId: args.userId,
@@ -394,6 +411,7 @@ export class Memory {
       visibility: args.visibility ?? "private",
       metadata: args.metadata,
       upsert: args.upsert ?? true,
+      idempotencyKey: args.idempotencyKey,
     });
   }
 
@@ -791,7 +809,19 @@ export class Memory {
   // Unified search
   // ==========================================================================
 
-  /** Search one or more memory sources and return a single ranked list. */
+  /**
+   * Search one or more memory sources and return a single ranked list.
+   *
+   * When several sources are requested and one of them fails with a
+   * non-retryable server error (HTTP 500, 501 or 505 to 599), the other
+   * sources' results are still returned and a `MemorySearchWarning` naming the
+   * failed source is emitted with `process.emitWarning`. A retryable 502, 503
+   * or 504, a malformed response body, every other error, and a server error
+   * on every requested source still throw.
+   *
+   * @throws MemoryServerError If every requested source fails on the server,
+   * or any source returns a retryable or malformed response.
+   */
   async search(args: {
     query: string;
     sources?:
@@ -821,38 +851,31 @@ export class Memory {
     const userId = resolved.userId;
     const sessionId = resolved.sessionId;
 
-    const chunks: MemoryChunk[] = [];
-    for (const source of normalizeSources(args.sources)) {
-      if (source === SearchSource.SEMANTIC) {
-        chunks.push(
-          ...(await this.runtime.searchSemantic({
-            query: args.query,
-            userId,
-            visibility: args.visibility,
-            topK,
-          })),
-        );
-      } else if (source === SearchSource.EPISODIC) {
-        chunks.push(
-          ...(await this.runtime.searchEpisodes({
-            query: args.query,
-            userId,
-            visibility: args.visibility,
-            sessionId,
-            topK,
-          })),
-        );
-      } else if (source === SearchSource.TAXONOMIC) {
-        chunks.push(
-          ...(await this.runtime.searchTaxonomic({
-            query: args.query,
-            userId,
-            domain: args.domain,
-            visibility: args.visibility,
-            topK,
-          })),
-        );
-      } else if (source === SearchSource.PROCEDURAL) {
+    const legs: Record<SearchSource, () => Promise<MemoryChunk[]>> = {
+      [SearchSource.SEMANTIC]: () =>
+        this.runtime.searchSemantic({
+          query: args.query,
+          userId,
+          visibility: args.visibility,
+          topK,
+        }),
+      [SearchSource.EPISODIC]: () =>
+        this.runtime.searchEpisodes({
+          query: args.query,
+          userId,
+          visibility: args.visibility,
+          sessionId,
+          topK,
+        }),
+      [SearchSource.TAXONOMIC]: () =>
+        this.runtime.searchTaxonomic({
+          query: args.query,
+          userId,
+          domain: args.domain,
+          visibility: args.visibility,
+          topK,
+        }),
+      [SearchSource.PROCEDURAL]: async () => {
         const procs = await this.runtime.discoverProcedures({
           query: args.query,
           userId,
@@ -862,8 +885,37 @@ export class Memory {
           similarityThreshold: args.similarityThreshold ?? 0.0,
           metadataFilter: args.metadataFilter,
         });
-        chunks.push(...procs.map(procedureToChunk));
+        return procs.map(procedureToChunk);
+      },
+    };
+
+    const requested = normalizeSources(args.sources);
+    const chunks: MemoryChunk[] = [];
+    const failed: Array<[SearchSource, MemoryServerError]> = [];
+    for (const source of requested) {
+      try {
+        chunks.push(...(await legs[source]()));
+      } catch (err) {
+        // Only a non-retryable 5xx is treated as local to one source (for
+        // example one unreadable stored memory), so it does not discard the
+        // others' results. A retryable 502/503/504, a malformed response body
+        // (no status), and every other error still throw.
+        if (!(err instanceof MemoryServerError) || !isSourceLocalFault(err)) {
+          throw err;
+        }
+        failed.push([source, err]);
       }
+    }
+    if (failed.length > 0 && failed.length === requested.length) {
+      throw failed[0][1];
+    }
+    for (const [source, err] of failed) {
+      // Status only: the error message carries server-supplied text, and
+      // emitWarning prints it to the caller's terminal unescaped.
+      process.emitWarning(
+        `Memory.search: ${source} source failed (HTTP ${err.status ?? "unknown"}) and was left out of the results`,
+        "MemorySearchWarning",
+      );
     }
 
     // Sort by similarity_score descending; unscored chunks sort last.

@@ -569,8 +569,10 @@ saveProcedure(args): Promise<{
 saveSemantic(args): Promise<{
   acknowledged: boolean;
   has_embedding: boolean;
-  id: string;
+  id: string | null;
   label: string;
+  operation_id?: string | null;
+  operation_status?: string | null;
 }>;
 ```
 
@@ -578,8 +580,9 @@ saveSemantic(args): Promise<{
 
 | Parameter | Type |
 | :------ | :------ |
-| `args` | \{ `agentId?`: `string` \| `null`; `label`: `string`; `metadata?`: `Record`\<`string`, `unknown`\> \| `null`; `source?`: `string`; `text`: `string`; `upsert?`: `boolean`; `userId?`: `string` \| `null`; `visibility?`: `string`; \} |
+| `args` | \{ `agentId?`: `string` \| `null`; `idempotencyKey?`: `string` \| `null`; `label`: `string`; `metadata?`: `Record`\<`string`, `unknown`\> \| `null`; `source?`: `string`; `text`: `string`; `upsert?`: `boolean`; `userId?`: `string` \| `null`; `visibility?`: `string`; \} |
 | `args.agentId?` | `string` \| `null` |
+| `args.idempotencyKey?` | `string` \| `null` |
 | `args.label` | `string` |
 | `args.metadata?` | `Record`\<`string`, `unknown`\> \| `null` |
 | `args.source?` | `string` |
@@ -593,8 +596,10 @@ saveSemantic(args): Promise<{
 `Promise`\<\{
   `acknowledged`: `boolean`;
   `has_embedding`: `boolean`;
-  `id`: `string`;
+  `id`: `string` \| `null`;
   `label`: `string`;
+  `operation_id?`: `string` \| `null`;
+  `operation_status?`: `string` \| `null`;
 \}\>
 
 <a id="api-savetaxonomic"></a>
@@ -643,6 +648,13 @@ search(args): Promise<object[]>;
 
 Search one or more memory sources and return a single ranked list.
 
+When several sources are requested and one of them fails with a
+non-retryable server error (HTTP 500, 501 or 505 to 599), the other
+sources' results are still returned and a `MemorySearchWarning` naming the
+failed source is emitted with `process.emitWarning`. A retryable 502, 503
+or 504, a malformed response body, every other error, and a server error
+on every requested source still throw.
+
 **Parameters**
 
 | Parameter | Type |
@@ -662,6 +674,11 @@ Search one or more memory sources and return a single ranked list.
 **Returns**
 
 `Promise`\<`object`[]\>
+
+**Throws**
+
+MemoryServerError If every requested source fails on the server,
+or any source returns a retryable or malformed response.
 
 <a id="api-searchepisodes"></a>
 
@@ -1117,8 +1134,10 @@ createProcedural(args): Promise<{
 createSemantic(args): Promise<{
   acknowledged: boolean;
   has_embedding: boolean;
-  id: string;
+  id: string | null;
   label: string;
+  operation_id?: string | null;
+  operation_status?: string | null;
 }>;
 ```
 
@@ -1126,8 +1145,9 @@ createSemantic(args): Promise<{
 
 | Parameter | Type |
 | :------ | :------ |
-| `args` | \{ `agentId?`: `string` \| `null`; `label`: `string`; `metadata?`: `Record`\<`string`, `unknown`\> \| `null`; `source?`: `string`; `text`: `string`; `upsert?`: `boolean`; `userId`: `string`; `visibility?`: `string`; \} |
+| `args` | \{ `agentId?`: `string` \| `null`; `idempotencyKey?`: `string` \| `null`; `label`: `string`; `metadata?`: `Record`\<`string`, `unknown`\> \| `null`; `source?`: `string`; `text`: `string`; `upsert?`: `boolean`; `userId`: `string`; `visibility?`: `string`; \} |
 | `args.agentId?` | `string` \| `null` |
+| `args.idempotencyKey?` | `string` \| `null` |
 | `args.label` | `string` |
 | `args.metadata?` | `Record`\<`string`, `unknown`\> \| `null` |
 | `args.source?` | `string` |
@@ -1141,8 +1161,10 @@ createSemantic(args): Promise<{
 `Promise`\<\{
   `acknowledged`: `boolean`;
   `has_embedding`: `boolean`;
-  `id`: `string`;
+  `id`: `string` \| `null`;
   `label`: `string`;
+  `operation_id?`: `string` \| `null`;
+  `operation_status?`: `string` \| `null`;
 \}\>
 
 **Implementation of**
@@ -2005,8 +2027,10 @@ createProcedural(args): Promise<{
 createSemantic(args): Promise<{
   acknowledged: boolean;
   has_embedding: boolean;
-  id: string;
+  id: string | null;
   label: string;
+  operation_id?: string | null;
+  operation_status?: string | null;
 }>;
 ```
 
@@ -2014,8 +2038,9 @@ createSemantic(args): Promise<{
 
 | Parameter | Type |
 | :------ | :------ |
-| `args` | \{ `agentId?`: `string` \| `null`; `label`: `string`; `metadata?`: `Record`\<`string`, `unknown`\> \| `null`; `source?`: `string`; `text`: `string`; `upsert?`: `boolean`; `userId`: `string`; `visibility?`: `string`; \} |
+| `args` | \{ `agentId?`: `string` \| `null`; `idempotencyKey?`: `string` \| `null`; `label`: `string`; `metadata?`: `Record`\<`string`, `unknown`\> \| `null`; `source?`: `string`; `text`: `string`; `upsert?`: `boolean`; `userId`: `string`; `visibility?`: `string`; \} |
 | `args.agentId?` | `string` \| `null` |
+| `args.idempotencyKey?` | `string` \| `null` |
 | `args.label` | `string` |
 | `args.metadata?` | `Record`\<`string`, `unknown`\> \| `null` |
 | `args.source?` | `string` |
@@ -2029,8 +2054,10 @@ createSemantic(args): Promise<{
 `Promise`\<\{
   `acknowledged`: `boolean`;
   `has_embedding`: `boolean`;
-  `id`: `string`;
+  `id`: `string` \| `null`;
   `label`: `string`;
+  `operation_id?`: `string` \| `null`;
+  `operation_status?`: `string` \| `null`;
 \}\>
 
 <a id="api-createtaxonomic-1"></a>
@@ -2794,8 +2821,10 @@ const CreateProceduralResultSchema: ZodObject<{
 const CreateSemanticResultSchema: ZodObject<{
   acknowledged: ZodDefault<ZodBoolean>;
   has_embedding: ZodBoolean;
-  id: ZodString;
+  id: ZodNullable<ZodString>;
   label: ZodString;
+  operation_id: ZodOptional<ZodNullable<ZodString>>;
+  operation_status: ZodOptional<ZodNullable<ZodString>>;
 }, $strip>;
 ```
 

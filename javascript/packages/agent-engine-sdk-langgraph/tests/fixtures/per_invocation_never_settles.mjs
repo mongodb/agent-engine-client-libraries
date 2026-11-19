@@ -47,6 +47,7 @@ server.runtime = {
 server.chunkSeq = new Map();
 server.ownerCallbackUrl = new Map();
 server.abandonedBuilds = new Map();
+server.durableAckSenders = new Map();
 server.sendStreamChunk = async () => {};
 server.reportCallback = async () => {};
 server.handleExecute = (request) => server.doHandleExecute(request);

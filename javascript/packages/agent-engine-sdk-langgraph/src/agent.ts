@@ -16,7 +16,12 @@ import {
   type BaseMessage,
 } from "@langchain/core/messages";
 import type { RunnableConfig } from "@langchain/core/runnables";
-import { Command, type Interrupt, Overwrite } from "@langchain/langgraph";
+import {
+  Command,
+  DeltaChannel,
+  type Interrupt,
+  Overwrite,
+} from "@langchain/langgraph";
 import type { CompiledStateGraph } from "@langchain/langgraph";
 import { randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
@@ -39,6 +44,7 @@ import {
 } from "@mongodb-js/agent-engine-runner-shared";
 import { commitCancelledTurnCheckpoint } from "./cancelled_turn.js";
 import {
+  CONTINUE_FROM_CHECKPOINT,
   type ExecutionSession,
   type PrepareAgentInput,
   type ResolveThreadId,
@@ -455,12 +461,23 @@ export class LangGraphBaseAgent implements BaseAgent {
       turnMessageId,
       nodeNames: Object.keys(this.compiledGraph.getGraph().nodes),
       resume: ctx.resume === true,
+      deltaChannels: this.deltaChannels(),
     });
     // The synthetic tip IS the just-written checkpoint: read its id back
     // rather than threading it through the commit's message-id return.
     const tip = await saver.getTuple({ configurable: { thread_id: threadId } });
     if (tip === undefined) return null;
     return { thread_id: threadId, checkpoint_id: String(tip.checkpoint.id) };
+  }
+
+  /** The graph's channels that checkpoints store only as deltas. */
+  private deltaChannels(): Record<string, DeltaChannel> {
+    return Object.fromEntries(
+      Object.entries(this.compiledGraph.channels).filter(
+        (entry): entry is [string, DeltaChannel] =>
+          entry[1] instanceof DeltaChannel,
+      ),
+    );
   }
 
   private session(ctx: RequestContext, input: AgentInput): ExecutionSession {
@@ -517,6 +534,10 @@ export class LangGraphBaseAgent implements BaseAgent {
       );
       if (interrupt instanceof Command) {
         nextInput = interrupt;
+        continue;
+      }
+      if (interrupt === CONTINUE_FROM_CHECKPOINT) {
+        nextInput = null;
         continue;
       }
       if (interrupt !== null) return interrupt;
@@ -799,6 +820,10 @@ export class LangGraphBaseAgent implements BaseAgent {
       );
       if (interrupt instanceof Command) {
         nextInput = interrupt;
+        continue;
+      }
+      if (interrupt === CONTINUE_FROM_CHECKPOINT) {
+        nextInput = null;
         continue;
       }
       if (interrupt !== null) {

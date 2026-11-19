@@ -164,7 +164,12 @@ class TestAdvertiseCapabilities:
             "framework",
             "features",
         }
-        assert body["features"] == {"owner_callback_fallback": True}
+        assert body["features"] == {
+            "owner_callback_fallback": True,
+            "durable_ack": True,
+            "stream_journal": True,
+        }
+
         # The agent config object itself is untouched by the injection.
         assert server.runtime.agent_config.features.explicit() == {}
 

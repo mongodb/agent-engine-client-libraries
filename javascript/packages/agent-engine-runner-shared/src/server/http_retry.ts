@@ -44,6 +44,12 @@ export function waitForRetry(
 
 export class RetryablePostError extends Error {}
 
+/**
+ * Raised when a deadline-bounded retry loop runs out of budget before any
+ * attempt succeeded. The caller must treat the payload as not delivered.
+ */
+export class RetryBudgetExhausted extends Error {}
+
 // Ceiling on an honored `Retry-After` wait: a cooperative 503 hint is worth a
 // short pause, but the runner must not park a callback for an OE-chosen
 // duration.
@@ -172,6 +178,7 @@ async function ownerDelivered(
   ownerUrl: string,
   serviceUrl: string,
   serialized: string,
+  cancellationSignal?: AbortSignal,
 ): Promise<boolean> {
   return ownerPreAttemptDelivered(
     ownerUrl,
@@ -179,9 +186,122 @@ async function ownerDelivered(
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: serialized,
-      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      signal: cancellationSignal
+        ? AbortSignal.any([
+            cancellationSignal,
+            AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+          ])
+        : AbortSignal.timeout(REQUEST_TIMEOUT_MS),
       ...getFetchOptionsWithTLS(ownerUrl),
     }),
     (message) => logger.warn(`${message} URL ${serviceUrl}`),
   );
+}
+
+/** Options for {@link postWithRetriesUntil}. */
+export interface PostUntilOptions {
+  /**
+   * Monotonic deadline (`performance.now()` based). Retryable failures are
+   * retried until it passes; a deadline already in the past fails immediately.
+   */
+  deadlineMs: number;
+  maxDelayMs: number;
+  baseDelayMs?: number;
+  ownerUrl?: string | null;
+  onOwnerFailure?: (() => void) | null;
+  /** Aborts an in-flight attempt and the backoff wait (used by sender close). */
+  cancellationSignal?: AbortSignal;
+}
+
+/**
+ * POST to OE, retrying retryable failures until a deadline.
+ *
+ * Mirrors Python's `post_json_with_retries_until`. Same owner-first policy and
+ * retry classification as {@link postWithRetries} — the difference is the
+ * budget: instead of a bounded attempt count, transport failures and 5xx
+ * responses are retried until `deadlineMs` passes, so a caller whose payload
+ * must not be dropped (the ordered durable chunk stream) can ride out a long
+ * outage. A 4xx response fails immediately (a caller bug, not a transient
+ * condition). Throws the last retryable failure, or {@link RetryBudgetExhausted}
+ * when the deadline passed before an attempt succeeded.
+ */
+export async function postWithRetriesUntil(
+  url: string,
+  body: unknown,
+  options: PostUntilOptions,
+): Promise<void> {
+  const {
+    deadlineMs,
+    maxDelayMs,
+    baseDelayMs = DEFAULT_POST_BASE_DELAY_MS,
+    ownerUrl,
+    onOwnerFailure,
+    cancellationSignal,
+  } = options;
+  const serialized = JSON.stringify(body);
+  if (ownerUrl != null) {
+    if (await ownerDelivered(ownerUrl, url, serialized, cancellationSignal))
+      return;
+    // A cancelled execution must not start the service fallback: surface the
+    // cancellation reason instead of posting again.
+    if (cancellationSignal?.aborted) throw cancellationSignal.reason;
+    onOwnerFailure?.();
+  }
+
+  let backoffMs = baseDelayMs;
+  const tlsOptions = getFetchOptionsWithTLS(url);
+  while (true) {
+    const remainingMs = deadlineMs - performance.now();
+    if (remainingMs <= 0) {
+      throw new RetryBudgetExhausted(
+        `retry budget exhausted before ${url} acknowledged the payload`,
+      );
+    }
+    let retryWaitMs: number | null = null;
+    let response: Response | undefined;
+    try {
+      const requestSignal = cancellationSignal
+        ? AbortSignal.any([
+            cancellationSignal,
+            AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+          ])
+        : AbortSignal.timeout(REQUEST_TIMEOUT_MS);
+      response = await fetchPlatform(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: serialized,
+        signal: requestSignal,
+        ...tlsOptions,
+      });
+    } catch (error) {
+      if (cancellationSignal?.aborted) throw error;
+      // Transport failure: retried below unless the deadline has passed.
+    }
+    if (response) {
+      const ok = response.ok;
+      const status = response.status;
+      const retryAfter = response.headers?.get?.("Retry-After") ?? null;
+      await discardResponseBody(response);
+      if (ok) return;
+      if (status < 500) throw new Error(`HTTP ${status} from ${url}`);
+      if (status === 503) retryWaitMs = retryAfterWaitMs(retryAfter);
+    }
+    // Doubling a running cap (rather than `base * 2 ** attempt`) keeps the
+    // exponent from overflowing on a long outage, and never sleeps past the
+    // deadline: the loop re-checks it on wake.
+    const waitMs = Math.min(
+      retryWaitMs ?? backoffMs,
+      Math.max(0, deadlineMs - performance.now()),
+    );
+    backoffMs = Math.min(backoffMs * 2, maxDelayMs);
+    if (waitMs > 0) {
+      if (cancellationSignal) {
+        if (!(await waitForRetry(waitMs, cancellationSignal))) {
+          throw cancellationSignal.reason;
+        }
+      } else {
+        await sleep(waitMs);
+      }
+    }
+  }
 }

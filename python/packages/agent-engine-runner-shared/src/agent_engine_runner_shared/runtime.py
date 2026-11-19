@@ -40,6 +40,7 @@ from agent_engine_runner_shared.utils import (
 if TYPE_CHECKING:
     from agent_engine_sdk_memory.models import (
         ContextResponse,
+        CreateSemanticResult,
         CustomMemoryRetrieveResult,
         CustomMemorySaveResult,
         SourceSpec,
@@ -47,15 +48,18 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Product application name reported to MongoDB, so customers can attribute
+# Agent Engine traffic.
+_MONGO_APP_NAME = "Agent Engine"
+
 
 def _resolve_listen_host() -> str:
     """Resolve uvicorn's listen host from ``APP_HOST``, defaulting to
     ``"0.0.0.0"``.
 
     ECP stamps ``APP_HOST`` on every runner component (AER, Tool) at deploy
-    time — ``"::"`` for vm-mode (cell, IPv6-first
-    pod network) and ``"0.0.0.0"`` for container-mode (Kind, classic
-    helix, v4 pod IPs). The runner-base image also bakes in
+    time — ``"::"`` for the cell's IPv6-first pod network.
+    The runner-base image also bakes in
     ``APP_HOST=0.0.0.0`` as a baseline. So every production path has the
     var set; this default only matters for ad-hoc Python invocations that
     bypass both the image and ECP, and ``"0.0.0.0"`` is the safe choice
@@ -409,7 +413,6 @@ class TenantRuntime:
 
         try:
             from agent_engine_runner_shared.tracing import (
-                platform_trace_exporter_enabled,
                 scrub_credentials,
                 setup_tracing,
                 start_mongodb_tracing_retry,
@@ -417,10 +420,9 @@ class TenantRuntime:
 
             scrub = scrub_credentials
 
-            if platform_trace_exporter_enabled() and os.getenv("OE_URL", "").strip():
-                # The platform exporter is enabled, so the OE is the trace
-                # writer: the guest sends spans to it and opens no MongoDB
-                # trace-store connection.
+            if os.getenv("OE_URL", "").strip():
+                # The OE is the trace writer: the guest sends spans to it and
+                # opens no MongoDB trace-store connection.
                 setup_tracing(service_name=self.app_name)
                 logger.info("Tracing enabled")
                 return
@@ -430,7 +432,11 @@ class TenantRuntime:
 
                 from agent_engine_runner_shared.db_config import resolve_store_db_name
 
-                client = MongoClient(self._mongodb_uri, serverSelectionTimeoutMS=5000)
+                client = MongoClient(
+                    self._mongodb_uri,
+                    serverSelectionTimeoutMS=5000,
+                    appname=_MONGO_APP_NAME,
+                )
                 try:
                     client.admin.command("ping")
                     database_name = resolve_store_db_name(client, base=self._database_name_override)
@@ -585,12 +591,12 @@ class TenantRuntime:
             kwargs["max_tokens"] = max_tokens
 
         def _read_memory() -> str:
-            from agent_engine_runner_shared.memory import build_context
+            from agent_engine_runner_shared.memory import build_context, describe_memory_error
 
             try:
                 return build_context(**kwargs)
             except Exception as e:
-                logger.warning(f"Failed to build memory context: {e}")
+                logger.warning(f"Failed to build memory context: {describe_memory_error(e)}")
                 return ""
 
         if attempt is None or is_memory_read_owned_by_tool():
@@ -705,13 +711,18 @@ class TenantRuntime:
             kwargs["max_tokens"] = max_tokens
 
         def _read_memory() -> Dict[str, Any]:
-            from agent_engine_runner_shared.memory import build_context_from_sources
+            from agent_engine_runner_shared.memory import (
+                build_context_from_sources,
+                describe_memory_error,
+            )
 
             try:
                 response = build_context_from_sources(**kwargs)
                 return response.model_dump(mode="json")
             except Exception as e:
-                logger.warning(f"Failed to build per-source memory context: {e}")
+                logger.warning(
+                    f"Failed to build per-source memory context: {describe_memory_error(e)}"
+                )
                 return _empty().model_dump(mode="json")
 
         if attempt is None:
@@ -813,11 +824,12 @@ class TenantRuntime:
         metadata: Optional[Dict[str, Any]] = None,
         upsert: bool = True,
         agent_id: Optional[str] = None,
+        idempotency_key: str | None = None,
     ) -> bool:
         """
-        Save a semantic memory to the memory engine.
+        Submit a semantic write and return whether it was accepted.
 
-        Handles embedding generation and storage automatically.
+        Consolidation and embedding can finish after acceptance.
 
         Args:
             text: The memory content to store
@@ -829,8 +841,44 @@ class TenantRuntime:
             upsert: If True, update existing memory with same label (default: True)
 
         Returns:
-            True if saved successfully, False otherwise
+            True if accepted, False when memory is not enabled. A failed save
+            raises the memory client's error.
         """
+        from agent_engine_sdk_memory.errors import MemoryNotSupportedError
+
+        resolved_user_id = user_id or get_current_user_id()
+        if not resolved_user_id:
+            raise ValueError("user_id is required to save semantic memory")
+        try:
+            return self.create_semantic(
+                text=text,
+                label=label,
+                user_id=resolved_user_id,
+                source=source,
+                visibility=visibility,
+                metadata=metadata,
+                upsert=upsert,
+                agent_id=agent_id,
+                idempotency_key=idempotency_key,
+            ).acknowledged
+        except MemoryNotSupportedError:
+            return False
+
+    def create_semantic(
+        self,
+        text: str,
+        label: str,
+        user_id: Optional[str] = None,
+        source: str = "agent",
+        visibility: str = "private",
+        metadata: Optional[Dict[str, Any]] = None,
+        upsert: bool = True,
+        agent_id: Optional[str] = None,
+        idempotency_key: str | None = None,
+    ) -> "CreateSemanticResult":
+        """Submit a semantic write and preserve its durable operation reference."""
+        from agent_engine_sdk_memory.errors import MemoryNotSupportedError
+
         from agent_engine_runner_shared.memory import create_semantic_memory
 
         resolved_user_id = user_id or get_current_user_id()
@@ -849,8 +897,11 @@ class TenantRuntime:
             upsert=upsert,
             project_id=self.project_id,
             agent_id=agent_id,
+            idempotency_key=idempotency_key,
         )
-        return result is not None
+        if result is None:
+            raise MemoryNotSupportedError("memory is not enabled for this agent")
+        return result
 
     def search_semantic(
         self,
@@ -978,7 +1029,8 @@ class TenantRuntime:
             metadata: Arbitrary key-value metadata stored on the entry
 
         Returns:
-            Created document ID, or None if creation fails
+            Created document ID, or None when memory is not enabled. A failed
+            call raises the memory client's error.
         """
         from agent_engine_runner_shared.memory import create_taxonomic_memory
 
@@ -1114,7 +1166,8 @@ class TenantRuntime:
                 the episode (mirrors save_semantic's metadata)
 
         Returns:
-            Created document ID, or None if creation fails
+            Created document ID, or None when memory is not enabled or no
+            session_id is given. A failed call raises the memory client's error.
         """
         from agent_engine_runner_shared.memory import create_episodic_memory
 
@@ -1220,24 +1273,20 @@ class TenantRuntime:
         if self._memory_engine is None or not self.org_id:
             return []
 
-        try:
-            kwargs: Dict[str, Any] = dict(
-                query=query,
-                org_id=self.org_id,
-                user_id=user_id,
-                visibility=visibility,
-                project_id=self.project_id,
-                tags=tags,
-                top_k=top_k,
-                similarity_threshold=similarity_threshold,
-            )
-            if metadata_filter is not None:
-                kwargs["metadata_filter"] = metadata_filter
+        kwargs: Dict[str, Any] = dict(
+            query=query,
+            org_id=self.org_id,
+            user_id=user_id,
+            visibility=visibility,
+            project_id=self.project_id,
+            tags=tags,
+            top_k=top_k,
+            similarity_threshold=similarity_threshold,
+        )
+        if metadata_filter is not None:
+            kwargs["metadata_filter"] = metadata_filter
 
-            return self._memory_engine.discover_procedures(**kwargs)
-        except Exception as e:
-            logger.warning(f"Failed to discover procedures: {e}")
-            return []
+        return self._memory_engine.discover_procedures(**kwargs)
 
     def get_procedure(
         self,
@@ -1251,25 +1300,21 @@ class TenantRuntime:
         if self._memory_engine is None or not self.org_id:
             return None
 
-        try:
-            result = self._memory_engine.get_procedural(
-                org_id=self.org_id,
-                project_id=self.project_id,
-                procedure=procedure_name,
-                user_id=user_id,
-                visibility=visibility,
-                include_deleted=include_deleted,
-            )
-            if result is None:
-                return None
-            if hasattr(result, "model_dump"):
-                return result.model_dump()
-            if hasattr(result, "dict"):
-                return result.dict()
-            return result
-        except Exception as e:
-            logger.warning(f"Failed to get procedure '{procedure_name}': {e}")
+        result = self._memory_engine.get_procedural(
+            org_id=self.org_id,
+            project_id=self.project_id,
+            procedure=procedure_name,
+            user_id=user_id,
+            visibility=visibility,
+            include_deleted=include_deleted,
+        )
+        if result is None:
             return None
+        if hasattr(result, "model_dump"):
+            return result.model_dump()
+        if hasattr(result, "dict"):
+            return result.dict()
+        return result
 
     def save_procedure(
         self,
@@ -1301,98 +1346,134 @@ class TenantRuntime:
         if not resolved_user_id:
             raise ValueError("user_id is required to save procedural memory")
 
-        try:
-            resolved_project_id = self.project_id
-            if update_existing:
-                # Identity is org/project/owner/name. Do not filter the
-                # existence check by visibility so an update can change it.
-                # OE still requires user_id (or visibility) on proxied GETs.
-                existing = self._memory_engine.get_procedural(
-                    org_id=self.org_id,
-                    project_id=resolved_project_id,
-                    procedure=procedure,
-                    user_id=resolved_user_id,
+        resolved_project_id = self.project_id
+        if update_existing:
+            # Identity is org/project/owner/name. Do not filter the
+            # existence check by visibility so an update can change it.
+            # OE still requires user_id (or visibility) on proxied GETs.
+            existing = self._memory_engine.get_procedural(
+                org_id=self.org_id,
+                project_id=resolved_project_id,
+                procedure=procedure,
+                user_id=resolved_user_id,
+            )
+            if existing is not None:
+                if isinstance(existing, dict):
+                    existing_id = existing.get("id") or existing.get("_id")
+                    existing_visibility = existing.get("visibility")
+                else:
+                    existing_id = getattr(existing, "id", None) or getattr(existing, "_id", None)
+                    existing_visibility = getattr(existing, "visibility", None)
+                visibility_changed = visibility is not None and visibility != existing_visibility
+                visibility_rank = {"private": 0, "shared": 1, "org": 2}
+                narrowing = visibility_changed and visibility_rank.get(
+                    visibility, 2
+                ) < visibility_rank.get(existing_visibility or "", 2)
+                target = (
+                    {"id": str(existing_id)}
+                    if existing_id is not None
+                    else {"procedure": procedure}
                 )
-                if existing is not None:
-                    if isinstance(existing, dict):
-                        existing_id = existing.get("id") or existing.get("_id")
-                    else:
-                        existing_id = getattr(existing, "id", None) or getattr(
-                            existing, "_id", None
-                        )
-                    updated = self._memory_engine.update_procedural(
+                if narrowing:
+                    self._memory_engine.update_procedural(
                         org_id=self.org_id,
-                        id=str(existing_id) if existing_id is not None else None,
-                        procedure=procedure,
-                        description=description,
-                        content=content,
-                        steps=steps,
-                        resources=resources,
-                        allowed_tools=allowed_tools,
-                        trigger_conditions=trigger_conditions,
-                        tags=tags,
+                        **target,
                         visibility=visibility,
                         project_id=resolved_project_id,
                         user_id=resolved_user_id,
-                        metadata=metadata,
+                        if_user_id=resolved_user_id,
+                        if_visibility=existing_visibility,
+                    )
+                    existing_visibility = visibility
+                updated = self._memory_engine.update_procedural(
+                    org_id=self.org_id,
+                    **target,
+                    description=description,
+                    content=content,
+                    steps=steps,
+                    resources=resources,
+                    allowed_tools=allowed_tools,
+                    trigger_conditions=trigger_conditions,
+                    tags=tags,
+                    project_id=resolved_project_id,
+                    user_id=resolved_user_id,
+                    if_user_id=resolved_user_id,
+                    if_visibility=existing_visibility,
+                    metadata=metadata,
+                )
+                if hasattr(updated, "model_dump"):
+                    updated = updated.model_dump()
+                elif hasattr(updated, "dict"):
+                    updated = updated.dict()
+                if visibility_changed and not narrowing:
+                    # Publish only the saved replacement, never the retained predecessor.
+                    if not isinstance(updated, dict) or not updated.get("id"):
+                        raise ValueError("Procedure replacement did not return an ID")
+                    updated = self._memory_engine.update_procedural(
+                        org_id=self.org_id,
+                        id=str(updated["id"]),
+                        visibility=visibility,
+                        project_id=resolved_project_id,
+                        user_id=resolved_user_id,
+                        if_user_id=resolved_user_id,
+                        if_visibility=existing_visibility,
                     )
                     if hasattr(updated, "model_dump"):
                         return updated.model_dump()
                     if hasattr(updated, "dict"):
                         return updated.dict()
-                    return updated
+                return updated
 
-            created = self._memory_engine.create_procedural(
-                procedure=procedure,
-                description=description,
-                content=content,
+        created = self._memory_engine.create_procedural(
+            procedure=procedure,
+            description=description,
+            content=content,
+            org_id=self.org_id,
+            user_id=resolved_user_id,
+            steps=steps,
+            resources=resources,
+            allowed_tools=allowed_tools,
+            compatibility=compatibility,
+            license=license,
+            trigger_conditions=trigger_conditions,
+            tags=tags,
+            visibility=visibility,
+            project_id=resolved_project_id,
+            agent_id=agent_id,
+            extraction_source=extraction_source,
+            source_format=source_format,
+            source_path=source_path,
+            metadata=metadata,
+        )
+        create_fallback = {
+            "id": str(created.id),
+            "procedure": created.procedure,
+            "has_embedding": created.has_embedding,
+            "acknowledged": created.acknowledged,
+        }
+        try:
+            created_doc = self._memory_engine.get_procedural(
                 org_id=self.org_id,
-                user_id=resolved_user_id,
-                steps=steps,
-                resources=resources,
-                allowed_tools=allowed_tools,
-                compatibility=compatibility,
-                license=license,
-                trigger_conditions=trigger_conditions,
-                tags=tags,
-                visibility=visibility,
                 project_id=resolved_project_id,
-                agent_id=agent_id,
-                extraction_source=extraction_source,
-                source_format=source_format,
-                source_path=source_path,
-                metadata=metadata,
+                id=str(created.id),
+                user_id=resolved_user_id,
+                visibility=visibility,
             )
-            create_fallback = {
-                "id": str(created.id),
-                "procedure": created.procedure,
-                "has_embedding": created.has_embedding,
-                "acknowledged": created.acknowledged,
-            }
-            try:
-                created_doc = self._memory_engine.get_procedural(
-                    org_id=self.org_id,
-                    project_id=resolved_project_id,
-                    id=str(created.id),
-                    user_id=resolved_user_id,
-                    visibility=visibility,
-                )
-            except Exception as fetch_err:
-                logger.warning(
-                    f"Procedure '{procedure}' created (id={created.id}) but "
-                    f"post-create fetch failed: {fetch_err}"
-                )
-                return create_fallback
-            if created_doc is None:
-                return create_fallback
-            if hasattr(created_doc, "model_dump"):
-                return created_doc.model_dump()
-            if hasattr(created_doc, "dict"):
-                return created_doc.dict()
-            return created_doc
-        except Exception as e:
-            logger.warning(f"Failed to save procedure '{procedure}': {e}")
-            return None
+        except Exception as fetch_err:
+            from agent_engine_runner_shared.memory import describe_memory_error
+
+            logger.warning(
+                f"Procedure '{procedure}' created (id={created.id}) but "
+                f"post-create fetch failed: {describe_memory_error(fetch_err)}"
+            )
+            return create_fallback
+        if created_doc is None:
+            return create_fallback
+        if hasattr(created_doc, "model_dump"):
+            return created_doc.model_dump()
+        if hasattr(created_doc, "dict"):
+            return created_doc.dict()
+        return created_doc
 
     def get_current_user_id(self) -> Optional[str]:
         """

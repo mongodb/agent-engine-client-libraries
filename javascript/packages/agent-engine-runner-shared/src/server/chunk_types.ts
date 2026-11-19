@@ -73,3 +73,11 @@ export const LLM_CREDENTIAL_REJECTED_ERROR_CODE = "llm_credential_rejected";
  * without `metadata.source` so the code drives client-owned attribution.
  */
 export const TOOL_CREDENTIAL_REJECTED_ERROR_CODE = "tool_credential_rejected";
+
+/**
+ * Machine-readable discriminator set on `metadata.error_code` of an ERROR
+ * chunk/callback when the turn's stream chunks could not be durably
+ * acknowledged within the turn budget, so the turn is failed instead of being
+ * presented as complete. A resume can retry.
+ */
+export const DURABLE_ACK_INCOMPLETE_ERROR_CODE = "durable_ack_incomplete";

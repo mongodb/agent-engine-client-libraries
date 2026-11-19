@@ -20,7 +20,7 @@ from opentelemetry.propagate import get_global_textmap, set_global_textmap
 from opentelemetry.sdk.trace import Event, ReadableSpan, TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor, SpanExporter, SpanExportResult
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
-from opentelemetry.trace import SpanContext, SpanKind, Status, StatusCode, TraceFlags
+from opentelemetry.trace import Link, SpanContext, SpanKind, Status, StatusCode, TraceFlags
 from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
 
 import agent_engine_runner_shared.tracing.setup as tracing_setup
@@ -69,6 +69,7 @@ def mock_span():
     span.attributes = {"key": "value"}
     span.resource.attributes = {"service.name": "test_service"}
     span.events = []
+    span.links = []
 
     return span
 
@@ -145,6 +146,30 @@ def test_mongodb_exporter_inserts_span(mock_span):
     assert len(docs) == 1
     assert docs[0]["trace_id"] == "12345678123456781234567812345678"
     assert docs[0]["name"] == "test_span"
+
+
+def test_mongodb_exporter_omits_links_when_span_has_none(mock_span):
+    collection = MagicMock()
+    MongoDBSpanExporter(collection).export([mock_span])
+
+    assert "links" not in collection.insert_many.call_args[0][0][0]
+
+
+def test_mongodb_exporter_writes_span_links(mock_span):
+    linked = SpanContext(
+        trace_id=0xABCDEF, span_id=0xBEEF, is_remote=False, trace_flags=TraceFlags.SAMPLED
+    )
+    mock_span.links = [Link(linked, {"langgraph.node": "branch_a"})]
+    collection = MagicMock()
+    MongoDBSpanExporter(collection).export([mock_span])
+
+    assert collection.insert_many.call_args[0][0][0]["links"] == [
+        {
+            "trace_id": format(0xABCDEF, "032x"),
+            "span_id": format(0xBEEF, "016x"),
+            "attributes": {"langgraph.node": "branch_a"},
+        }
+    ]
 
 
 def test_mongodb_exporter_does_not_hoist_untrusted_root_context(mock_span):
@@ -370,7 +395,12 @@ def content_bearing_span():
             timestamp=1500,
         )
     ]
-    span.links = []
+    span.links = [
+        Link(
+            SpanContext(trace_id=0x1, span_id=0x3, is_remote=False, trace_flags=TraceFlags.SAMPLED),
+            {"langgraph.node": "branch_a", "input.value": "linked prompt"},
+        )
+    ]
     span.instrumentation_scope = None
     span.attributes = {
         "openinference.span.kind": "LLM",
@@ -440,6 +470,10 @@ def test_otlp_exporter_redacts_content_by_default(monkeypatch, content_bearing_s
     exported_event = exported.events[0]
     assert "tool.parameters" not in exported_event.attributes
     assert exported_event.attributes["exception.type"] == "ValidationError"
+    # So are link attributes; the link itself survives.
+    (exported_link,) = exported.links
+    assert exported_link.context.span_id == 0x3
+    assert dict(exported_link.attributes) == {"langgraph.node": "branch_a"}
     # The original span (as goes to Mongo/JSONL) is untouched.
     assert content_bearing_span.attributes["input.value"] == "what is the customer's SSN?"
     assert content_bearing_span.attributes["api_key"] == "sk-should-not-leak"
@@ -457,6 +491,46 @@ def test_otlp_exporter_passes_through_content_when_full_capture(monkeypatch, con
     exported_spans = inner.export.call_args[0][0]
     assert exported_spans[0] is content_bearing_span
     assert exported_spans[0].attributes["input.value"] == "what is the customer's SSN?"
+
+
+def test_otlp_exporter_redacts_status_description(monkeypatch, content_bearing_span):
+    """The SDK copies a thrown exception's text into status.description, so it
+    can echo request content the same way an exception event does. Keep the
+    code so a backend still classifies the span; drop the description."""
+    monkeypatch.delenv(
+        "AGENTIC_PLATFORM_OTEL_CONTENT_CAPTURE",  # open-source-refs:ignore — runtime env-var interface name
+        raising=False,
+    )
+    message = "invalid payload: ssn 123-45-6789"
+    content_bearing_span.status = Status(StatusCode.ERROR, message)
+    inner = MagicMock(spec=SpanExporter)
+    inner.export.return_value = SpanExportResult.SUCCESS
+    exporter = ContentPolicyOTLPSpanExporter(inner)
+
+    exporter.export([content_bearing_span])
+
+    exported = inner.export.call_args[0][0][0]
+    assert exported.status.status_code == StatusCode.ERROR
+    assert not exported.status.description
+    # The original span (as goes to Mongo/JSONL) is untouched.
+    assert content_bearing_span.status.description == message
+
+
+def test_otlp_exporter_keeps_status_description_when_full_capture(
+    monkeypatch, content_bearing_span
+):
+    monkeypatch.setenv(
+        "AGENTIC_PLATFORM_OTEL_CONTENT_CAPTURE",  # open-source-refs:ignore — runtime env-var interface name
+        "full",
+    )
+    content_bearing_span.status = Status(StatusCode.ERROR, "boom")
+    inner = MagicMock(spec=SpanExporter)
+    inner.export.return_value = SpanExportResult.SUCCESS
+    exporter = ContentPolicyOTLPSpanExporter(inner)
+
+    exporter.export([content_bearing_span])
+
+    assert inner.export.call_args[0][0][0].status.description == "boom"
 
 
 def test_otlp_exporter_fails_closed_when_redaction_errors(monkeypatch):

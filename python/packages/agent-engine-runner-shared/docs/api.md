@@ -15,6 +15,7 @@
     * [build\_context\_from\_sources](#agent_engine_runner_shared.runtime.TenantRuntime.build_context_from_sources)
     * [write\_turn\_async](#agent_engine_runner_shared.runtime.TenantRuntime.write_turn_async)
     * [save\_semantic](#agent_engine_runner_shared.runtime.TenantRuntime.save_semantic)
+    * [create\_semantic](#agent_engine_runner_shared.runtime.TenantRuntime.create_semantic)
     * [search\_semantic](#agent_engine_runner_shared.runtime.TenantRuntime.search_semantic)
     * [save\_custom](#agent_engine_runner_shared.runtime.TenantRuntime.save_custom)
     * [retrieve\_custom](#agent_engine_runner_shared.runtime.TenantRuntime.retrieve_custom)
@@ -559,12 +560,13 @@ def save_semantic(text: str,
                   visibility: str = "private",
                   metadata: Optional[Dict[str, Any]] = None,
                   upsert: bool = True,
-                  agent_id: Optional[str] = None) -> bool
+                  agent_id: Optional[str] = None,
+                  idempotency_key: str | None = None) -> bool
 ```
 
-Save a semantic memory to the memory engine.
+Submit a semantic write and return whether it was accepted.
 
-Handles embedding generation and storage automatically.
+Consolidation and embedding can finish after acceptance.
 
 **Arguments**:
 
@@ -579,7 +581,27 @@ Handles embedding generation and storage automatically.
 
 **Returns**:
 
-  True if saved successfully, False otherwise
+  True if accepted, False when memory is not enabled. A failed save
+  raises the memory client's error.
+
+<a id="agent_engine_runner_shared.runtime.TenantRuntime.create_semantic"></a>
+
+#### create\_semantic
+
+```python
+def create_semantic(
+        text: str,
+        label: str,
+        user_id: Optional[str] = None,
+        source: str = "agent",
+        visibility: str = "private",
+        metadata: Optional[Dict[str, Any]] = None,
+        upsert: bool = True,
+        agent_id: Optional[str] = None,
+        idempotency_key: str | None = None) -> "CreateSemanticResult"
+```
+
+Submit a semantic write and preserve its durable operation reference.
 
 <a id="agent_engine_runner_shared.runtime.TenantRuntime.search_semantic"></a>
 
@@ -692,7 +714,8 @@ Taxonomic memories are used for:
 
 **Returns**:
 
-  Created document ID, or None if creation fails
+  Created document ID, or None when memory is not enabled. A failed
+  call raises the memory client's error.
 
 <a id="agent_engine_runner_shared.runtime.TenantRuntime.search_taxonomic"></a>
 
@@ -797,7 +820,8 @@ Episodic memories are used for:
 
 **Returns**:
 
-  Created document ID, or None if creation fails
+  Created document ID, or None when memory is not enabled or no
+  session_id is given. A failed call raises the memory client's error.
 
 <a id="agent_engine_runner_shared.runtime.TenantRuntime.search_episodes"></a>
 

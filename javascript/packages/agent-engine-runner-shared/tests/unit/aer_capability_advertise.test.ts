@@ -87,6 +87,7 @@ function makeServer(
   server.sendStreamChunk = vi.fn().mockResolvedValue(undefined);
   server.reportCallback = vi.fn().mockResolvedValue(undefined);
   server.chunkSeq = new Map();
+  server.durableAckSenders = new Map();
   server.ownerCallbackUrl = new Map();
   return server;
 }
@@ -135,6 +136,8 @@ describe("AER capability advertise", () => {
       durable_workflow: true,
       memory: false,
       owner_callback_fallback: true,
+      durable_ack: true,
+      stream_journal: true,
     });
     expect(server.capabilitiesAdvertised).toBe(true);
   });
@@ -157,6 +160,7 @@ describe("AER capability advertise", () => {
     expect(features).not.toHaveProperty("durable_workflow");
     expect(features["memory"]).toBe(true);
     expect(features["owner_callback_fallback"]).toBe(true);
+    expect(features["durable_ack"]).toBe(true);
   });
 
   test("owner_callback_fallback is injected without mutating the loaded agent config", async () => {
@@ -189,6 +193,8 @@ describe("AER capability advertise", () => {
     );
     expect(capturedBody?.["features"]).toEqual({
       owner_callback_fallback: true,
+      durable_ack: true,
+      stream_journal: true,
     });
     // The agent config object itself is untouched by the injection.
     expect(explicitFeatures(cfg.features)).toEqual({});

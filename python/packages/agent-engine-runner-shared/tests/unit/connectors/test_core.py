@@ -569,31 +569,81 @@ def test_fail_before_dispatch(document, arguments, env):
             executor.execute("jiradc_getComments", arguments, env=env)
 
 
-def test_unknown_top_level_arguments_are_ignored(document):
-    requests = []
+def _edit_issue(document):
+    """Add an operation whose JSON body fields are top-level arguments, like Jira's editIssue."""
+    document["tools"].append(
+        {
+            "name": "jiradc_editIssue",
+            "description": "Edits an issue.",
+            "method": "PUT",
+            "path": "/api/2/issue/{issueIdOrKey}",
+            "params": {"path": ["issueIdOrKey"], "body": ["fields", "update"]},
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "issueIdOrKey": {"type": "string"},
+                    "fields": {"type": "object"},
+                    "update": {"type": "object"},
+                },
+                "required": ["issueIdOrKey"],
+            },
+        }
+    )
+    return ToolDefinitions.model_validate(document)
 
+
+@pytest.mark.parametrize(
+    "arguments,unexpected",
+    [
+        # A model that wraps body fields as another operation of the same API
+        # expects would otherwise send an empty write that the provider accepts.
+        ({"issueIdOrKey": "DEMO-1", "body": {"fields": {"assignee": None}}}, "body"),
+        ({"issueIdOrKey": "DEMO-1", "Authorization": "evil"}, "Authorization"),
+    ],
+)
+def test_unknown_top_level_arguments_fail_before_dispatch(document, arguments, unexpected):
     def handler(request):
-        requests.append(request)
-        return httpx.Response(200, text="ok")
+        pytest.fail("invalid invocation reached network")
+
+    with ConnectorExecutor(
+        _edit_issue(document), transport=httpx.MockTransport(handler)
+    ) as executor:
+        with pytest.raises(ValueError) as raised:
+            executor.execute("jiradc_editIssue", arguments, env={"JIRA_TOKEN": "token"})
+    message = str(raised.value)
+    assert f"unexpected arguments: {unexpected}" in message
+    assert "accepted arguments: fields, issueIdOrKey, update" in message
+
+
+def test_schema_mismatch_names_the_field_without_its_value(document):
+    def handler(request):
+        pytest.fail("invalid invocation reached network")
 
     with ConnectorExecutor(
         ToolDefinitions.model_validate(document), transport=httpx.MockTransport(handler)
     ) as executor:
-        assert (
+        with pytest.raises(ValueError) as raised:
             executor.execute(
-                "jiradc_getComments",
-                {
-                    "issueIdOrKey": "DEMO-1",
-                    "unmapped": {"arbitrary": "value"},
-                    "Authorization": "evil",
-                },
+                "jiradc_addComment",
+                {"issueIdOrKey": "DEMO-1", "body": 31337},
                 env={"JIRA_TOKEN": "token"},
             )
-            == "ok"
-        )
-    assert len(requests) == 1
-    assert str(requests[0].url) == "https://jira.example/rest/api/2/issue/DEMO-1/comment"
-    assert requests[0].headers["authorization"] == "Bearer token"
+    message = str(raised.value)
+    assert message.startswith("arguments do not match the compiled input schema")
+    assert "body: must be string" in message
+    assert "31337" not in message
+
+
+def test_missing_required_argument_is_named(document):
+    def handler(request):
+        pytest.fail("invalid invocation reached network")
+
+    with ConnectorExecutor(
+        ToolDefinitions.model_validate(document), transport=httpx.MockTransport(handler)
+    ) as executor:
+        with pytest.raises(ValueError) as raised:
+            executor.execute("jiradc_addComment", {"body": "Hello"}, env={"JIRA_TOKEN": "token"})
+    assert "arguments: must have required property 'issueIdOrKey'" in str(raised.value)
 
 
 def test_path_segment_validation_rejects_nested_encoding_without_recursive_work(document):

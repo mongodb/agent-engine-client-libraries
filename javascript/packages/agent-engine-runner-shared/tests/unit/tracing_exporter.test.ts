@@ -1,33 +1,8 @@
-/**
- * Unit tests for the span exporters.
- *
- * Mirrors Python's tests/unit/test_tracing_exporter.py.
- *
- * Source change to enable parity: `runInstrumentor` was exported from
- * `tracing/setup.ts`. Python imports `_run_instrumentor` directly
- * (leading-underscore = convention-private but still importable). Same
- * pattern as `resolveListenHost` — TS strict export semantics required
- * adding `export`.
- *
- * TS-vs-Python adaptations:
- *   - `SpanExporter.export()` is callback-based in TS, return-based in
- *     Python. Wrapped in `exportAndWait()` to return a promise.
- *   - Python uses `MagicMock(spec=ReadableSpan)` with manual attribute
- *     setup. TS builds a minimal structurally-typed mock and casts to
- *     `ReadableSpan` (the full OTEL interface has many fields the
- *     exporters don't touch).
- *   - Python's `caplog` fixture for log capture has no Vitest equivalent.
- *     `vi.mock` on the logger module is used instead — same pattern as
- *     `metrics.test.ts`.
- */
-
 import { describe, test, expect, vi, beforeEach, afterEach } from "vitest";
 import { readFileSync, existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-// vi.mock the logger BEFORE source imports so the runInstrumentor warnings
-// can be observed via the mock. Hoisted by Vitest.
 const mocks = vi.hoisted(() => ({
   logger: {
     info: vi.fn(),
@@ -58,10 +33,9 @@ import {
   registerInstrumentor,
   resetHooks,
 } from "../../src/index.js";
+import { buildResourceAttributes } from "../../src/tracing/setup.js";
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
+const RESOURCE_PREFIX = "agentic_platform"; // open-source-refs:ignore — data contract
 
 function makeMockSpan(overrides: Partial<ReadableSpan> = {}): ReadableSpan {
   const base = {
@@ -72,10 +46,10 @@ function makeMockSpan(overrides: Partial<ReadableSpan> = {}): ReadableSpan {
       isRemote: false,
     }),
     name: "test_span",
-    kind: 0, // INTERNAL
+    kind: 0,
     startTime: [1, 0] as [number, number],
     endTime: [2, 0] as [number, number],
-    status: { code: 1 }, // OK
+    status: { code: 1 },
     attributes: { key: "value" },
     resource: { attributes: { "service.name": "test_service" } },
     events: [],
@@ -83,7 +57,6 @@ function makeMockSpan(overrides: Partial<ReadableSpan> = {}): ReadableSpan {
   return { ...base, ...overrides } as unknown as ReadableSpan;
 }
 
-/** Convert the callback-based SpanExporter.export() into a promise. */
 function exportAndWait(
   exporter: SpanExporter,
   spans: ReadableSpan[],
@@ -107,19 +80,14 @@ afterEach(() => {
   resetHooks();
 });
 
-// ---------------------------------------------------------------------------
-// JSONL Exporter
-// ---------------------------------------------------------------------------
-
 describe("JSONLSpanExporter", () => {
   test("writes a span to the file", async () => {
-    // test_jsonl_exporter_writes_span
     const traceFile = join(tmpDir, "traces.jsonl");
     const exporter = new JSONLSpanExporter(traceFile);
 
     const result = await exportAndWait(exporter, [makeMockSpan()]);
 
-    expect(result.code).toBe(0); // EXPORT_SUCCESS
+    expect(result.code).toBe(0);
     expect(existsSync(traceFile)).toBe(true);
 
     const doc = JSON.parse(
@@ -131,8 +99,38 @@ describe("JSONLSpanExporter", () => {
     expect(doc["attributes"]["key"]).toBe("value");
   });
 
+  test("writes span links, and omits the field when there are none", async () => {
+    const traceFile = join(tmpDir, "traces.jsonl");
+    const exporter = new JSONLSpanExporter(traceFile);
+    const link = {
+      context: {
+        traceId: "abcdefabcdefabcdefabcdefabcdefab",
+        spanId: "000000000000beef",
+        traceFlags: 1,
+      },
+      attributes: { "langgraph.node": "branch_a" },
+    };
+
+    await exportAndWait(exporter, [
+      makeMockSpan({ links: [link] } as Partial<ReadableSpan>),
+      makeMockSpan(),
+    ]);
+
+    const [linked, plain] = readFileSync(traceFile, "utf-8")
+      .trimEnd()
+      .split("\n")
+      .map((line) => JSON.parse(line));
+    expect(linked["links"]).toEqual([
+      {
+        trace_id: "abcdefabcdefabcdefabcdefabcdefab",
+        span_id: "000000000000beef",
+        attributes: { "langgraph.node": "branch_a" },
+      },
+    ]);
+    expect(plain).not.toHaveProperty("links");
+  });
+
   test("appends to an existing file across multiple exports", async () => {
-    // test_jsonl_exporter_appends
     const traceFile = join(tmpDir, "traces.jsonl");
     const exporter = new JSONLSpanExporter(traceFile);
 
@@ -146,31 +144,25 @@ describe("JSONLSpanExporter", () => {
   });
 
   test("handles an empty span list without writing the file", async () => {
-    // test_jsonl_exporter_handles_empty
     const traceFile = join(tmpDir, "traces.jsonl");
     const exporter = new JSONLSpanExporter(traceFile);
 
     const result = await exportAndWait(exporter, []);
 
-    expect(result.code).toBe(0); // EXPORT_SUCCESS
+    expect(result.code).toBe(0);
     expect(existsSync(traceFile)).toBe(false);
   });
 });
 
-// ---------------------------------------------------------------------------
-// MongoDB Exporter
-// ---------------------------------------------------------------------------
-
 describe("MongoDBSpanExporter", () => {
   test("inserts a span via insertMany", async () => {
-    // test_mongodb_exporter_inserts_span
     const insertMany = vi.fn().mockResolvedValue({ insertedCount: 1 });
     const collection = { insertMany } as unknown as Collection;
     const exporter = new MongoDBSpanExporter(collection);
 
     const result = await exportAndWait(exporter, [makeMockSpan()]);
 
-    expect(result.code).toBe(0); // EXPORT_SUCCESS
+    expect(result.code).toBe(0);
     expect(insertMany).toHaveBeenCalledOnce();
 
     const docs = insertMany.mock.calls[0]?.[0] as Record<string, unknown>[];
@@ -180,19 +172,17 @@ describe("MongoDBSpanExporter", () => {
   });
 
   test("handles an empty span list without calling insertMany", async () => {
-    // test_mongodb_exporter_handles_empty
     const insertMany = vi.fn();
     const collection = { insertMany } as unknown as Collection;
     const exporter = new MongoDBSpanExporter(collection);
 
     const result = await exportAndWait(exporter, []);
 
-    expect(result.code).toBe(0); // EXPORT_SUCCESS
+    expect(result.code).toBe(0);
     expect(insertMany).not.toHaveBeenCalled();
   });
 
   test("returns FAILURE when insertMany rejects", async () => {
-    // test_mongodb_exporter_handles_error
     const insertMany = vi
       .fn()
       .mockRejectedValue(new Error("Connection failed"));
@@ -201,13 +191,96 @@ describe("MongoDBSpanExporter", () => {
 
     const result = await exportAndWait(exporter, [makeMockSpan()]);
 
-    expect(result.code).toBe(1); // EXPORT_FAILED
+    expect(result.code).toBe(1);
+  });
+
+  test("writes kind and status as their OTel names, not numbers", async () => {
+    const insertMany = vi.fn().mockResolvedValue({ insertedCount: 1 });
+    const collection = { insertMany } as unknown as Collection;
+    const exporter = new MongoDBSpanExporter(collection);
+
+    await exportAndWait(exporter, [
+      makeMockSpan({ kind: 1, status: { code: 2, message: "broke" } }),
+    ]);
+
+    const docs = insertMany.mock.calls[0]?.[0] as Record<string, unknown>[];
+    expect(docs[0]?.["kind"]).toBe("SERVER");
+    expect(docs[0]?.["status"]).toEqual({
+      code: "ERROR",
+      description: "broke",
+    });
+  });
+
+  test("maps the default INTERNAL / OK codes to names", async () => {
+    const insertMany = vi.fn().mockResolvedValue({ insertedCount: 1 });
+    const collection = { insertMany } as unknown as Collection;
+    const exporter = new MongoDBSpanExporter(collection);
+
+    await exportAndWait(exporter, [
+      makeMockSpan({ kind: 0, status: { code: 1 } }),
+    ]);
+
+    const docs = insertMany.mock.calls[0]?.[0] as Record<string, unknown>[];
+    expect(docs[0]?.["kind"]).toBe("INTERNAL");
+    expect((docs[0]?.["status"] as { code: string }).code).toBe("OK");
+  });
+
+  test("falls back to the numeric string for out-of-range kind/status", async () => {
+    const insertMany = vi.fn().mockResolvedValue({ insertedCount: 1 });
+    const collection = { insertMany } as unknown as Collection;
+    const exporter = new MongoDBSpanExporter(collection);
+
+    await exportAndWait(exporter, [
+      makeMockSpan({
+        kind: 99 as unknown as ReadableSpan["kind"],
+        status: { code: 42 as unknown as ReadableSpan["status"]["code"] },
+      }),
+    ]);
+
+    const docs = insertMany.mock.calls[0]?.[0] as Record<string, unknown>[];
+    expect(docs[0]?.["kind"]).toBe("99");
+    expect((docs[0]?.["status"] as { code: string }).code).toBe("42");
   });
 });
 
-// ---------------------------------------------------------------------------
-// ContentPolicyOTLPSpanExporter
-// ---------------------------------------------------------------------------
+describe("buildResourceAttributes", () => {
+  const ENV_KEYS = [
+    "ORG_ID",
+    "PROJECT_ID",
+    "APP_ID",
+    "DEPLOYMENT_ID",
+    "AGENT_ID",
+    "RUNNER_MODE",
+    "AGENT_ENGINE_ENVIRONMENT",
+  ];
+
+  afterEach(() => {
+    for (const key of ENV_KEYS) delete process.env[key];
+  });
+
+  test("maps platform env vars onto resource keys and omits absent ones", () => {
+    process.env["ORG_ID"] = "org-1";
+    process.env["APP_ID"] = "workspace-1";
+    process.env["RUNNER_MODE"] = "aer";
+
+    const attrs = buildResourceAttributes("svc");
+
+    expect(attrs["service.name"]).toBe("svc");
+    expect(attrs[`${RESOURCE_PREFIX}.org_id`]).toBe("org-1");
+    expect(attrs[`${RESOURCE_PREFIX}.workspace_id`]).toBe("workspace-1");
+    expect(attrs[`${RESOURCE_PREFIX}.runtime_mode`]).toBe("aer");
+    expect(attrs).not.toHaveProperty(`${RESOURCE_PREFIX}.project_id`);
+    expect(attrs).not.toHaveProperty(`${RESOURCE_PREFIX}.agent_id`);
+  });
+
+  test("maps the environment var to the environment resource key", () => {
+    process.env["AGENT_ENGINE_ENVIRONMENT"] = "qa";
+
+    const attrs = buildResourceAttributes("svc");
+
+    expect(attrs[`${RESOURCE_PREFIX}.environment`]).toBe("qa");
+  });
+});
 
 describe("getContentCaptureMode", () => {
   const ENV_KEY = "AGENTIC_PLATFORM_OTEL_CONTENT_CAPTURE";
@@ -246,6 +319,29 @@ describe("ContentPolicyOTLPSpanExporter", () => {
     };
   }
 
+  test("drain waits for an export the batch timer already started", async () => {
+    let finishExport!: () => void;
+    const inner = makeInner();
+    inner.export = vi.fn(
+      (_spans: ReadableSpan[], cb: (r: ExportResult) => void) => {
+        finishExport = () => cb({ code: 0 });
+      },
+    );
+    const exporter = new ContentPolicyOTLPSpanExporter(inner, "metadata-only");
+
+    void exportAndWait(exporter, [makeMockSpan()]);
+
+    let settled = false;
+    const drained = exporter.drain().then(() => {
+      settled = true;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(settled).toBe(false);
+
+    finishExport();
+    await expect(drained).resolves.toBeUndefined();
+  });
+
   test("metadata-only mode strips every redacted-fragment attribute", async () => {
     const inner = makeInner();
     const exporter = new ContentPolicyOTLPSpanExporter(inner, "metadata-only");
@@ -273,6 +369,66 @@ describe("ContentPolicyOTLPSpanExporter", () => {
       "model.name": "gpt-x",
     });
     expect(forwarded[0]?.events[0]?.attributes).toEqual({});
+  });
+
+  test("metadata-only mode strips the free-form status message but keeps the code", async () => {
+    const inner = makeInner();
+    const exporter = new ContentPolicyOTLPSpanExporter(inner, "metadata-only");
+    const message = "invalid payload: ssn 123-45-6789";
+    const span = makeMockSpan({
+      status: { code: 2, message },
+      events: [
+        {
+          name: "exception",
+          time: [1, 0],
+          attributes: { "exception.message": message },
+        } as unknown as ReadableSpan["events"][number],
+      ],
+    });
+
+    await exportAndWait(exporter, [span]);
+
+    const forwarded = inner.export.mock.calls[0]?.[0] as ReadableSpan[];
+    expect(forwarded[0]?.status).toEqual({ code: 2 });
+    expect(forwarded[0]?.status.message).toBeUndefined();
+    expect(forwarded[0]?.events[0]?.attributes).toEqual({});
+    expect(span.status.message).toBe(message);
+  });
+
+  test("full mode keeps the status message", async () => {
+    const inner = makeInner();
+    const exporter = new ContentPolicyOTLPSpanExporter(inner, "full");
+    const span = makeMockSpan({ status: { code: 2, message: "boom" } });
+
+    await exportAndWait(exporter, [span]);
+
+    const forwarded = inner.export.mock.calls[0]?.[0] as ReadableSpan[];
+    expect(forwarded[0]?.status.message).toBe("boom");
+  });
+
+  test("metadata-only mode strips content from link attributes", async () => {
+    const inner = makeInner();
+    const exporter = new ContentPolicyOTLPSpanExporter(inner, "metadata-only");
+    const context = {
+      traceId: "abcdefabcdefabcdefabcdefabcdefab",
+      spanId: "000000000000beef",
+      traceFlags: 1,
+    };
+    const span = makeMockSpan({
+      links: [
+        {
+          context,
+          attributes: { "langgraph.node": "branch_a", "input.value": "secret" },
+        },
+      ],
+    } as Partial<ReadableSpan>);
+
+    await exportAndWait(exporter, [span]);
+
+    const forwarded = inner.export.mock.calls[0]?.[0] as ReadableSpan[];
+    expect(forwarded[0]?.links).toEqual([
+      { context, attributes: { "langgraph.node": "branch_a" } },
+    ]);
   });
 
   test("full mode passes attributes through unredacted", async () => {
@@ -322,7 +478,7 @@ describe("ContentPolicyOTLPSpanExporter", () => {
 
     const result = await exportAndWait(exporter, [makeMockSpan()]);
 
-    expect(result.code).toBe(1); // EXPORT_FAILED
+    expect(result.code).toBe(1);
   });
 
   test("shutdown swallows an inner rejection", async () => {
@@ -342,13 +498,8 @@ describe("ContentPolicyOTLPSpanExporter", () => {
   });
 });
 
-// ---------------------------------------------------------------------------
-// runInstrumentor (instrumentor hook)
-// ---------------------------------------------------------------------------
-
 describe("runInstrumentor", () => {
   test("calls the registered instrumentor exactly once", () => {
-    // test_calls_registered_instrumentor
     const fn = vi.fn();
     registerInstrumentor(fn);
 
@@ -358,7 +509,6 @@ describe("runInstrumentor", () => {
   });
 
   test("logs a warning when no instrumentor is registered", () => {
-    // test_logs_warning_when_no_hook
     runInstrumentor();
 
     expect(mocks.logger.warn).toHaveBeenCalledOnce();
@@ -367,14 +517,12 @@ describe("runInstrumentor", () => {
   });
 
   test("catches instrumentor exceptions and logs a warning", () => {
-    // test_instrumentor_failure_does_not_raise
     registerInstrumentor(() => {
       throw new Error("boom");
     });
 
     expect(() => runInstrumentor()).not.toThrow();
     expect(mocks.logger.warn).toHaveBeenCalledOnce();
-    // Second arg is the message string (first is the structured fields object).
     const [, msg] = mocks.logger.warn.mock.calls[0] ?? [];
     expect(String(msg)).toMatch(/Framework instrumentor failed/);
   });

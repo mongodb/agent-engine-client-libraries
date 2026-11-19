@@ -27,11 +27,21 @@ test("reference titles and index use package identities", () => {
   const workspace = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
   const index = readFileSync(new URL("../docs/README.md", import.meta.url), "utf8");
   for (const path of workspace.workspaces) {
-    const pkg = JSON.parse(readFileSync(new URL(`../${path}/package.json`, import.meta.url), "utf8"));
+    const packageFile = new URL(`../${path}/package.json`, import.meta.url);
+    // A mirror export omits excluded preview packages entirely.
+    if (!existsSync(packageFile)) continue;
+    const pkg = JSON.parse(readFileSync(packageFile, "utf8"));
     const directory = basename(path);
     const content = pages.get(resolve(docsDir, directory, "docs/api.md"));
     assert.ok(content.startsWith(`# ${pkg.name}\n`));
     assert.ok(content.includes("\n## Table of Contents\n"));
+    if (pkg.private) {
+      // An internal preview is documented inside its own package only; it must
+      // not appear as navigation in the public index the mirror exports.
+      assert.ok(!index.includes(`\`${pkg.name}\``), `Internal preview ${pkg.name} in docs/README.md`);
+      assert.ok(!index.includes(`(../packages/${directory}/docs/api.md)`), `Internal preview ${directory} link in docs/README.md`);
+      continue;
+    }
     assert.ok(index.includes(`\`${pkg.name}\``), `Missing ${pkg.name} in docs/README.md`);
     assert.ok(index.includes(`(../packages/${directory}/docs/api.md)`), `Missing ${directory} API link in docs/README.md`);
   }

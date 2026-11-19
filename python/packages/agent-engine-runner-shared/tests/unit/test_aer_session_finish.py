@@ -62,7 +62,8 @@ def _make_server() -> AERServer:
     server.runtime = runtime  # type: ignore[attr-defined]
     server._client_lock = asyncio.Lock()  # type: ignore[attr-defined]
     server._a2a_registered = False  # type: ignore[attr-defined]
-    server._chunk_seq = {}  # type: ignore[attr-defined]
+    server._chunk_seq = {}
+    server._durable_ack_senders = {}  # type: ignore[attr-defined]
     server._owner_callback_url = {}  # type: ignore[attr-defined]
     server._durability_owner_id = "owner-test"  # type: ignore[attr-defined]
     server._pending_session_finish = {}  # type: ignore[attr-defined]
@@ -341,7 +342,7 @@ async def test_trace_flush_completes_before_finish_post(
     release_flush = threading.Event()
     order: list[str] = []
 
-    def _gated_flush() -> bool:
+    def _gated_flush(timeout_millis: int) -> bool:
         order.append("flush-start")
         flush_started.set()
         assert release_flush.wait(timeout=2.0), "flush was never released"
@@ -383,6 +384,53 @@ async def test_trace_flush_completes_before_finish_post(
                 finish_task.cancel()
 
     assert order == ["flush-start", "flush-end", "finish"]
+
+
+async def test_trace_flush_deadline_expiry_still_releases(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A flush worker that overruns the deadline is abandoned; /finish proceeds.
+
+    The worker runs off the event loop, so the release must not wait for it
+    indefinitely: on expiry it warns and requests teardown anyway.
+    """
+    server = _make_server()
+    flush_started = threading.Event()
+    release_flush = threading.Event()
+
+    def _blocking_flush(timeout_millis: int) -> bool:
+        flush_started.set()
+        assert release_flush.wait(timeout=5.0), "flush was never released"
+        return True
+
+    monkeypatch.setattr("agent_engine_runner_shared.tracing.force_flush_tracing", _blocking_flush)
+    monkeypatch.setattr(
+        "agent_engine_runner_shared.server.aer.SESSION_FINISH_TRACE_FLUSH_TIMEOUT_MS",
+        30,
+    )
+
+    finish_calls: list[str] = []
+
+    async def _fake_post_json_with_retries(client: Any, url: str, payload: dict) -> None:
+        finish_calls.append(url)
+
+    with (
+        patch.object(AERServer, "_get_client", new=AsyncMock(return_value=MagicMock())),
+        patch(
+            "agent_engine_runner_shared.server.aer.post_json_with_retries",
+            new=_fake_post_json_with_retries,
+        ),
+    ):
+        try:
+            await asyncio.wait_for(
+                server._release_finished_session(_execute_request("exec-flush-deadline")),
+                timeout=3.0,
+            )
+            # The finish POST fired while the worker was still held.
+            assert flush_started.is_set()
+            assert finish_calls == ["http://oe/executions/exec-flush-deadline/finish"]
+        finally:
+            release_flush.set()
 
 
 @pytest.mark.parametrize("durable", [False, True])

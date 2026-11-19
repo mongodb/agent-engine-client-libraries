@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any, cast
@@ -33,6 +33,7 @@ from agent_engine_sdk import (
 )
 from langchain_core.messages import HumanMessage
 from langchain_core.runnables import RunnableConfig
+from langgraph.channels.delta import DeltaChannel
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.types import (
     Command,
@@ -409,6 +410,7 @@ class LangGraphBaseAgent(BaseAgent):
             ),
             node_names=self._graph.get_graph().nodes.keys(),
             resume=bool(ctx.resume),
+            delta_channels=self._delta_channels(),
         )
         # The synthetic tip IS the just-written checkpoint: read its id back
         # rather than threading it through the commit's message-id return.
@@ -419,6 +421,15 @@ class LangGraphBaseAgent(BaseAgent):
         return {
             "thread_id": thread_id,
             "checkpoint_id": str(tip.checkpoint["id"]),
+        }
+
+    def _delta_channels(self) -> Mapping[str, DeltaChannel[Any]]:
+        """The graph's channels that checkpoints store only as deltas."""
+        channels: Mapping[str, Any] = getattr(self._graph, "channels", {})
+        return {
+            name: channel
+            for name, channel in channels.items()
+            if isinstance(channel, DeltaChannel)
         }
 
     async def _prepare_run(

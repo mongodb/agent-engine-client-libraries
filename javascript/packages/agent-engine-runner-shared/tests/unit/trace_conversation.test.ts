@@ -1,9 +1,3 @@
-/**
- * Input-message trimming: only the messages a call added are stored.
- *
- * Mirrors Python's tests/unit/test_trace_conversation.py.
- */
-
 import { describe, test, expect, vi } from "vitest";
 
 vi.mock("../../src/logger.js", () => ({
@@ -176,8 +170,6 @@ describe("ConversationDeltaTracker", () => {
     const staged = tracker.copy();
     staged.trim(messages("hi", "there"), TRACE_ID, "aer");
 
-    // The staged write is invisible to the original, which has only stored
-    // "hi", so the same prompt still reports one message of progress.
     const after = tracker.trim(messages("hi", "there"), TRACE_ID, "aer");
     expect(after[ATTR_INPUT_MESSAGES_OFFSET]).toBe(1);
   });
@@ -271,7 +263,6 @@ describe("MongoDBSpanExporter conversation trimming", () => {
     await exportAndWait(exporter, [makeSpan(messages("hi", "again"))]);
 
     const retried = docsOf(insertMany, 1);
-    // The failed span never landed, so the retry has to carry the whole prompt.
     expect(
       storedContents(retried["attributes"] as Record<string, unknown>),
     ).toEqual(["hi", "again"]);
@@ -292,7 +283,6 @@ describe("MongoDBSpanExporter conversation trimming", () => {
   }
 
   test("drops a prompt the caller records", async () => {
-    // The agent's span already stores it; the tool-pod copy is redundant.
     const insertMany = vi.fn().mockResolvedValue(undefined);
     const exporter = new MongoDBSpanExporter({
       insertMany,
@@ -315,14 +305,11 @@ describe("MongoDBSpanExporter conversation trimming", () => {
     expect(storedContents(stored)).toEqual([]);
     expect(stored["input.value"]).toBeUndefined();
     expect(stored["input.mime_type"]).toBeUndefined();
-    // The marker outlives the prompt: it is how a reader finds the stored copy.
     expect(stored[ATTR_INPUT_MESSAGES_RECORDED_BY]).toBe(RECORDED_BY_CALLER);
-    // No offset is written, so a reader does not replay this span as a slice.
     expect(stored[ATTR_INPUT_MESSAGES_OFFSET]).toBeUndefined();
   });
 
   test("a dropped prompt does not advance the tracked conversation", async () => {
-    // A tool-pod span that records its own prompt starts from the whole list.
     const insertMany = vi.fn().mockResolvedValue(undefined);
     const exporter = new MongoDBSpanExporter({
       insertMany,
@@ -360,7 +347,6 @@ describe("ExecutionContextSpanProcessor", () => {
     const tracer = provider.getTracer("test");
 
     const start = () => tracer.startSpan("ChatOpenAI");
-    // The marker is read at span start, so the block has to wrap `startSpan`.
     const span = callerRecords
       ? runAsCallerRecordedConversation(start)
       : start();

@@ -34,7 +34,7 @@ def reset_tracing_flags(monkeypatch):
     """Isolate tracing_setup's exporter-state flags across tests."""
     monkeypatch.setattr(tracing_setup, "_mongodb_exporter_attached", False)
     monkeypatch.setattr(tracing_setup, "_mongodb_degraded", False)
-    monkeypatch.setattr(tracing_setup, "_platform_exporter_attached", False)
+    monkeypatch.setattr(tracing_setup, "_platform_exporter", None)
     return monkeypatch
 
 
@@ -78,7 +78,6 @@ def test_health_reports_healthy_when_trace_store_attached(reset_tracing_flags):
 
 
 def test_health_reports_degraded_when_platform_exporter_failed(reset_tracing_flags):
-    reset_tracing_flags.setattr(tracing_setup, "_platform_exporter_attached", True)
     reset_tracing_flags.setattr(
         tracing_setup, "_platform_exporter", SimpleNamespace(last_error="export failed")
     )
@@ -95,7 +94,6 @@ def test_health_reports_degraded_when_platform_exporter_failed(reset_tracing_fla
 
 
 def test_health_reports_healthy_when_platform_exporter_attached(reset_tracing_flags):
-    reset_tracing_flags.setattr(tracing_setup, "_platform_exporter_attached", True)
     reset_tracing_flags.setattr(
         tracing_setup, "_platform_exporter", SimpleNamespace(last_error=None)
     )

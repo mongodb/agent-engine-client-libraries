@@ -12,8 +12,22 @@
  * failing finish POST must never affect the already-sent response.
  */
 
-import { describe, test, expect, vi, afterEach } from "vitest";
+import { describe, test, expect, vi, beforeEach, afterEach } from "vitest";
 import Fastify from "fastify";
+import type * as TracingSetup from "../../src/tracing/setup.js";
+
+// The /execute route's post-response release flushes the tracer provider before
+// asking the OE to reclaim the pod. Stub the flush so its ordering against the
+// finish POST is observable; everything else in the module stays real.
+const tracingMocks = vi.hoisted(() => ({
+  forceFlushTracing: vi.fn(async () => true),
+}));
+
+vi.mock("../../src/tracing/setup.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof TracingSetup>();
+  return { ...actual, forceFlushTracing: tracingMocks.forceFlushTracing };
+});
+
 import {
   AERServer,
   getCurrentTraceId,
@@ -24,6 +38,11 @@ import {
 } from "../../src/index.js";
 import type { ExecutorCallbackRequest } from "../../src/models.js";
 import { CallbackDelivery } from "../../src/server/callback_delivery.js";
+
+beforeEach(() => {
+  tracingMocks.forceFlushTracing.mockReset();
+  tracingMocks.forceFlushTracing.mockResolvedValue(true);
+});
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -76,6 +95,7 @@ function makeAerServer(): AerServerPrivates {
   server.sendStreamChunk = vi.fn().mockResolvedValue(undefined);
   server.reportCallback = vi.fn().mockResolvedValue(undefined);
   server.chunkSeq = new Map();
+  server.durableAckSenders = new Map();
   server.ownerCallbackUrl = new Map();
   server.pendingSessionFinish = new Map();
   server.callbackDelivery =
@@ -408,6 +428,90 @@ describe("AER /execute route: post-response session finish", () => {
     expect(response.statusCode).toBe(200);
     await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledOnce());
     expect(drain).toHaveBeenCalledWith(10_000);
+    expect(fetchMock.mock.calls[0]?.[0]).toContain(
+      `/executions/${executionId}/finish`,
+    );
+  });
+
+  test("pending finish flushes tracing before releasing the session", async () => {
+    const server = makeRouteServer() as unknown as AERServer & {
+      handleExecute: ReturnType<typeof vi.fn>;
+      pendingSessionFinish: Map<string, ExecutorCallbackRequest>;
+    };
+    const executionId = "exec-trace-flush";
+    server.pendingSessionFinish.set(executionId, {
+      execution_id: executionId,
+      status: "COMPLETED",
+    });
+    server.handleExecute = vi
+      .fn()
+      .mockResolvedValue({ status: "completed", result: "ok" });
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValue(new Response(null, { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    // Hold the flush open: the finish POST must not fire until it settles, or
+    // the OE could reclaim the pod (zero grace) before the run root is stored.
+    let releaseFlush!: (flushed: boolean) => void;
+    tracingMocks.forceFlushTracing.mockImplementationOnce(
+      () =>
+        new Promise<boolean>((resolve) => {
+          releaseFlush = resolve;
+        }),
+    );
+
+    const app = Fastify();
+    server.registerRoutes(app);
+    const response = await app.inject({
+      method: "POST",
+      url: "/execute",
+      payload: executeRequest(executionId),
+    });
+
+    expect(response.statusCode).toBe(200);
+    await vi.waitFor(() =>
+      expect(tracingMocks.forceFlushTracing).toHaveBeenCalledOnce(),
+    );
+    expect(fetchMock).not.toHaveBeenCalled();
+
+    releaseFlush(true);
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledOnce());
+    expect(fetchMock.mock.calls[0]?.[0]).toContain(
+      `/executions/${executionId}/finish`,
+    );
+  });
+
+  test("pending finish releases the session even when the tracing flush fails", async () => {
+    const server = makeRouteServer() as unknown as AERServer & {
+      handleExecute: ReturnType<typeof vi.fn>;
+      pendingSessionFinish: Map<string, ExecutorCallbackRequest>;
+    };
+    const executionId = "exec-trace-flush-fail";
+    server.pendingSessionFinish.set(executionId, {
+      execution_id: executionId,
+      status: "COMPLETED",
+    });
+    server.handleExecute = vi
+      .fn()
+      .mockResolvedValue({ status: "completed", result: "ok" });
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValue(new Response(null, { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+    // A slow or down store must not hold the release open.
+    tracingMocks.forceFlushTracing.mockResolvedValueOnce(false);
+
+    const app = Fastify();
+    server.registerRoutes(app);
+    const response = await app.inject({
+      method: "POST",
+      url: "/execute",
+      payload: executeRequest(executionId),
+    });
+
+    expect(response.statusCode).toBe(200);
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledOnce());
     expect(fetchMock.mock.calls[0]?.[0]).toContain(
       `/executions/${executionId}/finish`,
     );

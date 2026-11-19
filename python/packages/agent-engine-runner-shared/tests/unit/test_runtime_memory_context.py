@@ -435,7 +435,15 @@ class TestRuntimeMemoryContext:
 
         def fake_create_semantic_memory(**kwargs):
             captured_kwargs.update(kwargs)
-            return "memory-id"
+            from agent_engine_sdk_memory.models import CreateSemanticResult
+
+            return CreateSemanticResult(
+                id=None,
+                label="label",
+                has_embedding=False,
+                operation_id="operation-1",
+                operation_status="queued",
+            )
 
         monkeypatch.setattr(
             "agent_engine_runner_shared.memory.create_semantic_memory",
@@ -617,6 +625,31 @@ class TestRuntimeMemoryContext:
         assert get_kwargs["org_id"] == "org1"
         assert get_kwargs["procedure"] == "deploy-app"
 
+    @pytest.mark.parametrize("existing_as_model", [False, True])
+    def test_save_procedure_omits_unchanged_visibility(self, monkeypatch, existing_as_model):
+        monkeypatch.setenv("ORG_ID", "org1")
+        monkeypatch.setenv("PROJECT_ID", "proj1")
+        runtime = TenantRuntime(app_name="Test")
+        runtime._memory_engine = Mock()
+        existing = {"id": "proc-id", "procedure": "deploy-app", "visibility": "private"}
+        runtime._memory_engine.get_procedural.return_value = (
+            SimpleNamespace(**existing) if existing_as_model else existing
+        )
+        runtime._memory_engine.update_procedural.return_value = {"id": "next-id"}
+
+        assert runtime.save_procedure(
+            procedure="deploy-app",
+            description="Deploy",
+            content="v2",
+            user_id="user_123",
+            update_existing=True,
+        ) == {"id": "next-id"}
+        runtime._memory_engine.update_procedural.assert_called_once()
+        kwargs = runtime._memory_engine.update_procedural.call_args.kwargs
+        assert "visibility" not in kwargs
+        assert kwargs["if_visibility"] == "private"
+        assert kwargs["if_user_id"] == kwargs["user_id"] == "user_123"
+
     def test_save_procedure_create_forwards_metadata(self, monkeypatch):
         """Developer metadata reaches create_procedural on the create path."""
         monkeypatch.setenv("ORG_ID", "org1")
@@ -707,7 +740,7 @@ class TestRuntimeMemoryContext:
         runtime._memory_engine = Mock()
         existing = {"id": "proc-id", "procedure": "deploy-app", "visibility": "private"}
         updated = {
-            "id": "proc-id",
+            "id": "next-id",
             "procedure": "deploy-app",
             "content": "v2",
             "visibility": "org",
@@ -728,10 +761,81 @@ class TestRuntimeMemoryContext:
         get_kwargs = runtime._memory_engine.get_procedural.call_args[1]
         assert get_kwargs["user_id"] == "user_123"
         assert get_kwargs.get("visibility") is None
-        update_kwargs = runtime._memory_engine.update_procedural.call_args[1]
+        update_kwargs = runtime._memory_engine.update_procedural.call_args_list[0].kwargs
         assert update_kwargs["id"] == "proc-id"
         assert update_kwargs["user_id"] == "user_123"
-        assert update_kwargs["visibility"] == "org"
+        assert "visibility" not in update_kwargs
+        assert update_kwargs["if_visibility"] == "private"
+        visibility_kwargs = runtime._memory_engine.update_procedural.call_args_list[1].kwargs
+        assert visibility_kwargs["id"] == "next-id"
+        assert visibility_kwargs["visibility"] == "org"
+        assert visibility_kwargs["if_visibility"] == "private"
+        assert visibility_kwargs["if_user_id"] == "user_123"
+        assert "content" not in visibility_kwargs
+        assert "description" not in visibility_kwargs
+        assert runtime._memory_engine.update_procedural.call_count == 2
+        runtime._memory_engine.create_procedural.assert_not_called()
+
+    @pytest.mark.parametrize("visibility", ["org", "shared"])
+    @pytest.mark.parametrize("failed_step", [1, 2])
+    def test_save_procedure_broadening_failures_never_publish_old_behavior(
+        self, monkeypatch, visibility, failed_step
+    ):
+        monkeypatch.setenv("ORG_ID", "org1")
+        monkeypatch.setenv("PROJECT_ID", "proj1")
+        runtime = TenantRuntime(app_name="Test")
+        runtime._memory_engine = Mock()
+        runtime._memory_engine.get_procedural.return_value = {
+            "id": "old-id",
+            "visibility": "private",
+        }
+        runtime._memory_engine.update_procedural.side_effect = (
+            [RuntimeError("Embedding failed")]
+            if failed_step == 1
+            else [{"id": "new-id"}, RuntimeError("Scope changed")]
+        )
+        with pytest.raises(RuntimeError):
+            runtime.save_procedure(
+                procedure="deploy-app",
+                description="Safe",
+                content="Safe",
+                user_id="owner",
+                visibility=visibility,
+                update_existing=True,
+            )
+        calls = runtime._memory_engine.update_procedural.call_args_list
+        assert len(calls) == failed_step
+        assert calls[0].kwargs["id"] == "old-id"
+        assert calls[0].kwargs["if_visibility"] == "private"
+        assert "visibility" not in calls[0].kwargs
+        if failed_step == 2:
+            assert calls[1].kwargs["id"] == "new-id"
+            assert calls[1].kwargs["visibility"] == visibility
+            assert calls[1].kwargs["if_user_id"] == "owner"
+            assert calls[1].kwargs["if_visibility"] == "private"
+            assert "content" not in calls[1].kwargs
+
+    def test_save_procedure_does_not_edit_behavior_after_visibility_failure(self, monkeypatch):
+        monkeypatch.setenv("ORG_ID", "org1")
+        monkeypatch.setenv("PROJECT_ID", "proj1")
+        runtime = TenantRuntime(app_name="Test")
+        runtime._memory_engine = Mock()
+        runtime._memory_engine.get_procedural.return_value = {
+            "id": "proc-id",
+            "visibility": "private",
+        }
+        runtime._memory_engine.update_procedural.side_effect = RuntimeError("Scope changed")
+
+        with pytest.raises(RuntimeError, match="Scope changed"):
+            runtime.save_procedure(
+                procedure="deploy-app",
+                description="Deploy",
+                content="v2",
+                user_id="user_123",
+                visibility="org",
+                update_existing=True,
+            )
+        runtime._memory_engine.update_procedural.assert_called_once()
         runtime._memory_engine.create_procedural.assert_not_called()
 
     def test_save_procedure_update_existing_missing_creates(self, monkeypatch):
@@ -869,7 +973,7 @@ class TestRuntimeMemoryContext:
 
         assert result == updated
         update_kwargs = runtime._memory_engine.update_procedural.call_args[1]
-        assert update_kwargs["id"] is None
+        assert "id" not in update_kwargs
         assert update_kwargs["procedure"] == "deploy-app"
         assert update_kwargs["user_id"] == "user_123"
 

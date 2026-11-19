@@ -79,7 +79,10 @@ import {
 import type { AnyBackendProtocol } from "deepagents";
 import type { BaseCheckpointSaver } from "@langchain/langgraph";
 import { withEmptyBatchGuard } from "./checkpointer.js";
-import { withDurableToolResultIdentity } from "./durable_tools.js";
+import {
+  withDurableOAuthTask,
+  withDurableToolResultIdentity,
+} from "./durable_tools.js";
 import { LangGraphBaseAgent } from "./agent.js";
 import type { PrepareAgentInput, ResolveThreadId } from "./agent.js";
 import {
@@ -94,6 +97,10 @@ import { PlatformCheckpointer } from "./platform_checkpointer.js";
 import { SecureWrappedLLM, type SecureLLMWrapper } from "./secure_llm.js";
 
 const logger = getLogger("agent_engine_sdk_langgraph.runtime");
+
+// Product application name reported to MongoDB, so customers can attribute
+// Agent Engine traffic.
+const MONGO_APP_NAME = "Agent Engine";
 
 /**
  * This package's version, used as the workflow adapter version OE records.
@@ -1120,7 +1127,9 @@ export class App extends BaseApp {
     const mongodbUri =
       this.runtime.getMongodbUri() ?? process.env["MONGODB_URI"] ?? "";
     if (mongodbUri === "") return;
-    const client = new MongoClient(mongodbUri);
+    const client = new MongoClient(mongodbUri, {
+      appName: MONGO_APP_NAME,
+    });
     try {
       this.resolvedCheckpointDb = await resolveStoreDbName(
         client as unknown as Parameters<typeof resolveStoreDbName>[0],
@@ -1292,7 +1301,9 @@ export class App extends BaseApp {
 
       if (mongodbUri !== "") {
         logger.info(`Using MongoDB checkpointer: db=${checkpointDb}`);
-        const client = new MongoClient(mongodbUri);
+        const client = new MongoClient(mongodbUri, {
+          appName: MONGO_APP_NAME,
+        });
         try {
           // `@langchain/langgraph-checkpoint-mongodb` pins `mongodb@^6` while our
           // top-level dep is `mongodb@^7`. The two `MongoClient` types differ
@@ -1569,7 +1580,7 @@ export class App extends BaseApp {
         },
       );
       const durableWrapperFunc = withDurableToolResultIdentity(
-        wrapperFunc,
+        provider ? withDurableOAuthTask(wrapperFunc, toolName) : wrapperFunc,
         toolName,
       );
       // Forward the original tool's Zod schema. Without it, lcTool() builds a

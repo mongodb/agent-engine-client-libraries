@@ -84,6 +84,10 @@ from agent_engine_sdk_langgraph.secure_llm import SecureWrappedLLM
 
 logger = logging.getLogger(__name__)
 
+# Product application name reported to MongoDB, so customers can attribute
+# Agent Engine traffic.
+_MONGO_APP_NAME = "Agent Engine"
+
 _UNSET = object()  # Sentinel for "use default" -- distinct from None
 
 
@@ -1312,15 +1316,16 @@ class App(BaseApp):
             )
 
         from .agent import LangGraphBaseAgent
-        from .node_logger_adapter import LangGraphCallbackAdapter
+        from .node_logger_adapter import (
+            GraphBranchLinkHandler,
+            LangGraphCallbackAdapter,
+        )
 
         # Wrap BaseExecutionCallback instances as LangChain callbacks.
         # The only caller is the AER, which passes NodeExecutionLogger.
-        adapted_callbacks = None
-        if callbacks:
-            adapted_callbacks = []
-            for cb in callbacks:
-                adapted_callbacks.append(LangGraphCallbackAdapter(cb))
+        adapted_callbacks: list[Any] = [GraphBranchLinkHandler()]
+        for cb in callbacks or []:
+            adapted_callbacks.append(LangGraphCallbackAdapter(cb))
 
         # The parser is inert unless features.use_custom_parser is true; opting
         # in without a registered parser is a fail-fast misconfiguration.
@@ -1799,6 +1804,7 @@ class App(BaseApp):
                     serverSelectionTimeoutMS=server_selection_timeout_ms,
                     connectTimeoutMS=connect_timeout_ms,
                     socketTimeoutMS=socket_timeout_ms,
+                    appname=_MONGO_APP_NAME,
                 )
                 try:
                     # Exact database override when configured. Must not apply

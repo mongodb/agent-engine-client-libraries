@@ -9,6 +9,8 @@
  * - string and enum sources; a bare string treated as one source
  * - an unsupported source method propagates MemoryNotSupportedError
  * - an unknown source throws RangeError (TS's toSearchSource, vs Python's ValueError)
+ * - a server error in one source leaves the others' results; on every source it throws the first
+ * - a non-server error (auth) from one source still throws
  *
  * Adaptation notes:
  * - Python raises ValueError for an unknown source; the TS port narrows via
@@ -19,9 +21,13 @@
  *   recorder (the stubRuntime pattern from memory.test.ts, extended).
  */
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
-import { MemoryNotSupportedError } from "../src/errors.js";
+import {
+  MemoryAuthError,
+  MemoryNotSupportedError,
+  MemoryServerError,
+} from "../src/errors.js";
 import { Memory } from "../src/memory.js";
 import { SearchSource, type MemoryChunk } from "../src/models.js";
 import type { MemoryRuntime } from "../src/transport.js";
@@ -47,6 +53,7 @@ function fakeRuntime(opts: {
   taxonomic?: MemoryChunk[];
   procedures?: Array<Record<string, unknown>>;
   taxonomicError?: Error;
+  semanticError?: Error;
 }): { runtime: MemoryRuntime; calls: string[] } {
   const calls: string[] = [];
   const runtime: MemoryRuntime = {
@@ -62,6 +69,7 @@ function fakeRuntime(opts: {
     }),
     searchSemantic: async () => {
       calls.push("semantic");
+      if (opts.semanticError) throw opts.semanticError;
       return [...(opts.semantic ?? [])];
     },
     searchEpisodes: async () => {
@@ -211,4 +219,73 @@ describe("Memory.search fan-out, merge, and adaptation", () => {
       new Memory({ runtime }).search({ query: "q", sources: ["stm"] }),
     ).rejects.toBeInstanceOf(RangeError);
   });
+
+  it("returns the other sources' results when one fails on the server", async () => {
+    const warn = vi.spyOn(process, "emitWarning").mockImplementation(() => {});
+    const { runtime } = fakeRuntime({
+      semantic: [chunk("semantic", 0.5, "s")],
+      taxonomicError: new MemoryServerError("detail \u001b]52;c;boom\u0007", {
+        status: 500,
+      }),
+    });
+    const results = await new Memory({ runtime }).search({
+      query: "q",
+      sources: ["semantic", "taxonomic"],
+    });
+    expect(results.map((c) => c.id)).toEqual(["s"]);
+    const message = String(warn.mock.calls[0]?.[0]);
+    expect(message).toContain("taxonomic source failed (HTTP 500)");
+    // Server-supplied text stays out of the warning.
+    expect(message).not.toContain("detail");
+    expect(message).not.toContain("\u001b");
+    warn.mockRestore();
+  });
+
+  it("throws the first error when every requested source fails", async () => {
+    const warn = vi.spyOn(process, "emitWarning").mockImplementation(() => {});
+    const first = new MemoryServerError("semantic down", { status: 500 });
+    const { runtime } = fakeRuntime({
+      semanticError: first,
+      taxonomicError: new MemoryServerError("taxonomic down", { status: 500 }),
+    });
+    await expect(
+      new Memory({ runtime }).search({
+        query: "q",
+        sources: ["semantic", "taxonomic"],
+      }),
+    ).rejects.toBe(first);
+    // No partial-result warning when nothing is returned.
+    expect(warn).not.toHaveBeenCalled();
+    warn.mockRestore();
+  });
+
+  it("still throws an auth error from one source", async () => {
+    const { runtime } = fakeRuntime({
+      semantic: [chunk("semantic", 0.5)],
+      taxonomicError: new MemoryAuthError("token expired", { status: 401 }),
+    });
+    await expect(
+      new Memory({ runtime }).search({
+        query: "q",
+        sources: ["semantic", "taxonomic"],
+      }),
+    ).rejects.toBeInstanceOf(MemoryAuthError);
+  });
+
+  it.each([null, 502, 503, 504])(
+    "still throws a retryable or malformed server error (status %s)",
+    async (status) => {
+      // null is a malformed success body; 502-504 tell the caller to retry.
+      const { runtime } = fakeRuntime({
+        semantic: [chunk("semantic", 0.5)],
+        taxonomicError: new MemoryServerError("not a source fault", { status }),
+      });
+      await expect(
+        new Memory({ runtime }).search({
+          query: "q",
+          sources: ["semantic", "taxonomic"],
+        }),
+      ).rejects.toBeInstanceOf(MemoryServerError);
+    },
+  );
 });

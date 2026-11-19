@@ -18,6 +18,7 @@ import httpx
 
 from agent_engine_runner_shared.context import (
     current_execution_id,
+    current_local_chunk_sink,
     current_oe_url,
     get_current_oe_owner_url,
     report_oe_owner_url_failure,
@@ -110,6 +111,18 @@ def emit(event: str, data: str) -> None:
             f"emit: event {event!r} is reserved for infrastructure use; "
             f"choose a non-terminal event type such as 'step'"
         )
+
+    # A journaled turn installs a request-scoped sink: the chunk is then
+    # sequenced and recorded on the turn's journal, so a replay is a complete
+    # copy of what the client saw. Outside the AER (a Tool Pod tool) there is no
+    # sink and progress keeps its own best-effort transport.
+    local_sink = current_local_chunk_sink.get()
+    if local_sink is not None:
+        try:
+            local_sink(event, data)
+        except Exception as exc:  # noqa: BLE001 - emit is best-effort
+            logger.debug("emit: local sink failed: %s", exc)
+        return
 
     execution_id = current_execution_id.get()
     oe_url = current_oe_url.get()

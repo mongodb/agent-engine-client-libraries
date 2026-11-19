@@ -45,6 +45,7 @@ function makeServer(): AerPrivates {
   server.sendStreamChunk = vi.fn().mockResolvedValue(undefined);
   server.reportCallback = vi.fn().mockResolvedValue(undefined);
   server.chunkSeq = new Map();
+  server.durableAckSenders = new Map();
   server.ownerCallbackUrl = new Map();
   return server;
 }

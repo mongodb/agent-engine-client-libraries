@@ -446,9 +446,10 @@ export class MemoryClient {
     embedding?: number[] | null;
     metadata?: Record<string, unknown> | null;
     upsert?: boolean;
+    idempotencyKey?: string | null;
     signal?: AbortSignal;
   }): Promise<CreateSemanticResult> {
-    const body = {
+    const body: Record<string, unknown> = {
       label: params.label,
       text: params.text,
       org_id: params.orgId,
@@ -464,6 +465,8 @@ export class MemoryClient {
       // existing memory with the same label instead of erroring on duplicate.
       upsert: params.upsert ?? false,
     };
+    if (params.idempotencyKey != null)
+      body.idempotency_key = params.idempotencyKey;
     return this.request(
       "POST",
       "/semantic",
@@ -938,11 +941,18 @@ export class MemoryClient {
     return data.entries.length > 0 ? data.entries[0] : null;
   }
 
+  /**
+   * Store changed procedural behavior as a retained version synchronously.
+   * Reuse idempotencyKey for retries on the same lineage and payload.
+   * Omitting it starts a new logical edit.
+   */
   async updateProcedural(params: {
     orgId: string;
     projectId: string;
     id?: string | null;
     procedure?: string | null;
+    userId?: string | null;
+    idempotencyKey?: string | null;
     description?: string | null;
     content?: string | null;
     steps?: Array<Record<string, unknown>> | null;
@@ -959,6 +969,7 @@ export class MemoryClient {
         orgId: params.orgId,
         projectId: params.projectId,
         procedure: params.procedure,
+        userId: params.userId,
         signal: params.signal,
       });
       if (existing == null)
@@ -978,6 +989,8 @@ export class MemoryClient {
       );
     const body = {
       org_id: params.orgId,
+      user_id: params.userId,
+      idempotency_key: params.idempotencyKey,
       description: params.description,
       content: params.content,
       steps: params.steps,
@@ -993,7 +1006,8 @@ export class MemoryClient {
       `/procedural/${encodeIdSegment(String(memoryId))}`,
       z.unknown(),
       body,
-      undefined,
+      // The Gateway scopes machine-caller procedural writes by the query user_id.
+      { user_id: params.userId },
       params.signal,
     );
   }

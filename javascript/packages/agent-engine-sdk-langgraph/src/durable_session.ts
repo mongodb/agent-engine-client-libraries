@@ -36,6 +36,7 @@ import {
   getCurrentUserId,
   getCurrentWrapper,
   guardrailReviewWaitId,
+  OAUTH_AUTHORIZATION_ACTIVITY_NAME,
   interruptedActivities,
   markInterruptedActivitiesAnswered,
   recordInterruptedActivity,
@@ -56,7 +57,9 @@ import {
 } from "./durable_subgraphs.js";
 import { takeRaisedInterruptIds } from "./raised_interrupts.js";
 import {
+  CONTINUE_FROM_CHECKPOINT,
   ExecutionSession,
+  type GraphContinuation,
   type PreparedRun,
   type SessionOptions,
 } from "./execution_session.js";
@@ -171,6 +174,10 @@ function isDirectInterruptActivity(activity: InterruptedActivity): boolean {
     segments.length === 1 &&
     segments[0]?.name.startsWith("langgraph.task:") === true
   );
+}
+
+function isOAuthAuthorizationWait(activity: InterruptedActivity): boolean {
+  return activity.command.activityName === OAUTH_AUTHORIZATION_ACTIVITY_NAME;
 }
 
 function directInterruptId(activity: InterruptedActivity): string | undefined {
@@ -541,9 +548,9 @@ export class DurableSession extends ExecutionSession {
     response: string,
     messages: readonly unknown[],
     raised: readonly Interrupt[],
-  ): Promise<Command | AgentOutput | null> {
+  ): Promise<GraphContinuation | AgentOutput | null> {
     const result = await this.settlePendingInterrupts(config, raised);
-    if (result === null || result instanceof Command) return result;
+    if (!Array.isArray(result)) return result;
     return invokeSuspendOutput({
       response,
       threadId: this.threadId,
@@ -559,9 +566,9 @@ export class DurableSession extends ExecutionSession {
     config: RunnableConfig,
     captured: readonly Interrupt[],
     messages: readonly BaseMessage[],
-  ): Promise<Command | StreamEvent | null> {
+  ): Promise<GraphContinuation | StreamEvent | null> {
     const result = await this.settlePendingInterrupts(config, captured);
-    if (result === null || result instanceof Command) return result;
+    if (!Array.isArray(result)) return result;
     return streamHitlSuspendEvent({
       interrupts: result,
       checkpointId: undefined,
@@ -573,7 +580,7 @@ export class DurableSession extends ExecutionSession {
   private async settlePendingInterrupts(
     config: RunnableConfig,
     captured: readonly Interrupt[],
-  ): Promise<Command | PublicInterrupt[] | null> {
+  ): Promise<GraphContinuation | PublicInterrupt[] | null> {
     const graph = this.graph as unknown as {
       getState(
         config: RunnableConfig,
@@ -637,8 +644,25 @@ export class DurableSession extends ExecutionSession {
       activitiesByNativeId.set(id, activity);
     }
 
+    // ToolNode runs each OAuth call in its own LangGraph task, and the state
+    // reports only the pause the node re-raised, though every sibling call
+    // paused and registered its wait before the step ended. OE owns each
+    // consent wait, so all registered pauses join the frontier.
+    const registered = [...activitiesByNativeId.values()];
+    const exposedIds = new Set(pending.map((interrupt) => interrupt.id));
+    const frontier = registered.some(isOAuthAuthorizationWait)
+      ? [
+          ...pending,
+          ...registered.flatMap((activity) =>
+            uniqueInterrupts(
+              (activity.controlFlow as GraphInterrupt).interrupts,
+            ).filter((interrupt) => !exposedIds.has(interrupt.id)),
+          ),
+        ]
+      : pending;
+
     const interruptByPosition = new Map<string, PublicInterrupt>();
-    const suspensions = pending.map((interrupt) => {
+    const suspensions = frontier.map((interrupt) => {
       const activity = activitiesByNativeId.get(interrupt.id);
       if (activity === undefined) {
         throw new UnsupportedDurableGraphError(
@@ -655,6 +679,19 @@ export class DurableSession extends ExecutionSession {
       interruptByPosition.set(key, interrupt);
       return entry;
     });
+    // OE answers a consent wait itself, so the graph continues from its
+    // checkpoint, while an application pause continues with its answer as a
+    // LangGraph resume value. Continuing a step needs one of the two.
+    const consentWaits = frontier.filter((interrupt) => {
+      const activity = activitiesByNativeId.get(interrupt.id);
+      return activity !== undefined && isOAuthAuthorizationWait(activity);
+    }).length;
+    if (consentWaits > 0 && consentWaits < frontier.length) {
+      throw new UnsupportedDurableGraphError(
+        "a durable OAuth consent wait cannot pause in the same step as " +
+          "another pause",
+      );
+    }
 
     const oeUrl = getCurrentOeUrl();
     if (!oeUrl) {
@@ -722,7 +759,11 @@ export class DurableSession extends ExecutionSession {
       const memoryClient = new WorkflowClient(oeUrl);
       for (const { interrupt, outcome } of settled) {
         const activity = activitiesByNativeId.get(interrupt.id);
-        if (activity === undefined || !isDirectInterruptActivity(activity)) {
+        if (
+          activity === undefined ||
+          (!isDirectInterruptActivity(activity) &&
+            !isOAuthAuthorizationWait(activity))
+        ) {
           continue;
         }
         const context = create(ActivityContextSchema, {
@@ -731,9 +772,12 @@ export class DurableSession extends ExecutionSession {
           attemptId: outcome.attemptId,
           fencingToken: outcome.fencingToken,
         });
-        if (guardrailReviewWaitId(interrupt.value) !== null) {
-          // The answer is the platform's review decision, not something the
-          // user or a tool said.
+        if (
+          isOAuthAuthorizationWait(activity) ||
+          guardrailReviewWaitId(interrupt.value) !== null
+        ) {
+          // A platform answer wakes a credential gate or a review; it is not
+          // something the user or a tool said.
           await durableMemory.acknowledge(memoryClient, context);
           continue;
         }
@@ -754,6 +798,7 @@ export class DurableSession extends ExecutionSession {
         return position === undefined ? [] : [position];
       }),
     );
+    if (consentWaits > 0) return CONTINUE_FROM_CHECKPOINT;
     return new Command({
       resume: Object.fromEntries(
         settled.map(({ interrupt, outcome }) => [

@@ -5,7 +5,7 @@
 # Usage: docker buildx build -t runner:latest -f packages/python/packages/agent-engine-runner-shared/Dockerfile .
 
 ARG BASE_TARGETPLATFORM=linux/amd64
-ARG RUNNER_BASE_IMAGE=664315256653.dkr.ecr.us-east-1.amazonaws.com/base/amazonlinux2023-python:v3.11-202611021131-0cb5df7@sha256:059f4396b31473f85e83c9219255b37f7b24e3caaef1c129363d50bc50383ceb
+ARG RUNNER_BASE_IMAGE=664315256653.dkr.ecr.us-east-1.amazonaws.com/base/amazonlinux2023-python:v3.11-202611172336-ff48840@sha256:53525e25e3608222e3fe1b6399611f06620d52cbfcb33445138c76be50feaa23
 
 FROM --platform=${BASE_TARGETPLATFORM} ghcr.io/astral-sh/uv@sha256:ff07b86af50d4d9391d9daf4ff89ce427bc544f9aae87057e69a1cc0aa369946 AS uv
 

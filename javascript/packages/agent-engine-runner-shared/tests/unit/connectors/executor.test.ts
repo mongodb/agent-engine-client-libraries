@@ -115,6 +115,84 @@ describe("ConnectorExecutor", () => {
     expect(calls.requests).toHaveLength(0);
   });
 
+  it("names the failed field without echoing its value", async () => {
+    const calls = transport(async () => response());
+    const executor = new ConnectorExecutor(definitions(), {
+      transport: calls.transport,
+    });
+    const failure = execute(executor, "jiradc_addComment", {
+      issueIdOrKey: "DEMO-1",
+      body: 31337,
+    });
+    await expect(failure).rejects.toThrow(
+      "arguments do not match the compiled input schema: body: must be string",
+    );
+    await expect(failure).rejects.not.toThrow("31337");
+    expect(calls.requests).toHaveLength(0);
+  });
+
+  it("names a missing required argument", async () => {
+    const calls = transport(async () => response());
+    const executor = new ConnectorExecutor(definitions(), {
+      transport: calls.transport,
+    });
+    await expect(
+      execute(executor, "jiradc_addComment", { body: "Hello" }),
+    ).rejects.toThrow("arguments: must have required property 'issueIdOrKey'");
+    expect(calls.requests).toHaveLength(0);
+  });
+
+  describe("an operation whose body fields are top-level arguments", () => {
+    const editIssue = (): ToolDefinitions =>
+      customDefinitions({
+        name: "jiradc_editIssue",
+        description: "",
+        method: "PUT",
+        path: "/api/2/issue/{issueIdOrKey}",
+        params: {
+          path: ["issueIdOrKey"],
+          query: [],
+          header: [],
+          cookie: [],
+          body: ["fields", "update"],
+          wrapped: false,
+          query_style: {},
+          form_style: {},
+        },
+        inputSchema: {
+          type: "object",
+          properties: {
+            issueIdOrKey: { type: "string" },
+            fields: { type: "object" },
+            update: { type: "object" },
+          },
+          required: ["issueIdOrKey"],
+        },
+        body_encoding: "json",
+      });
+
+    // A model that wraps body fields as another operation of the same API
+    // expects would otherwise send an empty write the provider accepts.
+    it.each([
+      [{ body: { fields: { assignee: null } } }, "body"],
+      [{ Authorization: "evil" }, "Authorization"],
+    ])("rejects unknown arguments before I/O", async (extra, unexpected) => {
+      const calls = transport(async () => response(204));
+      const executor = new ConnectorExecutor(editIssue(), {
+        transport: calls.transport,
+      });
+      await expect(
+        execute(executor, "jiradc_editIssue", {
+          issueIdOrKey: "DEMO-1",
+          ...extra,
+        }),
+      ).rejects.toThrow(
+        `unexpected arguments: ${unexpected}; accepted arguments: fields, issueIdOrKey, update`,
+      );
+      expect(calls.requests).toHaveLength(0);
+    });
+  });
+
   it("uses static auth and ignores a delegated token", async () => {
     const calls = transport(async () => response(200, "ok"));
     const executor = new ConnectorExecutor(definitions(), {

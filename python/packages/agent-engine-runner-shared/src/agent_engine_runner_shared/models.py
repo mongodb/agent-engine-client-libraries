@@ -292,6 +292,28 @@ class ExecuteRequest(BaseModel):
             "retry semantics."
         ),
     )
+    stream_journal_enabled: bool = Field(
+        default=False,
+        description=(
+            "True when the turn's chunks are recorded in the runner's own "
+            "stream journal, which — not live delivery — is the durable copy: "
+            "live delivery becomes best effort, so a full queue or an "
+            "exhausted retry budget drops chunks instead of blocking producers, "
+            "and settlement does not wait for delivery to drain. Takes "
+            "precedence over durable_ack_enabled when both are set. "
+            "False/absent leaves the chunk path untouched."
+        ),
+    )
+    stream_generation: int = Field(
+        default=0,
+        description=(
+            "Generation this dispatch opened for the stream journal. The runner "
+            "stamps it on every chunk and keys the journal by it, so a resume leg "
+            "carries a higher generation and addresses a separate body. "
+            "Zero/absent disables journaling even when stream_journal_enabled is "
+            "set."
+        ),
+    )
     # `message` resolution (promote payload["message"] when the top level is
     # empty; reject when both are set) lives in the AER, the only component that
     # unpacks the opaque payload — see agent_engine_runner_shared.server.aer. Keeping it out

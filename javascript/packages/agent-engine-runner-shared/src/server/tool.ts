@@ -13,6 +13,7 @@ import os from "node:os";
 import { once } from "node:events";
 import type { ServerResponse } from "node:http";
 import type { FastifyInstance } from "fastify";
+import { SpanStatusCode, type Span } from "@opentelemetry/api";
 import type { JsonValue, LLMStreamChunk } from "@mongodb-js/agent-engine-sdk";
 import type { LLMTokenUsage } from "@mongodb-js/agent-engine-sdk";
 import { getLogger } from "../logger.js";
@@ -62,6 +63,16 @@ import { TimeoutError } from "../timeout.js";
 import { fatalWithTermination } from "../launcher.js";
 import { evaluateGuardrailCheck } from "../guardrails_evaluator/index.js";
 import { evaluateGuardrailCheckTraced } from "./guardrail_span.js";
+import {
+  runWithInboundTraceContext,
+  streamWithInboundTraceContext,
+} from "./inbound_trace_span.js";
+import {
+  TOOL_EXECUTE,
+  TOOL_INVOKE_LLM,
+  TOOL_INVOKE_LLM_STREAM,
+  OpenInferenceSpanKind,
+} from "../span_names.js";
 import { SecureLLMProxy } from "../secure_llm_proxy.js";
 import { closeAllTLSAgents } from "../tls_client.js";
 import {
@@ -99,6 +110,26 @@ import { resolveOwnerUrl } from "./owner_url.js";
 import { runAsCallerRecordedConversation } from "../tracing/conversation.js";
 
 const logger = getLogger("agent_engine_runner_shared.server.tool");
+
+// Instrumentation scope for the tool pod's boundary spans, matching the Python
+// tool pod's `get_tracer("agent-engine-runner-shared.tool")`.
+const TOOL_TRACER_NAME = "agent-engine-runner-shared.tool";
+
+/**
+ * Record ERROR on a tool-pod boundary span when the handler reported a failure
+ * in-band instead of throwing.
+ *
+ * The real `/execute` and `/invoke_llm` handlers catch tool/LLM failures and
+ * return an `error` status rather than rethrowing, and the streaming handler
+ * yields an `error` frame. Without this the boundary would finish UNSET and a
+ * backend renders it as OK while the caller sees a failure. The HTTP/SSE
+ * response contract is unchanged — only the span status is set.
+ */
+function markBoundaryOutcome(span: Span, status: string | undefined): void {
+  if (status === "error") {
+    span.setStatus({ code: SpanStatusCode.ERROR });
+  }
+}
 
 /**
  * Max time to wait for a slow SSE client to drain before aborting the stream.
@@ -806,7 +837,32 @@ export class ToolServer extends BaseServer {
         body.step_number,
       );
       try {
-        const result = await this.handleExecute(body);
+        const result = await runWithInboundTraceContext(
+          {
+            name: TOOL_EXECUTE,
+            kind: OpenInferenceSpanKind.TOOL,
+            tracerName: TOOL_TRACER_NAME,
+            // The boundary opens before `runWithExecutionContext`, so the
+            // ExecutionContextSpanProcessor cannot stamp identity on it. Carry
+            // it here so the boundary keeps the same identity as its children
+            // and stays visible to the session/execution trace filters instead
+            // of being dropped while its children are returned. Mirrors the
+            // AER's `aer.execute` stamping.
+            attributes: {
+              "execution.id": body.execution_id,
+              "session.id": body.session_id,
+              "thread.id": body.session_id,
+            },
+          },
+          request.headers,
+          async (span) => {
+            const result = await this.handleExecute(body);
+            // The handler encodes a failed tool call as an error status rather
+            // than throwing, so mark the boundary from the outcome.
+            markBoundaryOutcome(span, result.status);
+            return result;
+          },
+        );
         return reply.send(result);
       } finally {
         this.drainRegistry.endWork(
@@ -827,7 +883,29 @@ export class ToolServer extends BaseServer {
         body.step_number,
       );
       try {
-        const result = await this.handleInvokeLlm(body, drainController.signal);
+        const result = await runWithInboundTraceContext(
+          {
+            name: TOOL_INVOKE_LLM,
+            kind: OpenInferenceSpanKind.CHAIN,
+            tracerName: TOOL_TRACER_NAME,
+            // Opened before `runWithExecutionContext`, so stamp the identity
+            // the processor would otherwise add — see the /execute route. The
+            // invoke_llm request carries only an execution id (no session id),
+            // matching the context its children run under.
+            attributes: { "execution.id": body.execution_id },
+          },
+          request.headers,
+          async (span) => {
+            const result = await this.handleInvokeLlm(
+              body,
+              drainController.signal,
+            );
+            // A failed routed LLM call is encoded as an error status, not
+            // thrown, so mark the boundary from the outcome.
+            markBoundaryOutcome(span, result.status);
+            return result;
+          },
+        );
         // Mirror Python's `_sync_usage_with_result` model validator: ensure
         // `result.usage` is populated (OE reads `result["usage"]`), not just the
         // top-level `usage`.
@@ -875,7 +953,21 @@ export class ToolServer extends BaseServer {
       // when the LLM adapter ignores the signal it was handed.
       await pipeSseLinesToResponse(
         res,
-        (signal) => this.handleInvokeLlmStream(body, signal),
+        (signal) =>
+          streamWithInboundTraceContext(
+            {
+              name: TOOL_INVOKE_LLM_STREAM,
+              kind: OpenInferenceSpanKind.CHAIN,
+              tracerName: TOOL_TRACER_NAME,
+              // Opened before `runWithExecutionContext`, so stamp the identity
+              // the processor would otherwise add — see the /execute route.
+              attributes: { "execution.id": body.execution_id },
+            },
+            request.headers,
+            // The boundary span is threaded in so a mid-stream provider failure
+            // — surfaced as an error frame, never thrown — can mark it ERROR.
+            (span) => this.handleInvokeLlmStream(body, signal, span),
+          ),
         {
           signal: drainController.signal,
           onGeneratorSettled: () =>
@@ -1335,6 +1427,7 @@ export class ToolServer extends BaseServer {
   private async *handleInvokeLlmStream(
     request: LLMPodInvokeRequest,
     signal?: AbortSignal,
+    boundarySpan?: Span,
   ): AsyncGenerator<string> {
     const podName = os.hostname();
     const startTime = performance.now();
@@ -1344,7 +1437,13 @@ export class ToolServer extends BaseServer {
       oeUrl: "",
       traceId: request.platform_trace_id,
     };
-    const gen = this.invokeLlmStreamEvents(request, signal, podName, startTime);
+    const gen = this.invokeLlmStreamEvents(
+      request,
+      signal,
+      podName,
+      startTime,
+      boundarySpan,
+    );
     try {
       while (true) {
         // Each step runs the model span inside the request's context, which the
@@ -1368,6 +1467,7 @@ export class ToolServer extends BaseServer {
     signal: AbortSignal | undefined,
     podName: string,
     startTime: number,
+    boundarySpan?: Span,
   ): AsyncGenerator<string> {
     try {
       let usage: LLMTokenUsage | undefined;
@@ -1414,6 +1514,9 @@ export class ToolServer extends BaseServer {
       logger.warn(
         `LLM stream failed: ${e instanceof Error ? e.message : String(e)}`,
       );
+      // The failure is surfaced as an in-band frame, not a throw, so the
+      // boundary span must be marked here or it would render as OK.
+      boundarySpan?.setStatus({ code: SpanStatusCode.ERROR });
       const errorEvent: LLMPodStreamEvent = {
         error: formatLlmError(e),
         error_code: llmFailureErrorCode(e),

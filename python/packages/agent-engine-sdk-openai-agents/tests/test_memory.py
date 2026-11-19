@@ -6,6 +6,7 @@ from unittest.mock import MagicMock
 
 import pytest
 from agent_engine_sdk_memory import Memory
+from agent_engine_sdk_memory.models import CreateSemanticResult
 
 from agent_engine_runner_shared.memory_appbound import (
     AppBoundCrudClient,
@@ -32,20 +33,23 @@ def test_memory_is_one_facade_over_the_app_runtime(app: App) -> None:
     assert memory._client._runtime is app._runtime
 
 
-@pytest.mark.parametrize("stored", [True, False])
-def test_save_semantic_reports_whether_the_runtime_stored_it(
-    app: App, stored: bool
-) -> None:
-    app._runtime.save_semantic.return_value = stored
+def test_save_semantic_returns_the_accepted_operation(app: App) -> None:
+    accepted = CreateSemanticResult(
+        id=None,
+        label="contact_pref",
+        has_embedding=False,
+        operation_id="op-1",
+        operation_status="queued",
+    )
+    app._runtime.create_semantic.return_value = accepted
 
     result = app.memory.save_semantic(
         text="Prefers email", label="contact_pref", user_id="u1"
     )
 
-    assert result.acknowledged is stored
-    assert result.label == "contact_pref"
+    assert result == accepted
     # The user id attributes the memory, so it must reach the runtime unchanged.
-    sent = app._runtime.save_semantic.call_args.kwargs
+    sent = app._runtime.create_semantic.call_args.kwargs
     assert (sent["text"], sent["label"], sent["user_id"]) == (
         "Prefers email",
         "contact_pref",

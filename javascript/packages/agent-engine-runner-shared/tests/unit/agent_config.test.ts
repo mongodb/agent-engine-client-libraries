@@ -707,7 +707,20 @@ describe("isPlatformEnvVar membership", () => {
     expect(isPlatformEnvVar("AGENT_ENGINE_ENVIRONMENT")).toBe(true);
     expect(isPlatformEnvVar("MDBAE_LOCAL_MODE")).toBe(true);
     expect(isPlatformEnvVar("MDBAE_LOCAL_PORT")).toBe(true);
+    expect(isPlatformEnvVar("AGENTENGINE_STREAM_JOURNAL_DIR")).toBe(true);
     expect(isPlatformEnvVar("MY_API_TOKEN")).toBe(false);
+  });
+
+  test("keeps the journal directory override out of the tenant mapping", async () => {
+    // The runner-owned stream-journal directory is platform-owned: tenant YAML
+    // must not be able to dereference it. Mirrors Python's exclusion.
+    const { tenantEnvVars } = await import("../../src/utils.js");
+    const mapping = tenantEnvVars({
+      AGENTENGINE_STREAM_JOURNAL_DIR: "/scratch/agent-engine-stream-journal",
+      TENANT_VAR: "value",
+    });
+    expect(mapping["AGENTENGINE_STREAM_JOURNAL_DIR"]).toBeUndefined();
+    expect(mapping["TENANT_VAR"]).toBe("value");
   });
 });
 

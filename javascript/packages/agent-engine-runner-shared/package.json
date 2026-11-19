@@ -1,6 +1,6 @@
 {
   "name": "@mongodb-js/agent-engine-runner-shared",
-  "version": "0.11.14",
+  "version": "0.11.15",
   "description": "Runner SDK - Framework-agnostic agent runtime (TypeScript)",
   "license": "Apache-2.0",
   "repository": {
@@ -38,10 +38,11 @@
   "dependencies": {
     "@bufbuild/protobuf": "2.12.1",
     "@fastify/cors": "^10.0.0",
-    "@mongodb-js/agent-engine-sdk-memory": "0.11.14",
-    "@mongodb-js/agent-engine-sdk": "0.11.14",
+    "@mongodb-js/agent-engine-sdk-memory": "0.11.15",
+    "@mongodb-js/agent-engine-sdk": "0.11.15",
     "@modelcontextprotocol/client": "^2.3.1",
     "@opentelemetry/api": "^1.9.1",
+    "@opentelemetry/context-async-hooks": "^2.7.1",
     "@opentelemetry/core": "^2.0.0",
     "@opentelemetry/exporter-trace-otlp-http": "^0.205.0",
     "@opentelemetry/otlp-transformer": "^0.205.0",

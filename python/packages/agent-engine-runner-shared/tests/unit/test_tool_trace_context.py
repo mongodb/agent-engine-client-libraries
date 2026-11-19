@@ -79,8 +79,6 @@ def _route_client() -> TestClient:
     runtime = Mock()
     runtime._tools = {}
     runtime._tool_definitions = {}
-    # /execute resolves an unknown tool name against the MCP server list before
-    # giving up, so the stub needs a real (empty) one to iterate.
     runtime.agent_config.mcp.servers = []
     app = FastAPI()
     ToolServer(runtime).register_routes(app)
@@ -242,7 +240,7 @@ class TestDeclaredSpanKind:
                 "tool.invoke_llm.stream",
                 OpenInferenceSpanKind.CHAIN,
                 httpx.Headers({"traceparent": TRACEPARENT}),
-                chunks(),
+                lambda _span: chunks(),
             )
         ]
 
@@ -293,6 +291,33 @@ class TestRouteDeclaredSpanKind:
         spans = {span.name: span for span in in_memory_tracer.get_finished_spans()}
         assert span_name in spans, f"{path} produced spans {sorted(spans)}"
         assert spans[span_name].attributes[OPENINFERENCE_SPAN_KIND] == expected_kind.value
+
+    @pytest.mark.parametrize(
+        ("path", "payload", "span_name"),
+        [
+            ("/execute", _EXECUTE_PAYLOAD, "tool.execute"),
+            ("/invoke_llm", _INVOKE_LLM_PAYLOAD, "tool.invoke_llm"),
+            ("/invoke_llm/stream", _INVOKE_LLM_PAYLOAD, "tool.invoke_llm.stream"),
+        ],
+    )
+    def test_route_boundary_is_error_when_handler_encodes_a_failure(
+        self, in_memory_tracer, path, payload, span_name
+    ):
+        """A caught tool/LLM failure must mark its boundary ERROR.
+
+        The handlers convert failures into an ``error`` status (or, for the
+        stream, an in-band ``error`` frame) rather than rethrowing, so the
+        boundary has to be marked from the outcome — a finished UNSET span
+        renders as OK while the caller sees a failure.
+        """
+        client = _route_client()
+
+        response = client.post(path, json=payload, headers={"traceparent": TRACEPARENT})
+
+        assert response.status_code == 200, response.text
+        spans = {span.name: span for span in in_memory_tracer.get_finished_spans()}
+        assert span_name in spans, f"{path} produced spans {sorted(spans)}"
+        assert spans[span_name].status.status_code.name == "ERROR"
 
     def test_guardrails_check_span_records_input_and_decision(self, in_memory_tracer):
         client = _route_client()
@@ -531,7 +556,7 @@ class TestStreamWithInboundTraceContext:
                 "tool.invoke_llm.stream",
                 OpenInferenceSpanKind.CHAIN,
                 httpx.Headers({"traceparent": TRACEPARENT}),
-                chunks(),
+                lambda _span: chunks(),
             )
         ]
 
@@ -553,7 +578,7 @@ class TestStreamWithInboundTraceContext:
                 "tool.invoke_llm.stream",
                 OpenInferenceSpanKind.CHAIN,
                 httpx.Headers({"traceparent": TRACEPARENT}),
-                chunks(),
+                lambda _span: chunks(),
             )
         ]
 
@@ -574,7 +599,7 @@ class TestStreamWithInboundTraceContext:
                 "tool.invoke_llm.stream",
                 OpenInferenceSpanKind.CHAIN,
                 httpx.Headers({"traceparent": TRACEPARENT}),
-                chunks(),
+                lambda _span: chunks(),
             ):
                 pass
 
@@ -599,7 +624,7 @@ class TestStreamWithInboundTraceContext:
                 "tool.invoke_llm.stream",
                 OpenInferenceSpanKind.CHAIN,
                 httpx.Headers({"traceparent": TRACEPARENT}),
-                chunks(),
+                lambda _span: chunks(),
             )
         ]
         assert got == ["a"]

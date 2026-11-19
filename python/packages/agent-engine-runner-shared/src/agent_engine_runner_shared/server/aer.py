@@ -13,12 +13,25 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import contextvars
 import inspect
 import json
 import logging
 import os
+import threading
 import time
-from typing import TYPE_CHECKING, Any, Callable, Dict, NamedTuple, Optional, TypedDict, Union, cast
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    AsyncIterator,
+    Callable,
+    Dict,
+    NamedTuple,
+    Optional,
+    TypedDict,
+    Union,
+    cast,
+)
 
 import httpx
 from agent_engine_sdk import (
@@ -31,6 +44,7 @@ from agent_engine_sdk.models import (
     SessionsSummaryResponse,
 )
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Query, Request, Response
+from fastapi.responses import StreamingResponse
 from pydantic import JsonValue, ValidationError
 
 from agent_engine_runner_shared import tls_client
@@ -40,6 +54,7 @@ from agent_engine_runner_shared.context import (
     clear_execution_context,
     close_session_finish_latch,
     current_execution_id,
+    current_local_chunk_sink,
     customer_origin_scope,
     get_current_oe_owner_url,
     is_session_finish_requested,
@@ -71,9 +86,14 @@ from agent_engine_runner_shared.secure_wrapper import (
 )
 from agent_engine_runner_shared.server.base import BaseServer
 from agent_engine_runner_shared.server.callback_delivery import CallbackDelivery
+from agent_engine_runner_shared.server.chunk_delivery import (
+    DurableAckError,
+    DurableChunkSender,
+)
 from agent_engine_runner_shared.server.chunk_types import (
     CUSTOM_EVENT,
     DONE,
+    DURABLE_ACK_INCOMPLETE_ERROR_CODE,
     ERROR,
     LLM_CREDENTIAL_REJECTED_ERROR_CODE,
     LLM_INVOCATION_ERROR_CODE,
@@ -91,10 +111,21 @@ from agent_engine_runner_shared.server.graph_warm import GraphWarmer
 from agent_engine_runner_shared.server.http_retry import post_json_with_retries
 from agent_engine_runner_shared.server.oe_url import resolve_oe_url
 from agent_engine_runner_shared.server.owner_url import resolve_owner_url
+from agent_engine_runner_shared.server.stream_journal import (
+    REASON_ABORTED,
+    REASON_COMPLETED,
+    REASON_ERROR,
+    REASON_SUSPENDED,
+    JournalWriter,
+    ReaderLease,
+    ReaderLimitExceeded,
+    StreamJournalRegistry,
+)
 from agent_engine_runner_shared.span_kinds import OPENINFERENCE_SPAN_KIND, OpenInferenceSpanKind
 from agent_engine_runner_shared.span_names import AER_BUILD_AGENT
 from agent_engine_runner_shared.tls_client import create_async_httpx_client_with_tls
 from agent_engine_runner_shared.utils import (
+    PROGRESS_TIMEOUT_SECS,
     filter_thinking_tokens,
     get_env_float,
     get_request_timeout,
@@ -128,7 +159,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 # Whole-turn execution timeout. The platform stamps it in vm-mode; this default
-# covers container mode and local dev. It sits under the 70-minute stream
+# covers local development. It sits under the 70-minute stream
 # deadline so the runner, not the stream, ends a long turn.
 EXECUTION_TIMEOUT = get_env_float("RUNNER_EXECUTION_TIMEOUT", 3600.0)
 
@@ -142,6 +173,16 @@ CANCELLED_TURN_COMMIT_TIMEOUT_S = 3.0
 # exponential backoff (0.1s, 0.2s, 0.4s ...). 4xx responses are not retried.
 MAX_CHUNK_POST_ATTEMPTS = 3
 CHUNK_POST_BASE_DELAY_S = 0.1
+# Ordered durable chunk acknowledgement (negotiated: the engine stamps
+# durable_ack_enabled when the workspace advertised the durable_ack
+# capability). The whole turn's budget bounds the sender's in-order retries:
+# the platform's stream deadline is what the caller was promised, so retrying
+# a batch past it would only produce output nobody is left to read.
+DURABLE_ACK_TURN_BUDGET_S = EXECUTION_TIMEOUT
+# A failing turn drains its outstanding chunks best-effort, bounded well below
+# the turn budget: the ERROR terminal and its settlement must not be held on
+# the network while the engine is unresponsive.
+DURABLE_ACK_ERROR_DRAIN_TIMEOUT_S = 5.0
 # After the SDK emits a terminal result/suspend event, ask the iterator for one
 # more item so async generators can run their natural cleanup path instead of
 # being closed by GeneratorExit from an in-loop return.
@@ -151,6 +192,10 @@ AGENT_STREAM_TERMINAL_DRAIN_TIMEOUT_S = get_env_float("AGENT_STREAM_TERMINAL_DRA
 # with zero grace once it honours the finish request, so a write still queued
 # past this deadline is released anyway rather than held forever.
 SESSION_FINISH_MEMORY_DRAIN_TIMEOUT_S = 10.0
+# Independent deadline for the pre-release trace flush. The synchronous flush
+# runs off the event loop; this bounds how long the release waits for it, so a
+# stalled exporter cannot hold the /finish POST open.
+SESSION_FINISH_TRACE_FLUSH_TIMEOUT_MS = 5000
 CAPABILITY_ADVERTISE_TIMEOUT_S = 10.0
 
 
@@ -386,6 +431,68 @@ def _reject_ambiguous_message(request: ExecuteRequest) -> None:
         )
 
 
+def _log_background_failure(task: "asyncio.Future[Any]") -> None:
+    """Log a fire-and-forget delivery failure instead of losing it silently."""
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.debug("Background chunk delivery failed: %s", exc)
+
+
+def _sse_frame(event: str, data: Dict[str, Any]) -> str:
+    """Encode one Server-Sent Event frame.
+
+    The event name is one of a fixed set of literals and the data object is
+    JSON-encoded, so a raw newline carried inside any field value is escaped and
+    cannot forge a frame boundary.
+    """
+    return (
+        f"event: {event}\ndata: {json.dumps(data, separators=(',', ':'), ensure_ascii=False)}\n\n"
+    )
+
+
+async def _stream_journal_sse(
+    registry: StreamJournalRegistry,
+    execution_id: str,
+    generation: int,
+    after_seq: int,
+    lease: ReaderLease,
+) -> AsyncIterator[str]:
+    """Yield a generation's journal as SSE frames, releasing the reader lease.
+
+    The lease is released in ``finally`` so a client disconnect (which closes
+    the body) frees the slot; :class:`_JournalStreamingResponse` releases it
+    again on every response exit, which is what covers a body that never starts.
+    """
+    try:
+        async for event, data in registry.stream(execution_id, generation, after_seq):
+            yield _sse_frame(event, data)
+    finally:
+        registry.release_reader(lease)
+
+
+class _JournalStreamingResponse(StreamingResponse):
+    """A journal SSE response that always releases its reader lease.
+
+    The body generator's ``finally`` covers a started stream, but an ASGI
+    response can fail or be cancelled before its body's first step (a send
+    error on the response start, a replica shutting down). Wrapping ``__call__``
+    makes the release unconditional for the whole response lifetime; ``release``
+    is idempotent, so the generator's own release stays as the mid-stream path.
+    """
+
+    def __init__(self, *args: Any, on_close: Callable[[], None], **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._on_close = on_close
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            self._on_close()
+
+
 class AERServer(BaseServer):
     """
     Agent Execution Runtime server - framework-agnostic agent execution.
@@ -396,6 +503,12 @@ class AERServer(BaseServer):
     - Report completion or suspension to OE
     """
 
+    # Backing stores for the stream-journal properties. Class-level defaults so
+    # a server built without __init__ (test harnesses) reads a fresh store on
+    # first access instead of raising.
+    _stream_journals: Optional[StreamJournalRegistry] = None
+    _stream_journal_writers: Optional[Dict[str, JournalWriter]] = None
+
     def __init__(self, runtime: "TenantRuntime"):
         super().__init__(runtime)
         self._clients: Dict[str, httpx.AsyncClient] = {}
@@ -404,6 +517,11 @@ class AERServer(BaseServer):
         self._a2a_registered = False
         self._capabilities_advertised = False
         self._chunk_seq: Dict[str, int] = {}
+        # Ordered durable chunk senders per in-flight execution, registered
+        # only when the engine negotiated durable acknowledgement. Absent for
+        # every other execution, which keeps the legacy per-chunk path
+        # byte-for-byte unchanged.
+        self._durable_ack_senders: Dict[str, DurableChunkSender] = {}
         # Validated replica-specific OE owner callback URL per in-flight
         # execution. Resolved once in _handle_execute and read by the
         # /stream/chunk and /executor/callback transports so a call site added
@@ -422,6 +540,30 @@ class AERServer(BaseServer):
     @property
     def mode_name(self) -> str:
         return "aer"
+
+    @property
+    def stream_journals(self) -> StreamJournalRegistry:
+        """Runner-scoped stream journal store, lazily created on first access.
+
+        Lazy for the same reason as ``drain_registry``: several test harnesses
+        build servers without ``__init__``, and the registry has no
+        construction-time dependencies.
+        """
+        if self._stream_journals is None:
+            self._stream_journals = StreamJournalRegistry()
+        return self._stream_journals
+
+    @property
+    def stream_journal_writers(self) -> Dict[str, JournalWriter]:
+        """Open journal per in-flight execution, keyed by execution id.
+
+        Only populated while a turn carries ``stream_journal_enabled`` and a
+        non-zero ``stream_generation``; every other execution leaves the chunk
+        path byte-for-byte unchanged.
+        """
+        if self._stream_journal_writers is None:
+            self._stream_journal_writers = {}
+        return self._stream_journal_writers
 
     def _get_cert_mtimes(self) -> Optional[tuple[float, float, float]]:
         """Get modification times of TLS cert files for rotation detection."""
@@ -445,7 +587,7 @@ class AERServer(BaseServer):
         # Normalize URL for cache key (strip trailing slash)
         cache_key = base_url.rstrip("/")
 
-        # Check if certs have been rotated (container mode only) and create/rotate client.
+        # Check if certs have been rotated (file-based TLS only) and create/rotate client.
         # CRITICAL: cert rotation check must be inside the lock to avoid race conditions
         # where two coroutines both close the same client and the second raises KeyError.
         current_mtimes = self._get_cert_mtimes()
@@ -534,6 +676,16 @@ class AERServer(BaseServer):
         # SDK-injected, not an agent.yaml flag: always true for this SDK
         # version, so OE can tell it's safe to emit owner callback URLs.
         features = {"owner_callback_fallback": True, **features}
+        # SDK-injected too: this runner delivers its chunk stream in order and
+        # retries until the engine confirms durable persistence, so the engine
+        # may negotiate durable acknowledgement (durable_ack_enabled) on
+        # dispatch. Inert until the engine stamps it.
+        features.setdefault("durable_ack", True)
+        # SDK-injected too: this runner journals a turn's chunk stream on its
+        # own disk and serves it back over /stream/journal/* on resume, so the
+        # engine may dispatch with stream_journal_enabled. Inert until the
+        # engine stamps it.
+        features.setdefault("stream_journal", True)
         payload = {
             "workspace_id": workspace_id,
             "org_id": org_id,
@@ -782,6 +934,50 @@ class AERServer(BaseServer):
                 )
             return await plugin.get_messages_for_session(session_id)
 
+        # Runner stream journal read routes. The runner owns the journal; these
+        # serve it back to whichever engine replica resumes the turn. They sit
+        # behind the same auth middleware as every other route, which is
+        # inactive on a runner with no RUNNER_AUTH_TOKEN; the executor network
+        # policy (only the per-project OE may reach this port) is the control.
+        @app.get("/stream/journal/{execution_id}")
+        async def stream_journal_index(execution_id: str) -> Dict[str, Any]:
+            """Return the stream-journal index for an execution.
+
+            Lists every generation this runner opened for ``execution_id`` with
+            its last recorded sequence, close reason, and whether its body is
+            still retained. 404 when the runner never opened that execution.
+            """
+            index = server.stream_journals.read_index(execution_id)
+            if index is None:
+                raise HTTPException(status_code=404, detail="unknown stream journal execution")
+            return index
+
+        @app.get("/stream/journal/{execution_id}/{generation}")
+        async def stream_journal_read(
+            execution_id: str,
+            generation: int,
+            after_seq: int = Query(default=0, ge=0),
+        ) -> StreamingResponse:
+            """Stream a generation's journal as Server-Sent Events.
+
+            Emits ``chunk`` frames for every recorded chunk after ``after_seq``,
+            then exactly one ``end`` (carrying the close reason) or
+            ``incomplete`` frame. Follows live appends on the same connection.
+            404 for an unknown or evicted generation; 429 over the reader limit.
+            """
+            registry = server.stream_journals
+            if not registry.has_generation(execution_id, generation):
+                raise HTTPException(status_code=404, detail="unknown stream journal generation")
+            try:
+                lease = registry.acquire_reader(execution_id, generation)
+            except ReaderLimitExceeded:
+                raise HTTPException(status_code=429, detail="stream journal reader limit reached")
+            return _JournalStreamingResponse(
+                _stream_journal_sse(registry, execution_id, generation, after_seq, lease),
+                media_type="text/event-stream",
+                on_close=lambda: registry.release_reader(lease),
+            )
+
     @staticmethod
     @contextlib.contextmanager
     def _traced_step(name: str, kind: OpenInferenceSpanKind = OpenInferenceSpanKind.CHAIN):
@@ -967,7 +1163,22 @@ class AERServer(BaseServer):
         execution_cancelled = False
         execution_timed_out = False
         prep_complete = False
+        local_chunk_sink_token: Optional[contextvars.Token[Any]] = None
+        # Lifecycle reason for the stream journal, set by the paths that settle
+        # cleanly. Left None by an error exit (the finally maps that to "error")
+        # and overridden by cancellation.
+        journal_close_reason: Optional[str] = None
         try:
+            # Stream journal, only when the engine negotiated it: from here on
+            # every chunk this turn emits is appended to a journal on the
+            # runner's own disk, so a resume on any replica can read the turn's
+            # stream back. Opened before any preparation that can emit a
+            # terminal chunk, and closed by the finally below on every exit.
+            # Nothing is registered without the flag and a generation, so the
+            # legacy path is untouched.
+            if request.stream_journal_enabled and request.stream_generation > 0:
+                await self._open_stream_journal(request, session_id)
+
             # Build the per-execution graph before materializing the agent. A
             # per-execution builder does its own I/O and may be async, so the
             # build is awaited here.
@@ -1072,6 +1283,7 @@ class AERServer(BaseServer):
                 custom_headers=request.custom_headers,
                 payload=request.payload,
             )
+            local_chunk_sink_token = self._install_local_chunk_sink(request)
             ctx = RequestContext(
                 execution_id=request.execution_id,
                 session_id=session_id,
@@ -1135,7 +1347,22 @@ class AERServer(BaseServer):
             # propagate unconverted.
             prep_complete = True
 
-            # Execute via BaseAgent.stream()
+            # Ordered chunk delivery through one coalescing poster, started
+            # only when the engine asked for it: a journal dispatch (the
+            # journal is the durable copy, so live delivery is best effort) or
+            # a negotiated durable acknowledgement (live delivery is the
+            # durable copy, so a failed drain fails the turn). A dispatch that
+            # carries both is a journal dispatch. The sender is torn down by
+            # the finally below. Nothing is registered without one of the two,
+            # so the legacy path is untouched.
+            if request.stream_journal_enabled or request.durable_ack_enabled:
+                self._start_durable_chunk_sender(request, owner_url_failure)
+
+            # Execute via BaseAgent.stream(). The absolute deadline is the
+            # turn's original budget: successful settlement must not outlive
+            # it, so a turn whose budget expired cannot be presented as
+            # completed.
+            execution_deadline = time.monotonic() + EXECUTION_TIMEOUT
             run_deadline = asyncio.timeout(EXECUTION_TIMEOUT)
             try:
                 async with run_deadline:
@@ -1183,7 +1410,12 @@ class AERServer(BaseServer):
                     history=history,
                     durable_attempt=durable_attempt,
                     stage_callback=stage_callback,
+                    execution_deadline=execution_deadline,
                 )
+                # A suspension ends this generation's journal; the chunks
+                # before it are what a resume replays. The finally writes the
+                # end marker.
+                journal_close_reason = REASON_SUSPENDED
                 execution_succeeded = True
                 return response
 
@@ -1207,6 +1439,31 @@ class AERServer(BaseServer):
                     logger.info(f"Memory write queued for user {request.user_id}")
                 except Exception as e:
                     logger.warning(f"Failed to queue memory write: {e}", exc_info=True)
+
+            # Settlement ordering (negotiated durable ack): every chunk
+            # produced by the turn must be acknowledged before the terminal
+            # frame and the settlement. A failed drain means chunks are not
+            # durable, so the turn is failed rather than presented as
+            # complete. A journal dispatch is exempt: the journal, not live
+            # delivery, is the durable copy, so settlement does not wait for
+            # the poster to drain.
+            sender = self._durable_ack_senders.get(request.execution_id)
+            if sender is not None and not sender.journal_mode:
+                try:
+                    # Successful settlement uses the execution's original
+                    # absolute deadline: a turn whose budget expired must not
+                    # be presented as completed.
+                    await sender.settle(timeout=max(0.0, execution_deadline - time.monotonic()))
+                    # A late acknowledgement can wake the settle after the
+                    # deadline passed: a successful settle must still be
+                    # inside the turn's original budget.
+                    if time.monotonic() >= execution_deadline:
+                        raise DurableAckError(
+                            f"durable chunk acknowledgement incomplete for execution "
+                            f"{request.execution_id}: settlement exceeded the execution deadline"
+                        )
+                except DurableAckError as ack_err:
+                    await self._fail_incomplete_durable_turn(request, stage_callback, ack_err)
 
             try:
                 done_metadata = {
@@ -1243,6 +1500,7 @@ class AERServer(BaseServer):
                 # that overwrites the finished run's result, so the session's
                 # pods must not be killed before the response is delivered.
                 self._pending_session_finish[request.execution_id] = completed_callback
+            journal_close_reason = REASON_COMPLETED
             execution_succeeded = True
             return AERExecuteResponse(status="completed", result=execution_outcome.content)
 
@@ -1295,6 +1553,10 @@ class AERServer(BaseServer):
             # truncation, and guardrail plumbing share this exception type
             # without that source and must stay uncoded.
             if e.source != LLM_INVOCATION_ERROR_SOURCE:
+                # The turn is failing: drain accepted output best-effort
+                # (bounded) before the settlement, preserving the original
+                # uncoded error.
+                await self._drain_durable_chunks_best_effort(request, label="uncoded LLM error")
                 log_execution_callback(request.execution_id, "ERROR", error=str(e), prefix="AER")
                 stage_callback(
                     status="ERROR",
@@ -1344,6 +1606,14 @@ class AERServer(BaseServer):
                 # Pre-stream setup failures (build, registrations, routing,
                 # heartbeat) fail closed and propagate unconverted.
                 raise
+            if isinstance(e, DurableAckError):
+                # A sender failure surfaced during production (budget
+                # exhausted, fatal engine response, undeliverable chunk): the
+                # turn must not be presented as complete, so it takes the same
+                # coded ERROR terminal + callback path as a failed settlement
+                # drain.
+                await self._fail_incomplete_durable_turn(request, stage_callback, e)
+            await self._drain_durable_chunks_best_effort(request, label="execution error")
             log_execution_callback(request.execution_id, "ERROR", error=str(e), prefix="AER")
             stage_callback(
                 status="ERROR",
@@ -1380,6 +1650,31 @@ class AERServer(BaseServer):
                     exc,
                     exc_info=(type(exc), exc, exc.__traceback__),
                 )
+
+            # The settlement paths have already drained or failed the turn, so
+            # anything still queued here can no longer be presented; stop the
+            # poster before the callback delivery below.
+            try:
+                sender = self._durable_ack_senders.pop(request.execution_id, None)
+                if sender is not None:
+                    await sender.aclose()
+            except BaseException as exc:
+                remember_cleanup_error("chunk sender shutdown", exc)
+
+            # Close this turn's stream journal before the callback delivery:
+            # the writer drains every chunk already accepted and writes the end
+            # marker naming the outcome, so a follower sees the terminal chunk
+            # before the end. Every exit reaches this, including suspension
+            # (which sends no closing chunk of its own); an unset reason means
+            # an unexpected exit, which closes as "error" so a follower is never
+            # told an untrusted prefix is complete.
+            try:
+                journal = self.stream_journal_writers.pop(request.execution_id, None)
+                if journal is not None:
+                    reason = REASON_ABORTED if execution_cancelled else journal_close_reason
+                    await journal.close(reason or REASON_ERROR)
+            except BaseException as exc:
+                remember_cleanup_error("stream journal close", exc)
 
             # Cancellation is a BaseException. Remember it long enough to
             # attempt every settlement phase, then re-raise the first failure.
@@ -1418,6 +1713,10 @@ class AERServer(BaseServer):
                     await wrapper.close()
             except BaseException as exc:
                 remember_cleanup_error("wrapper close", exc)
+            try:
+                local_chunk_sink_token = self._reset_local_chunk_sink(local_chunk_sink_token)
+            except BaseException as exc:
+                remember_cleanup_error("progress sink reset", exc)
             try:
                 if context_tokens is not None:
                     clear_execution_context(context_tokens)
@@ -1470,6 +1769,7 @@ class AERServer(BaseServer):
         history: Any,
         durable_attempt: Any,
         stage_callback: Callable[..., dict[str, Any]],
+        execution_deadline: float,
     ) -> AERExecuteResponse:
         """Resolve a suspended turn's payload and report it to OE and memory.
 
@@ -1484,6 +1784,9 @@ class AERServer(BaseServer):
                 # empty-payload branch below: without the callback the
                 # execution would stay "running" forever.
                 error_msg = "Agent produced an empty interrupt snapshot; cannot suspend."
+                await self._drain_durable_chunks_best_effort(
+                    request, label="empty interrupt snapshot"
+                )
                 log_execution_callback(request.execution_id, "ERROR", error=error_msg, prefix="AER")
                 stage_callback(status="ERROR", error=error_msg)
                 raise HTTPException(status_code=500, detail=error_msg)
@@ -1498,6 +1801,7 @@ class AERServer(BaseServer):
         else:
             if not outcome.suspend_payload:
                 error_msg = "Agent produced an empty suspend payload; cannot suspend."
+                await self._drain_durable_chunks_best_effort(request, label="empty suspend payload")
                 log_execution_callback(request.execution_id, "ERROR", error=error_msg, prefix="AER")
                 stage_callback(status="ERROR", error=error_msg)
                 raise HTTPException(status_code=500, detail=error_msg)
@@ -1550,6 +1854,25 @@ class AERServer(BaseServer):
             except Exception as e:
                 logger.warning(f"Failed to queue pre-suspend memory write: {e}", exc_info=True)
 
+        # Settlement ordering (negotiated durable ack): the suspension must
+        # not be presented before every chunk produced up to it is
+        # acknowledged — a resume replays the turn's history, and a gap there
+        # would be permanent. A failed drain fails the turn instead. A journal
+        # dispatch is exempt: the journal, not live delivery, is the durable
+        # copy, so settlement does not wait for the poster to drain.
+        sender = self._durable_ack_senders.get(request.execution_id)
+        if sender is not None and not sender.journal_mode:
+            try:
+                # Same original-deadline bound as completion settlement.
+                await sender.settle(timeout=max(0.0, execution_deadline - time.monotonic()))
+                if time.monotonic() >= execution_deadline:
+                    raise DurableAckError(
+                        f"durable chunk acknowledgement incomplete for execution "
+                        f"{request.execution_id}: settlement exceeded the execution deadline"
+                    )
+            except DurableAckError as ack_err:
+                await self._fail_incomplete_durable_turn(request, stage_callback, ack_err)
+
         # The framework adapter owns resume semantics; its opaque metadata is
         # forwarded to the OE verbatim and round-tripped back into
         # RequestContext.metadata on resume.
@@ -1575,7 +1898,11 @@ class AERServer(BaseServer):
 
         Best-effort by design: the terminal callback the caller stages is
         authoritative, so a failed delivery must not replace the real error.
+        Under negotiated durable ack the outstanding chunks are drained
+        best-effort first (bounded, so a failing turn is not held), but the
+        error terminal is delivered regardless: the turn is already failing.
         """
+        await self._drain_durable_chunks_best_effort(request, label=label)
         try:
             await self._send_stream_chunk(
                 request.platform_api_url,
@@ -1592,6 +1919,123 @@ class AERServer(BaseServer):
                 chunk_err,
                 exc_info=True,
             )
+
+    async def _drain_durable_chunks_best_effort(
+        self, request: ExecuteRequest, *, label: str
+    ) -> None:
+        """Drain the turn's outstanding chunks within a bounded window.
+
+        Best-effort: a turn that is already failing must not be held on the
+        network while the engine is unresponsive, so a drain that cannot
+        finish within the window is abandoned with a warning and the caller
+        proceeds.
+        """
+        sender = self._durable_ack_senders.get(request.execution_id)
+        if sender is None:
+            return
+        try:
+            await sender.settle(timeout=DURABLE_ACK_ERROR_DRAIN_TIMEOUT_S)
+        except DurableAckError as ack_err:
+            logger.warning(
+                "Draining %s execution %s chunks before its ERROR terminal failed "
+                "within the bounded window; proceeding anyway: %s",
+                label,
+                request.execution_id,
+                ack_err,
+            )
+
+    def _start_durable_chunk_sender(
+        self,
+        request: ExecuteRequest,
+        owner_url_failure: OwnerUrlFailureState,
+    ) -> None:
+        """Register this execution's ordered chunk sender.
+
+        Built only when the engine asked for it (a journal dispatch or a
+        negotiated durable acknowledgement), and torn down by the execution's
+        finally. A journal dispatch builds the poster in journal mode, where
+        live delivery is best effort and settlement is not gated; a dispatch
+        that carries both fields is a journal dispatch. The owner pre-attempt
+        follows the shared owner-callback policy through the same helpers the
+        legacy chunk POST uses: one best-effort attempt, service fallback,
+        owner never retried, and the failure latched so later settlement posts
+        skip the owner.
+        """
+        execution_id = request.execution_id
+
+        async def client_getter() -> httpx.AsyncClient:
+            return await self._get_client(request.platform_api_url)
+
+        def owner_url_getter() -> Optional[str]:
+            owner = self._get_owner_callback_url(execution_id)
+            return f"{owner}/stream/chunk" if owner else None
+
+        def on_owner_failure() -> None:
+            self._discard_owner_callback_url(execution_id)
+            # Explicit latch: the poster runs as its own task, and while the
+            # context copy it inherits shares this mutable holder, setting it
+            # here keeps the failure visible to the settlement paths
+            # regardless of task context.
+            owner_url_failure.failed = True
+
+        self._durable_ack_senders[execution_id] = DurableChunkSender(
+            execution_id=execution_id,
+            chunk_url=f"{request.platform_api_url}/stream/chunk",
+            client_getter=client_getter,
+            owner_url_getter=owner_url_getter,
+            on_owner_failure=on_owner_failure,
+            deadline=time.monotonic() + DURABLE_ACK_TURN_BUDGET_S,
+            journal_mode=request.stream_journal_enabled,
+        )
+
+    async def _open_stream_journal(self, request: ExecuteRequest, session_id: str) -> None:
+        """Open this turn's stream journal and register it for chunk recording.
+
+        Built only when the engine set ``stream_journal_enabled`` with a
+        non-zero generation, and closed by the execution's finally. The registry
+        keeps the body (and, after eviction, its index) for the runner's
+        lifetime.
+        """
+        journal = await self.stream_journals.open_journal(
+            execution_id=request.execution_id,
+            session_id=session_id,
+            generation=request.stream_generation,
+        )
+        self.stream_journal_writers[request.execution_id] = journal
+
+    async def _fail_incomplete_durable_turn(
+        self,
+        request: ExecuteRequest,
+        stage_callback: Callable[..., dict[str, Any]],
+        error: BaseException,
+    ) -> None:
+        """Fail a turn whose chunks could not be acknowledged, never as complete.
+
+        Reached when the settlement gate found unacknowledged chunks (budget
+        exhausted, or a fatal engine response): the turn is failed with an
+        error terminal and an ERROR callback so the engine settles it as
+        errored — a resume can retry — instead of completing a turn whose
+        stream has a gap. Raises HTTPException so the /execute response
+        reports the failure too.
+        """
+        error_msg = f"Stream chunk delivery could not be durably acknowledged: {error}"
+        logger.warning(
+            "Refusing to present execution %s as complete: %s",
+            request.execution_id,
+            error,
+        )
+        await self._deliver_error_chunk(
+            request,
+            error_msg,
+            {"error_code": DURABLE_ACK_INCOMPLETE_ERROR_CODE},
+            label="durable-ack",
+        )
+        stage_callback(
+            status="ERROR",
+            error=error_msg,
+            metadata={"error_code": DURABLE_ACK_INCOMPLETE_ERROR_CODE},
+        )
+        raise HTTPException(status_code=500, detail=error_msg)
 
     async def _retain_cancelled_history(
         self,
@@ -1850,11 +2294,35 @@ class AERServer(BaseServer):
         log at WARNING on exhaustion and return; the run continues, the
         chunk is dropped.
         """
+        chunk = self._prepare_stream_chunk(
+            execution_id,
+            chunk_type,
+            content=content,
+            error=error,
+            metadata=metadata,
+            custom_event=custom_event,
+        )
+        await self._deliver_stream_chunk(oe_url, execution_id, chunk)
+
+    def _prepare_stream_chunk(
+        self,
+        execution_id: str,
+        chunk_type: str,
+        content: str = "",
+        error: str = "",
+        metadata: Optional[Dict[str, JsonValue]] = None,
+        custom_event: Optional[JsonValue] = None,
+    ) -> Dict[str, Any]:
+        """Allocate the turn's next sequence and journal the chunk.
+
+        Synchronous on purpose: the sequence order and the journal record are
+        fixed at the call site, including for a progress emit from a local tool,
+        whose public API is synchronous and cannot await delivery.
+        """
         seq = self._chunk_seq.get(execution_id, 0) + 1
         self._chunk_seq[execution_id] = seq
 
-        client = await self._get_client(oe_url)
-        chunk = {
+        chunk: Dict[str, Any] = {
             "execution_id": execution_id,
             "chunk_type": chunk_type,
             "content": content,
@@ -1863,8 +2331,44 @@ class AERServer(BaseServer):
             "custom_event": custom_event,
             "seq": seq,
         }
-        owner_url = self._get_owner_callback_url(execution_id)
+        # Stream journal, only for a journaled turn: stamp the generation and
+        # record the chunk (terminal included) before it is posted, so the
+        # journal is a complete, ordered copy of what the engine was sent. The
+        # recording never blocks; a bound drops the chunk and marks the journal
+        # incomplete.
+        journal = self.stream_journal_writers.get(execution_id)
+        if journal is not None:
+            chunk["generation"] = journal.generation
+            journal.record(chunk)
+        return chunk
+
+    async def _deliver_stream_chunk(
+        self, oe_url: str, execution_id: str, chunk: Dict[str, Any]
+    ) -> None:
+        """Deliver a prepared chunk to the engine, dropping it when non-terminal.
+
+        See :meth:`_send_stream_chunk` for the retry and re-raise contract.
+        """
+        chunk_type = str(chunk.get("chunk_type") or "")
+        seq = int(chunk.get("seq") or 0)
         terminal = chunk_type in (DONE, ERROR)
+
+        if not terminal:
+            sender = self._durable_ack_senders.get(execution_id)
+            if sender is not None:
+                # Ordered poster path: queue for the coalescing poster, which
+                # retries in order until the engine confirms durable
+                # persistence. On the durable-ack path a sender failure
+                # propagates — dropping the chunk would silently present an
+                # incomplete turn as complete. On the journal path the poster
+                # is in journal mode: it never blocks or fails the turn, and a
+                # chunk it cannot deliver live is dropped (the journal keeps
+                # it).
+                await sender.send(chunk)
+                return
+
+        client = await self._get_client(oe_url)
+        owner_url = self._get_owner_callback_url(execution_id)
         try:
             await self._post_chunk_with_retries(
                 client,
@@ -1889,6 +2393,88 @@ class AERServer(BaseServer):
 
         if terminal:
             self._chunk_seq.pop(execution_id, None)
+
+    def _install_local_chunk_sink(
+        self, request: ExecuteRequest
+    ) -> Optional[contextvars.Token[Any]]:
+        """Route in-process progress emits through the turn's own chunk path.
+
+        Only a journaled turn needs it: the chunk is then sequenced and recorded
+        like every other chunk, so a replay is complete. Other turns keep
+        progress's own best-effort transport untouched.
+        """
+        if not (request.stream_journal_enabled and request.stream_generation > 0):
+            return None
+        return current_local_chunk_sink.set(
+            self._local_chunk_sink(request.platform_api_url, request.execution_id)
+        )
+
+    @staticmethod
+    def _reset_local_chunk_sink(
+        token: Optional[contextvars.Token[Any]],
+    ) -> Optional[contextvars.Token[Any]]:
+        """Undo :meth:`_install_local_chunk_sink`, returning the cleared token."""
+        if token is None:
+            return None
+        current_local_chunk_sink.reset(token)
+        return None
+
+    def _local_chunk_sink(self, oe_url: str, execution_id: str) -> Callable[[str, str], None]:
+        """Build the request-scoped sink for in-process progress emits.
+
+        A local tool calls ``emit`` / ``emit_step`` synchronously, and an async
+        tool reaches it through ``asyncio.to_thread`` — so the call can arrive on
+        a worker thread. Sequence allocation and the journal record are
+        single-loop state, so admission is marshalled onto the loop that
+        installed the sink and the caller waits for it: the record is therefore
+        ordered before the emitting tool returns, while delivery stays
+        fire-and-forget.
+        """
+        try:
+            owner_loop: Optional[asyncio.AbstractEventLoop] = asyncio.get_running_loop()
+        except RuntimeError:
+            owner_loop = None
+
+        def admit(event: str, data: str) -> None:
+            chunk = self._prepare_stream_chunk(execution_id, chunk_type=event, content=data)
+            task = asyncio.ensure_future(self._deliver_stream_chunk(oe_url, execution_id, chunk))
+            task.add_done_callback(_log_background_failure)
+
+        def sink(event: str, data: str) -> None:
+            try:
+                running: Optional[asyncio.AbstractEventLoop] = asyncio.get_running_loop()
+            except RuntimeError:
+                running = None
+            # On the owner loop (or before any loop is known, as in a
+            # single-threaded harness) admission runs inline.
+            if owner_loop is None or running is owner_loop:
+                admit(event, data)
+                return
+            admitted = threading.Event()
+            failure: Dict[str, BaseException] = {}
+
+            def run() -> None:
+                try:
+                    admit(event, data)
+                except BaseException as exc:  # noqa: BLE001 - reported to the caller
+                    failure["error"] = exc
+                finally:
+                    admitted.set()
+
+            try:
+                owner_loop.call_soon_threadsafe(run)
+            except RuntimeError:
+                # The owner loop is gone (pod teardown): nothing can be
+                # recorded, and emit is best-effort by contract.
+                return
+            if not admitted.wait(PROGRESS_TIMEOUT_SECS):
+                logger.debug("Progress emit was not admitted within the bound for %s", execution_id)
+            elif "error" in failure:
+                logger.debug(
+                    "Progress emit admission failed for %s: %s", execution_id, failure["error"]
+                )
+
+        return sink
 
     async def _emit_subagent_boundary(
         self,
@@ -2197,14 +2783,23 @@ class AERServer(BaseServer):
                 )
         # Flush trace spans before the OE frees this pod: /finish triggers a
         # zero-grace teardown, so spans still queued in the BatchSpanProcessor
-        # would otherwise be lost. Best-effort and bounded.
+        # would otherwise be lost. Best-effort and bounded: the synchronous
+        # flush runs off the event loop (the pod keeps serving health,
+        # session-history, and drain requests while it waits) and the await has
+        # its own deadline, so a stalled exporter cannot hold the release open.
         try:
             from agent_engine_runner_shared.tracing import force_flush_tracing
 
-            if not await asyncio.to_thread(force_flush_tracing):
+            flushed = await asyncio.wait_for(
+                asyncio.to_thread(force_flush_tracing, SESSION_FINISH_TRACE_FLUSH_TIMEOUT_MS),
+                timeout=SESSION_FINISH_TRACE_FLUSH_TIMEOUT_MS / 1000,
+            )
+            if not flushed:
                 logger.warning(
                     "Trace flush before session release timed out; some spans may be lost"
                 )
+        except asyncio.TimeoutError:
+            logger.warning("Trace flush before session release timed out; some spans may be lost")
         except Exception:
             logger.debug("Trace flush before session release failed", exc_info=True)
 

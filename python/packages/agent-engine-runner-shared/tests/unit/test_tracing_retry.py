@@ -28,7 +28,6 @@ def isolated_tracer_provider(monkeypatch):
     monkeypatch.setattr(tracing_setup, "_retry_thread", None)
     monkeypatch.setattr(tracing_setup, "_tracing_mongo_client", None)
     monkeypatch.setattr(tracing_setup, "_platform_exporter", None)
-    monkeypatch.setattr(tracing_setup, "_platform_exporter_attached", False)
     yield tracing_setup
     # shutdown_tracing() signals and joins the retry thread itself.
     if tracing_setup._tracer_provider is not None or tracing_setup._retry_thread is not None:

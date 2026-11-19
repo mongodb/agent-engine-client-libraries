@@ -26,7 +26,7 @@ LLM_PROVIDER_ENV_VARS = {
 DEFAULT_MODELS = {
     "openai": "gpt-5.6-luna",
     "anthropic": "claude-sonnet-5",
-    "gemini": "gemini-3-flash-preview",
+    "gemini": "gemini-3.8-flash",
     "cerebras": "gpt-oss-120b",
 }
 # An OpenAI request occasionally stalls without ever responding. Without a

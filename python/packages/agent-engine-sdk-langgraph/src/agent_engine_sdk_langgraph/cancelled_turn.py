@@ -14,11 +14,13 @@ validation rejects snapshots with pending tasks.
 from __future__ import annotations
 
 import logging
-from collections.abc import Collection
-from typing import Any
+from collections.abc import Collection, Mapping
+from typing import Any, cast
 from uuid import uuid4
 
 from langchain_core.messages import HumanMessage
+from langchain_core.runnables import RunnableConfig
+from langgraph.channels.delta import DeltaChannel
 from langgraph.checkpoint.base import empty_checkpoint
 
 _logger = logging.getLogger(__name__)
@@ -45,6 +47,7 @@ async def commit_cancelled_turn(
     turn_message_id: str | None,
     node_names: Collection[str],
     resume: bool = False,
+    delta_channels: Mapping[str, DeltaChannel[Any]] | None = None,
 ) -> str | None:
     """Write the cancelled-turn marker checkpoint; return the turn's user-message id.
 
@@ -60,8 +63,15 @@ async def commit_cancelled_turn(
     prompt's content. No ``checkpoint_writes`` rows are attached — the next
     invoke's cancelled-predecessor fence stays a no-op on this tip, and the
     half-dead super-step's orphaned writes are never joined to it.
+
+    ``delta_channels`` are the graph's channels that checkpoints store only as
+    deltas (the deep agents' ``messages``); their stored value is reconstructed
+    first, because a marker written with the raw ``channel_values`` would
+    otherwise drop them (see ``materialize_delta_channels``).
     """
-    config = {"configurable": {"thread_id": thread_id, "checkpoint_ns": ""}}
+    config: RunnableConfig = {
+        "configurable": {"thread_id": thread_id, "checkpoint_ns": ""}
+    }
     latest = await saver.aget_tuple(config)
 
     channel_values: dict[str, Any] = {}
@@ -78,6 +88,13 @@ async def commit_cancelled_turn(
         }
         parent_id = latest.checkpoint["id"]
         prior_step = (latest.metadata or {}).get("step", -1)
+        if delta_channels:
+            channel_values = await materialize_delta_channels(
+                saver,
+                _pin_checkpoint(config, latest.checkpoint["id"]),
+                channel_values,
+                delta_channels,
+            )
         clear_queued_tasks(channel_values)
 
     messages = list(channel_values.get("messages") or [])
@@ -131,6 +148,48 @@ async def commit_cancelled_turn(
         channel_versions,
     )
     return resolved_id
+
+
+def _pin_checkpoint(config: RunnableConfig, checkpoint_id: str) -> RunnableConfig:
+    """Point a thread config at one checkpoint, so a concurrent write can't
+    move the target between the copy and the delta-channel walk."""
+    configurable = dict(config.get("configurable") or {})
+    configurable["checkpoint_id"] = checkpoint_id
+    return {**config, "configurable": configurable}
+
+
+async def materialize_delta_channels(
+    saver: Any,
+    config: RunnableConfig,
+    channel_values: dict[str, Any],
+    delta_channels: Mapping[str, DeltaChannel[Any]],
+) -> dict[str, Any]:
+    """Replace a checkpoint's delta channels with their full values.
+
+    A checkpoint holds a ``DeltaChannel`` only as a periodic snapshot blob and
+    otherwise omits it, leaving LangGraph to replay ancestor writes. Copying
+    ``channel_values`` verbatim therefore drops the channel, and the plain value
+    then written in its place shadows that replay on the next load.
+    """
+    values = dict(channel_values)
+    omitted = [name for name in delta_channels if name not in values]
+    histories = (
+        await saver.aget_delta_channel_history(config=config, channels=omitted)
+        if omitted
+        else {}
+    )
+    for name, spec in delta_channels.items():
+        if name in histories:
+            history = histories[name]
+            channel = spec.from_checkpoint(history.get("seed", cast(type, spec.typ)()))
+            channel.replay_writes(history["writes"])
+        else:
+            channel = spec.from_checkpoint(values[name])
+        if channel.is_available():
+            values[name] = channel.get()
+        else:
+            values.pop(name, None)
+    return values
 
 
 def clear_queued_tasks(channel_values: dict[str, Any]) -> dict[str, Any]:

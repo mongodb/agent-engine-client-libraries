@@ -178,6 +178,7 @@ class FakeClient:
         agent_id: str | None = None,
         metadata: dict[str, Any] | None = None,
         upsert: bool = False,
+        idempotency_key: str | None = None,
     ) -> CreateSemanticResult:
         self._record("create_semantic", locals())
         return CreateSemanticResult(id="semantic-id", label=label, has_embedding=False)

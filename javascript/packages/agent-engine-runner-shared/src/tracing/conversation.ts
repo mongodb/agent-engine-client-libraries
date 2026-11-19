@@ -1,26 +1,3 @@
-/**
- * Trim an LLM span's input messages to the messages added since the last call.
- *
- * Every LLM call receives the whole conversation, so an OpenInference span
- * carries the entire transcript under `llm.input_messages.*`. A run with N
- * calls therefore stores the conversation N times and the trace grows
- * quadratically in the number of steps.
- *
- * The tracker rewrites each span's input messages to the messages added since
- * the previous call in the same trace and stream, and records where that slice
- * starts. A reader replays the slices to rebuild the full context. Spans
- * written before this existed carry no offset and read as a full list, so old
- * and new traces read the same way.
- *
- * The platform forwards an agent's LLM call to a tool pod that makes the
- * provider request, and both processes instrument it. The caller's span stores
- * the conversation for that call, so the tool-pod copy is dropped outright
- * (`omitInputMessages`) instead of being trimmed a second time.
- *
- * Mirrors `agent_engine_runner_shared/tracing/conversation.py` — keep the
- * attribute names and the prefix rule identical.
- */
-
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash } from "node:crypto";
 
@@ -32,10 +9,6 @@ export const ATTR_INPUT_MESSAGES_TOTAL =
   "agent_engine.internal.input_messages.total";
 export const ATTR_INPUT_MESSAGES_STREAM =
   "agent_engine.internal.input_messages.stream";
-// Written on a span whose prompt the calling pod stores itself. The platform
-// forwards an agent's LLM call to a tool pod that makes the provider request,
-// so both processes record the same conversation; the tool-pod copy is
-// redundant.
 export const ATTR_INPUT_MESSAGES_RECORDED_BY =
   "agent_engine.internal.input_messages.recorded_by";
 export const RECORDED_BY_CALLER = "caller";
@@ -43,16 +16,8 @@ export const RECORDED_BY_CALLER = "caller";
 const INPUT_MESSAGES_PREFIX = "llm.input_messages.";
 const INPUT_MESSAGES_KEY = /^llm\.input_messages\.(\d+)\.(.+)$/;
 
-// Resource attribute carrying the pod's role. The name predates the product
-// rename and is the contract the runner already emits on every span, not
-// branding: it is how a reader tells the agent process from the tool process.
 export const RUNTIME_MODE_ATTRIBUTE = "agentic_platform.runtime_mode"; // open-source-refs:ignore — data contract
 
-/**
- * One entry per in-flight conversation. Bounded because a long-lived pod
- * serves many traces; eviction only costs compression on a later span, never
- * correctness, since a missing entry reads as "store the full list".
- */
 const MAX_TRACKED_CONVERSATIONS = 256;
 
 type MessageRow = Record<string, unknown>;
@@ -62,51 +27,30 @@ function fingerprint(message: MessageRow): string {
     .sort()
     .map((field) => `${field}\u0001${String(message[field])}`)
     .join("\u0000");
-  // 64 bits, matching the Python tracker's digest_size. The tracker holds one
-  // digest per message, so a full-length digest would dominate its memory.
   return createHash("blake2b512")
     .update(payload, "utf8")
     .digest("hex")
     .slice(0, 16);
 }
 
-/** Whether a span carries an OpenInference input-message list. */
 export function hasInputMessages(attributes: Record<string, unknown>): boolean {
   return Object.keys(attributes).some((name) =>
     name.startsWith(INPUT_MESSAGES_PREFIX),
   );
 }
 
-// True while the tool pod runs an LLM call the agent made and already records.
-// A span ends — and is exported — before the request span that names the call,
-// so the trace tree cannot say at write time where a prompt is stored; the
-// process that forwards the call is the only one that knows.
 const callerRecorded = new AsyncLocalStorage<boolean>();
 
-/**
- * Mark spans started inside `fn` as a call the caller already records.
- *
- * Scoped to the tool pod's platform-forwarded LLM routes. A prompt recorded
- * only in the tool pod — a tool that calls a provider itself — stays unmarked
- * and keeps its messages.
- */
 export function runAsCallerRecordedConversation<T>(fn: () => T): T {
   return callerRecorded.run(true, fn);
 }
 
-/**
- * Attribute a span whose prompt the calling pod already stores.
- *
- * Called for every span as it starts; only spans carrying a prompt use the
- * attribute, which is how the trace store and its readers find the copy.
- */
 export function markInputRecordedByCaller(span: Span): void {
   if (callerRecorded.getStore() === true) {
     span.setAttribute(ATTR_INPUT_MESSAGES_RECORDED_BY, RECORDED_BY_CALLER);
   }
 }
 
-/** Drop a span's prompt, keeping the marker that says where it lives. */
 export function omitInputMessages(
   attributes: Record<string, unknown>,
 ): Record<string, unknown> {
@@ -115,8 +59,6 @@ export function omitInputMessages(
     if (name.startsWith(INPUT_MESSAGES_PREFIX)) continue;
     omitted[name] = value;
   }
-  // OpenInference also serializes the prompt into input.value; leaving it
-  // would store the conversation the marker says is stored elsewhere.
   delete omitted["input.value"];
   delete omitted["input.mime_type"];
   omitted[ATTR_INPUT_MESSAGES_RECORDED_BY] = RECORDED_BY_CALLER;
@@ -144,23 +86,12 @@ export class ConversationDeltaTracker {
 
   constructor(private readonly maxConversations = MAX_TRACKED_CONVERSATIONS) {}
 
-  /**
-   * Independent tracker holding the same progress. The exporter trims a batch
-   * on a copy and adopts it only after the write succeeds, so a failed write
-   * cannot advance progress the store never recorded.
-   */
   copy(): ConversationDeltaTracker {
     const clone = new ConversationDeltaTracker(this.maxConversations);
     clone.byConversation = new Map(this.byConversation);
     return clone;
   }
 
-  /**
-   * Return `attributes` with only the new input messages kept. `streamId`
-   * separates the agent-side span from the tool-pod span for the same call:
-   * both carry the conversation, they are exported by different processes,
-   * and their message indices must not be compared.
-   */
   trim(
     attributes: Record<string, unknown>,
     traceId: string,
@@ -176,8 +107,6 @@ export class ConversationDeltaTracker {
 
     const key = `${streamId}\u0000${traceId}`;
     const stored = this.byConversation.get(key) ?? [];
-    // Only a strict extension can be expressed as an offset. A retry or a
-    // branch that rewrote history stores its full list instead.
     const extendsStored =
       stored.length <= total &&
       stored.every((digest, index) => fingerprints[index] === digest);
@@ -189,9 +118,6 @@ export class ConversationDeltaTracker {
       if (name.startsWith(INPUT_MESSAGES_PREFIX)) continue;
       trimmed[name] = value;
     }
-    // OpenInference serializes the same prompt into input.value, so leaving it
-    // keeps the trace quadratic; readers replay the trimmed message list
-    // instead, and GET /events therefore previews no input for LLM spans.
     delete trimmed["input.value"];
     delete trimmed["input.mime_type"];
     for (let index = offset; index < total; index += 1) {
@@ -216,7 +142,6 @@ export class ConversationDeltaTracker {
   }
 }
 
-/** Identify which process wrote a span (see `ConversationDeltaTracker`). */
 export function traceStream(resource: Record<string, unknown>): string {
   const runtimeMode =
     resource[RUNTIME_MODE_ATTRIBUTE] ?? process.env["RUNNER_MODE"];

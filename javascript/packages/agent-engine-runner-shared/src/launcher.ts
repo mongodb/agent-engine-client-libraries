@@ -209,7 +209,7 @@ export function boundText(
  * platform's crash diagnostics read, and from there into the
  * customer-facing deploy timeline.
  *
- * This is customer code (container mode), so unlike the platform's own
+ * This is customer code, so unlike the platform's own
  * components the design intentionally keeps the full exception name,
  * message, and stack — redacted, not summarized away — since that detail is
  * what the customer needs to fix their own agent. Best-effort: if the write

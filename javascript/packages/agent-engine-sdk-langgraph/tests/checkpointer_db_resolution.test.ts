@@ -13,11 +13,15 @@ const closeMock = vi.fn();
 const dbMock = vi.fn();
 const mongoDBSaverCtor = vi.fn();
 const registerQueryPluginMock = vi.fn();
+const mongoClientCtor = vi.fn();
 
 vi.mock("mongodb", () => ({
   MongoClient: class FakeMongoClient {
     close = closeMock;
     db = dbMock;
+    constructor(...args: unknown[]) {
+      mongoClientCtor(...args);
+    }
   },
 }));
 
@@ -45,11 +49,14 @@ vi.mock("@mongodb-js/agent-engine-runner-shared", async (importOriginal) => {
 
 const { App } = await import("../src/runtime.js");
 
+const MONGO_APP_NAME = "Agent Engine";
+
 type PrivateApp = {
   resolveCheckpointDbName: () => Promise<void>;
   resolvedCheckpointDb: string | null;
   registerQueryPlugin: () => void;
   checkpointDbName: () => string;
+  checkpointer: () => unknown;
 };
 
 describe("App.resolveCheckpointDbName()", () => {
@@ -69,6 +76,7 @@ describe("App.resolveCheckpointDbName()", () => {
     mongoDBSaverCtor.mockReset();
     registerQueryPluginMock.mockReset();
     dbMock.mockReset();
+    mongoClientCtor.mockReset();
     dbMock.mockReturnValue({
       collection: vi.fn().mockReturnValue({}),
     });
@@ -142,5 +150,20 @@ describe("App.resolveCheckpointDbName()", () => {
     expect(registerQueryPluginMock).toHaveBeenCalledTimes(1);
     expect(dbMock).toHaveBeenCalledWith("external_checkpoints_agent");
     expect(app.checkpointDbName()).toBe("external_checkpoints_agent");
+  });
+
+  it("sets the platform appName on both probe and checkpointer clients", async () => {
+    const app = new App({ appName: "Test Agent" }) as unknown as PrivateApp;
+
+    await app.resolveCheckpointDbName();
+    expect(mongoClientCtor.mock.calls[0]?.[1]).toEqual({
+      appName: MONGO_APP_NAME,
+    });
+
+    mongoClientCtor.mockClear();
+    app.checkpointer();
+    expect(mongoClientCtor.mock.calls[0]?.[1]).toEqual({
+      appName: MONGO_APP_NAME,
+    });
   });
 });

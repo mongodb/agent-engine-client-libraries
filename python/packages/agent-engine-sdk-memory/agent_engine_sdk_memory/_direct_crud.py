@@ -84,6 +84,7 @@ class _EmptyTenancyCrudClient:
         agent_id: str | None = None,
         metadata: dict[str, Any] | None = None,
         upsert: bool = False,
+        idempotency_key: str | None = None,
     ) -> CreateSemanticResult:
         resp = self._t.post(
             self._base + _SEMANTIC_SUFFIX,
@@ -97,6 +98,7 @@ class _EmptyTenancyCrudClient:
                 "agent_id": agent_id,
                 "metadata": metadata,
                 "upsert": upsert,
+                "idempotency_key": idempotency_key,
             },
             retry=False,
         )

@@ -19,7 +19,8 @@ from typing import Any, Self, cast
 from urllib.parse import quote, urlencode, urljoin
 
 import httpx
-from jsonschema import Draft202012Validator
+from jsonschema import Draft202012Validator, ValidationError
+from jsonschema.exceptions import best_match
 
 from agent_engine_runner_shared.connectors.definitions import (
     Operation,
@@ -64,6 +65,27 @@ def _retry_delay(retry_after: str, attempt: int) -> float:
         except (ValueError, TypeError, OverflowError):
             pass  # Invalid provider advice does not replace bounded backoff.
     return delay
+
+
+def _describe(error: ValidationError) -> str:
+    """Say which argument failed which rule, without echoing the argument's value.
+
+    The text returns to the model so it can correct the call. Values stay out
+    so a large or sensitive argument is not copied into the error.
+    """
+    location = ".".join(str(part) for part in error.absolute_path) or "arguments"
+    if error.validator == "type":
+        expected = error.validator_value
+        return (
+            f"{location}: must be {','.join(expected) if isinstance(expected, list) else expected}"
+        )
+    if error.validator == "required" and isinstance(error.instance, dict):
+        required = cast(list[str], error.validator_value)
+        missing = [name for name in required if name not in error.instance]
+        return f"{location}: must have required property " + ", ".join(
+            f"'{name}'" for name in missing
+        )
+    return f"{location}: must satisfy the schema's {error.validator} rule"
 
 
 class ConnectorExecutor:
@@ -127,9 +149,19 @@ class ConnectorExecutor:
         properties = tool.inputSchema.get("properties", {})
         if not isinstance(arguments, dict):
             raise ValueError("arguments do not match the compiled input schema")
-        arguments = {name: arguments[name] for name in properties if name in arguments}
-        if not Draft202012Validator(tool.inputSchema).is_valid(arguments):
-            raise ValueError("arguments do not match the compiled input schema")
+        unexpected = sorted(name for name in arguments if name not in properties)
+        if unexpected:
+            # Dropping them instead would turn a misshaped write into an empty
+            # request that the provider accepts as a successful no-op.
+            raise ValueError(
+                f"unexpected arguments: {', '.join(unexpected)}; "
+                f"accepted arguments: {', '.join(sorted(properties))}"
+            )
+        error = best_match(Draft202012Validator(tool.inputSchema).iter_errors(arguments))
+        if error is not None:
+            raise ValueError(
+                f"arguments do not match the compiled input schema: {_describe(error)}"
+            )
         try:
             json.dumps(arguments, allow_nan=False)
         except (ValueError, TypeError):

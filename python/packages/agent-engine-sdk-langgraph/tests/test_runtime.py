@@ -1820,6 +1820,7 @@ class TestAppCheckpointer:
             serverSelectionTimeoutMS=2500,
             connectTimeoutMS=3000,
             socketTimeoutMS=4250,
+            appname="Agent Engine",
         )
 
     def test_close_releases_mongo_client(self):
@@ -2079,6 +2080,7 @@ class TestAppGetAgent:
     def test_get_agent_wraps_execution_callbacks(self):
         """App.get_agent() wraps BaseExecutionCallback."""
         from agent_engine_sdk_langgraph.node_logger_adapter import (
+            GraphBranchLinkHandler,
             LangGraphCallbackAdapter,
         )
 
@@ -2096,8 +2098,9 @@ class TestAppGetAgent:
 
         agent = app.get_agent(callbacks=[execution_callback])
 
-        assert len(agent._callbacks) == 1
-        assert isinstance(agent._callbacks[0], LangGraphCallbackAdapter)
+        assert len(agent._callbacks) == 2
+        assert isinstance(agent._callbacks[0], GraphBranchLinkHandler)
+        assert isinstance(agent._callbacks[1], LangGraphCallbackAdapter)
 
     def test_get_agent_cache_hit_does_not_reset_llm_registry(self):
         """get_agent() caches the built graph, so a second call with the

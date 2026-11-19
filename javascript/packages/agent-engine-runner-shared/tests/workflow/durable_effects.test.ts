@@ -163,7 +163,10 @@ describe("durable Tool effects", () => {
         const url = String(input);
         calls.push({ url, body: requestBody(init) });
         if (url.endsWith("/executor/activity/start")) {
-          return replayResponse("tool-replay", { cached: true });
+          return replayResponse("tool-replay", {
+            kind: "result",
+            result: { cached: true },
+          });
         }
         throw new Error(`unexpected external dispatch: ${url}`);
       }),
@@ -189,6 +192,9 @@ describe("durable Tool effects", () => {
       arguments: { q: "teal" },
       is_local: false,
       metadata: { source: "agent" },
+      // OE compares inputs exactly on replay, so this marker refuses a
+      // history recorded before typed OAuth outcomes.
+      oauth_outcome: 1,
       provider: "oauth",
       scopes: ["read", "write"],
       tool_call_id: "call-1",

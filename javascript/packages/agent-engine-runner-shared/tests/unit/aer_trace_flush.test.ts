@@ -1,12 +1,3 @@
-/**
- * The session-finish path must flush queued trace spans before it POSTs
- * /finish, because that POST triggers a zero-grace teardown of the pod. A flush
- * that is merely started, or reordered after the POST, loses the turn's spans.
- *
- * The tracing module is mocked so the flush can be gated: no finish POST may be
- * dispatched while the flush is in progress, and the flush must complete first.
- */
-
 import { describe, test, expect, vi, afterEach } from "vitest";
 import Fastify from "fastify";
 

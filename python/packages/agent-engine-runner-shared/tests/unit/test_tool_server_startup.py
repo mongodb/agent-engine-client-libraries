@@ -918,6 +918,21 @@ class TestToolServerStartup:
         assert set(runtime._tools.keys()) == EXPECTED_TOOLS
 
     @pytest.mark.asyncio
+    async def test_on_shutdown_flushes_tracing(self, monkeypatch):
+        """The Tool pod ends the tool.* spans and gets only a bounded grace
+        before teardown, so its shutdown must flush buffered spans."""
+        server = ToolServer(_make_runtime())
+        flushed: list[str] = []
+        monkeypatch.setattr(
+            "agent_engine_runner_shared.tracing.shutdown_tracing",
+            lambda: flushed.append("flush"),
+        )
+
+        await server.on_shutdown()
+
+        assert flushed == ["flush"]
+
+    @pytest.mark.asyncio
     async def test_connector_startup_is_idempotent(self, tmp_path):
         runtime = _make_connector_runtime(tmp_path)
         server = ToolServer(runtime)

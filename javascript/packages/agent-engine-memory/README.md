@@ -113,3 +113,17 @@ npm install
 npm test      # vitest
 npm run build # tsc
 ```
+
+## Queued semantic writes
+
+Semantic saves acknowledge durable consolidation with `id: null`,
+`operation_id` and `operation_status`. Awaiting a save does not mean retrieval
+can see the new fact. Poll the scoped operation endpoint at
+`GET /api/v1/projects/{project_id}/memory/semantic/operations/{operation_id}?user_id={user_id}`
+until it succeeds or fails. `user_id` must be the user the save was made for.
+A service account that saved with `userId: "u1"` must poll with
+`user_id=u1`. Without it the lookup is scoped to the service account and
+returns 404. Keep the same `idempotencyKey` when retrying one logical write.
+A reused key with different content or options returns 409. A call without a
+key starts a separate write. Pending processing can leave the previous fact
+visible. Submit content and visibility changes in separate requests.

@@ -1,14 +1,11 @@
-/**
- * Tracing setup for Runner SDK.
- *
- * Ported from `agent_engine_runner_shared/tracing/setup.py`. Initializes OpenTelemetry
- * with `BasicTracerProvider` and optionally a Mongo exporter. Calls the
- * framework instrumentor hook
- * registered via `agent_engine_runner_shared/hooks.ts:registerInstrumentor`.
- */
-
-import { isSpanContextValid, propagation, trace } from "@opentelemetry/api";
+import {
+  context,
+  isSpanContextValid,
+  propagation,
+  trace,
+} from "@opentelemetry/api";
 import type { Context, Tracer } from "@opentelemetry/api";
+import { AsyncLocalStorageContextManager } from "@opentelemetry/context-async-hooks";
 import type { ExportResult } from "@opentelemetry/core";
 import { W3CTraceContextPropagator } from "@opentelemetry/core";
 import { resourceFromAttributes } from "@opentelemetry/resources";
@@ -42,47 +39,52 @@ import { markInputRecordedByCaller } from "./conversation.js";
 
 const logger = getLogger("agent_engine_runner_shared.tracing");
 
-let tracerProvider: TracerProvider | null = null;
-// MongoClient instance built by `resolveTracingCollection`. Held here so
-// `shutdownTracing` can close the pool — `MongoDBSpanExporter.shutdown()`
-// is a no-op, so without this reference the client (and its connection
-// pool, monitor threads, heartbeat intervals) would leak until process exit.
-let tracingMongoClient: MongoClient | null = null;
-// In-flight initialization promise. `setupTracing` sets `tracerProvider` late
-// (after awaiting dynamic imports + the MongoClient connect), so the entry
-// guard alone can't stop concurrent callers from both running full setup —
-// which would open two Mongo clients and leak the first when the second
-// overwrites `tracingMongoClient`. Sharing this promise serializes them.
-let setupPromise: Promise<void> | null = null;
+const PLATFORM_RESOURCE_ATTR_PREFIX = "agentic_platform"; // open-source-refs:ignore — persisted data contract
 
-// MongoDB trace-store exporter state — mirrors Python's setup.py. The store
-// connection can fail at pod startup (e.g. a transient Atlas TLS error); without
-// retry the pod permanently lost database tracing for its whole lifetime.
-// `mongodbExporterAttached` tracks whether a MongoDB span processor
-// is live; `mongodbDegraded` marks a configured-but-unreachable store so /health
-// can surface DEGRADED. The retry timer re-attempts the connection in the
-// background and attaches the exporter on recovery.
+const PLATFORM_RESOURCE_ENV_VARS: ReadonlyArray<readonly [string, string]> = [
+  [`${PLATFORM_RESOURCE_ATTR_PREFIX}.org_id`, "ORG_ID"],
+  [`${PLATFORM_RESOURCE_ATTR_PREFIX}.project_id`, "PROJECT_ID"],
+  [`${PLATFORM_RESOURCE_ATTR_PREFIX}.workspace_id`, "APP_ID"],
+  [`${PLATFORM_RESOURCE_ATTR_PREFIX}.deployment_id`, "DEPLOYMENT_ID"],
+  [`${PLATFORM_RESOURCE_ATTR_PREFIX}.agent_id`, "AGENT_ID"],
+  [`${PLATFORM_RESOURCE_ATTR_PREFIX}.runtime_mode`, "RUNNER_MODE"],
+  [`${PLATFORM_RESOURCE_ATTR_PREFIX}.environment`, "AGENT_ENGINE_ENVIRONMENT"],
+];
+
+/**
+ * Build the provider resource attributes for `serviceName`.
+ *
+ * Ported from Python's `_build_resource_attributes`. The platform resource
+ * attribute keys carry process-level platform identity; a missing env var omits
+ * its key rather than writing an empty value.
+ */
+export function buildResourceAttributes(
+  serviceName: string,
+): Record<string, string> {
+  const attributes: Record<string, string> = { "service.name": serviceName };
+  for (const [resourceKey, envVar] of PLATFORM_RESOURCE_ENV_VARS) {
+    const value = process.env[envVar];
+    if (value) attributes[resourceKey] = value;
+  }
+  return attributes;
+}
+
+const MONGO_APP_NAME = "Agent Engine";
+
+let tracerProvider: TracerProvider | null = null;
+let tracingMongoClient: MongoClient | null = null;
+let setupPromise: Promise<void> | null = null;
+let registeredContextManager: AsyncLocalStorageContextManager | null = null;
+
 let mongodbExporterAttached = false;
 let mongodbDegraded = false;
 let retryTimer: ReturnType<typeof setTimeout> | null = null;
-// Stop signal for the background retry loop, mirroring Python's
-// `_retry_stop_event`. `shutdownTracing` sets this so an in-flight retry
-// attempt (past `retryTimer = null`, mid-`await resolveTracingCollection`)
-// can't reschedule a new timer or overwrite `tracingMongoClient` with a
-// client whose pool shutdown already closed — both would leak past shutdown.
 let retryStopped = false;
-// The lazy Mongo exporter registered with the tracer provider at setup time
-// when a store URI is configured. `BasicTracerProvider` (v2.x) takes span
-// processors only via its constructor — there is no `addSpanProcessor`, and
-// `setGlobalTracerProvider` rejects re-registration — so the provider is built
-// once with the lazy Mongo processor and the collection is wired in later by
-// `attachMongoTracing` once the store recovers. While the collection
-// is unset, `export` is a no-op.
 let lazyMongoExporter: LazyMongoSpanExporter | null = null;
+let otlpSpanExporter: ContentPolicyOTLPSpanExporter | null = null;
 
 let platformExporter: PlatformSpanExporter | null = null;
 
-// The larger queue absorbs the burst of spans emitted as a turn finishes.
 const PLATFORM_BSP_MAX_QUEUE_SIZE = 2048;
 const PLATFORM_BSP_MAX_EXPORT_BATCH_SIZE = 512;
 const PLATFORM_BSP_SCHEDULE_DELAY_MILLIS = 2000;
@@ -114,7 +116,6 @@ export class ExecutionContextSpanProcessor implements SpanProcessor {
   }
 }
 
-/** A SpanExporter whose Mongo collection is wired in after construction. */
 class LazyMongoSpanExporter implements SpanExporter {
   private inner: MongoDBSpanExporter | null = null;
 
@@ -140,6 +141,10 @@ class LazyMongoSpanExporter implements SpanExporter {
   forceFlush(): Promise<void> {
     return this.inner?.forceFlush() ?? Promise.resolve();
   }
+
+  drain(): Promise<void> {
+    return this.inner?.drain() ?? Promise.resolve();
+  }
 }
 
 export interface SetupTracingArgs {
@@ -162,6 +167,16 @@ export interface SetupTracingArgs {
   mongodbCollectionName?: string;
 }
 
+async function closeMongoClientIgnoringErrors(
+  client: MongoClient,
+): Promise<void> {
+  try {
+    await client.close();
+  } catch {
+    return;
+  }
+}
+
 async function resolveTracingCollection(
   args: SetupTracingArgs,
 ): Promise<{ collection: Collection | null; errorMessage: string | null }> {
@@ -175,36 +190,23 @@ async function resolveTracingCollection(
     const { MongoClient } = await import("mongodb");
     client = new MongoClient(args.mongodbUri, {
       serverSelectionTimeoutMS: 5000,
+      appName: MONGO_APP_NAME,
     });
     await client.connect();
-    // Mirrors Python's `client.admin.command("ping")` — surfaces a dead
-    // server immediately rather than waiting for the first span insert.
     await client.db("admin").command({ ping: 1 });
-    // Resolve the per-project-scoped store DB now that a client exists, so
-    // traces land in the same database the OE reads.
     const { resolveStoreDbName } = await import("../db_config.js");
     const dbName = await resolveStoreDbName(
       client,
       args.mongodbDatabaseName ?? undefined,
     );
-    // Retain the client so `shutdownTracing` can close it.
     tracingMongoClient = client;
     return {
       collection: client.db(dbName).collection(collName),
       errorMessage: null,
     };
   } catch (err) {
-    // Close on failure so a half-open client doesn't leak. `connect()` may
-    // not have completed, but `close()` is safe to call on a never-connected
-    // client per the driver docs. The scrubbed error message is returned for
-    // the caller to log at the severity it chooses (ERROR at startup, DEBUG
-    // on retries) — this function stays log-free so retries don't spam.
     if (client !== undefined) {
-      try {
-        await client.close();
-      } catch {
-        // best-effort cleanup
-      }
+      await closeMongoClientIgnoringErrors(client);
     }
     return {
       collection: null,
@@ -234,25 +236,12 @@ async function resolveTracingCollection(
  * startup failure.
  */
 export function scrubCredentials(message: unknown): string {
-  // The run is [^"'] (any char except quotes): it still crosses embedded
-  // newlines in a password (a --stdin-set secret can carry one), but stops
-  // at a JSON string boundary — a credential echoed inside a compact JSON
-  // body must not fold later siblings into the mask.
   return String(message).replace(
     /(mongodb(?:\+srv)?:\/\/)((?:(?!mongodb(?:\+srv)?:\/\/)[^"'])*)@(?=[^\s@/?#"'][^\s@?"']*(?:[/?#:\s"']|$))/gi,
     "$1***@",
   );
 }
 
-/**
- * Whether an OTLP endpoint was explicitly configured.
- *
- * `OTLPTraceExporter` defaults to `http://localhost:4318` when no endpoint
- * env var is set, which would silently start exporting to a collector that
- * doesn't exist in this cell architecture. Gate on explicit configuration so
- * "no endpoint configured" truly means "no OTLP traffic." Mirrors Python's
- * `_otlp_endpoint_configured`.
- */
 function otlpEndpointConfigured(): boolean {
   return Boolean(
     process.env["OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"] ||
@@ -260,22 +249,8 @@ function otlpEndpointConfigured(): boolean {
   );
 }
 
-/**
- * Upper bound (ms) on how long a `TenantRuntime.shutdown()` flush can spend
- * waiting on the OTLP exporter. `shutdown()` runs on the SIGTERM/SIGINT drain
- * path, so an unreachable/slow collector would otherwise add up to the OTel
- * default export timeout (10s) of latency to every pod termination.
- * Deliberately short relative to that default.
- */
 const OTLP_EXPORT_TIMEOUT_MILLIS = 3000;
 
-/**
- * Build the OTLP export span processor, if an endpoint was explicitly
- * configured. Additive and never replaces Mongo. Content-capture redaction
- * (`AGENTIC_PLATFORM_OTEL_CONTENT_CAPTURE`) applies only to this path.
- * Guarded: a missing dependency or bad endpoint must not take down tracing
- * setup entirely — mirrors Python's try/except around the same block.
- */
 async function buildOtlpSpanProcessor(): Promise<SpanProcessor | null> {
   if (!otlpEndpointConfigured()) return null;
   try {
@@ -293,6 +268,7 @@ async function buildOtlpSpanProcessor(): Promise<SpanProcessor | null> {
       new OTLPTraceExporter({ timeoutMillis: OTLP_EXPORT_TIMEOUT_MILLIS }),
       contentCaptureMode,
     );
+    otlpSpanExporter = otlpExporter;
     logger.info({ contentCaptureMode }, "Tracing: OTLP output enabled");
     return new BatchSpanProcessor(otlpExporter);
   } catch (err) {
@@ -304,7 +280,6 @@ async function buildOtlpSpanProcessor(): Promise<SpanProcessor | null> {
   }
 }
 
-/** Retry interval (seconds) for the background trace-store reconnection. */
 function getRetryIntervalSeconds(): number {
   const raw = Number(process.env["AGENTIC_TRACE_STORE_RETRY_INTERVAL_SECONDS"]);
   return Number.isFinite(raw) && raw > 0 ? raw : 30;
@@ -315,8 +290,6 @@ export async function setupTracing(args: SetupTracingArgs = {}): Promise<void> {
     logger.debug("Tracing already initialized");
     return;
   }
-  // Serialize concurrent callers onto the first call's promise. Cleared in
-  // `finally` so a degraded run (e.g. OTEL deps absent) can be retried later.
   if (setupPromise !== null) return setupPromise;
   setupPromise = doSetupTracing(args).finally(() => {
     setupPromise = null;
@@ -324,47 +297,17 @@ export async function setupTracing(args: SetupTracingArgs = {}): Promise<void> {
   return setupPromise;
 }
 
-/**
- * Opt-out for the OE platform trace exporter. Unset means on. `"0"` or
- * `"false"` keeps the MongoDB trace-store path: the OE never sees those spans,
- * so PII redaction cannot apply to them. Any other value, including an
- * unrecognized one, keeps the exporter on so a typo cannot route spans past the
- * OE. Mirrors Python's `platform_trace_exporter_enabled`; the name avoids the
- * reserved tenant-secret prefix so a workspace can set it directly.
- */
-export const PLATFORM_TRACE_EXPORTER_ENV = "AGENTIC_TRACE_EXPORTER";
-
-export function platformTraceExporterEnabled(
-  env: NodeJS.ProcessEnv = process.env,
-): boolean {
-  const value = (env[PLATFORM_TRACE_EXPORTER_ENV] ?? "").trim().toLowerCase();
-  return value !== "0" && value !== "false";
-}
-
 async function doSetupTracing(args: SetupTracingArgs): Promise<void> {
   const serviceName = args.serviceName ?? "runner-sdk";
   const spanProcessors: SpanProcessor[] = [new ExecutionContextSpanProcessor()];
 
-  // OE_URL takes precedence so live guests never write traces directly to
-  // MongoDB.
   const oeUrl = (process.env["OE_URL"] ?? "").trim();
   const otlpConfigured = otlpEndpointConfigured();
-  const usePlatform = oeUrl !== "" && platformTraceExporterEnabled();
-  if (oeUrl && !usePlatform) {
-    logger.warn(
-      `Tracing: ${PLATFORM_TRACE_EXPORTER_ENV} disables the platform trace ` +
-        "exporter; spans go to the trace store without PII redaction",
-    );
-  }
-  if (usePlatform) {
+  if (oeUrl) {
     attachPlatformExporter(spanProcessors, oeUrl);
   } else {
     const { collection, errorMessage } = await resolveTracingCollection(args);
     if (args.mongodbUri) {
-      // A store URI was configured — register the lazy Mongo exporter up front
-      // (the provider is built once, below, with it in the processor list). If
-      // the store was reachable at startup, wire the collection in immediately;
-      // otherwise leave it unset and retry in the background.
       const lazy = new LazyMongoSpanExporter();
       lazyMongoExporter = lazy;
       spanProcessors.push(new BatchSpanProcessor(lazy));
@@ -387,7 +330,7 @@ async function doSetupTracing(args: SetupTracingArgs): Promise<void> {
     } else if (!otlpConfigured) {
       logger.warn(
         "Tracing: no trace destination configured " +
-          "(platform exporter disabled or OE_URL unset, no MongoDB collection, no OTLP endpoint)",
+          "(OE_URL unset, no MongoDB collection, no OTLP endpoint)",
       );
     }
   }
@@ -396,25 +339,24 @@ async function doSetupTracing(args: SetupTracingArgs): Promise<void> {
   if (otlpProcessor !== null) spanProcessors.push(otlpProcessor);
 
   const provider = new BasicTracerProvider({
-    resource: resourceFromAttributes({
-      "service.name": serviceName,
-    }),
+    resource: resourceFromAttributes(buildResourceAttributes(serviceName)),
     spanProcessors,
   });
+
+  const contextManager = new AsyncLocalStorageContextManager();
+  contextManager.enable();
+  if (context.setGlobalContextManager(contextManager)) {
+    registeredContextManager = contextManager;
+  } else {
+    contextManager.disable();
+    logger.debug(
+      "A global context manager is already registered; keeping the existing one",
+    );
+  }
 
   trace.setGlobalTracerProvider(provider);
   tracerProvider = provider;
 
-  // Restrict the global propagator to W3C trace-context only, mirroring
-  // Python's set_global_textmap(TraceContextTextMapPropagator()). The API's
-  // own default (once anything registers a composite propagator, e.g. an
-  // auto-instrumentation package) also propagates Baggage, which would leak
-  // arbitrary unredacted key/value pairs onto every outbound call that goes
-  // through the global propagator once something starts writing to it.
-  // AER/Tool-Pod -> OE calls (tls_client.ts's fetchPlatform) already sidestep
-  // this by injecting through their own local propagator instance regardless
-  // of this setting, but this closes the gap for any future code path that
-  // uses the global API directly.
   propagation.setGlobalPropagator(new W3CTraceContextPropagator());
 
   runInstrumentor();
@@ -456,22 +398,23 @@ export function runInstrumentor(): void {
   }
 }
 
+const SHUTDOWN_TRACE_FLUSH_TIMEOUT_MILLIS = 5_000;
+
 export async function shutdownTracing(): Promise<void> {
-  // Signal in-flight retry attempts to stop before tearing down the provider
-  // they attach exporters to. Set before clearing the timer so an attempt
-  // that resumes mid-shutdown sees the flag and cleans up its own client
-  // rather than rescheduling or overwriting `tracingMongoClient`.
   retryStopped = true;
-  // Cleared unconditionally so a partially-failed setup
-  // (provider never created but retry scheduled) still cleans up.
   if (retryTimer !== null) {
     clearTimeout(retryTimer);
     retryTimer = null;
   }
   if (tracerProvider !== null) {
+    await forceFlushTracing(SHUTDOWN_TRACE_FLUSH_TIMEOUT_MILLIS);
     await tracerProvider.shutdown();
     tracerProvider = null;
     logger.info("Tracing shutdown complete");
+  }
+  if (registeredContextManager !== null) {
+    context.disable();
+    registeredContextManager = null;
   }
   if (tracingMongoClient !== null) {
     try {
@@ -483,22 +426,27 @@ export async function shutdownTracing(): Promise<void> {
     }
     tracingMongoClient = null;
   }
-  // Reset store-exporter state so a fresh setupTracing() in the same
-  // process (e.g. tests) starts clean.
   mongodbExporterAttached = false;
   mongodbDegraded = false;
   lazyMongoExporter = null;
   platformExporter = null;
+  otlpSpanExporter = null;
 }
 
 /**
- * Drain buffered spans and wait for in-flight platform exports, bounded by
+ * Drain buffered spans and wait for in-flight exporter work, bounded by
  * `timeoutMillis`.
  *
  * Called from the session-finish path before the OE releases the pod, so a
- * turn's spans are not lost to a zero-grace teardown. Returns true when tracing
- * is not initialized or the flush completed within the timeout; false when it
- * timed out or raised.
+ * turn's spans are not lost to a zero-grace teardown. `provider.forceFlush()`
+ * drains each processor's buffer, but a batch processor ships on a timer and
+ * does not track an export it already started: a span it removed from the
+ * buffer and is still shipping is invisible to it, so the flush can resolve
+ * before that write lands. Await each exporter's own in-flight work too — the
+ * platform exporter, the Mongo store, and (when configured) OTLP — so the
+ * caller does not release on a false flush. Returns true when tracing is not
+ * initialized or the flush completed within the timeout; false when it timed
+ * out or raised.
  */
 export async function forceFlushTracing(
   timeoutMillis = 5000,
@@ -507,10 +455,11 @@ export async function forceFlushTracing(
   if (provider === null) return true;
   try {
     const providerFlushed = provider.forceFlush();
-    const exportsDrained = platformExporter?.forceFlush() ?? Promise.resolve();
-    // A failed provider flush must not abandon an in-flight export that still
-    // has budget to finish, so join both to settlement and report failure only
-    // once neither can make progress.
+    const exportsDrained = Promise.all([
+      platformExporter?.forceFlush() ?? Promise.resolve(),
+      lazyMongoExporter?.drain() ?? Promise.resolve(),
+      otlpSpanExporter?.drain() ?? Promise.resolve(),
+    ]);
     const settled = Promise.allSettled([providerFlushed, exportsDrained]);
     if (
       !(await raceWithTimeout(
@@ -555,8 +504,8 @@ function raceWithTimeout(
  * `"disabled"` when no store URI was configured.
  *
  * `platform_exporter` is `"attached"` when traces are sent to the OE,
- * `"degraded"` after an incomplete export, or `"disabled"` when the opt-out is
- * set or `OE_URL` is unset. OTLP may still be configured in the disabled state.
+ * `"degraded"` after an incomplete export, or `"disabled"` when `OE_URL` is
+ * unset. OTLP may still be configured in the disabled state.
  */
 export function tracingStatus(): {
   database_exporter: string;
@@ -605,12 +554,6 @@ export function attachMongoTracing(collection: Collection): void {
   );
 }
 
-/**
- * Schedule a retry attempt. The timer is unref'd so it never pins the event
- * loop: the retry is best-effort background work and must not be the handle
- * keeping the process alive (Python's retry thread is a daemon for the same
- * reason).
- */
 function scheduleRetry(
   attempt: () => void,
   intervalMs: number,
@@ -620,7 +563,6 @@ function scheduleRetry(
   return timer;
 }
 
-/** Retry the trace-store connection in the background. */
 function startMongoRetry(args: SetupTracingArgs): void {
   if (mongodbExporterAttached) return;
   if (retryTimer !== null) return;
@@ -630,17 +572,9 @@ function startMongoRetry(args: SetupTracingArgs): void {
     retryTimer = null;
     if (mongodbExporterAttached || retryStopped) return;
     const { collection, errorMessage } = await resolveTracingCollection(args);
-    // Shutdown may have raced with this attempt while it was awaiting the
-    // store connection. `resolveTracingCollection` already assigned a fresh
-    // client to `tracingMongoClient` on success — close it so its pool
-    // doesn't leak, then bail without rescheduling.
     if (retryStopped) {
       if (tracingMongoClient !== null) {
-        try {
-          await tracingMongoClient.close();
-        } catch {
-          // best-effort cleanup
-        }
+        await closeMongoClientIgnoringErrors(tracingMongoClient);
         tracingMongoClient = null;
       }
       return;

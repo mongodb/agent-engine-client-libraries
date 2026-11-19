@@ -25,7 +25,9 @@ export const WriteTurnResultSchema = z.looseObject({
 export type WriteTurnResult = z.infer<typeof WriteTurnResultSchema>;
 
 export const CreateSemanticResultSchema = z.looseObject({
-  id: z.string(),
+  id: z.string().nullable(),
+  operation_id: z.string().nullable().optional(),
+  operation_status: z.string().nullable().optional(),
   label: z.string(),
   has_embedding: z.boolean(),
   acknowledged: z.boolean(),
@@ -39,6 +41,8 @@ export const BulkCreateSemanticResultSchema = z.looseObject({
   skipped_labels: z.array(z.string()),
   has_embeddings: z.boolean(),
   acknowledged: z.boolean(),
+  accepted_operations: z.array(CreateSemanticResultSchema).default([]),
+  idempotency_key: z.string().nullable().optional(),
 });
 export type BulkCreateSemanticResult = z.infer<
   typeof BulkCreateSemanticResultSchema

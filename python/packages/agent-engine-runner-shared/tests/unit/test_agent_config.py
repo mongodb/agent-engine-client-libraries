@@ -1123,6 +1123,7 @@ def test_is_platform_env_var_membership_checks():
     assert is_platform_env_var("CORS_ALLOWED_ORIGINS") is True
     assert is_platform_env_var("AGENT_STREAM_TERMINAL_DRAIN_TIMEOUT") is True
     assert is_platform_env_var("SHUTDOWN_GRACE_PERIOD_MS") is True
+    assert is_platform_env_var("AGENTENGINE_STREAM_JOURNAL_DIR") is True
     assert is_platform_env_var("CHECKPOINTER_SERVER_SELECTION_TIMEOUT") is True
     assert is_platform_env_var("CHECKPOINTER_CONNECT_TIMEOUT") is True
     assert is_platform_env_var("CHECKPOINTER_SOCKET_TIMEOUT") is True

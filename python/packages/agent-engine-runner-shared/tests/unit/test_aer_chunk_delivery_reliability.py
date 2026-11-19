@@ -65,7 +65,8 @@ def _make_server() -> AERServer:
     server._client = None  # type: ignore[attr-defined]
     server._client_lock = asyncio.Lock()  # type: ignore[attr-defined]
     server._a2a_registered = False  # type: ignore[attr-defined]
-    server._chunk_seq = {}  # type: ignore[attr-defined]
+    server._chunk_seq = {}
+    server._durable_ack_senders = {}  # type: ignore[attr-defined]
     server._owner_callback_url = {}  # type: ignore[attr-defined]
     server._callback_delivery = CallbackDelivery(  # type: ignore[attr-defined]
         lambda url: server._get_client(url)  # type: ignore[attr-defined]

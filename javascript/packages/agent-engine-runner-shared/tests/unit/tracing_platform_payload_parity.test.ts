@@ -1,16 +1,8 @@
-/**
- * The TypeScript platform exporter sends the payload the Python one sends.
- *
- * Both runner test suites decode their own request and compare it with the
- * shared fixture, so a field one runner drops or renames fails here instead of
- * in the OE.
- */
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { describe, expect, test, vi } from "vitest";
 import { resourceFromAttributes } from "@opentelemetry/resources";
 import type { ReadableSpan } from "@opentelemetry/sdk-trace-base";
-// The generated protobuf root has no public export; the test needs it to decode.
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 import otlpRoot from "@opentelemetry/otlp-transformer/build/src/generated/root.js";
 

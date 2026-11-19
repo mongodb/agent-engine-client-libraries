@@ -1,11 +1,3 @@
-/**
- * Regression: a tracing setup rejection carrying a non-Error value (a string
- * throw) must stay "logged and swallowed" — the catch handler in
- * TenantRuntime.initTracing must not throw itself (turning a degraded trace
- * store into a startup failure), and the rejected content must still be
- * credential-scrubbed before it reaches the log sink.
- */
-
 import { describe, test, expect, vi, beforeEach, afterEach } from "vitest";
 import type * as TracingIndex from "../../src/tracing/index.js";
 
@@ -30,9 +22,6 @@ vi.mock("../../src/tracing/index.js", async (importOriginal) => {
   const actual = await importOriginal<typeof TracingIndex>();
   return {
     ...actual,
-    // A rejection carrying a plain string (not an Error) whose text embeds a
-    // credential-bearing URI — the shape that previously threw inside the
-    // catch handler via (e as Error).message being undefined.
     setupTracing: () =>
       Promise.reject(
         "driver error: mongodb://admin:p@ss word@atlas-host.mongodb.net/db",
@@ -57,8 +46,6 @@ describe("TenantRuntime tracing setup failure handling", () => {
   test("a string rejection is swallowed and scrubbed, never rethrown", async () => {
     const runtime = new TenantRuntime({ appName: "Test" });
 
-    // tracingReady must RESOLVE: the pre-fix catch threw on the undefined
-    // .message, leaving the promise rejected and failing startup.
     await expect(
       (runtime as unknown as { tracingReady: Promise<void> }).tracingReady,
     ).resolves.toBeUndefined();

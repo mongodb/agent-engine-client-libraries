@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- Cancelling a turn on a non-durable Deep Agent keeps the session's earlier
+  conversation. The cancelled-turn checkpoint copied the thread's stored channel
+  values, which omit a `DeltaChannel` between snapshots, so it carried only the
+  stopped turn's message and the next turn started without history.
 - Durable Deep Agent sessions no longer fail with `this attempt already has an
   in-flight activity` when parallel tool calls or subagents use the Tool Pod
   backend at the same time. Each operation replays from its own recorded

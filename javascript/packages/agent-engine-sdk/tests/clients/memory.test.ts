@@ -793,14 +793,19 @@ describe("ProceduralMemory", () => {
       projectId: "proj1",
       id: "proc1",
       content: "updated",
+      userId: "owner",
+      idempotencyKey: "edit-one",
     });
 
     expect(fetchMock).toHaveBeenCalledOnce();
     const url = getCallUrl(fetchMock.mock.calls[0]);
     expect(url).toContain("/api/v1/memory/procedural/proc1");
+    expect(new URL(url).searchParams.get("user_id")).toBe("owner");
     const body = getCallBody(fetchMock.mock.calls[0]);
     expect(body["project_id"]).toBe("proj1");
     expect(body["content"]).toBe("updated");
+    expect(body["user_id"]).toBe("owner");
+    expect(body["idempotency_key"]).toBe("edit-one");
   });
 
   it("updateProcedural by procedure name — GET then PATCH, project_id on both", async () => {
@@ -823,6 +828,9 @@ describe("ProceduralMemory", () => {
     const patchBody = getCallBody(fetchMock.mock.calls[1]);
     expect(patchBody["project_id"]).toBe("proj1");
     expect(patchBody["content"]).toBe("new");
+    expect(
+      new URL(getCallUrl(fetchMock.mock.calls[1])).searchParams.has("user_id"),
+    ).toBe(false);
   });
 
   it("updateProcedural throws when procedure not found", async () => {

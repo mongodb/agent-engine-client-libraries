@@ -86,6 +86,7 @@ run_python_tests() {
     uv run pyright
     uv run pytest
   )
+
 }
 
 run_javascript_tests() {

@@ -14,8 +14,8 @@
  *
  * Two `MemoryClient` instances back each adapter: a retrying one for the write
  * turn and all reads (idempotent — turns carry an idempotency key, reads are
- * pure) and a non-retrying one for type-specific creates (no idempotency key, so
- * a retry after the server committed could duplicate the record).
+ * pure) and a non-retrying one for type-specific creates unless the caller
+ * supplies an idempotency key.
  */
 
 import {
@@ -337,7 +337,8 @@ export class MemoryClientAdapter implements MemoryRuntime, MemoryCrudClient {
     args: Parameters<MemoryCrudClient["createSemantic"]>[0],
   ): Promise<CreateSemanticResult> {
     try {
-      const r = await this.noRetry.createSemantic({
+      const client = args.idempotencyKey ? this.retry : this.noRetry;
+      const r = await client.createSemantic({
         label: args.label,
         text: args.text,
         orgId: EMPTY_ORG,
@@ -348,6 +349,7 @@ export class MemoryClientAdapter implements MemoryRuntime, MemoryCrudClient {
         agentId: args.agentId,
         metadata: args.metadata,
         upsert: args.upsert,
+        idempotencyKey: args.idempotencyKey,
       });
       return CreateSemanticResultSchema.parse(r);
     } catch (e) {

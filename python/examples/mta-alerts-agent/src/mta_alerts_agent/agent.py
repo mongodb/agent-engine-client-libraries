@@ -1293,7 +1293,7 @@ def _build_llm():
         from langchain_google_genai import ChatGoogleGenerativeAI
 
         return ChatGoogleGenerativeAI(
-            model=os.environ.get("GEMINI_MODEL", "gemini-3-flash-preview")
+            model=os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
         )
     elif os.environ.get("CEREBRAS_API_KEY"):
         from langchain_cerebras import ChatCerebras

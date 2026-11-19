@@ -7,7 +7,6 @@ export {
   getTracePath,
 } from "./exporters.js";
 export {
-  platformTraceExporterEnabled,
   setupTracing,
   shutdownTracing,
   forceFlushTracing,

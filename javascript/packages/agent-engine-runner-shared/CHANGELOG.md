@@ -8,12 +8,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- `AGENTIC_TRACE_EXPORTER=0` (or `false`) opts out of the platform trace
-  endpoint and keeps the direct MongoDB path, as in the Python runner. Spans
-  stored that way are not redacted. Without it, spans already go to
-  `POST /internal/traces` whenever `OE_URL` is set; `0.11.13` is the first
-  version that does this, and earlier versions write spans straight to MongoDB
-  without redaction.
 - Local debug mode for TypeScript agents: when the operator's local-only debug
   mode stamps `MDBAE_LOCAL_MODE=true`, the runtime opens Node's built-in
   inspector on `127.0.0.1:${MDBAE_LOCAL_PORT:-5678}` without waiting for a
@@ -28,6 +22,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bindings, and exposes the shared AER and Tool Pod runtime views.
 
 ### Changed
+- Spans go to the platform trace endpoint (`POST /internal/traces`) whenever
+  `OE_URL` is set. `0.11.13` is the first version that does this; earlier
+  versions write spans straight to MongoDB.
 - **Breaking:** the connector `tool.yaml` `auth` block no longer takes `type`.
   It names exactly one credential: `bearer: <secret>`, `basic: {username,
   password}`, `api_keys: [{env, location, name, prefix}]`, or
@@ -52,6 +49,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   one appended child boundary (composing with any active operation-path
   resolver). A pending-batch holder on the attempt context backs the
   adapter's two-phase model-step/tool-step stamping.
+
+### Removed
+- **Breaking:** `AGENTIC_TRACE_EXPORTER` no longer has any effect. Setting it
+  to `0` or `false` does not turn off the platform trace exporter.
 
 ### Fixed
 - Connector tools now capture the tenant environment for each Tool Pod

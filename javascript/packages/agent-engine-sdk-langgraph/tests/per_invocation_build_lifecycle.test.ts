@@ -64,6 +64,7 @@ interface ServerHarness {
     apply(request: unknown): unknown;
   };
   abandonedBuilds: Map<string, { build: Promise<unknown> }>;
+  durableAckSenders: Map<string, unknown>;
   handleExecute: (request: unknown) => Promise<unknown>;
   registerRoutes(app: Fastify.FastifyInstance): void;
   chunkSeq: Map<string, number>;
@@ -117,6 +118,7 @@ function makeServer(
   server.chunkSeq = new Map();
   server.ownerCallbackUrl = new Map();
   server.abandonedBuilds = new Map();
+  server.durableAckSenders = new Map();
   server.sendStreamChunk = vi.fn().mockResolvedValue(undefined);
   server.reportCallback = vi.fn().mockResolvedValue(undefined);
   // `handleExecute` is an instance field (arrow function), so Object.create

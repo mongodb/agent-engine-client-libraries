@@ -335,7 +335,7 @@ class TestCompile:
     def test_optional_body_with_nested_required_stays_omittable(self, tmp_path):
         """Execution-boundary semantics: an optional body can be omitted, but
         supplying it must still satisfy the body's own required properties.
-        Unknown top-level arguments are ignored by preview contract."""
+        The envelope schema allows extra top-level keys; the executor rejects them."""
         import jsonschema
 
         out = _connector_dir(tmp_path)

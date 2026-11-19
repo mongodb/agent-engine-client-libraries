@@ -20,7 +20,9 @@ import {
   type Checkpoint,
   type CheckpointMetadata,
   type CheckpointTuple,
+  type DeltaChannelHistory,
 } from "@langchain/langgraph-checkpoint";
+import type { DeltaChannel } from "@langchain/langgraph";
 import { HumanMessage } from "@langchain/core/messages";
 import type { RunnableConfig } from "@langchain/core/runnables";
 import { randomUUID } from "node:crypto";
@@ -54,6 +56,10 @@ export interface CancelledTurnSaver {
     newVersions: Record<string, number | string>,
   ): Promise<unknown>;
   getNextVersion(current: string | number | undefined): string | number;
+  getDeltaChannelHistory(options: {
+    config: RunnableConfig;
+    channels: string[];
+  }): Promise<Record<string, DeltaChannelHistory>>;
 }
 
 /**
@@ -70,6 +76,11 @@ export interface CancelledTurnSaver {
  * attached — the next invoke's cancelled-predecessor fence stays a no-op on
  * this tip, and the half-dead super-step's orphaned writes are never joined
  * to it.
+ *
+ * `deltaChannels` are the graph's channels that checkpoints store only as
+ * deltas (the deep agents' `messages`); their stored value is reconstructed
+ * first, because a marker written with the raw `channel_values` would
+ * otherwise drop them (see `materializeDeltaChannels`).
  */
 export async function commitCancelledTurnCheckpoint(
   saver: CancelledTurnSaver,
@@ -79,6 +90,7 @@ export async function commitCancelledTurnCheckpoint(
     turnMessageId,
     nodeNames,
     resume = false,
+    deltaChannels = {},
   }: {
     threadId: string;
     userMessage: string;
@@ -86,6 +98,8 @@ export async function commitCancelledTurnCheckpoint(
     nodeNames: Iterable<string>;
     /** The execution is a native HITL resume: its opener is already persisted. */
     resume?: boolean;
+    /** Channels checkpoints store only as deltas, keyed by channel name. */
+    deltaChannels?: Record<string, DeltaChannel>;
   },
 ): Promise<string | null> {
   const config: RunnableConfig = {
@@ -108,6 +122,17 @@ export async function commitCancelledTurnCheckpoint(
     }
     parentId = latest.checkpoint.id;
     priorStep = latest.metadata?.step ?? -1;
+    if (Object.keys(deltaChannels).length > 0) {
+      channelValues = await materializeDeltaChannels(
+        saver,
+        {
+          ...config,
+          configurable: { ...config.configurable, checkpoint_id: parentId },
+        },
+        channelValues,
+        deltaChannels,
+      );
+    }
     clearQueuedTasks(channelValues);
   }
 
@@ -167,6 +192,41 @@ export async function commitCancelledTurnCheckpoint(
     channelVersions,
   );
   return resolvedId ?? null;
+}
+
+/**
+ * Replace a checkpoint's delta channels with their full values.
+ *
+ * A checkpoint holds a `DeltaChannel` only as a periodic snapshot blob and
+ * otherwise omits it, leaving LangGraph to replay ancestor writes. Copying
+ * `channelValues` verbatim therefore drops the channel, and the plain value
+ * then written in its place shadows that replay on the next load.
+ */
+export async function materializeDeltaChannels(
+  saver: CancelledTurnSaver,
+  config: RunnableConfig,
+  channelValues: Record<string, unknown>,
+  deltaChannels: Record<string, DeltaChannel>,
+): Promise<Record<string, unknown>> {
+  const values: Record<string, unknown> = { ...channelValues };
+  const omitted = Object.keys(deltaChannels).filter(
+    (name) => !(name in values),
+  );
+  const histories =
+    omitted.length > 0
+      ? await saver.getDeltaChannelHistory({ config, channels: omitted })
+      : {};
+  for (const [name, spec] of Object.entries(deltaChannels)) {
+    const history = histories[name];
+    const channel =
+      history === undefined
+        ? spec.fromCheckpoint(values[name])
+        : spec.fromCheckpoint(history.seed);
+    if (history !== undefined) channel.replayWrites(history.writes);
+    if (channel.isAvailable()) values[name] = channel.get();
+    else delete values[name];
+  }
+  return values;
 }
 
 /**

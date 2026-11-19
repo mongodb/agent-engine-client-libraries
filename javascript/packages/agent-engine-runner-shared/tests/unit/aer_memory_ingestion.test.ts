@@ -67,6 +67,7 @@ function makeServer(): {
     getAgent: () => ({}) as ReturnType<ITenantRuntime["getAgent"]>,
   };
   server.chunkSeq = new Map();
+  server.durableAckSenders = new Map();
   server.ownerCallbackUrl = new Map();
   server.pendingSessionFinish = new Set();
   server.sendStreamChunk = vi.fn().mockResolvedValue(undefined);

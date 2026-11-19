@@ -42,6 +42,7 @@
   * [MemoryRouteNotFoundError](#agent_engine_sdk_memory.errors.MemoryRouteNotFoundError)
   * [MemoryServerError](#agent_engine_sdk_memory.errors.MemoryServerError)
   * [MemoryConnectionError](#agent_engine_sdk_memory.errors.MemoryConnectionError)
+  * [MemorySearchWarning](#agent_engine_sdk_memory.errors.MemorySearchWarning)
 * [agent\_engine\_sdk\_memory.models](#agent_engine_sdk_memory.models)
   * [WriteTurnResult](#agent_engine_sdk_memory.models.WriteTurnResult)
   * [CreateSemanticResult](#agent_engine_sdk_memory.models.CreateSemanticResult)
@@ -222,7 +223,8 @@ def save_semantic(*,
                   visibility: str = "private",
                   metadata: dict[str, Any] | None = None,
                   upsert: bool = True,
-                  agent_id: str | None = None) -> CreateSemanticResult
+                  agent_id: str | None = None,
+                  idempotency_key: str | None = None) -> CreateSemanticResult
 ```
 
 Save a semantic memory (fact, customer profile).
@@ -232,8 +234,17 @@ Save a semantic memory (fact, customer profile).
 - `visibility` - Access scope of the memory ("private" or "org").
 - `metadata` - Optional caller-supplied metadata dictionary stored with
   the memory.
-- `upsert` - When True (the default), replace an existing memory with
-  the same label instead of creating a duplicate.
+- `upsert` - When True (the default), consolidate against the lineage
+  identified by the label. Once the operation succeeds,
+  ``get_semantic(label=...)`` returns the current version under
+  this label.
+- `idempotency_key` - Reuse this key when retrying one logical write.
+
+
+**Returns**:
+
+  A durable operation reference. A queued result has no memory ID.
+  Acceptance does not imply immediate retrieval visibility.
 
 
 **Raises**:
@@ -769,10 +780,19 @@ nothing is prefixed for you. They are not validated against the declared
 set, so an undeclared or misspelled path is not rejected and silently
 yields no or degraded matches.
 
+When several sources are requested and one of them fails with a
+non-retryable server error (HTTP 500, 501 or 505 to 599), the other sources'
+results are still returned and a ``MemorySearchWarning`` naming the failed
+source is emitted. A retryable 502, 503 or 504, a malformed response body,
+every other error, and a server error on every requested source still
+raise.
+
 **Raises**:
 
 - `MemoryNotSupportedError` - If a requested source is unavailable in this
   mode. See ``docs/capability-matrix.md`` for current gaps.
+- `MemoryServerError` - If every requested source fails on the server, or
+  any source returns a retryable or malformed response.
 
 Seam primitives: the immutable request context and the runtime Protocol.
 
@@ -977,6 +997,16 @@ class MemoryConnectionError(MemoryAPIError)
 ```
 
 Raised when the transport fails to reach the memory backend (connect/timeout).
+
+<a id="agent_engine_sdk_memory.errors.MemorySearchWarning"></a>
+
+## MemorySearchWarning
+
+```python
+class MemorySearchWarning(UserWarning)
+```
+
+Emitted when ``Memory.search`` leaves out a source that failed on the server.
 
 Canonical Pydantic models for Memory API.
 

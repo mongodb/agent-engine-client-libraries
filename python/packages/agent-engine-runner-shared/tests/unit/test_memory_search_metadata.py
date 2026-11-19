@@ -104,7 +104,9 @@ def test_search_with_empty_query_omits_query_key(execution_context) -> None:
 
 def test_write_omits_query(execution_context) -> None:
     engine = MagicMock()
-    engine.create_semantic.return_value = SimpleNamespace(id="mem-1")
+    engine.create_semantic.return_value = SimpleNamespace(
+        id="mem-1", label="l", has_embedding=False, acknowledged=True
+    )
 
     create_semantic_memory(engine, text="fact", label="l", org_id="o", user_id="u1")
 

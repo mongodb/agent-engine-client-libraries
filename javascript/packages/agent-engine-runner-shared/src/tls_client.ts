@@ -100,7 +100,7 @@ const agentMtimeCache = new Map<string, [number, number, number] | null>();
 /**
  * Get certificate file modification times for rotation detection.
  *
- * Only container mode (TLS_*_PATH) supports rotation detection via mtime.
+ * Only file-based TLS (TLS_*_PATH) supports rotation detection via mtime.
  * VM mode (TLS_*_PEM) cannot detect rotation - the env var is static for
  * the pod's lifetime, so rotation requires pod restart.
  *
@@ -112,7 +112,7 @@ function getCertMtimes(): [number, number, number] | null {
     const keyPath = process.env.TLS_KEY_PATH;
     const caPath = process.env.TLS_CA_CERT_PATH;
 
-    // Only track mtimes if using file-based certs (container mode)
+    // Only track mtimes if using file-based certs (file-based TLS)
     if (!certPath || !keyPath || !caPath) {
       return null;
     }
@@ -131,14 +131,14 @@ function getCertMtimes(): [number, number, number] | null {
 /**
  * Get certificate content from environment.
  *
- * For container mode, reads from TLS_*_PATH file.
- * For VM mode, reads TLS_*_PEM (raw PEM from SecretKeyRef) directly.
+ * For file-based TLS, reads from TLS_*_PATH file.
+ * For PEM-based TLS, reads TLS_*_PEM (raw PEM from SecretKeyRef) directly.
  *
  * @param certType - One of "CERT", "KEY", or "CA_CERT"
  * @returns Certificate content as string, or empty string if not available
  */
 function getCertContentFromEnv(certType: string): string {
-  // Check for direct path first (container mode)
+  // Check for direct path first (file-based TLS)
   const pathEnv = `TLS_${certType}_PATH`;
   const certPath = process.env[pathEnv];
   if (certPath) {
@@ -207,7 +207,7 @@ function getConnectOptionsForURL(
  * blocking the event loop on filesystem I/O for every request. Certificate files
  * are only read once per base URL when creating the agent, not on every fetch.
  *
- * Certificate rotation: In container mode (TLS_*_PATH), automatically detects
+ * Certificate rotation: In file-based TLS (TLS_*_PATH), automatically detects
  * cert-manager rotation by comparing file mtimes and invalidates the cached agent
  * so the next request picks up renewed certificates. In VM mode (TLS_*_PEM), the
  * env vars are static for the pod's lifetime, so rotation requires a pod restart.
@@ -226,7 +226,7 @@ export function getFetchOptionsWithTLS(url: string): RequestInit | undefined {
   const urlObj = new URL(url);
   const baseUrl = `${urlObj.protocol}//${urlObj.host}`;
 
-  // Check if certs have been rotated (container mode only).
+  // Check if certs have been rotated (file-based TLS only).
   // Cert-manager rotates certificates by updating the Secret volume mount.
   // Kubelet propagates the change to the pod's filesystem (up to ~60s delay).
   // We detect rotation by comparing file mtimes and invalidate the cached agent.
@@ -271,7 +271,7 @@ export function getFetchOptionsWithTLS(url: string): RequestInit | undefined {
   }
 
   // Cache miss: read certificates (fail-closed) and create a new agent.
-  // Supports both direct paths (container mode) and PEM env content (VM mode).
+  // Supports both direct paths (file-based TLS) and PEM env content (VM mode).
   const connect = getConnectOptionsForURL(url);
 
   // Configure mTLS

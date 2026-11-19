@@ -5,10 +5,7 @@
     "typedoc-plugin-markdown"
   ],
   "entryPoints": [
-    "packages/agent-engine-sdk/src/index.ts",
-    "packages/agent-engine-memory/src/index.ts",
-    "packages/agent-engine-runner-shared/src/index.ts",
-    "packages/agent-engine-sdk-langgraph/src/index.ts"
+    "packages/*/src/index.ts"
   ],
   "out": "docs/api",
   "readme": "none",

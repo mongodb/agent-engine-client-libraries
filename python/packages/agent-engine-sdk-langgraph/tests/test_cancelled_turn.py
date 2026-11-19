@@ -4,13 +4,16 @@ stopped turn visible in playground history without making it resumable."""
 from __future__ import annotations
 
 from types import SimpleNamespace
-from typing import Any, cast
+from typing import Annotated, Any, TypedDict, cast
 from unittest.mock import MagicMock
 
 import pytest
 from agent_engine_sdk import AgentInput, RequestContext
 from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.runnables import RunnableConfig
+from langgraph.channels.delta import DeltaChannel
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command
 
 from agent_engine_sdk_langgraph.agent import (
@@ -23,6 +26,7 @@ from agent_engine_sdk_langgraph.cancelled_turn import (
     CANCELLED_TURN_MESSAGE_IDS_METADATA_KEY,
     CANCELLED_TURN_METADATA_KEY,
     commit_cancelled_turn,
+    materialize_delta_channels,
 )
 from agent_engine_sdk_langgraph.platform_checkpointer import PlatformCheckpointer
 
@@ -673,6 +677,161 @@ def _send_graph(saver: Any) -> Any:
     )
     builder.add_edge("worker", END)
     return builder.compile(checkpointer=saver), payloads, release
+
+
+def _append_messages(state: list[Any], writes: Any) -> list[Any]:
+    """Batch reducer for a ``DeltaChannel``: every write adds to the list."""
+    return [*state, *(message for write in writes for message in write)]
+
+
+class _DeltaMessageState(TypedDict):
+    # deepagents' own layout: the conversation lives in a delta channel.
+    messages: Annotated[list[Any], DeltaChannel(_append_messages)]
+
+
+class TestConversationInADeltaChannel:
+    """deepagents keeps ``messages`` in a ``DeltaChannel``, which a checkpoint
+    stores as deltas rather than as a value. The cancelled-turn marker must
+    reconstruct it; copying the stored values truncates the session to the
+    stopped turn's opener."""
+
+    @staticmethod
+    def _agent(saver: Any, seen: list[list[str]]) -> LangGraphBaseAgent:
+        def reply(state: _DeltaMessageState) -> dict[str, Any]:
+            seen.append([message.content for message in state["messages"]])
+            return {"messages": [AIMessage(f"re: {state['messages'][-1].content}")]}
+
+        builder: StateGraph[Any] = StateGraph(_DeltaMessageState)
+        builder.add_node("reply", reply)
+        builder.add_edge(START, "reply")
+        builder.add_edge("reply", END)
+        return LangGraphBaseAgent(
+            builder.compile(checkpointer=PlatformCheckpointer(native=saver)),
+            prepare_input=lambda input_, _ctx: {
+                "messages": [HumanMessage(input_.payload["message"])]
+            },
+        )
+
+    @pytest.mark.anyio
+    async def test_a_cancelled_turn_keeps_the_earlier_conversation(self) -> None:
+        saver = InMemorySaver()
+        seen: list[list[str]] = []
+        agent = self._agent(saver, seen)
+        ctx = RequestContext(session_id="sess-1", workspace_id="ws-1")
+        config: RunnableConfig = {
+            "configurable": {"thread_id": "sess-1:ws-1", "checkpoint_ns": ""}
+        }
+
+        await agent.invoke(ctx, AgentInput(payload={"message": "my name is Max"}))
+        await agent.invoke(ctx, AgentInput(payload={"message": "what is my name?"}))
+        # The precondition for the bug: the tip stores messages as deltas only.
+        tip = await saver.aget_tuple(config)
+        assert tip is not None
+        assert "messages" not in tip.checkpoint["channel_values"]
+
+        # The drained turn had its input built (opener id stashed) but never
+        # committed a checkpoint carrying it, as in a mid-superstep cancel.
+        _stash_turn_message_id(
+            ctx, {"messages": [HumanMessage(content="and now?", id="input:3")]}
+        )
+        await agent.commit_cancelled_turn(
+            ctx, AgentInput(payload={"message": "and now?"})
+        )
+
+        earlier = [
+            "my name is Max",
+            "re: my name is Max",
+            "what is my name?",
+            "re: what is my name?",
+        ]
+        state = await agent.compiled_graph.aget_state(config)
+        assert [message.content for message in state.values["messages"]] == [
+            *earlier,
+            "and now?",
+        ]
+
+        await agent.invoke(ctx, AgentInput(payload={"message": "still there?"}))
+        assert seen[-1] == [*earlier, "and now?", "still there?"]
+
+    @pytest.mark.anyio
+    async def test_a_mid_run_cancel_leaves_the_interrupted_writes_out(
+        self,
+    ) -> None:
+        """The delta history walk starts at the tip's parent, so a task's
+        half-written message on the stopped super-step never reaches the marker
+        — nor the model on the next turn."""
+        saver = InMemorySaver()
+        seen: list[list[str]] = []
+        agent = self._agent(saver, seen)
+        ctx = RequestContext(session_id="sess-1", workspace_id="ws-1")
+        config: RunnableConfig = {
+            "configurable": {"thread_id": "sess-1:ws-1", "checkpoint_ns": ""}
+        }
+
+        await agent.invoke(ctx, AgentInput(payload={"message": "my name is Max"}))
+        await agent.invoke(ctx, AgentInput(payload={"message": "what is my name?"}))
+        tip = await saver.aget_tuple(config)
+        assert tip is not None
+        await saver.aput_writes(
+            {
+                "configurable": {
+                    **config["configurable"],
+                    "checkpoint_id": tip.checkpoint["id"],
+                }
+            },
+            [("messages", [AIMessage(content="partial answer")])],
+            task_id="reply",
+        )
+
+        cancel_ctx = RequestContext(session_id="sess-1", workspace_id="ws-1")
+        _stash_turn_message_id(
+            cancel_ctx, {"messages": [HumanMessage(content="and now?", id="input:3")]}
+        )
+        await agent.commit_cancelled_turn(
+            cancel_ctx, AgentInput(payload={"message": "and now?"})
+        )
+
+        earlier = [
+            "my name is Max",
+            "re: my name is Max",
+            "what is my name?",
+            "re: what is my name?",
+        ]
+        state = await agent.compiled_graph.aget_state(config)
+        assert [message.content for message in state.values["messages"]] == [
+            *earlier,
+            "and now?",
+        ]
+
+
+class _HistoryStubSaver:
+    """Native saver stub that records which channels asked for history."""
+
+    def __init__(self) -> None:
+        self.history_channels: list[list[str]] = []
+
+    async def aget_delta_channel_history(
+        self, *, config: Any, channels: list[str]
+    ) -> dict[str, Any]:
+        self.history_channels.append(channels)
+        return {}
+
+
+@pytest.mark.anyio
+async def test_a_checkpoint_stored_value_is_not_replaced_by_history() -> None:
+    """A delta channel the checkpoint already stores (its periodic snapshot)
+    is read as stored; replaying history over it would truncate the session at
+    the snapshot boundary."""
+    saver = _HistoryStubSaver()
+    stored = [HumanMessage(content="earlier")]
+    values = await materialize_delta_channels(
+        saver,
+        {"configurable": {"thread_id": "t", "checkpoint_ns": ""}},
+        {"messages": stored},
+        {"messages": DeltaChannel(_append_messages)},
+    )
+    assert values["messages"] == stored
+    assert saver.history_channels == []
 
 
 @pytest.mark.anyio

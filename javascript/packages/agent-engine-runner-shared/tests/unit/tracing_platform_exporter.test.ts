@@ -54,7 +54,6 @@ import {
   forceFlushTracing,
   getFetchOptionsWithTLS,
   getTracer,
-  platformTraceExporterEnabled,
   setupTracing,
   shutdownTracing,
   tracingStatus,
@@ -91,8 +90,6 @@ function makeSpans(count: number, padBytes = 0): ReadableSpan[] {
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 
-// JSON keeps payload size controllable while letting tests inspect delivered
-// IDs.
 function fakeSerializer(
   deserialize?: (bytes: Uint8Array) => IExportTraceServiceResponse,
 ): ISerializer<ReadableSpan[], IExportTraceServiceResponse> {
@@ -627,8 +624,6 @@ describe("PlatformSpanExporter", () => {
       serializer: fakeSerializer(),
     });
 
-    // A scheduled processor flush can empty its buffer before this request
-    // settles.
     const inFlight = exportAndWait(exporter, makeSpans(1));
     let drained = false;
     const drain = exporter.forceFlush().then(() => {
@@ -734,45 +729,6 @@ describe("setupTracing platform exporter wiring", () => {
     });
   });
 
-  test.each(["", "1", "true", "TRUE", "yes", "off", "garbage"])(
-    "platformTraceExporterEnabled is on for %j",
-    (value) => {
-      expect(
-        platformTraceExporterEnabled({ AGENTIC_TRACE_EXPORTER: value }),
-      ).toBe(true);
-      expect(platformTraceExporterEnabled({})).toBe(true);
-    },
-  );
-
-  test.each(["0", "false", "FALSE", " false "])(
-    "platformTraceExporterEnabled opt-out value %j",
-    (value) => {
-      expect(
-        platformTraceExporterEnabled({ AGENTIC_TRACE_EXPORTER: value }),
-      ).toBe(false);
-    },
-  );
-
-  test("opt-out keeps the MongoDB exporter and warns", async () => {
-    process.env["OE_URL"] = "http://oe:8000";
-    process.env["AGENTIC_TRACE_EXPORTER"] = "0";
-    mongo.dbObj.command.mockResolvedValue({ ok: 1 });
-
-    await setupTracing({
-      serviceName: "svc-optout",
-      mongodbUri: URI,
-      mongodbDatabaseName: "testdb",
-    });
-
-    expect(tracingStatus()).toEqual({
-      database_exporter: "attached",
-      platform_exporter: "disabled",
-    });
-    expect(mocks.logger.warn).toHaveBeenCalledWith(
-      expect.stringContaining("without PII redaction"),
-    );
-  });
-
   test("an unreachable OE loses the batch and reports degraded, with no Mongo fallback", async () => {
     process.env["OE_URL"] = "http://oe:8000";
     const fetchImpl = vi.fn(async () => {
@@ -818,21 +774,29 @@ describe("setupTracing platform exporter wiring", () => {
     expect(exporter.lastError).toBeNull();
   });
 
-  test("prefers OE_URL over a MongoDB collection", async () => {
-    process.env["OE_URL"] = "http://oe:8000";
+  test.each([undefined, "0", "false"])(
+    "prefers OE_URL over a MongoDB collection (AGENTIC_TRACE_EXPORTER=%s)",
+    async (legacyOptout) => {
+      process.env["OE_URL"] = "http://oe:8000";
+      if (legacyOptout === undefined) {
+        delete process.env["AGENTIC_TRACE_EXPORTER"];
+      } else {
+        process.env["AGENTIC_TRACE_EXPORTER"] = legacyOptout;
+      }
 
-    await setupTracing({
-      serviceName: "svc-both",
-      mongodbUri: URI,
-      mongodbDatabaseName: "testdb",
-    });
+      await setupTracing({
+        serviceName: "svc-both",
+        mongodbUri: URI,
+        mongodbDatabaseName: "testdb",
+      });
 
-    expect(tracingStatus()).toEqual({
-      database_exporter: "disabled",
-      platform_exporter: "attached",
-    });
-    expect(mongo.instance.connect).not.toHaveBeenCalled();
-  });
+      expect(tracingStatus()).toEqual({
+        database_exporter: "disabled",
+        platform_exporter: "attached",
+      });
+      expect(mongo.instance.connect).not.toHaveBeenCalled();
+    },
+  );
 
   test("without OE_URL the MongoDB exporter is used", async () => {
     mongo.dbObj.command.mockResolvedValue({ ok: 1 });
@@ -850,8 +814,6 @@ describe("setupTracing platform exporter wiring", () => {
   });
 
   test("forceFlushTracing waits for an export the schedule timer already dispatched", async () => {
-    // The scheduled flush can remove a batch from the processor buffer before
-    // export settles; provider.forceFlush() alone does not wait for that export.
     vi.useFakeTimers();
     try {
       process.env["OE_URL"] = "http://oe:8000";
@@ -889,8 +851,6 @@ describe("setupTracing platform exporter wiring", () => {
   });
 
   test("forceFlushTracing still drains in-flight exports when the buffered flush fails", async () => {
-    // A buffered batch that fails makes provider.forceFlush() reject; that
-    // rejection must not abandon a scheduled export still awaiting the OE.
     vi.useFakeTimers();
     try {
       process.env["OE_URL"] = "http://oe:8000";
@@ -915,7 +875,6 @@ describe("setupTracing platform exporter wiring", () => {
       await vi.advanceTimersByTimeAsync(2000);
       expect(calls).toBe(1);
 
-      // A second batch the buffered flush will fail on.
       getTracer("test").startSpan("buffered").end();
 
       let flushed: boolean | null = null;

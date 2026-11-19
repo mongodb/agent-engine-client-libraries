@@ -243,6 +243,7 @@ describe("Memory facade orchestration", () => {
       label: "l",
       userId: "u",
       metadata: { channel: "web" },
+      idempotencyKey: "semantic-idem-1",
     });
     expect(res.id).toBe("1");
     expect(received).toMatchObject({
@@ -251,6 +252,7 @@ describe("Memory facade orchestration", () => {
       userId: "u",
       metadata: { channel: "web" },
       upsert: true,
+      idempotencyKey: "semantic-idem-1",
     });
   });
 

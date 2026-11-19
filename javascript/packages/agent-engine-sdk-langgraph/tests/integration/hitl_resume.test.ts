@@ -59,6 +59,7 @@ interface AerServerPrivates {
   reportCallback: ReturnType<typeof vi.fn>;
   doHandleExecute: (request: ExecuteRequest) => Promise<unknown>;
   chunkSeq: Map<string, number>;
+  durableAckSenders: Map<string, unknown>;
 }
 
 function makeAerServer(agent: LangGraphBaseAgent): AerServerPrivates {
@@ -72,6 +73,7 @@ function makeAerServer(agent: LangGraphBaseAgent): AerServerPrivates {
   server.sendStreamChunk = vi.fn().mockResolvedValue(undefined);
   server.reportCallback = vi.fn().mockResolvedValue(undefined);
   server.chunkSeq = new Map();
+  server.durableAckSenders = new Map();
   return server;
 }
 
@@ -145,6 +147,8 @@ describe.skipIf(TEST_MONGO_URI === "")(
           resume: false,
           previous_execution_cancelled: false,
           durable_ack_enabled: false,
+          stream_journal_enabled: false,
+          stream_generation: 0,
           thread_id: "thread-hitl-parallel",
         } as ExecuteRequest)) as { status: string };
 
@@ -201,6 +205,8 @@ describe.skipIf(TEST_MONGO_URI === "")(
           resume: true,
           previous_execution_cancelled: false,
           durable_ack_enabled: false,
+          stream_journal_enabled: false,
+          stream_generation: 0,
           resume_data: resumeMap,
           metadata: mustGet(callbackFields.metadata),
           thread_id: "thread-hitl-parallel",
@@ -249,6 +255,8 @@ describe.skipIf(TEST_MONGO_URI === "")(
           resume: false,
           previous_execution_cancelled: false,
           durable_ack_enabled: false,
+          stream_journal_enabled: false,
+          stream_generation: 0,
           thread_id: "thread-hitl-1",
         } as ExecuteRequest)) as {
           status: string;
@@ -287,6 +295,8 @@ describe.skipIf(TEST_MONGO_URI === "")(
           resume: true,
           previous_execution_cancelled: false,
           durable_ack_enabled: false,
+          stream_journal_enabled: false,
+          stream_generation: 0,
           resume_data: { decision: "approve" },
           metadata,
           thread_id: "thread-hitl-1",

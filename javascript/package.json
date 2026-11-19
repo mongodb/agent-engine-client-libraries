@@ -7,6 +7,7 @@
     "npm": ">=11.10.0"
   },
   "workspaces": [
+    "packages/agent-engine-client",
     "packages/agent-engine-sdk",
     "packages/agent-engine-memory",
     "packages/agent-engine-runner-shared",

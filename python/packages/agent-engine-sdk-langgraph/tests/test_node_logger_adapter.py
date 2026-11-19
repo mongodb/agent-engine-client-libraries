@@ -2,10 +2,13 @@
 
 import asyncio
 import logging
-from typing import Any
+import operator
+from collections.abc import Iterator
+from typing import Annotated, Any, TypedDict
 from unittest.mock import MagicMock
 from uuid import UUID
 
+import pytest
 from deepagents import create_deep_agent
 from langchain.agents.middleware import before_model
 from langchain_core.language_models.chat_models import BaseChatModel
@@ -14,8 +17,12 @@ from langchain_core.outputs import ChatGeneration, ChatResult
 from langchain_core.runnables import Runnable
 from langchain_core.tools import tool
 from langgraph.errors import GraphInterrupt
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
 from agent_engine_sdk_langgraph.node_logger_adapter import (
+    GraphBranchLinkHandler,
     LangGraphCallbackAdapter,
     _extract_node_name,
 )
@@ -497,3 +504,111 @@ class TestCancellationClosesNodeAsInterrupted:
         mock_callback.on_node_end.assert_called_once()
         mock_callback.on_node_error.assert_not_called()
         assert "does not implement on_node_interrupted" in caplog.text
+
+
+class TestGraphBranchLinkHandler:
+    """Join and follow-on node spans link to the parallel branches they follow."""
+
+    @pytest.fixture
+    def exporter(self) -> Iterator[InMemorySpanExporter]:
+        from openinference.instrumentation.langchain import LangChainInstrumentor
+
+        exporter = InMemorySpanExporter()
+        provider = TracerProvider()
+        provider.add_span_processor(SimpleSpanProcessor(exporter))
+        instrumentor = LangChainInstrumentor()
+        instrumentor.instrument(tracer_provider=provider)
+        try:
+            yield exporter
+        finally:
+            instrumentor.uninstrument()
+
+    @staticmethod
+    def _graph(edges: list[tuple[Any, str]], nodes: str) -> Any:
+        from langgraph.graph import END, START, StateGraph
+
+        class State(TypedDict):
+            v: Annotated[list[str], operator.add]
+
+        graph = StateGraph(State)
+        for name in nodes:
+            graph.add_node(name, lambda s, n=name: {"v": [n]})
+        graph.add_edge(START, nodes[0])
+        for src, dst in edges:
+            graph.add_edge(src, dst)
+        graph.add_edge(nodes[-1], END)
+        return graph.compile()
+
+    @staticmethod
+    def _links(exporter: InMemorySpanExporter) -> dict[str, set[str]]:
+        spans = exporter.get_finished_spans()
+        by_id = {s.context.span_id: s.name for s in spans}
+        return {
+            s.name: {by_id[link.context.span_id] for link in s.links}
+            for s in spans
+            if s.links
+        }
+
+    def test_serial_graph_has_no_links(self, exporter: InMemorySpanExporter) -> None:
+        graph = self._graph([("A", "B"), ("B", "C")], "ABC")
+        graph.invoke({"v": []}, config={"callbacks": [GraphBranchLinkHandler()]})
+
+        assert self._links(exporter) == {}
+
+    def test_join_links_to_every_branch(self, exporter: InMemorySpanExporter) -> None:
+        graph = self._graph([("A", "B"), ("A", "C"), (["B", "C"], "D")], "ABCD")
+        graph.invoke({"v": []}, config={"callbacks": [GraphBranchLinkHandler()]})
+
+        assert self._links(exporter) == {"D": {"B", "C"}}
+
+    def test_fan_in_without_join_edge_links_previous_step(
+        self, exporter: InMemorySpanExporter
+    ) -> None:
+        graph = self._graph([("A", "B"), ("A", "C"), ("B", "D"), ("C", "D")], "ABCD")
+        graph.invoke({"v": []}, config={"callbacks": [GraphBranchLinkHandler()]})
+
+        assert self._links(exporter) == {"D": {"B", "C"}}
+
+    def test_join_reaches_branches_from_earlier_steps(
+        self, exporter: InMemorySpanExporter
+    ) -> None:
+        # B finishes a step before D; F's join edge still links to both.
+        graph = self._graph(
+            [("A", "B"), ("A", "C"), ("C", "D"), (["B", "D"], "F")], "ABCDF"
+        )
+        graph.invoke({"v": []}, config={"callbacks": [GraphBranchLinkHandler()]})
+
+        links = self._links(exporter)
+        assert links["F"] == {"B", "D"}
+
+    @pytest.mark.anyio
+    async def test_async_join_links(self, exporter: InMemorySpanExporter) -> None:
+        graph = self._graph([("A", "B"), ("A", "C"), (["B", "C"], "D")], "ABCD")
+        await graph.ainvoke({"v": []}, config={"callbacks": [GraphBranchLinkHandler()]})
+
+        assert self._links(exporter) == {"D": {"B", "C"}}
+
+    def test_link_attributes_carry_only_node_and_step(
+        self, exporter: InMemorySpanExporter
+    ) -> None:
+        graph = self._graph([("A", "B"), ("A", "C"), (["B", "C"], "D")], "ABCD")
+        graph.invoke(
+            {"v": ["secret prompt"]}, config={"callbacks": [GraphBranchLinkHandler()]}
+        )
+
+        (join,) = [s for s in exporter.get_finished_spans() if s.links]
+        attrs = [dict(link.attributes or {}) for link in join.links]
+        assert sorted(attrs, key=lambda a: a["langgraph.node"]) == [
+            {"langgraph.node": "B", "langgraph.step": 2},
+            {"langgraph.node": "C", "langgraph.step": 2},
+        ]
+
+    def test_releases_state_when_graph_finishes(
+        self, exporter: InMemorySpanExporter
+    ) -> None:
+        handler = GraphBranchLinkHandler()
+        graph = self._graph([("A", "B"), ("A", "C"), (["B", "C"], "D")], "ABCD")
+        graph.invoke({"v": []}, config={"callbacks": [handler]})
+
+        assert handler._steps == {}
+        assert handler._pending == {}

@@ -976,3 +976,14 @@ the package pulls any of them into `sys.modules`.
 the internal `MemoryClient` in `agent_engine_runner_shared/memory.py`, passing its
 execution-context lookup as an `execution_id_provider` callable so per-request
 execution-id headers work without this package importing any platform code.
+
+## Queued semantic writes
+
+Semantic saves acknowledge durable consolidation with `id: null`,
+`operation_id` and `operation_status`. Awaiting a save does not mean retrieval
+can see the new fact. Poll the scoped operation endpoint at
+`GET /api/v1/projects/{project_id}/memory/semantic/operations/{operation_id}`
+until it succeeds or fails. Keep the same `idempotency_key` when retrying one logical write.
+A reused key with different content or options returns 409. A call without a
+key starts a separate write. Pending processing can leave the previous fact
+visible. Submit content and visibility changes in separate requests.

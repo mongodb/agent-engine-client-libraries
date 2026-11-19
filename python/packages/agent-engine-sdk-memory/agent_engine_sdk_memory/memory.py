@@ -12,7 +12,7 @@ import contextlib
 import os
 import uuid
 import warnings
-from collections.abc import Generator, Mapping, Sequence
+from collections.abc import Callable, Generator, Iterable, Mapping, Sequence
 from types import TracebackType
 from typing import Any, cast, overload
 
@@ -30,6 +30,8 @@ from agent_engine_sdk_memory._tag_syntax import (
 from agent_engine_sdk_memory.errors import (
     MemoryBadRequestError,
     MemoryNotSupportedError,
+    MemorySearchWarning,
+    MemoryServerError,
 )
 from agent_engine_sdk_memory.identity import resolve_identity
 from agent_engine_sdk_memory.models import (
@@ -60,6 +62,18 @@ from agent_engine_sdk_memory.validation import (
 )
 
 __all__ = ["Memory"]
+
+_RETRYABLE_SERVER_STATUSES = frozenset({502, 503, 504})
+
+
+def _is_source_local_fault(exc: MemoryServerError) -> bool:
+    status = exc.status
+    return (
+        status is not None
+        and 500 <= status < 600
+        and status not in _RETRYABLE_SERVER_STATUSES
+    )
+
 
 _CUSTOM_TYPES_UNSUPPORTED_MSG = (
     "this platform version does not support custom memory types; "
@@ -540,6 +554,7 @@ class Memory:
         metadata: dict[str, Any] | None = None,
         upsert: bool = True,
         agent_id: str | None = None,
+        idempotency_key: str | None = None,
     ) -> CreateSemanticResult:
         """Save a semantic memory (fact, customer profile).
 
@@ -547,8 +562,15 @@ class Memory:
             visibility: Access scope of the memory ("private" or "org").
             metadata: Optional caller-supplied metadata dictionary stored with
                 the memory.
-            upsert: When True (the default), replace an existing memory with
-                the same label instead of creating a duplicate.
+            upsert: When True (the default), consolidate against the lineage
+                identified by the label. Once the operation succeeds,
+                ``get_semantic(label=...)`` returns the current version under
+                this label.
+            idempotency_key: Reuse this key when retrying one logical write.
+
+        Returns:
+            A durable operation reference. A queued result has no memory ID.
+            Acceptance does not imply immediate retrieval visibility.
 
         Raises:
             MemoryIdentityError: If ``user_id`` is not supplied and cannot be
@@ -567,6 +589,7 @@ class Memory:
             visibility=visibility,
             metadata=metadata,
             upsert=upsert,
+            idempotency_key=idempotency_key,
         )
 
     def search_semantic(
@@ -1232,9 +1255,18 @@ class Memory:
         set, so an undeclared or misspelled path is not rejected and silently
         yields no or degraded matches.
 
+        When several sources are requested and one of them fails with a
+        non-retryable server error (HTTP 500, 501 or 505 to 599), the other sources'
+        results are still returned and a ``MemorySearchWarning`` naming the failed
+        source is emitted. A retryable 502, 503 or 504, a malformed response body,
+        every other error, and a server error on every requested source still
+        raise.
+
         Raises:
             MemoryNotSupportedError: If a requested source is unavailable in this
                 mode. See ``docs/capability-matrix.md`` for current gaps.
+            MemoryServerError: If every requested source fails on the server, or
+                any source returns a retryable or malformed response.
         """
         # session_id feeds only the episodic leg below. The semantic, taxonomic,
         # and procedural legs ignore it. Setting suppress_inherited_session_id on
@@ -1250,47 +1282,62 @@ class Memory:
         rid = resolved["user_id"]
         rsession = resolved["session_id"]
 
+        legs: dict[SearchSource, Callable[[], Iterable[MemoryChunk]]] = {
+            SearchSource.SEMANTIC: lambda: self._runtime.search_semantic(
+                query=query, user_id=rid, visibility=visibility, top_k=top_k
+            ),
+            SearchSource.EPISODIC: lambda: self._runtime.search_episodes(
+                query=query,
+                user_id=rid,
+                visibility=visibility,
+                session_id=rsession,
+                top_k=top_k,
+            ),
+            SearchSource.TAXONOMIC: lambda: self._runtime.search_taxonomic(
+                query=query,
+                user_id=rid,
+                domain=domain,
+                visibility=visibility,
+                top_k=top_k,
+            ),
+            SearchSource.PROCEDURAL: lambda: (
+                _procedure_to_chunk(proc)
+                for proc in self._runtime.discover_procedures(
+                    query=query,
+                    user_id=rid,
+                    visibility=visibility,
+                    tags=tags,
+                    top_k=top_k,
+                    similarity_threshold=similarity_threshold,
+                    metadata_filter=metadata_filter,
+                )
+            ),
+        }
+
+        requested = _normalize_sources(sources)
         chunks: list[MemoryChunk] = []
-        for source in _normalize_sources(sources):
-            if source is SearchSource.SEMANTIC:
-                chunks.extend(
-                    self._runtime.search_semantic(
-                        query=query, user_id=rid, visibility=visibility, top_k=top_k
-                    )
-                )
-            elif source is SearchSource.EPISODIC:
-                chunks.extend(
-                    self._runtime.search_episodes(
-                        query=query,
-                        user_id=rid,
-                        visibility=visibility,
-                        session_id=rsession,
-                        top_k=top_k,
-                    )
-                )
-            elif source is SearchSource.TAXONOMIC:
-                chunks.extend(
-                    self._runtime.search_taxonomic(
-                        query=query,
-                        user_id=rid,
-                        domain=domain,
-                        visibility=visibility,
-                        top_k=top_k,
-                    )
-                )
-            elif source is SearchSource.PROCEDURAL:
-                chunks.extend(
-                    _procedure_to_chunk(proc)
-                    for proc in self._runtime.discover_procedures(
-                        query=query,
-                        user_id=rid,
-                        visibility=visibility,
-                        tags=tags,
-                        top_k=top_k,
-                        similarity_threshold=similarity_threshold,
-                        metadata_filter=metadata_filter,
-                    )
-                )
+        failed: list[tuple[SearchSource, MemoryServerError]] = []
+        for source in requested:
+            try:
+                chunks.extend(legs[source]())
+            except MemoryServerError as exc:
+                # Only a non-retryable 5xx is treated as local to one source (for
+                # example one unreadable stored memory), so it does not discard
+                # the others' results. A retryable 502/503/504, a malformed
+                # response body, and every other error still raise.
+                if not _is_source_local_fault(exc):
+                    raise
+                failed.append((source, exc))
+        if failed and len(failed) == len(requested):
+            raise failed[0][1]
+        for source, exc in failed:
+            # Status only: the error message carries server-supplied text.
+            warnings.warn(
+                f"Memory.search: {source.value} source failed (HTTP {exc.status}) "
+                "and was left out of the results",
+                MemorySearchWarning,
+                stacklevel=2,
+            )
 
         chunks.sort(
             key=lambda c: (c.similarity_score is None, -(c.similarity_score or 0.0))

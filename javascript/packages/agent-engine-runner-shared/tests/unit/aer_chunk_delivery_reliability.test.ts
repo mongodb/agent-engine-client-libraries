@@ -108,6 +108,7 @@ function makeCallbackServer(): CallbackServerPrivates {
   const server = Object.create(AERServer.prototype) as CallbackServerPrivates;
   server.runtime = {};
   server.chunkSeq = new Map();
+  server.durableAckSenders = new Map();
   server.ownerCallbackUrl = new Map();
   server.callbackDelivery =
     new CallbackDelivery() as unknown as CallbackDeliveryPrivates;
@@ -674,6 +675,7 @@ function makeRealServer(): RealSendServer {
   // prototype method. Seed the callback state that the ctor would have.
   const server = Object.create(AERServer.prototype) as RealSendServer;
   server.chunkSeq = new Map();
+  server.durableAckSenders = new Map();
   server.ownerCallbackUrl = new Map();
   server.callbackDelivery =
     new CallbackDelivery() as unknown as CallbackDeliveryPrivates;
@@ -884,6 +886,7 @@ function makeAerServer(): AerServerPrivates {
   server.sendStreamChunk = vi.fn().mockResolvedValue(undefined);
   server.reportCallback = vi.fn().mockResolvedValue(undefined);
   server.chunkSeq = new Map();
+  server.durableAckSenders = new Map();
   server.ownerCallbackUrl = new Map();
   return server;
 }
@@ -1282,6 +1285,7 @@ function makeHandlerServer(): HandlerServer {
     getAgent: () => new FakeAgent([]),
   };
   server.chunkSeq = new Map();
+  server.durableAckSenders = new Map();
   server.ownerCallbackUrl = new Map();
   server.callbackDelivery =
     new CallbackDelivery() as unknown as CallbackDeliveryPrivates;

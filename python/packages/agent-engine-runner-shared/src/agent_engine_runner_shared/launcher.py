@@ -204,7 +204,7 @@ def _write_termination_message(summary: str, exc: BaseException | None = None) -
     Agentic Operator's crash diagnostics read, and from there into the
     customer-facing deploy timeline.
 
-    This is customer code (container mode), so unlike the platform's own
+    This is customer code, so unlike the platform's own
     components the design intentionally keeps the full exception type,
     message, and traceback — redacted, not summarized away — since that
     detail is what the customer needs to fix their own agent. Best-effort:

@@ -1,11 +1,17 @@
 """Memory.search: cross-source fan-out, merge/ordering, adaptation, fail-loud."""
 
+import warnings
 from datetime import datetime, timezone
 from typing import Any
 
 import pytest
 from agent_engine_sdk_memory import Memory
-from agent_engine_sdk_memory.errors import MemoryNotSupportedError
+from agent_engine_sdk_memory.errors import (
+    MemoryAuthError,
+    MemoryNotSupportedError,
+    MemorySearchWarning,
+    MemoryServerError,
+)
 from agent_engine_sdk_memory.models import MemoryChunk, MemorySource, SearchSource
 
 
@@ -30,16 +36,20 @@ class _FakeRuntime:
         taxonomic: list[MemoryChunk] = [],
         procedures: list[dict[str, Any]] = [],
         taxonomic_error: Exception | None = None,
+        semantic_error: Exception | None = None,
     ) -> None:
         self._semantic = list(semantic)
         self._episodic = list(episodic)
         self._taxonomic = list(taxonomic)
         self._procedures = list(procedures)
         self._taxonomic_error = taxonomic_error
+        self._semantic_error = semantic_error
         self.calls: list[str] = []
 
     def search_semantic(self, *, query, user_id=None, visibility=None, top_k=50):
         self.calls.append("semantic")
+        if self._semantic_error is not None:
+            raise self._semantic_error
         return list(self._semantic)
 
     def search_episodes(
@@ -149,3 +159,50 @@ def test_search_raises_when_a_requested_source_is_unsupported():
 def test_search_rejects_unknown_source():
     with pytest.raises(ValueError):
         Memory(runtime=_FakeRuntime()).search("q", sources=["stm"])
+
+
+def test_search_returns_other_sources_when_one_fails_on_the_server():
+    rt = _FakeRuntime(
+        semantic=[_chunk(MemorySource.SEMANTIC, 0.5, id_="s")],
+        taxonomic_error=MemoryServerError("detail \x1b]52;c;boom\x07", status=500),
+    )
+    with pytest.warns(MemorySearchWarning) as record:
+        results = Memory(runtime=rt).search("q", sources=["semantic", "taxonomic"])
+    assert [c.id for c in results] == ["s"]
+    message = str(record[0].message)
+    assert "taxonomic source failed (HTTP 500)" in message
+    # Server-supplied text stays out of the warning.
+    assert "\x1b" not in message and "detail" not in message
+
+
+def test_search_raises_the_first_error_when_every_requested_source_fails():
+    first = MemoryServerError("semantic down", status=500)
+    rt = _FakeRuntime(
+        semantic_error=first,
+        taxonomic_error=MemoryServerError("taxonomic down", status=500),
+    )
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")  # no partial-result warning either
+        with pytest.raises(MemoryServerError) as exc_info:
+            Memory(runtime=rt).search("q", sources=["semantic", "taxonomic"])
+    assert exc_info.value is first
+
+
+def test_search_still_raises_auth_errors_from_one_source():
+    rt = _FakeRuntime(
+        semantic=[_chunk(MemorySource.SEMANTIC, 0.5)],
+        taxonomic_error=MemoryAuthError("token expired", status=401),
+    )
+    with pytest.raises(MemoryAuthError):
+        Memory(runtime=rt).search("q", sources=["semantic", "taxonomic"])
+
+
+@pytest.mark.parametrize("status", [200, 502, 503, 504])
+def test_search_still_raises_retryable_or_malformed_server_errors(status):
+    # 200 is a malformed success body; 502-504 tell the caller to retry.
+    rt = _FakeRuntime(
+        semantic=[_chunk(MemorySource.SEMANTIC, 0.5)],
+        taxonomic_error=MemoryServerError("not a source fault", status=status),
+    )
+    with pytest.raises(MemoryServerError):
+        Memory(runtime=rt).search("q", sources=["semantic", "taxonomic"])

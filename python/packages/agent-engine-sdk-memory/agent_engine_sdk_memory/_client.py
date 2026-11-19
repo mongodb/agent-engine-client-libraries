@@ -9,13 +9,17 @@ from __future__ import annotations
 import logging
 import warnings
 from collections.abc import Callable, Mapping
-from typing import Any
+from typing import Any, cast
 from urllib.parse import quote
 
 import httpx
 
-from agent_engine_sdk_memory._transport import raise_for_status
+from agent_engine_sdk_memory._transport import (
+    malformed_body_as_server_error,
+    raise_for_status,
+)
 from agent_engine_sdk_memory._wire import custom_retrieve_body, custom_save_body
+from agent_engine_sdk_memory.errors import MemoryConnectionError
 from agent_engine_sdk_memory.models import (
     ContextResponse,
     CreateEpisodicResult,
@@ -84,6 +88,33 @@ _CREATE_EPISODIC_EXTRA_FIELDS = (
     "embedding",
     "skip_embedding",
 )
+
+
+def _require_object(value: Any) -> dict[str, Any]:
+    """Return a decoded JSON object, raising ``TypeError`` for any other shape.
+
+    Call it inside ``malformed_body_as_server_error``, which turns the
+    ``TypeError`` into ``MemoryServerError``. Without it a list body would be
+    returned as a record, and an empty one would look like a missing record.
+    """
+    if not isinstance(value, dict):
+        raise TypeError(f"expected a JSON object, got {type(value).__name__}")
+    return cast("dict[str, Any]", value)
+
+
+def _require_list(value: Any, item_type: type) -> list[Any]:
+    """Return ``value`` if it is a list of ``item_type``, else raise ``TypeError``.
+
+    Same contract as ``_require_object``: an explicit ``null`` or a list of the
+    wrong items becomes ``MemoryServerError`` instead of failing later in the
+    caller's code.
+    """
+    if not isinstance(value, list):
+        raise TypeError(f"expected a list, got {type(value).__name__}")
+    items = cast("list[Any]", value)
+    if not all(isinstance(item, item_type) for item in items):
+        raise TypeError(f"expected a list of {item_type.__name__}")
+    return items
 
 
 class MemoryClient:
@@ -181,6 +212,21 @@ class MemoryClient:
                 headers[_HEADER_EXECUTION_ID_LEGACY] = execution_id
         return headers
 
+    def _send(
+        self, send: Callable[..., httpx.Response], url: str, **kwargs: Any
+    ) -> httpx.Response:
+        """Issue one request, raising ``MemoryConnectionError`` when the memory
+        server cannot be reached.
+
+        Callers check the response themselves, so a lookup can treat 404 as
+        "not found" before ``raise_for_status`` maps any other failure to a
+        typed ``MemoryAPIError``.
+        """
+        try:
+            return send(url, **kwargs)
+        except httpx.TransportError as exc:
+            raise MemoryConnectionError(str(exc), status=None) from exc
+
     def close(self) -> None:
         """Close the underlying HTTP client."""
         self._client.close()
@@ -232,13 +278,15 @@ class MemoryClient:
         if metadata is not None:
             body["metadata"] = metadata
 
-        resp = self._client.post(
+        resp = self._send(
+            self._client.post,
             f"{self._base_url}{self._api_prefix}/stm/turns",
             json=body,
             headers=self._request_headers(),
         )
-        resp.raise_for_status()
-        return WriteTurnResult.model_validate(resp.json())
+        raise_for_status(resp)
+        with malformed_body_as_server_error(resp, "write_turn"):
+            return WriteTurnResult.model_validate(resp.json())
 
     # =========================================================================
     # Context Building
@@ -280,13 +328,15 @@ class MemoryClient:
         if max_tokens is not None:
             body["max_tokens"] = max_tokens
 
-        resp = self._client.post(
+        resp = self._send(
+            self._client.post,
             f"{self._base_url}{self._api_prefix}/retrieval/context",
             json=body,
             headers=self._request_headers(),
         )
-        resp.raise_for_status()
-        return ContextResponse.model_validate(resp.json())
+        raise_for_status(resp)
+        with malformed_body_as_server_error(resp, "build_context"):
+            return ContextResponse.model_validate(resp.json())
 
     def build_context2(
         self,
@@ -332,13 +382,15 @@ class MemoryClient:
         if format_style is not None:
             body["format_style"] = format_style
 
-        resp = self._client.post(
+        resp = self._send(
+            self._client.post,
             f"{self._base_url}{self._api_prefix}/retrieval/context-from-sources",
             json=body,
             headers=self._request_headers(),
         )
-        resp.raise_for_status()
-        return ContextResponse.model_validate(resp.json())
+        raise_for_status(resp)
+        with malformed_body_as_server_error(resp, "build_context2"):
+            return ContextResponse.model_validate(resp.json())
 
     # =========================================================================
     # Semantic Memory
@@ -357,6 +409,7 @@ class MemoryClient:
         embedding: list[float] | None = None,
         metadata: dict[str, Any] | None = None,
         upsert: bool = False,
+        idempotency_key: str | None = None,
         **kwargs: Any,
     ) -> CreateSemanticResult:
         """Create a semantic memory."""
@@ -386,15 +439,18 @@ class MemoryClient:
             "embedding": embedding,
             "metadata": metadata,
             "upsert": upsert,
+            "idempotency_key": idempotency_key,
         }
 
-        resp = self._client.post(
+        resp = self._send(
+            self._client.post,
             f"{self._base_url}{self._api_prefix}/semantic",
             json=body,
             headers=self._request_headers(),
         )
-        resp.raise_for_status()
-        return CreateSemanticResult.model_validate(resp.json())
+        raise_for_status(resp)
+        with malformed_body_as_server_error(resp, "create_semantic"):
+            return CreateSemanticResult.model_validate(resp.json())
 
     def fetch_semantic_memories(
         self,
@@ -416,14 +472,18 @@ class MemoryClient:
             "top_k": top_k,
         }
 
-        resp = self._client.post(
+        resp = self._send(
+            self._client.post,
             f"{self._base_url}{self._api_prefix}/retrieval/semantic",
             json=body,
             headers=self._request_headers(),
         )
-        resp.raise_for_status()
-        memories_data = resp.json().get("memories", [])
-        return [MemoryChunk.model_validate(m) for m in memories_data]
+        raise_for_status(resp)
+        with malformed_body_as_server_error(resp, "fetch_semantic_memories"):
+            memories_data = _require_list(
+                _require_object(resp.json()).get("memories"), dict
+            )
+            return [MemoryChunk.model_validate(m) for m in memories_data]
 
     def get_semantic(
         self,
@@ -451,14 +511,16 @@ class MemoryClient:
                 id_params["user_id"] = user_id
             if visibility:
                 id_params["visibility"] = visibility
-            resp = self._client.get(
+            resp = self._send(
+                self._client.get,
                 f"{self._base_url}{self._api_prefix}/semantic/{_quote_path_segment(id)}",
                 params=id_params,
                 headers=self._request_headers(),
             )
         else:
             # Otherwise list with label filter
-            resp = self._client.get(
+            resp = self._send(
+                self._client.get,
                 f"{self._base_url}{self._api_prefix}/semantic",
                 params=params,
                 headers=self._request_headers(),
@@ -466,14 +528,16 @@ class MemoryClient:
 
         if resp.status_code == 404:
             return None
-        resp.raise_for_status()
+        raise_for_status(resp)
 
-        data = resp.json()
-        # If list endpoint, return first match
-        if "entries" in data:
-            entries = data["entries"]
+        with malformed_body_as_server_error(resp, "get_semantic"):
+            data = _require_object(resp.json())
+            if id:
+                return data
+            # The list endpoint was called: its first match is the record. An
+            # envelope without entries is malformed, not a record.
+            entries = _require_list(data.get("entries"), dict)
             return entries[0] if entries else None
-        return data
 
     def update_semantic(
         self,
@@ -501,13 +565,15 @@ class MemoryClient:
             "visibility": visibility,
         }
 
-        resp = self._client.patch(
+        resp = self._send(
+            self._client.patch,
             f"{self._base_url}{self._api_prefix}/semantic/{_quote_path_segment(memory_id)}",
             json=body,
             headers=self._request_headers(),
         )
-        resp.raise_for_status()
-        return resp.json()
+        raise_for_status(resp)
+        with malformed_body_as_server_error(resp, "update_semantic"):
+            return _require_object(resp.json())
 
     # =========================================================================
     # Episodic Memory
@@ -545,13 +611,15 @@ class MemoryClient:
             if field in kwargs:
                 body[field] = kwargs[field]
 
-        resp = self._client.post(
+        resp = self._send(
+            self._client.post,
             f"{self._base_url}{self._api_prefix}/episodic",
             json=body,
             headers=self._request_headers(),
         )
-        resp.raise_for_status()
-        return CreateEpisodicResult.model_validate(resp.json())
+        raise_for_status(resp)
+        with malformed_body_as_server_error(resp, "create_episodic"):
+            return CreateEpisodicResult.model_validate(resp.json())
 
     def fetch_episodic_memories(
         self,
@@ -575,14 +643,18 @@ class MemoryClient:
             "top_k": top_k,
         }
 
-        resp = self._client.post(
+        resp = self._send(
+            self._client.post,
             f"{self._base_url}{self._api_prefix}/retrieval/episodic",
             json=body,
             headers=self._request_headers(),
         )
-        resp.raise_for_status()
-        memories_data = resp.json().get("memories", [])
-        return [MemoryChunk.model_validate(m) for m in memories_data]
+        raise_for_status(resp)
+        with malformed_body_as_server_error(resp, "fetch_episodic_memories"):
+            memories_data = _require_list(
+                _require_object(resp.json()).get("memories"), dict
+            )
+            return [MemoryChunk.model_validate(m) for m in memories_data]
 
     def list_episodic(
         self,
@@ -616,13 +688,15 @@ class MemoryClient:
         if visibility and visibility.strip():
             params["visibility"] = visibility
 
-        resp = self._client.get(
+        resp = self._send(
+            self._client.get,
             f"{self._base_url}{self._api_prefix}/episodic",
             params=params,
             headers=self._request_headers(),
         )
-        resp.raise_for_status()
-        return resp.json().get("entries", [])
+        raise_for_status(resp)
+        with malformed_body_as_server_error(resp, "list_episodic"):
+            return _require_list(_require_object(resp.json()).get("entries"), dict)
 
     # =========================================================================
     # Taxonomic Memory
@@ -657,13 +731,15 @@ class MemoryClient:
         if metadata is not None:
             body["metadata"] = metadata
 
-        resp = self._client.post(
+        resp = self._send(
+            self._client.post,
             f"{self._base_url}{self._api_prefix}/taxonomic",
             json=body,
             headers=self._request_headers(),
         )
-        resp.raise_for_status()
-        return CreateTaxonomicResult.model_validate(resp.json())
+        raise_for_status(resp)
+        with malformed_body_as_server_error(resp, "create_taxonomic"):
+            return CreateTaxonomicResult.model_validate(resp.json())
 
     def fetch_taxonomic_memories(
         self,
@@ -687,14 +763,18 @@ class MemoryClient:
             "top_k": top_k,
         }
 
-        resp = self._client.post(
+        resp = self._send(
+            self._client.post,
             f"{self._base_url}{self._api_prefix}/retrieval/taxonomic",
             json=body,
             headers=self._request_headers(),
         )
-        resp.raise_for_status()
-        memories_data = resp.json().get("memories", [])
-        return [MemoryChunk.model_validate(m) for m in memories_data]
+        raise_for_status(resp)
+        with malformed_body_as_server_error(resp, "fetch_taxonomic_memories"):
+            memories_data = _require_list(
+                _require_object(resp.json()).get("memories"), dict
+            )
+            return [MemoryChunk.model_validate(m) for m in memories_data]
 
     def get_taxonomic(
         self,
@@ -717,23 +797,25 @@ class MemoryClient:
         if visibility:
             params["visibility"] = visibility
 
-        resp = self._client.get(
+        resp = self._send(
+            self._client.get,
             f"{self._base_url}{self._api_prefix}/taxonomic",
             params=params,
             headers=self._request_headers(),
         )
         if resp.status_code == 404:
             return None
-        resp.raise_for_status()
+        raise_for_status(resp)
 
-        entries = resp.json().get("entries", [])
-        # Filter by term if provided
-        if term:
-            for entry in entries:
-                if entry.get("term") == term:
-                    return entry
-            return None
-        return entries[0] if entries else None
+        with malformed_body_as_server_error(resp, "get_taxonomic"):
+            entries = _require_list(_require_object(resp.json()).get("entries"), dict)
+            # Filter by term if provided
+            if term:
+                for entry in entries:
+                    if entry.get("term") == term:
+                        return entry
+                return None
+            return entries[0] if entries else None
 
     def get_distinct_domains(
         self,
@@ -746,13 +828,15 @@ class MemoryClient:
         params: dict[str, Any] = {"org_id": org_id, "project_id": project_id}
         if visibility:
             params["visibility"] = visibility
-        resp = self._client.get(
+        resp = self._send(
+            self._client.get,
             f"{self._base_url}{self._api_prefix}/taxonomic/domains",
             params=params,
             headers=self._request_headers(),
         )
-        resp.raise_for_status()
-        return resp.json().get("domains", [])
+        raise_for_status(resp)
+        with malformed_body_as_server_error(resp, "get_distinct_domains"):
+            return _require_list(_require_object(resp.json()).get("domains"), str)
 
     # =========================================================================
     # Procedural Memory
@@ -811,13 +895,15 @@ class MemoryClient:
         if metadata is not None:
             body["metadata"] = metadata
 
-        resp = self._client.post(
+        resp = self._send(
+            self._client.post,
             f"{self._base_url}{self._api_prefix}/procedural",
             json=body,
             headers=self._request_headers(),
         )
-        resp.raise_for_status()
-        return CreateProceduralResult.model_validate(resp.json())
+        raise_for_status(resp)
+        with malformed_body_as_server_error(resp, "create_procedural"):
+            return CreateProceduralResult.model_validate(resp.json())
 
     def get_procedural(
         self,
@@ -842,7 +928,8 @@ class MemoryClient:
                 id_params["user_id"] = user_id
             if visibility:
                 id_params["visibility"] = visibility
-            resp = self._client.get(
+            resp = self._send(
+                self._client.get,
                 f"{self._base_url}{self._api_prefix}/procedural/{_quote_path_segment(id)}",
                 params=id_params,
                 headers=self._request_headers(),
@@ -859,7 +946,8 @@ class MemoryClient:
                 params["visibility"] = visibility
             if procedure:
                 params["procedure"] = procedure
-            resp = self._client.get(
+            resp = self._send(
+                self._client.get,
                 f"{self._base_url}{self._api_prefix}/procedural",
                 params=params,
                 headers=self._request_headers(),
@@ -867,18 +955,21 @@ class MemoryClient:
 
         if resp.status_code == 404:
             return None
-        resp.raise_for_status()
+        raise_for_status(resp)
 
-        data = resp.json()
-        if "entries" in data:
-            entries = data["entries"]
+        with malformed_body_as_server_error(resp, "get_procedural"):
+            data = _require_object(resp.json())
+            if id:
+                return data
+            # The list endpoint was called; an envelope without entries is
+            # malformed, not a record.
+            entries = _require_list(data.get("entries"), dict)
             if procedure:
                 for entry in entries:
                     if entry.get("procedure") == procedure:
                         return entry
                 return None
             return entries[0] if entries else None
-        return data
 
     def update_procedural(
         self,
@@ -897,6 +988,9 @@ class MemoryClient:
         visibility: str | None = None,
         user_id: str | None = None,
         metadata: dict[str, Any] | None = None,
+        idempotency_key: str | None = None,
+        if_user_id: str | None = None,
+        if_visibility: str | None = None,
         **kwargs: Any,
     ) -> Any:
         """Update a procedural memory.
@@ -904,6 +998,14 @@ class MemoryClient:
         ``user_id`` is required and must name the memory's owner, matching
         ``create_procedural``: procedural memories are user-owned, and writes
         without an owner identity are rejected.
+
+        Behavior edits return the stored successor synchronously. Reuse an
+        ``idempotency_key`` with the same target and payload for retries.
+        Omitting the key starts a new logical edit. Metadata and embedding
+        maintenance keep the existing version.
+
+        ``if_user_id`` and ``if_visibility`` condition the update on the
+        stored owner and visibility. A scope mismatch leaves the record unchanged.
         """
         if not user_id:
             raise ValueError("user_id is required to update procedural memory")
@@ -939,14 +1041,26 @@ class MemoryClient:
         }
         if metadata is not None:
             body["metadata"] = metadata
+        if idempotency_key is not None:
+            body["idempotency_key"] = idempotency_key
 
-        resp = self._client.patch(
+        resp = self._send(
+            self._client.patch,
             f"{self._base_url}{self._api_prefix}/procedural/{_quote_path_segment(memory_id)}",
             json=body,
             headers=self._request_headers(),
+            params={
+                key: value
+                for key, value in {
+                    "if_user_id": if_user_id,
+                    "if_visibility": if_visibility,
+                }.items()
+                if value is not None
+            },
         )
-        resp.raise_for_status()
-        return resp.json()
+        raise_for_status(resp)
+        with malformed_body_as_server_error(resp, "update_procedural"):
+            return _require_object(resp.json())
 
     def delete_procedural(
         self,
@@ -993,13 +1107,15 @@ class MemoryClient:
         if visibility:
             params["visibility"] = visibility
 
-        resp = self._client.delete(
+        resp = self._send(
+            self._client.delete,
             f"{self._base_url}{self._api_prefix}/procedural/{_quote_path_segment(memory_id)}",
             params=params,
             headers=self._request_headers(),
         )
-        resp.raise_for_status()
-        return DeleteResult.model_validate(resp.json())
+        raise_for_status(resp)
+        with malformed_body_as_server_error(resp, "delete_procedural"):
+            return DeleteResult.model_validate(resp.json())
 
     def discover_procedures(
         self,
@@ -1029,22 +1145,26 @@ class MemoryClient:
         if metadata_filter:
             body["metadata_filter"] = metadata_filter
 
-        resp = self._client.post(
+        resp = self._send(
+            self._client.post,
             f"{self._base_url}{self._api_prefix}/retrieval/procedural",
             json=body,
             headers=self._request_headers(),
         )
-        resp.raise_for_status()
-        memories_data = resp.json().get("memories", [])
-        return [
-            {
-                "procedure": m.get("metadata", {}).get("procedure", ""),
-                "content": m.get("content", ""),
-                "score": m.get("similarity_score", 0.0),
-                **m.get("metadata", {}),
-            }
-            for m in memories_data
-        ]
+        raise_for_status(resp)
+        with malformed_body_as_server_error(resp, "discover_procedures"):
+            memories_data = _require_list(
+                _require_object(resp.json()).get("memories"), dict
+            )
+            return [
+                {
+                    "procedure": m.get("metadata", {}).get("procedure", ""),
+                    "content": m.get("content", ""),
+                    "score": m.get("similarity_score", 0.0),
+                    **m.get("metadata", {}),
+                }
+                for m in memories_data
+            ]
 
     def fetch_procedural_memories(
         self,
@@ -1069,14 +1189,18 @@ class MemoryClient:
             "top_k": top_k,
         }
 
-        resp = self._client.post(
+        resp = self._send(
+            self._client.post,
             f"{self._base_url}{self._api_prefix}/retrieval/procedural",
             json=body,
             headers=self._request_headers(),
         )
-        resp.raise_for_status()
-        memories_data = resp.json().get("memories", [])
-        return [MemoryChunk.model_validate(m) for m in memories_data]
+        raise_for_status(resp)
+        with malformed_body_as_server_error(resp, "fetch_procedural_memories"):
+            memories_data = _require_list(
+                _require_object(resp.json()).get("memories"), dict
+            )
+            return [MemoryChunk.model_validate(m) for m in memories_data]
 
     # =========================================================================
     # Custom Types
@@ -1095,13 +1219,15 @@ class MemoryClient:
             content=content, tags=tags, contextual_metadata=contextual_metadata
         )
 
-        resp = self._client.post(
+        resp = self._send(
+            self._client.post,
             f"{self._base_url}{self._api_prefix}/types/{_quote_path_segment(memory_type)}",
             json=body,
             headers=self._request_headers(),
         )
         raise_for_status(resp)
-        return CustomMemorySaveResult.model_validate(resp.json())
+        with malformed_body_as_server_error(resp, "create_custom"):
+            return CustomMemorySaveResult.model_validate(resp.json())
 
     def retrieve_custom(
         self,
@@ -1114,14 +1240,16 @@ class MemoryClient:
         """Retrieve custom-type memories by semantic query with equality tag filters."""
         body = custom_retrieve_body(query=query, top_k=top_k, tags=tags)
 
-        resp = self._client.post(
+        resp = self._send(
+            self._client.post,
             f"{self._base_url}{self._api_prefix}"
             f"/types/{_quote_path_segment(memory_type)}/retrieve",
             json=body,
             headers=self._request_headers(),
         )
         raise_for_status(resp)
-        return CustomMemoryRetrieveResult.model_validate(resp.json())
+        with malformed_body_as_server_error(resp, "retrieve_custom"):
+            return CustomMemoryRetrieveResult.model_validate(resp.json())
 
     # =========================================================================
     # Bootstrap (no-op for HTTP client)

@@ -7,6 +7,10 @@
 # Python jobs build the distributions and hand them to the official PyPI publish
 # action, which authenticates with trusted publishing (short-lived OIDC, no
 # stored token). JavaScript also uses trusted publishing through the npm CLI.
+# The agent-engine-client application SDK (Python and TypeScript) is an
+# internal preview and intentionally has no publish job here.
+# client-libraries/.mirror-exclude also keeps both packages out of the public
+# mirror; add publish jobs and remove those entries only at GA.
 # Both publish only when resolve-mode says so; every other run builds or packs
 # without uploading.
 # Python and JavaScript chains run in parallel after resolve-mode.

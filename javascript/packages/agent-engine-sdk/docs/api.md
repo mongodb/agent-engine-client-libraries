@@ -1091,8 +1091,10 @@ createSemantic(params): Promise<{
 [key: string]: unknown;
   acknowledged: boolean;
   has_embedding: boolean;
-  id: string;
+  id: string | null;
   label: string;
+  operation_id?: string | null;
+  operation_status?: string | null;
 }>;
 ```
 
@@ -1100,9 +1102,10 @@ createSemantic(params): Promise<{
 
 | Parameter | Type |
 | :------ | :------ |
-| `params` | \{ `agentId?`: `string` \| `null`; `embedding?`: `number`[] \| `null`; `label`: `string`; `metadata?`: `Record`\<`string`, `unknown`\> \| `null`; `orgId`: `string`; `projectId`: `string`; `signal?`: `AbortSignal`; `source?`: `string`; `text`: `string`; `upsert?`: `boolean`; `userId`: `string`; `visibility?`: `string`; \} |
+| `params` | \{ `agentId?`: `string` \| `null`; `embedding?`: `number`[] \| `null`; `idempotencyKey?`: `string` \| `null`; `label`: `string`; `metadata?`: `Record`\<`string`, `unknown`\> \| `null`; `orgId`: `string`; `projectId`: `string`; `signal?`: `AbortSignal`; `source?`: `string`; `text`: `string`; `upsert?`: `boolean`; `userId`: `string`; `visibility?`: `string`; \} |
 | `params.agentId?` | `string` \| `null` |
 | `params.embedding?` | `number`[] \| `null` |
+| `params.idempotencyKey?` | `string` \| `null` |
 | `params.label` | `string` |
 | `params.metadata?` | `Record`\<`string`, `unknown`\> \| `null` |
 | `params.orgId` | `string` |
@@ -1120,8 +1123,10 @@ createSemantic(params): Promise<{
 \[`key`: `string`\]: `unknown`;
   `acknowledged`: `boolean`;
   `has_embedding`: `boolean`;
-  `id`: `string`;
+  `id`: `string` \| `null`;
   `label`: `string`;
+  `operation_id?`: `string` \| `null`;
+  `operation_status?`: `string` \| `null`;
 \}\>
 
 <a id="api-createtaxonomic"></a>
@@ -1489,15 +1494,20 @@ retrieveCustom(params): Promise<{
 updateProcedural(params): Promise<unknown>;
 ```
 
+Store changed procedural behavior as a retained version synchronously.
+Reuse idempotencyKey for retries on the same lineage and payload.
+Omitting it starts a new logical edit.
+
 **Parameters**
 
 | Parameter | Type |
 | :------ | :------ |
-| `params` | \{ `allowedTools?`: `string`[] \| `null`; `content?`: `string` \| `null`; `description?`: `string` \| `null`; `id?`: `string` \| `null`; `orgId`: `string`; `procedure?`: `string` \| `null`; `projectId`: `string`; `resources?`: `Record`\<`string`, `unknown`\>[] \| `null`; `signal?`: `AbortSignal`; `steps?`: `Record`\<`string`, `unknown`\>[] \| `null`; `tags?`: `string`[] \| `null`; `triggerConditions?`: `string`[] \| `null`; `visibility?`: `string` \| `null`; \} |
+| `params` | \{ `allowedTools?`: `string`[] \| `null`; `content?`: `string` \| `null`; `description?`: `string` \| `null`; `id?`: `string` \| `null`; `idempotencyKey?`: `string` \| `null`; `orgId`: `string`; `procedure?`: `string` \| `null`; `projectId`: `string`; `resources?`: `Record`\<`string`, `unknown`\>[] \| `null`; `signal?`: `AbortSignal`; `steps?`: `Record`\<`string`, `unknown`\>[] \| `null`; `tags?`: `string`[] \| `null`; `triggerConditions?`: `string`[] \| `null`; `userId?`: `string` \| `null`; `visibility?`: `string` \| `null`; \} |
 | `params.allowedTools?` | `string`[] \| `null` |
 | `params.content?` | `string` \| `null` |
 | `params.description?` | `string` \| `null` |
 | `params.id?` | `string` \| `null` |
+| `params.idempotencyKey?` | `string` \| `null` |
 | `params.orgId` | `string` |
 | `params.procedure?` | `string` \| `null` |
 | `params.projectId` | `string` |
@@ -1506,6 +1516,7 @@ updateProcedural(params): Promise<unknown>;
 | `params.steps?` | `Record`\<`string`, `unknown`\>[] \| `null` |
 | `params.tags?` | `string`[] \| `null` |
 | `params.triggerConditions?` | `string`[] \| `null` |
+| `params.userId?` | `string` \| `null` |
 | `params.visibility?` | `string` \| `null` |
 
 **Returns**
@@ -2733,10 +2744,19 @@ Reference to a branch and its fork point.
 
 ```ts
 const BulkCreateSemanticResultSchema: ZodObject<{
+  accepted_operations: ZodDefault<ZodArray<ZodObject<{
+     acknowledged: ZodBoolean;
+     has_embedding: ZodBoolean;
+     id: ZodNullable<ZodString>;
+     label: ZodString;
+     operation_id: ZodOptional<ZodNullable<ZodString>>;
+     operation_status: ZodOptional<ZodNullable<ZodString>>;
+  }, $loose>>>;
   acknowledged: ZodBoolean;
   created_count: ZodNumber;
   created_ids: ZodArray<ZodString>;
   has_embeddings: ZodBoolean;
+  idempotency_key: ZodOptional<ZodNullable<ZodString>>;
   skipped_count: ZodNumber;
   skipped_labels: ZodArray<ZodString>;
 }, $loose>;
@@ -2869,8 +2889,10 @@ const CreateProceduralResultSchema: ZodObject<{
 const CreateSemanticResultSchema: ZodObject<{
   acknowledged: ZodBoolean;
   has_embedding: ZodBoolean;
-  id: ZodString;
+  id: ZodNullable<ZodString>;
   label: ZodString;
+  operation_id: ZodOptional<ZodNullable<ZodString>>;
+  operation_status: ZodOptional<ZodNullable<ZodString>>;
 }, $loose>;
 ```
 

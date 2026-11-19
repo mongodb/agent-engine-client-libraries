@@ -18,19 +18,36 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING, Any, Dict, Iterator, List, Literal, Optional, Union
 
+from agent_engine_sdk_memory.errors import MemoryAPIError
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from agent_engine_runner_shared.context import (
     get_current_execution_id,
     record_current_memory_metadata,
 )
+from agent_engine_runner_shared.error_reporting import _redact_text
 from agent_engine_runner_shared.types import MemoryContextProtocol, MemoryEngineProtocol
 from agent_engine_runner_shared.utils import normalize_content
 
 if TYPE_CHECKING:
-    from agent_engine_sdk_memory.models import ContextResponse, SourceSpec
+    from agent_engine_sdk_memory.models import ContextResponse, CreateSemanticResult, SourceSpec
 
 logger = logging.getLogger(__name__)
+
+
+def describe_memory_error(exc: BaseException) -> str:
+    """Name a failed memory call for a log line without repeating server text.
+
+    A memory-client error is named by its type, HTTP status and error code,
+    because its message can repeat what the memory server said. Any other
+    exception is named by its type and its message with credentials redacted.
+    """
+    if isinstance(exc, MemoryAPIError):
+        parts = [f"HTTP {exc.status}" if exc.status is not None else "no response"]
+        if exc.code:
+            parts.append(exc.code)
+        return f"{type(exc).__name__} ({', '.join(parts)})"
+    return f"{type(exc).__name__}: {_redact_text(str(exc))}"
 
 
 class MemoryToolCall(BaseModel):
@@ -368,7 +385,12 @@ def build_context(
         return result
 
     except Exception as e:
-        logger.warning(f"Failed to build memory context: {e}", exc_info=True)
+        # A memory-client error is expected and fully named by its status; a
+        # traceback only helps for anything else.
+        logger.warning(
+            f"Failed to build memory context: {describe_memory_error(e)}",
+            exc_info=not isinstance(e, MemoryAPIError),
+        )
         return ""
 
 
@@ -423,7 +445,10 @@ def build_context_from_sources(
 
         return memory_engine.build_context2(**kwargs)
     except Exception as e:
-        logger.warning(f"Failed to build per-source memory context: {e}", exc_info=True)
+        logger.warning(
+            f"Failed to build per-source memory context: {describe_memory_error(e)}",
+            exc_info=not isinstance(e, MemoryAPIError),
+        )
         return _empty()
 
 
@@ -518,7 +543,7 @@ def write_turn_to_memory(
             logger.debug("No messages to write to memory")
 
     except Exception as e:
-        logger.warning(f"Failed to write turn to memory: {e}")
+        logger.warning(f"Failed to write turn to memory: {describe_memory_error(e)}")
 
 
 # =============================================================================
@@ -732,7 +757,6 @@ class MemoryWriter:
 
         Internal method - use write_turn_async or write_turn_sync instead.
         """
-        last_error: Optional[Exception] = None
 
         for attempt in range(self._max_retries):
             try:
@@ -753,19 +777,19 @@ class MemoryWriter:
                 return  # Success
 
             except Exception as e:
-                last_error = e
                 if attempt < self._max_retries - 1:
                     backoff = 0.1 * (2**attempt)  # 0.1s, 0.2s, 0.4s
                     logger.warning(
                         f"Memory write attempt {attempt + 1}/{self._max_retries} failed "
-                        f"for session {session_id}: {e}. Retrying in {backoff:.1f}s..."
+                        f"for session {session_id}: {describe_memory_error(e)}. "
+                        f"Retrying in {backoff:.1f}s..."
                     )
                     time.sleep(backoff)
                 else:
                     logger.error(
                         f"Memory write failed after {self._max_retries} attempts "
-                        f"for session {session_id}: {last_error}",
-                        exc_info=True,
+                        f"for session {session_id}: {describe_memory_error(e)}",
+                        exc_info=not isinstance(e, MemoryAPIError),
                     )
 
     def shutdown(self, wait: bool = True) -> None:
@@ -789,6 +813,12 @@ class MemoryWriter:
 # Semantic Memory Operations
 # =============================================================================
 
+# The explicit memory operations below let the memory client's errors reach
+# the caller, so an agent can tell a failed call from a missing record (None)
+# or no matches ([]), as in the TypeScript SDK. Only the automatic paths above
+# (context building and turn writing) log and degrade, so that memory being
+# unavailable never fails a turn.
+
 
 def create_semantic_memory(
     memory_engine: Optional[MemoryEngineProtocol],
@@ -802,7 +832,8 @@ def create_semantic_memory(
     upsert: bool = True,
     project_id: Optional[str] = None,
     agent_id: Optional[str] = None,
-) -> Optional[str]:
+    idempotency_key: Optional[str] = None,
+) -> Optional[CreateSemanticResult]:
     """
     Create a semantic memory entry (long-lived facts and knowledge).
 
@@ -823,7 +854,8 @@ def create_semantic_memory(
         upsert: If True, update existing memory with same label (default: True)
 
     Returns:
-        Created document ID, or None if creation fails
+        Durable write result, or None when memory is disabled. A failed
+        call raises the memory client's error.
     """
     if memory_engine is None:
         logger.warning("Memory not enabled, cannot create semantic memory")
@@ -845,16 +877,21 @@ def create_semantic_memory(
             project_id=project_id,
             agent_id=agent_id,
             embedding=None,
-            metadata=metadata or {},
+            metadata=metadata,
             upsert=upsert,
+            **({"idempotency_key": idempotency_key} if idempotency_key is not None else {}),
         )
     except Exception as create_error:
-        logger.warning(f"Failed to create semantic memory: {create_error}")
-        return None
+        logger.warning(f"Failed to create semantic memory: {describe_memory_error(create_error)}")
+        raise
 
-    logger.info(f"Created semantic memory: label={label}, user_id={user_id}")
-    record_current_memory_metadata(action="write", memory_type="semantic", content=text)
-    return str(result.id) if hasattr(result, "id") else str(result)
+    from agent_engine_sdk_memory.models import CreateSemanticResult
+
+    accepted = CreateSemanticResult.model_validate(result, from_attributes=True)
+    if accepted.acknowledged:
+        logger.info(f"Semantic write accepted: label={label}, user_id={user_id}")
+        record_current_memory_metadata(action="write", memory_type="semantic", content=text)
+    return accepted
 
 
 def search_semantic_memory(
@@ -882,51 +919,46 @@ def search_semantic_memory(
     if memory_engine is None:
         return []
 
-    try:
-        chunks = memory_engine.fetch_semantic_memories(
-            query=query,
-            org_id=org_id,
-            project_id=project_id,
-            user_id=user_id,
-            visibility=visibility,
-            top_k=top_k,
+    chunks = memory_engine.fetch_semantic_memories(
+        query=query,
+        org_id=org_id,
+        project_id=project_id,
+        user_id=user_id,
+        visibility=visibility,
+        top_k=top_k,
+    )
+
+    results = []
+    for chunk in chunks:
+        chunk_meta = getattr(chunk, "metadata", {}) or {}
+        results.append(
+            {
+                "label": chunk_meta.get("label", ""),
+                "text": getattr(chunk, "text", getattr(chunk, "content", "")),
+                "source": chunk_meta.get("source", ""),
+                "visibility": getattr(chunk, "visibility", "private"),
+                # Prefer caller-supplied metadata; fall back to the internal
+                # contextual_metadata blob for extraction-created memories
+                # written before caller metadata existed. The fallback
+                # to read contextual_metadata is transitional and will be
+                # dropped after a few releases.
+                "metadata": chunk_meta.get("metadata")
+                or chunk_meta.get("contextual_metadata")
+                or {},
+                "similarity_score": getattr(chunk, "similarity_score", 0.0),
+            }
         )
 
-        results = []
-        for chunk in chunks:
-            chunk_meta = getattr(chunk, "metadata", {}) or {}
-            results.append(
-                {
-                    "label": chunk_meta.get("label", ""),
-                    "text": getattr(chunk, "text", getattr(chunk, "content", "")),
-                    "source": chunk_meta.get("source", ""),
-                    "visibility": getattr(chunk, "visibility", "private"),
-                    # Prefer caller-supplied metadata; fall back to the internal
-                    # contextual_metadata blob for extraction-created memories
-                    # written before caller metadata existed. The fallback
-                    # to read contextual_metadata is transitional and will be
-                    # dropped after a few releases.
-                    "metadata": chunk_meta.get("metadata")
-                    or chunk_meta.get("contextual_metadata")
-                    or {},
-                    "similarity_score": getattr(chunk, "similarity_score", 0.0),
-                }
-            )
-
-        logger.debug(f"Found {len(results)} semantic memories for query: {query[:50]}...")
-        first = results[0] if results else {}
-        record_current_memory_metadata(
-            action="recall",
-            memory_type="semantic",
-            content=str(first.get("text") or query),
-            relevance_score=first.get("similarity_score"),
-            query=query,
-        )
-        return results
-
-    except Exception as e:
-        logger.warning(f"Failed to search semantic memory: {e}")
-        return []
+    logger.debug(f"Found {len(results)} semantic memories for query: {query[:50]}...")
+    first = results[0] if results else {}
+    record_current_memory_metadata(
+        action="recall",
+        memory_type="semantic",
+        content=str(first.get("text") or query),
+        relevance_score=first.get("similarity_score"),
+        query=query,
+    )
+    return results
 
 
 def get_semantic_memory(
@@ -951,36 +983,32 @@ def get_semantic_memory(
     if memory_engine is None:
         return None
 
-    try:
-        result = memory_engine.get_semantic(
-            org_id=org_id,
-            project_id=project_id,
-            label=label,
-            user_id=user_id,
-            visibility=visibility,
+    result = memory_engine.get_semantic(
+        org_id=org_id,
+        project_id=project_id,
+        label=label,
+        user_id=user_id,
+        visibility=visibility,
+    )
+    if result:
+        content = result.get("text") or result.get("content") or ""
+        record_current_memory_metadata(
+            action="recall",
+            memory_type="semantic",
+            content=content or label,
         )
-        if result:
-            content = result.get("text") or result.get("content") or ""
-            record_current_memory_metadata(
-                action="recall",
-                memory_type="semantic",
-                content=content or label,
-            )
-            return {
-                "id": str(result.get("id") or result.get("_id", "")),
-                "label": result.get("label", label),
-                "text": content,
-                "source": result.get("source", ""),
-                "visibility": result.get("visibility", ""),
-                # Prefer caller-supplied metadata; fall back to the internal
-                # contextual_metadata blob for extraction-created memories.
-                "metadata": result.get("metadata") or result.get("contextual_metadata") or {},
-            }
-        record_current_memory_metadata(action="recall", memory_type="semantic", content=label)
-        return None
-    except Exception as e:
-        logger.warning(f"Failed to get semantic memory: {e}")
-        return None
+        return {
+            "id": str(result.get("id") or result.get("_id", "")),
+            "label": result.get("label", label),
+            "text": content,
+            "source": result.get("source", ""),
+            "visibility": result.get("visibility", ""),
+            # Prefer caller-supplied metadata; fall back to the internal
+            # contextual_metadata blob for extraction-created memories.
+            "metadata": result.get("metadata") or result.get("contextual_metadata") or {},
+        }
+    record_current_memory_metadata(action="recall", memory_type="semantic", content=label)
+    return None
 
 
 # =============================================================================
@@ -1020,35 +1048,32 @@ def create_taxonomic_memory(
         metadata: Arbitrary caller-supplied key-value metadata stored on the entry
 
     Returns:
-        Created document ID, or None if creation fails
+        Created document ID, or None when memory is not enabled. A failed
+        call raises the memory client's error.
     """
     if memory_engine is None:
         logger.warning("Memory not enabled, cannot create taxonomic memory")
         return None
 
-    try:
-        result = memory_engine.create_taxonomic(
-            domain=domain,
-            term=term,
-            definition=definition,
-            org_id=org_id,
-            user_id=user_id,
-            project_id=project_id,
-            related_terms=related_terms or [],
-            query_expansion=True,
-            visibility=visibility,
-            metadata=metadata,
-        )
-        logger.info(f"Created taxonomic memory: domain={domain}, term={term}")
-        record_current_memory_metadata(
-            action="write",
-            memory_type="taxonomic",
-            content=f"{term}: {definition}",
-        )
-        return result.id
-    except Exception as e:
-        logger.warning(f"Failed to create taxonomic memory: {e}")
-        return None
+    result = memory_engine.create_taxonomic(
+        domain=domain,
+        term=term,
+        definition=definition,
+        org_id=org_id,
+        user_id=user_id,
+        project_id=project_id,
+        related_terms=related_terms or [],
+        query_expansion=True,
+        visibility=visibility,
+        metadata=metadata,
+    )
+    logger.info(f"Created taxonomic memory: domain={domain}, term={term}")
+    record_current_memory_metadata(
+        action="write",
+        memory_type="taxonomic",
+        content=f"{term}: {definition}",
+    )
+    return result.id
 
 
 def search_taxonomic_memory(
@@ -1077,48 +1102,43 @@ def search_taxonomic_memory(
     if memory_engine is None:
         return []
 
-    try:
-        chunks = memory_engine.fetch_taxonomic_memories(
-            query=query,
-            org_id=org_id,
-            project_id=project_id,
-            user_id=user_id,
-            domain=domain,
-            visibility=visibility,
-            top_k=top_k,
+    chunks = memory_engine.fetch_taxonomic_memories(
+        query=query,
+        org_id=org_id,
+        project_id=project_id,
+        user_id=user_id,
+        domain=domain,
+        visibility=visibility,
+        top_k=top_k,
+    )
+
+    results = []
+    for chunk in chunks:
+        results.append(
+            {
+                "term": getattr(
+                    chunk, "term", chunk.content[:50] if hasattr(chunk, "content") else ""
+                ),
+                "definition": getattr(chunk, "definition", getattr(chunk, "content", "")),
+                "domain": getattr(chunk, "domain", domain or "unknown"),
+                "related_terms": getattr(chunk, "related_terms", []),
+                "similarity_score": getattr(chunk, "similarity_score", 0.0),
+            }
         )
 
-        results = []
-        for chunk in chunks:
-            results.append(
-                {
-                    "term": getattr(
-                        chunk, "term", chunk.content[:50] if hasattr(chunk, "content") else ""
-                    ),
-                    "definition": getattr(chunk, "definition", getattr(chunk, "content", "")),
-                    "domain": getattr(chunk, "domain", domain or "unknown"),
-                    "related_terms": getattr(chunk, "related_terms", []),
-                    "similarity_score": getattr(chunk, "similarity_score", 0.0),
-                }
-            )
-
-        logger.debug(f"Found {len(results)} taxonomic memories for query: {query[:50]}...")
-        first = results[0] if results else {}
-        term = first.get("term")
-        definition = first.get("definition")
-        content = f"{term}: {definition}" if term and definition else query
-        record_current_memory_metadata(
-            action="recall",
-            memory_type="taxonomic",
-            content=content,
-            relevance_score=first.get("similarity_score"),
-            query=query,
-        )
-        return results
-
-    except Exception as e:
-        logger.warning(f"Failed to search taxonomic memory: {e}")
-        return []
+    logger.debug(f"Found {len(results)} taxonomic memories for query: {query[:50]}...")
+    first = results[0] if results else {}
+    term = first.get("term")
+    definition = first.get("definition")
+    content = f"{term}: {definition}" if term and definition else query
+    record_current_memory_metadata(
+        action="recall",
+        memory_type="taxonomic",
+        content=content,
+        relevance_score=first.get("similarity_score"),
+        query=query,
+    )
+    return results
 
 
 def list_taxonomic_domains(
@@ -1140,19 +1160,15 @@ def list_taxonomic_domains(
     if memory_engine is None:
         return []
 
-    try:
-        domains = memory_engine.get_distinct_domains(
-            org_id=org_id, project_id=project_id, visibility=visibility
-        )
-        record_current_memory_metadata(
-            action="recall",
-            memory_type="taxonomic",
-            content=", ".join(domains) if domains else "taxonomic domains",
-        )
-        return domains
-    except Exception as e:
-        logger.warning(f"Failed to list taxonomic domains: {e}")
-        return []
+    domains = memory_engine.get_distinct_domains(
+        org_id=org_id, project_id=project_id, visibility=visibility
+    )
+    record_current_memory_metadata(
+        action="recall",
+        memory_type="taxonomic",
+        content=", ".join(domains) if domains else "taxonomic domains",
+    )
+    return domains
 
 
 def get_taxonomic_term(
@@ -1179,35 +1195,31 @@ def get_taxonomic_term(
     if memory_engine is None:
         return None
 
-    try:
-        result = memory_engine.get_taxonomic(
-            org_id=org_id,
-            project_id=project_id,
-            domain=domain,
-            term=term,
-            user_id=user_id,
-            visibility=visibility,
+    result = memory_engine.get_taxonomic(
+        org_id=org_id,
+        project_id=project_id,
+        domain=domain,
+        term=term,
+        user_id=user_id,
+        visibility=visibility,
+    )
+    if result:
+        term_val = result.get("term", term)
+        definition_val = result.get("definition", "")
+        record_current_memory_metadata(
+            action="recall",
+            memory_type="taxonomic",
+            content=f"{term_val}: {definition_val}",
         )
-        if result:
-            term_val = result.get("term", term)
-            definition_val = result.get("definition", "")
-            record_current_memory_metadata(
-                action="recall",
-                memory_type="taxonomic",
-                content=f"{term_val}: {definition_val}",
-            )
-            return {
-                "id": str(result.get("id") or result.get("_id", "")),
-                "domain": result.get("domain", domain),
-                "term": term_val,
-                "definition": definition_val,
-                "related_terms": result.get("related_terms", []),
-            }
-        record_current_memory_metadata(action="recall", memory_type="taxonomic", content=term)
-        return None
-    except Exception as e:
-        logger.warning(f"Failed to get taxonomic term: {e}")
-        return None
+        return {
+            "id": str(result.get("id") or result.get("_id", "")),
+            "domain": result.get("domain", domain),
+            "term": term_val,
+            "definition": definition_val,
+            "related_terms": result.get("related_terms", []),
+        }
+    record_current_memory_metadata(action="recall", memory_type="taxonomic", content=term)
+    return None
 
 
 # =============================================================================
@@ -1253,7 +1265,8 @@ def create_episodic_memory(
             episode (mirrors create_semantic_memory's metadata)
 
     Returns:
-        Created document ID, or None if creation fails
+        Created document ID, or None when memory is not enabled or no
+        session_id is given. A failed call raises the memory client's error.
     """
     if memory_engine is None:
         logger.warning("Memory not enabled, cannot create episodic memory")
@@ -1268,36 +1281,32 @@ def create_episodic_memory(
         f"user_id={user_id}, visibility={visibility}, tags={tags}"
     )
 
-    try:
-        import uuid
+    import uuid
 
-        result = memory_engine.create_episodic(
-            title=title,
-            content=content,
-            summary_text=summary_text or title,
-            org_id=org_id,
-            user_id=user_id,
-            session_id=session_id,
-            snapshot_ref_id=f"snapshot_{uuid.uuid4().hex[:8]}",
-            summary_type="llm",
-            source_agent="agent",
-            participants=participants or [],
-            tags=tags or [],
-            visibility=visibility,
-            project_id=project_id,
-            agent_id=agent_id,
-            metadata=metadata,
-        )
-        logger.info(f"Created episodic memory: title={title[:50]}..., user_id={user_id}")
-        record_current_memory_metadata(
-            action="write",
-            memory_type="episodic",
-            content=summary_text or title or content,
-        )
-        return result.id
-    except Exception as e:
-        logger.warning(f"Failed to create episodic memory: {e}")
-        return None
+    result = memory_engine.create_episodic(
+        title=title,
+        content=content,
+        summary_text=summary_text or title,
+        org_id=org_id,
+        user_id=user_id,
+        session_id=session_id,
+        snapshot_ref_id=f"snapshot_{uuid.uuid4().hex[:8]}",
+        summary_type="llm",
+        source_agent="agent",
+        participants=participants or [],
+        tags=tags or [],
+        visibility=visibility,
+        project_id=project_id,
+        agent_id=agent_id,
+        metadata=metadata,
+    )
+    logger.info(f"Created episodic memory: title={title[:50]}..., user_id={user_id}")
+    record_current_memory_metadata(
+        action="write",
+        memory_type="episodic",
+        content=summary_text or title or content,
+    )
+    return result.id
 
 
 def search_episodic_memory(
@@ -1327,45 +1336,40 @@ def search_episodic_memory(
     if memory_engine is None:
         return []
 
-    try:
-        chunks = memory_engine.fetch_episodic_memories(
-            query=query,
-            org_id=org_id,
-            project_id=project_id,
-            user_id=user_id,
-            visibility=visibility,
-            session_id=session_id,
-            top_k=top_k,
+    chunks = memory_engine.fetch_episodic_memories(
+        query=query,
+        org_id=org_id,
+        project_id=project_id,
+        user_id=user_id,
+        visibility=visibility,
+        session_id=session_id,
+        top_k=top_k,
+    )
+
+    results = []
+    for chunk in chunks:
+        results.append(
+            {
+                "title": getattr(chunk, "title", ""),
+                "content": getattr(chunk, "content", ""),
+                "summary": getattr(chunk, "summary_text", ""),
+                "session_id": getattr(chunk, "session_id", ""),
+                "participants": getattr(chunk, "participants", []),
+                "tags": getattr(chunk, "tags", []),
+                "similarity_score": getattr(chunk, "similarity_score", 0.0),
+            }
         )
 
-        results = []
-        for chunk in chunks:
-            results.append(
-                {
-                    "title": getattr(chunk, "title", ""),
-                    "content": getattr(chunk, "content", ""),
-                    "summary": getattr(chunk, "summary_text", ""),
-                    "session_id": getattr(chunk, "session_id", ""),
-                    "participants": getattr(chunk, "participants", []),
-                    "tags": getattr(chunk, "tags", []),
-                    "similarity_score": getattr(chunk, "similarity_score", 0.0),
-                }
-            )
-
-        logger.debug(f"Found {len(results)} episodic memories for query: {query[:50]}...")
-        first = results[0] if results else {}
-        record_current_memory_metadata(
-            action="recall",
-            memory_type="episodic",
-            content=str(first.get("summary") or first.get("content") or query),
-            relevance_score=first.get("similarity_score"),
-            query=query,
-        )
-        return results
-
-    except Exception as e:
-        logger.warning(f"Failed to search episodic memory: {e}")
-        return []
+    logger.debug(f"Found {len(results)} episodic memories for query: {query[:50]}...")
+    first = results[0] if results else {}
+    record_current_memory_metadata(
+        action="recall",
+        memory_type="episodic",
+        content=str(first.get("summary") or first.get("content") or query),
+        relevance_score=first.get("similarity_score"),
+        query=query,
+    )
+    return results
 
 
 def list_episodic_memories(
@@ -1393,39 +1397,34 @@ def list_episodic_memories(
     if memory_engine is None:
         return []
 
-    try:
-        episodes = memory_engine.list_episodic(
-            org_id=org_id,
-            project_id=project_id,
-            user_id=user_id,
-            visibility=visibility,
-            session_id=session_id,
-            limit=limit,
+    episodes = memory_engine.list_episodic(
+        org_id=org_id,
+        project_id=project_id,
+        user_id=user_id,
+        visibility=visibility,
+        session_id=session_id,
+        limit=limit,
+    )
+
+    results = []
+    for ep in episodes:
+        results.append(
+            {
+                "id": str(ep.get("id") or ep.get("_id", "")),
+                "title": ep.get("title", ""),
+                "summary": ep.get("summary_text") or ep.get("summary", ""),
+                "session_id": ep.get("session_id"),
+                "tags": ep.get("tags", []),
+            }
         )
 
-        results = []
-        for ep in episodes:
-            results.append(
-                {
-                    "id": str(ep.get("id") or ep.get("_id", "")),
-                    "title": ep.get("title", ""),
-                    "summary": ep.get("summary_text") or ep.get("summary", ""),
-                    "session_id": ep.get("session_id"),
-                    "tags": ep.get("tags", []),
-                }
-            )
-
-        first = results[0] if results else {}
-        record_current_memory_metadata(
-            action="recall",
-            memory_type="episodic",
-            content=str(first.get("summary") or first.get("title") or "episodic memories"),
-        )
-        return results
-
-    except Exception as e:
-        logger.warning(f"Failed to list episodic memories: {e}")
-        return []
+    first = results[0] if results else {}
+    record_current_memory_metadata(
+        action="recall",
+        memory_type="episodic",
+        content=str(first.get("summary") or first.get("title") or "episodic memories"),
+    )
+    return results
 
 
 # =============================================================================

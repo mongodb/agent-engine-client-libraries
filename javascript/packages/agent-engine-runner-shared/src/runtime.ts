@@ -57,8 +57,8 @@ const logger = getLogger("agent_engine_runner_shared.runtime");
  * Resolve the listen host from `APP_HOST`, defaulting to `"0.0.0.0"`.
  *
  * Matches Python's `_resolve_listen_host`: ECP stamps `APP_HOST` per
- * executor type at deploy time (`"::"` for vm-mode, `"0.0.0.0"` for
- * container-mode). Empty string normalises to the default — a shell that
+ * deploy time (`"::"` for the cell's IPv6-first pod network).
+ * Empty string normalises to the default — a shell that
  * exports `APP_HOST=""` must not bind to `""`.
  */
 export function resolveListenHost(): string {

@@ -73,7 +73,7 @@ DEFAULT_PROVIDER = "gemini"
 DEFAULT_MODELS = {
     "anthropic": "claude-sonnet-5",
     "cerebras": "gpt-oss-120b",
-    "gemini": "gemini-3-flash-preview",
+    "gemini": "gemini-3.8-flash",
     "openai": "gpt-5.6-luna",
 }
 # An OpenAI request occasionally stalls without ever responding. Without a
@@ -922,19 +922,27 @@ def save_customer_info(info_key: str, info_value: str) -> str:
     if not user_id:
         return json.dumps({"status": "error", "error": "No user_id available"})
 
+    from agent_engine_sdk_memory import MemoryNotSupportedError
+
     # Build descriptive text for semantic search
     profile_text = f"Customer {info_key}: {info_value}"
 
-    result = app.memory.save_semantic(
-        text=profile_text,
-        label=_customer_info_label(user_id, info_key),
-        source="insurance_agent",
-        metadata={
-            "type": "customer_info",
-            "info_key": info_key,
-        },
-        user_id=user_id,
-    )
+    # With memory off, a semantic save raises instead of returning an
+    # unacknowledged result (AP-8762). Report it to the model so the turn
+    # completes; remove this guard once AP-8762 settles the SDK behavior.
+    try:
+        result = app.memory.save_semantic(
+            text=profile_text,
+            label=_customer_info_label(user_id, info_key),
+            source="insurance_agent",
+            metadata={
+                "type": "customer_info",
+                "info_key": info_key,
+            },
+            user_id=user_id,
+        )
+    except MemoryNotSupportedError:
+        return json.dumps({"status": "error", "error": "Memory not enabled"})
 
     if result.acknowledged:
         return json.dumps({"status": "saved", "info_key": info_key, "user_id": user_id})

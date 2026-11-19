@@ -11,6 +11,7 @@
  */
 
 import type { FastifyInstance } from "fastify";
+import { trace, type Span } from "@opentelemetry/api";
 import { fromJson } from "@bufbuild/protobuf";
 import {
   JsonValueSchema,
@@ -95,8 +96,10 @@ import {
 } from "../checkpoint_workspace.js";
 import { BaseServer } from "./base.js";
 import { CallbackDelivery } from "./callback_delivery.js";
+import { DurableAckError, DurableChunkSender } from "./chunk_delivery.js";
 import {
   DONE,
+  DURABLE_ACK_INCOMPLETE_ERROR_CODE,
   ERROR,
   LLM_CREDENTIAL_REJECTED_ERROR_CODE,
   LLM_INVOCATION_ERROR_CODE,
@@ -110,9 +113,17 @@ import {
 import { resolveOeUrl } from "./oe_url.js";
 import { resolveOwnerUrl } from "./owner_url.js";
 import { discardResponseBody, postWithRetries } from "./http_retry.js";
+import {
+  StreamJournalManager,
+  journalSseLines,
+  type JournalReason,
+} from "./stream_journal.js";
+import { pipeSseLinesToResponse } from "./tool.js";
 import { forceFlushTracing, getTracer } from "../tracing/index.js";
+import { runWithInboundTraceContext } from "./inbound_trace_span.js";
 import {
   AER_BUILD_AGENT,
+  AER_EXECUTE,
   OPENINFERENCE_SPAN_KIND,
   OpenInferenceSpanKind,
 } from "../span_names.js";
@@ -120,7 +131,7 @@ import {
 const logger = getLogger("agent_engine_runner_shared.server.aer");
 
 // Whole-turn execution timeout. The platform stamps it in vm-mode; this default
-// covers container mode and local dev. It sits under the 70-minute stream
+// covers local development. It sits under the 70-minute stream
 // deadline so the runner, not the stream, ends a long turn.
 const EXECUTION_TIMEOUT_MS =
   getEnvFloat("RUNNER_EXECUTION_TIMEOUT", 3600.0) * 1000;
@@ -143,6 +154,24 @@ function abandonedBuildGraceMs(): number {
   return getEnvFloat("RUNNER_ABANDONED_BUILD_GRACE", 60.0) * 1000;
 }
 
+// Ordered durable chunk acknowledgement (negotiated: the engine stamps
+// durable_ack_enabled when the workspace advertised the durable_ack
+// capability). The whole turn's budget bounds the sender's in-order retries:
+// the platform's stream deadline is what the caller was promised, so retrying
+// a batch past it would only produce output nobody is left to read. Mirrors
+// Python's DURABLE_ACK_TURN_BUDGET_S.
+const DURABLE_ACK_TURN_BUDGET_MS = EXECUTION_TIMEOUT_MS;
+// A failing turn drains its outstanding chunks best-effort, bounded well below
+// the turn budget: the ERROR terminal and its settlement must not be held on
+// the network while the engine is unresponsive. Mirrors Python's
+// DURABLE_ACK_ERROR_DRAIN_TIMEOUT_S.
+const DURABLE_ACK_ERROR_DRAIN_TIMEOUT_MS = 5_000;
+// Tolerance for deciding that a settlement that ran out of budget did so at
+// the execution's deadline (and is therefore the timeout's to settle): the
+// settle's own deadline is computed from the same instant and can raise a
+// fraction of a millisecond early on float rounding.
+const SETTLEMENT_DEADLINE_TOLERANCE_MS = 5;
+
 // Per-request OE callback timeout.
 const REQUEST_TIMEOUT_MS = getRequestTimeout() * 1000;
 
@@ -153,9 +182,11 @@ const CAPABILITY_ADVERTISE_TIMEOUT_MS = 10_000;
 // Bounded wait for queued Memory writes before asking OE to release a finished
 // session. Mirrors the Python AER contract.
 const SESSION_FINISH_MEMORY_DRAIN_TIMEOUT_MS = 10_000;
-// Bound on the trace flush before the finish POST. /finish triggers a
-// zero-grace teardown, so queued spans must reach the OE first; the bound keeps
-// an unreachable OE from delaying the release indefinitely.
+
+// Bounded wait for the tracer provider to flush before asking OE to release a
+// finished session. The run root (`aer.execute`) ends with the turn, but a
+// batch processor has not necessarily shipped it yet; the OE may kill this pod
+// with zero grace once it honours /finish.
 const SESSION_FINISH_TRACE_FLUSH_TIMEOUT_MS = 5_000;
 const CANCELLED_HISTORY_TIMEOUT_MS = 3_000;
 
@@ -455,8 +486,46 @@ function validateCallbackInterrupts(
   }
 }
 
+/**
+ * Parse a path segment that must be an integer.
+ *
+ * Returns null when it is not one, so the route can answer the same 422 the
+ * Python twin's typed path parameter produces. A parsed but unknown generation
+ * (including a negative one) is a 404, not a validation error.
+ */
+function parseIntegerSegment(raw: string): number | null {
+  if (!/^-?\d+$/.test(raw)) return null;
+  const value = Number.parseInt(raw, 10);
+  return Number.isSafeInteger(value) ? value : null;
+}
+
+/**
+ * Parse the `after_seq` query value.
+ *
+ * Mirrors the Python route's `Query(default=0, ge=0)`: absent means "from the
+ * start", and a supplied value that is not a non-negative integer is a
+ * validation error rather than a silent reset. A resume cursor must never be
+ * reinterpreted as a different replay range.
+ */
+function parseAfterSeq(raw: string | undefined): number | "invalid" {
+  if (raw === undefined) return 0;
+  if (!/^\d+$/.test(raw)) return "invalid";
+  const value = Number.parseInt(raw, 10);
+  return Number.isSafeInteger(value) ? value : "invalid";
+}
+
 export class AERServer extends BaseServer {
   private chunkSeq: Map<string, number> = new Map();
+  // Ordered durable chunk senders per in-flight execution, registered only
+  // when the engine negotiated durable acknowledgement. Absent for every other
+  // execution, which keeps the legacy per-chunk path byte-for-byte unchanged.
+  private durableAckSenders: Map<string, DurableChunkSender> = new Map();
+  // Runner-wide stream journal and the generation each journaled execution
+  // opened. Registered only when the engine negotiated a journal dispatch, so
+  // the legacy per-chunk path stays byte-for-byte unchanged. Lazily created
+  // (like `drainRegistry`) so tests that skip the constructor still work.
+  private _streamJournal?: StreamJournalManager;
+  private _journalGeneration?: Map<string, number>;
   // Per-execution validated OE owner callback URL, keyed by
   // execution_id like `chunkSeq`. Set in `doHandleExecute` (only when the
   // request's owner URL validates against the resolved service URL) and read by
@@ -480,6 +549,19 @@ export class AERServer extends BaseServer {
   private capabilitiesAdvertised = false;
   get modeName(): string {
     return "aer";
+  }
+
+  /**
+   * Runner-wide stream journal, lazily created so a harness that skips the
+   * constructor still gets a working store.
+   */
+  get streamJournal(): StreamJournalManager {
+    return (this._streamJournal ??= new StreamJournalManager());
+  }
+
+  /** Per-execution journal generation, lazily created (see the field). */
+  private get journalGeneration(): Map<string, number> {
+    return (this._journalGeneration ??= new Map());
   }
 
   /**
@@ -693,6 +775,17 @@ export class AERServer extends BaseServer {
       owner_callback_fallback: true,
       ...explicitFeatures(agentCfg.features),
     };
+    // SDK-injected too: this runner delivers its chunk stream in order and
+    // retries until the engine confirms durable persistence, so the engine may
+    // negotiate durable acknowledgement (durable_ack_enabled) on dispatch.
+    // Inert until the engine stamps it. Mirrors Python's
+    // `features.setdefault("durable_ack", True)`.
+    if (!("durable_ack" in features)) features["durable_ack"] = true;
+    // SDK-injected too: this runner journals a turn's chunk stream on its own
+    // disk and serves it back over /stream/journal/* on resume, so the engine
+    // may dispatch with stream_journal_enabled. Inert until the engine stamps
+    // it. Mirrors Python's `features.setdefault("stream_journal", True)`.
+    if (!("stream_journal" in features)) features["stream_journal"] = true;
 
     const payload = {
       workspace_id: workspaceId,
@@ -765,7 +858,10 @@ export class AERServer extends BaseServer {
       // Throws 409 if the execution was drained after OE dispatched.
       this.drainRegistry.beginWork(body.execution_id);
       try {
-        const result = await this.handleExecute(body);
+        const result = await this.executeWithInboundTraceContext(
+          body,
+          request.headers,
+        );
         const responseBody = AERExecuteResponseSchema.parse(result);
         const finishCallback = getPendingSessionFinishes(this).get(
           body.execution_id,
@@ -852,6 +948,79 @@ export class AERServer extends BaseServer {
         }
       },
     );
+
+    // Runner stream journal read routes. The runner owns the journal; these
+    // serve it back to whichever engine replica resumes the turn. They sit
+    // behind the same auth hook as every other route, which is inactive on a
+    // runner with no RUNNER_AUTH_TOKEN; the executor network policy (only the
+    // per-project OE may reach this port) is the control.
+    app.get<{ Params: { execution_id: string } }>(
+      "/stream/journal/:execution_id",
+      async (request, reply) => {
+        const index = this.streamJournal.getIndex(request.params.execution_id);
+        if (index === null) {
+          return reply
+            .code(404)
+            .send({ detail: "unknown stream journal execution" });
+        }
+        return reply.send(index);
+      },
+    );
+
+    app.get<{
+      Params: { execution_id: string; generation: string };
+      Querystring: { after_seq?: string };
+    }>("/stream/journal/:execution_id/:generation", async (request, reply) => {
+      const executionId = request.params.execution_id;
+      const generation = parseIntegerSegment(request.params.generation);
+      if (generation === null) {
+        return reply
+          .code(422)
+          .send({ detail: "invalid stream journal generation" });
+      }
+      const afterSeq = parseAfterSeq(request.query.after_seq);
+      if (afterSeq === "invalid") {
+        return reply
+          .code(422)
+          .send({ detail: "invalid stream journal after_seq" });
+      }
+      const journal = this.streamJournal.getJournal(executionId, generation);
+      // An evicted body survives only in the index; a follow must fail closed
+      // rather than serve an empty stream as if it were complete.
+      if (journal === null || !journal.retained) {
+        return reply
+          .code(404)
+          .send({ detail: "unknown stream journal generation" });
+      }
+      const release = this.streamJournal.acquireReader(executionId, generation);
+      if (release === null) {
+        return reply
+          .code(429)
+          .send({ detail: "stream journal reader limit reached" });
+      }
+      // SSE is a raw stream: hijack so Fastify does not try to serialize a
+      // body, then let the shared pipe own the socket for the journal's
+      // lifetime (disconnect cancel, backpressure, safe end).
+      reply.hijack();
+      const res = reply.raw;
+      res.statusCode = 200;
+      res.setHeader("Content-Type", "text/event-stream");
+      res.setHeader("Cache-Control", "no-cache");
+      res.setHeader("Connection", "keep-alive");
+      res.flushHeaders();
+      try {
+        await pipeSseLinesToResponse(
+          res,
+          (signal) => journalSseLines(journal, afterSeq, signal),
+          { onGeneratorSettled: release },
+        );
+      } catch (error) {
+        // The pipe already settled the generator on most paths; release is
+        // idempotent so this only covers a failure before it started.
+        release();
+        throw error;
+      }
+    });
   }
 
   private async reportCancelledHistory(
@@ -930,13 +1099,47 @@ export class AERServer extends BaseServer {
     }
   }
 
+  /**
+   * Open `aer.execute` as the run's root, joining an inbound W3C traceparent
+   * when one arrived.
+   *
+   * Mirrors Python's `_execute_with_inbound_trace_context`. Without this the
+   * AER's own spans — and the trace_id persisted onto tool-call records via
+   * `getCurrentTraceContext()` — start a disconnected root trace even though
+   * the caller's traceparent now arrives over the A2A hop. With no inbound
+   * traceparent the span is a fresh local root, the same as in Python.
+   */
+  private executeWithInboundTraceContext(
+    body: ExecuteRequest,
+    headers: Record<string, string | string[] | undefined>,
+  ): Promise<AERExecuteResponse> {
+    // Outermost step of an invocation, so it declares AGENT rather than leaving
+    // a backend to guess from the span name.
+    return runWithInboundTraceContext(
+      {
+        name: AER_EXECUTE,
+        kind: OpenInferenceSpanKind.AGENT,
+        tracerName: "agent-engine-runner-shared.aer",
+        attributes: { "execution.id": body.execution_id },
+      },
+      headers,
+      (span) => this.handleExecute(body, span),
+    );
+  }
+
   private handleExecute = withMetrics(
     "aer_execute",
-    (request: ExecuteRequest) => this.doHandleExecute(request),
+    (request: ExecuteRequest, rootSpan?: Span) =>
+      this.doHandleExecute(request, rootSpan),
   );
 
   private async doHandleExecute(
     request: ExecuteRequest,
+    // The run root, passed explicitly by `executeWithInboundTraceContext` so
+    // the identity stamping below cannot land on an unrelated active span.
+    // Omitted only by direct callers (tests); the active span is the same root
+    // there, so the fallback is equivalent, never a silent wrong target.
+    rootSpan?: Span,
   ): Promise<AERExecuteResponse> {
     logSection();
     logger.debug(
@@ -989,6 +1192,28 @@ export class AERServer extends BaseServer {
       request.workspace_id ?? null,
     );
 
+    // `aer.execute` opened before `runWithExecutionContext`, so the
+    // ExecutionContextSpanProcessor could not stamp session/workspace on it.
+    // Stamp them on the run root explicitly — `executeWithInboundTraceContext`
+    // threads the root span in — so the identity cannot land on an unrelated
+    // active span if a wrapper ever opens one in between, and so it stays
+    // visible to the execution/session trace filters. The exporter reads
+    // attributes at span end, so the top-level session_id/execution_id land on
+    // the stored document.
+    const span = rootSpan ?? trace.getActiveSpan();
+    if (span !== undefined) {
+      if (sessionId) {
+        span.setAttribute("session.id", sessionId);
+        // thread.id mirrors session.id: the runner uses session_id as the
+        // LangGraph checkpoint thread_id, and some OTLP consumers key off
+        // "thread.id" — the same encoding Python's tracing setup writes.
+        span.setAttribute("thread.id", sessionId);
+      }
+      if (workspaceId) {
+        span.setAttribute("workspace.id", workspaceId);
+      }
+    }
+
     logger.debug(
       "AER: Message: %s",
       message.length > 50 ? message.slice(0, 50) + "..." : message,
@@ -1018,6 +1243,10 @@ export class AERServer extends BaseServer {
 
     let durableAttempt: AttemptContext | null = null;
     let pendingCallback: ExecutorCallbackRequest | undefined;
+    // Lifecycle reason for the stream journal, set by the paths that settle
+    // cleanly. Left null by an error exit (the finally maps that to "error")
+    // and overridden by cancellation.
+    let journalReason: JournalReason | null = null;
     const stageCallback = (
       status: string,
       fields: ExecutorCallbackFields = {},
@@ -1074,8 +1303,29 @@ export class AERServer extends BaseServer {
         // getCurrentPayload(). Mirrors Python set_execution_context(payload=...).
         payload: request.payload,
         signal: abortController.signal,
+        // A journaled turn routes in-process progress emits through the turn's
+        // own chunk path, so a local tool's step is sequenced and recorded like
+        // every other chunk. Other turns keep progress's own transport.
+        emitChunk:
+          request.stream_journal_enabled &&
+          Number.isInteger(request.stream_generation) &&
+          request.stream_generation > 0
+            ? (event, data) =>
+                this.sendStreamChunk(
+                  request.platform_api_url,
+                  request.execution_id,
+                  event,
+                  data,
+                  "",
+                  {},
+                )
+            : null,
       },
       async () => {
+        // The execution's original absolute deadline: successful settlement
+        // must not outlive it, so a turn whose budget expired cannot be
+        // presented as completed.
+        const executionDeadlineMs = performance.now() + EXECUTION_TIMEOUT_MS;
         const timeoutHandle = setTimeout(
           () => abortController.abort(),
           EXECUTION_TIMEOUT_MS,
@@ -1205,6 +1455,16 @@ export class AERServer extends BaseServer {
             sessionId.slice(0, 8),
           );
 
+          // Stream journal, only when the engine negotiated it: from here on
+          // every chunk this turn emits is appended to a journal on the
+          // runner's own disk, so a resume on any replica can read the turn's
+          // stream back. Admission happens before preparation, and the single
+          // finally below closes the journal after any outcome handler has
+          // emitted its terminal frame — including for a preparation failure.
+          await this.openStreamJournal(request, sessionId);
+
+          let suspendedCapture: CancelledHistoryCapture | null = null;
+          let executionOutcome: InterruptResult | StreamingResult;
           let graph: unknown;
           try {
             graph = await this.buildGraphForInvocation(
@@ -1313,8 +1573,38 @@ export class AERServer extends BaseServer {
                     signal: abortController.signal,
                   }),
                 );
-          let suspendedCapture: CancelledHistoryCapture | null = null;
-          let executionOutcome: InterruptResult | StreamingResult;
+          // Ordered chunk delivery through one coalescing poster, started
+          // only when the engine asked for it: a journal dispatch (the
+          // journal is the durable copy, so live delivery is best effort) or
+          // a negotiated durable acknowledgement (live delivery is the
+          // durable copy, so a failed drain fails the turn). A dispatch that
+          // carries both is a journal dispatch. The sender is torn down by the
+          // finally below. Nothing is registered otherwise, so the legacy path
+          // is untouched.
+          if (request.stream_journal_enabled || request.durable_ack_enabled) {
+            // The poster and the settlement waits observe a drain/Stop
+            // promptly, but a whole-turn timeout is not a cancellation — the
+            // sender's own budget bounds it — so accepted chunks can still use
+            // the bounded error drain. Production (a producer blocked on the
+            // queue cap) observes any abort so the timeout owner can run.
+            const senderAbort = new AbortController();
+            abortController.signal.addEventListener(
+              "abort",
+              () => {
+                if (abortController.signal.reason === DRAIN_ABORT_REASON) {
+                  senderAbort.abort(abortController.signal.reason);
+                }
+              },
+              { once: true },
+            );
+            this.startDurableChunkSender(
+              request,
+              ownerUrlFailure,
+              senderAbort.signal,
+              abortController.signal,
+            );
+          }
+
           try {
             // agent is assigned by the build step above (getAgent throws
             // rather than returning undefined); the declared type stays wide
@@ -1446,6 +1736,53 @@ export class AERServer extends BaseServer {
               }
             }
 
+            // Settlement ordering (negotiated durable ack): the suspension
+            // must not be presented before every chunk produced up to it is
+            // acknowledged — a resume replays the turn's history, and a gap
+            // there would be permanent. A failed drain fails the turn instead.
+            // A journal dispatch is exempt: the journal, not live delivery, is
+            // the durable copy, so settlement does not wait for the poster to
+            // drain.
+            const suspendSender = this.durableAckSenders.get(
+              request.execution_id,
+            );
+            if (suspendSender !== undefined && !suspendSender.journalMode) {
+              try {
+                // Same original-deadline bound as completion settlement.
+                await suspendSender.settle(
+                  Math.max(0, executionDeadlineMs - performance.now()),
+                );
+                // Same original-deadline bound as completion settlement.
+                if (
+                  performance.now() >=
+                  executionDeadlineMs - SETTLEMENT_DEADLINE_TOLERANCE_MS
+                ) {
+                  await this.failIncompleteDurableTurn(
+                    request,
+                    stageCallback,
+                    new DurableAckError(
+                      `durable chunk acknowledgement incomplete for execution ` +
+                        `${request.execution_id}: settlement exceeded the ` +
+                        `execution deadline`,
+                    ),
+                  );
+                }
+              } catch (ackErr) {
+                if (
+                  abortController.signal.aborted &&
+                  abortController.signal.reason === DRAIN_ABORT_REASON
+                ) {
+                  throw ackErr;
+                }
+                if (!(ackErr instanceof DurableAckError)) throw ackErr;
+                await this.failIncompleteDurableTurn(
+                  request,
+                  stageCallback,
+                  ackErr,
+                );
+              }
+            }
+
             stageCallback("SUSPENDED", {
               suspend_reason: suspendReason,
               suspend_context: suspendContext,
@@ -1453,6 +1790,9 @@ export class AERServer extends BaseServer {
               resume_schema: executionOutcome.resume_schema,
               metadata: executionOutcome.metadata,
             });
+            // A suspension ends this generation's journal; the chunks before
+            // it are what a resume replays. The finally writes the end marker.
+            journalReason = "suspended";
             return {
               status: "suspended",
               suspend_reason: suspendReason,
@@ -1475,6 +1815,60 @@ export class AERServer extends BaseServer {
             } catch (error) {
               const kind = error instanceof Error ? error.name : typeof error;
               logger.warn(`Failed to queue memory write (${kind})`);
+            }
+          }
+
+          // Settlement ordering (negotiated durable ack): every chunk produced
+          // by the turn must be acknowledged before the terminal frame and the
+          // settlement. A failed drain means chunks are not durable, so the
+          // turn is failed rather than presented as complete. A journal
+          // dispatch is exempt: the journal, not live delivery, is the durable
+          // copy, so settlement does not wait for the poster to drain.
+          const doneSender = this.durableAckSenders.get(request.execution_id);
+          if (doneSender !== undefined && !doneSender.journalMode) {
+            try {
+              // Successful settlement uses the execution's original absolute
+              // deadline: an already timed-out turn must not be presented as
+              // completed.
+              await doneSender.settle(
+                Math.max(0, executionDeadlineMs - performance.now()),
+              );
+              // A successful settle must still be inside the execution's
+              // original deadline: the settle's own wait can be woken by a
+              // late acknowledgement after the deadline passed, and an
+              // already timed-out turn must never be presented as completed.
+              if (
+                performance.now() >=
+                executionDeadlineMs - SETTLEMENT_DEADLINE_TOLERANCE_MS
+              ) {
+                await this.failIncompleteDurableTurn(
+                  request,
+                  stageCallback,
+                  new DurableAckError(
+                    `durable chunk acknowledgement incomplete for execution ` +
+                      `${request.execution_id}: settlement exceeded the ` +
+                      `execution deadline`,
+                  ),
+                );
+              }
+            } catch (ackErr) {
+              // A drain/Stop during settlement keeps its own cancellation
+              // owner; anything else — including the settlement running out
+              // of the execution's original budget with chunks still
+              // unacknowledged — is the incomplete-turn failure, which keeps
+              // its durable_ack_incomplete discriminator.
+              if (
+                abortController.signal.aborted &&
+                abortController.signal.reason === DRAIN_ABORT_REASON
+              ) {
+                throw ackErr;
+              }
+              if (!(ackErr instanceof DurableAckError)) throw ackErr;
+              await this.failIncompleteDurableTurn(
+                request,
+                stageCallback,
+                ackErr,
+              );
             }
           }
 
@@ -1508,6 +1902,7 @@ export class AERServer extends BaseServer {
               completedCallback,
             );
           }
+          journalReason = "completed";
           return { status: "completed", result: executionOutcome.content };
         } catch (err) {
           const httpError = err as Error & {
@@ -1542,6 +1937,7 @@ export class AERServer extends BaseServer {
             // preparation): the staged CANCELLED callback carries the
             // rescued checkpoint's coordinate for OE's branch-source selector.
             await commitCancelledTurnBestEffort();
+            journalReason = "aborted";
             return { status: "cancelled" };
           }
           // A policy denial is a deliberate, terminal outcome. Attach a
@@ -1654,6 +2050,13 @@ export class AERServer extends BaseServer {
                 null,
                 "AER",
               );
+              // The turn is failing: drain accepted output best-effort
+              // (bounded) before the settlement, preserving the original
+              // uncoded error.
+              await this.drainDurableChunksBestEffort(
+                request.execution_id,
+                "uncoded LLM error",
+              );
               stageCallback("ERROR", {
                 error: uncodedMsg,
               });
@@ -1691,6 +2094,20 @@ export class AERServer extends BaseServer {
             if (!httpError.statusCode) httpError.statusCode = 500;
             throw httpError;
           }
+          if (err instanceof DurableAckError) {
+            // A sender failure surfaced during production (budget exhausted,
+            // fatal engine response, undeliverable chunk): the turn must not
+            // be presented as complete, so it takes the same coded ERROR
+            // terminal + callback path as a failed settlement drain.
+            await this.failIncompleteDurableTurn(request, stageCallback, err);
+          }
+          // A turn that is failing still drains its outstanding chunks
+          // best-effort (bounded) so accepted output is not lost with the
+          // sender; the original error is preserved either way.
+          await this.drainDurableChunksBestEffort(
+            request.execution_id,
+            "execution error",
+          );
           const errorMsg = err instanceof Error ? err.message : String(err);
           logExecutionCallback(
             request.execution_id,
@@ -1717,6 +2134,31 @@ export class AERServer extends BaseServer {
           closeSessionFinish();
           clearTimeout(timeoutHandle);
           this.chunkSeq.delete(request.execution_id);
+          // The settlement paths have already drained or failed the turn, so
+          // anything still queued here can no longer be presented; stop the
+          // poster before the callback delivery below.
+          try {
+            const sender = this.durableAckSenders.get(request.execution_id);
+            if (sender !== undefined) {
+              this.durableAckSenders.delete(request.execution_id);
+              await sender.close();
+            }
+          } catch (error) {
+            rememberCleanupError("chunk sender shutdown", error);
+          }
+
+          // Close this turn's journal before the callback delivery: the writer
+          // drains every chunk already accepted and writes the end marker
+          // naming the outcome, so a follower sees the terminal chunk before
+          // the end. Every exit reaches this, including suspension (which
+          // sends no closing chunk of its own); an unset reason means an
+          // unexpected exit, which closes as "error" so a follower is never
+          // told an untrusted prefix is complete.
+          try {
+            await this.closeStreamJournal(request, journalReason ?? "error");
+          } catch (error) {
+            rememberCleanupError("stream journal close", error);
+          }
 
           try {
             await wrapper.close();
@@ -1799,6 +2241,185 @@ export class AERServer extends BaseServer {
     );
   }
 
+  /**
+   * Open this turn's stream journal and register its generation for chunk
+   * recording.
+   *
+   * Built only when the engine set `stream_journal_enabled` with a non-zero
+   * generation, and closed by the execution's finally. The registry keeps the
+   * body (and, after eviction, its index) for the runner's lifetime.
+   */
+  private async openStreamJournal(
+    request: ExecuteRequest,
+    sessionId: string,
+  ): Promise<void> {
+    const generation = request.stream_generation;
+    // The generation is the journal's key. A dispatch that omits it (or
+    // carries 0) is not a journal dispatch, so the legacy path stays untouched
+    // rather than producing an unaddressable body.
+    if (
+      !request.stream_journal_enabled ||
+      !Number.isInteger(generation) ||
+      generation <= 0
+    ) {
+      return;
+    }
+    this.journalGeneration.set(request.execution_id, generation);
+    await this.streamJournal.openJournal(
+      request.execution_id,
+      sessionId,
+      generation,
+    );
+  }
+
+  /**
+   * Close this execution's journal with a lifecycle reason.
+   *
+   * Idempotent, so both the preparation guard and the execution's finally can
+   * call it: whichever runs first owns the end marker.
+   */
+  private async closeStreamJournal(
+    request: ExecuteRequest,
+    reason: JournalReason,
+  ): Promise<void> {
+    const generation = this.journalGeneration.get(request.execution_id);
+    if (generation === undefined) return;
+    this.journalGeneration.delete(request.execution_id);
+    await this.streamJournal.closeJournal(
+      request.execution_id,
+      generation,
+      reason,
+    );
+  }
+
+  /**
+   * Register this execution's ordered durable chunk sender.
+   *
+   * Built only when the engine asked for it (a journal dispatch or a
+   * negotiated durable acknowledgement), and torn down by the execution's
+   * finally. A journal dispatch builds the poster in journal mode, where live
+   * delivery is best effort and settlement is not gated; a dispatch that
+   * carries both fields is a journal dispatch. The owner pre-attempt follows
+   * the shared owner-callback policy through the same helpers the legacy chunk
+   * POST uses: one best-effort attempt, service fallback, owner never retried,
+   * and the failure latched so later settlement posts skip the owner.
+   */
+  private startDurableChunkSender(
+    request: ExecuteRequest,
+    ownerUrlFailure: OwnerUrlFailureState,
+    cancellationSignal: AbortSignal,
+    productionSignal: AbortSignal,
+  ): void {
+    const executionId = request.execution_id;
+    this.durableAckSenders.set(
+      executionId,
+      new DurableChunkSender({
+        executionId,
+        chunkUrl: `${request.platform_api_url}/stream/chunk`,
+        deadlineMs: performance.now() + DURABLE_ACK_TURN_BUDGET_MS,
+        cancellationSignal,
+        productionSignal,
+        journalMode: request.stream_journal_enabled,
+        ownerUrlGetter: () => {
+          const ownerCallbacks = getOwnerCallbackUrls(this);
+          const owner =
+            getCurrentExecutionId() === executionId
+              ? getCurrentOeOwnerUrl()
+              : (ownerCallbacks.get(executionId) ?? null);
+          return owner ? `${owner}/stream/chunk` : null;
+        },
+        onOwnerFailure: () => {
+          getOwnerCallbackUrls(this).delete(executionId);
+          if (getCurrentExecutionId() === executionId) {
+            reportOeOwnerUrlFailure();
+          }
+          // Explicit latch: the poster runs as its own async chain, and
+          // setting it here keeps the failure visible to the settlement paths
+          // regardless of async-context propagation.
+          ownerUrlFailure.failed = true;
+        },
+      }),
+    );
+  }
+
+  /**
+   * Drain the turn's outstanding chunks within a bounded window.
+   *
+   * Best-effort: a turn that is already failing must not be held on the
+   * network while the engine is unresponsive, so a drain that cannot finish
+   * within the window is abandoned with a warning and the caller proceeds.
+   */
+  private async drainDurableChunksBestEffort(
+    executionId: string,
+    label: string,
+  ): Promise<void> {
+    const sender = this.durableAckSenders.get(executionId);
+    if (sender === undefined) return;
+    try {
+      await sender.settle(DURABLE_ACK_ERROR_DRAIN_TIMEOUT_MS);
+    } catch (ackErr) {
+      logger.warn(
+        `Draining ${label} execution ${executionId} chunks before its ERROR ` +
+          `terminal failed within the bounded window; proceeding anyway: ${
+            ackErr instanceof Error ? ackErr.message : String(ackErr)
+          }`,
+      );
+    }
+  }
+
+  /**
+   * Fail a turn whose chunks could not be acknowledged, never as complete.
+   *
+   * Reached when the settlement gate found unacknowledged chunks (budget
+   * exhausted, or a fatal engine response): the turn is failed with an error
+   * terminal and an ERROR callback so the engine settles it as errored — a
+   * resume can retry — instead of completing a turn whose stream has a gap.
+   * Throws an `alreadyReported` 500 so the outer catch re-raises without
+   * reporting a second time and the /execute response reports the failure.
+   */
+  private async failIncompleteDurableTurn(
+    request: ExecuteRequest,
+    stageCallback: (
+      status: string,
+      fields?: ExecutorCallbackFields,
+    ) => ExecutorCallbackRequest,
+    error: unknown,
+  ): Promise<never> {
+    const detail = error instanceof Error ? error.message : String(error);
+    const errorMsg = `Stream chunk delivery could not be durably acknowledged: ${detail}`;
+    logger.warn(
+      `Refusing to present execution ${request.execution_id} as complete: ${detail}`,
+    );
+    try {
+      await this.sendStreamChunk(
+        request.platform_api_url,
+        request.execution_id,
+        ERROR,
+        "",
+        errorMsg,
+        { error_code: DURABLE_ACK_INCOMPLETE_ERROR_CODE },
+      );
+    } catch (chunkErr) {
+      logger.error(
+        { err: chunkErr },
+        `Failed to deliver durable-ack ERROR chunk for execution ${request.execution_id} after retries`,
+      );
+    }
+    stageCallback("ERROR", {
+      error: errorMsg,
+      metadata: { error_code: DURABLE_ACK_INCOMPLETE_ERROR_CODE },
+    });
+    const httpError = new Error(errorMsg) as Error & {
+      statusCode: number;
+      alreadyReported?: boolean;
+    };
+    httpError.statusCode = 500;
+    // Terminal ERROR chunk + callback are already sent above. Mark the error
+    // so the outer catch re-raises without reporting a second time.
+    httpError.alreadyReported = true;
+    throw httpError;
+  }
+
   private async sendStreamChunk(
     oeUrl: string,
     executionId: string,
@@ -1812,7 +2433,7 @@ export class AERServer extends BaseServer {
     const seq = (this.chunkSeq.get(executionId) ?? 0) + 1;
     this.chunkSeq.set(executionId, seq);
 
-    const chunk = {
+    const chunk: Record<string, unknown> = {
       execution_id: executionId,
       chunk_type: chunkType,
       content,
@@ -1820,7 +2441,38 @@ export class AERServer extends BaseServer {
       metadata,
       seq,
     };
+    // Stream journal, only for a journaled turn: stamp the generation and
+    // record the chunk (terminal included) before it is posted, so the journal
+    // is a complete, ordered copy of what the engine was sent. The recording
+    // never blocks; a bound drops the chunk and marks the journal incomplete.
+    const generation = this.journalGeneration.get(executionId);
+    if (generation !== undefined) {
+      chunk["generation"] = generation;
+      this.streamJournal.append(executionId, generation, {
+        kind: "chunk",
+        seq,
+        generation,
+        chunk,
+      });
+    }
     const terminal = chunkType === DONE || chunkType === ERROR;
+    const durableSender = this.durableAckSenders.get(executionId);
+    if (durableSender !== undefined && !terminal) {
+      // Ordered poster path: queue for the coalescing poster, which retries in
+      // order until the engine confirms durable persistence. On the
+      // durable-ack path a sender failure propagates — dropping the chunk
+      // would silently present an incomplete turn as complete. On the journal
+      // path the poster is in journal mode: it never blocks or fails the turn,
+      // and a chunk it cannot deliver live is dropped (the journal keeps it).
+      await durableSender.send(chunk);
+      return;
+    }
+    if (durableSender !== undefined && chunkType === ERROR) {
+      // A failing turn drains its outstanding chunks best-effort first
+      // (bounded, so the error terminal is not held), then delivers the error
+      // regardless: the turn is already failing.
+      await this.drainDurableChunksBestEffort(executionId, "error terminal");
+    }
     const ownerCallbacks = getOwnerCallbackUrls(this);
     const owner =
       getCurrentExecutionId() === executionId
@@ -2064,13 +2716,15 @@ export class AERServer extends BaseServer {
       );
     }
 
-    // Flush trace spans before the OE frees this pod: /finish triggers a
-    // zero-grace teardown, so spans still queued in the BatchSpanProcessor
-    // would otherwise be lost. Best-effort and bounded.
+    // The run root ended with the turn, but a batch processor ships spans
+    // asynchronously. Flush (bounded) before the release request so the root
+    // reaches the trace store, instead of dying with the pod under the OE's
+    // zero-grace teardown. Best-effort: a slow store must not hold the release
+    // open, and a failure just leaves the run to the idle sweep.
     try {
       if (!(await forceFlushTracing(SESSION_FINISH_TRACE_FLUSH_TIMEOUT_MS))) {
         logger.warn(
-          "Trace flush before session release timed out; some spans may be lost",
+          "Session finish: tracing flush did not complete before releasing; the run root may be missing from traces",
         );
       }
     } catch (e) {

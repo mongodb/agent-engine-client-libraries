@@ -634,9 +634,15 @@ def test_appbound_crud_satisfies_protocol() -> None:
     assert isinstance(crud, MemoryCrudClient)
 
 
-def test_create_semantic_maps_bool_to_acknowledged() -> None:
+def test_create_semantic_preserves_durable_operation_receipt() -> None:
     tenant = MagicMock()
-    tenant.save_semantic.return_value = True
+    tenant.create_semantic.return_value = CreateSemanticResult(
+        id=None,
+        label="L",
+        has_embedding=False,
+        operation_id="operation-1",
+        operation_status="queued",
+    )
     crud = AppBoundCrudClient(tenant)
 
     meta = {"k": "v"}
@@ -652,11 +658,13 @@ def test_create_semantic_maps_bool_to_acknowledged() -> None:
     assert res.label == "L"
     assert res.has_embedding is False
     assert res.acknowledged is True
-    assert res.id == ""
+    assert res.id is None
+    assert res.operation_id == "operation-1"
+    assert res.operation_status == "queued"
 
     # Protocol → TenantRuntime: metadata is forwarded as metadata; upsert must
     # be forwarded (tenant default is True, protocol default is False).
-    _, kwargs = tenant.save_semantic.call_args
+    _, kwargs = tenant.create_semantic.call_args
     assert kwargs["metadata"] is meta
     assert "contextual_metadata" not in kwargs
     assert kwargs["upsert"] is True
@@ -665,11 +673,51 @@ def test_create_semantic_maps_bool_to_acknowledged() -> None:
 
 def test_create_semantic_false_is_not_acknowledged() -> None:
     tenant = MagicMock()
-    tenant.save_semantic.return_value = False
+    tenant.create_semantic.return_value = CreateSemanticResult(
+        id=None, label="L", has_embedding=False, acknowledged=False
+    )
     crud = AppBoundCrudClient(tenant)
 
     res = crud.create_semantic(label="L", text="T", user_id="u")
     assert res.acknowledged is False
+
+
+@pytest.mark.parametrize("unavailable", [False, True])
+def test_facade_semantic_write_preserves_engine_receipt_or_failure(monkeypatch, unavailable):
+    from agent_engine_sdk_memory import Memory
+
+    from agent_engine_runner_shared.runtime import TenantRuntime
+
+    _set_ambient(monkeypatch, user_id="ambient-user")
+    tenant = object.__new__(TenantRuntime)
+    tenant.org_id = "org"
+    tenant.project_id = "project"
+    engine = MagicMock()
+    tenant._memory_engine = engine
+    receipt = CreateSemanticResult(
+        id=None,
+        label="L",
+        has_embedding=False,
+        operation_id="accepted-operation",
+        operation_status="queued",
+    )
+    engine.create_semantic.return_value = receipt
+    memory = Memory(runtime=AppBoundRuntime(tenant), client=AppBoundCrudClient(tenant))
+    if unavailable:
+        engine.create_semantic.side_effect = RuntimeError("submission unavailable")
+        with pytest.raises(RuntimeError, match="submission unavailable"):
+            memory.save_semantic(label="L", text="fact", idempotency_key="stable-write")
+    else:
+        result = memory.save_semantic(label="L", text="fact", idempotency_key="stable-write")
+        assert result.id is None
+        assert result.operation_id == "accepted-operation"
+        assert result.operation_status == "queued"
+        kwargs = engine.create_semantic.call_args.kwargs
+        assert kwargs["org_id"] == "org"
+        assert kwargs["project_id"] == "project"
+        assert kwargs["user_id"] == "ambient-user"
+        assert kwargs["idempotency_key"] == "stable-write"
+        assert kwargs["metadata"] is None
 
 
 def test_create_episodic_maps_doc_id() -> None:
@@ -877,7 +925,13 @@ def test_facade_save_semantic_uses_ambient_user_id() -> None:
     )
 
     tenant = MagicMock()
-    tenant.save_semantic.return_value = True
+    tenant.create_semantic.return_value = CreateSemanticResult(
+        id=None,
+        label="L",
+        has_embedding=False,
+        operation_id="operation-1",
+        operation_status="queued",
+    )
     memory = Memory(
         runtime=AppBoundRuntime(tenant),
         client=AppBoundCrudClient(tenant),
@@ -890,14 +944,15 @@ def test_facade_save_semantic_uses_ambient_user_id() -> None:
         user_id="ambient-user",
     )
     try:
-        result = memory.save_semantic(text="t", label="l")
+        result = memory.save_semantic(text="t", label="l", idempotency_key="logical-write")
     finally:
         clear_execution_context(tokens)
 
     assert isinstance(result, CreateSemanticResult)
     assert result.acknowledged is True
-    _, kwargs = tenant.save_semantic.call_args
+    _, kwargs = tenant.create_semantic.call_args
     assert kwargs["user_id"] == "ambient-user"
+    assert kwargs["idempotency_key"] == "logical-write"
 
 
 # ---------------------------------------------------------------------------
@@ -945,7 +1000,13 @@ def test_appbound_tenancy_comes_from_tenant_not_public_arg(
     """The facade forwards only user identity; org/project stay tenant-internal."""
     tenant = MagicMock()
     tenant.search_semantic.return_value = []
-    tenant.save_semantic.return_value = True
+    tenant.create_semantic.return_value = CreateSemanticResult(
+        id=None,
+        label="L",
+        has_embedding=False,
+        operation_id="operation-1",
+        operation_status="queued",
+    )
     _set_ambient(monkeypatch, user_id="u")
     memory = _appbound_facade(tenant)
 
@@ -956,7 +1017,7 @@ def test_appbound_tenancy_comes_from_tenant_not_public_arg(
     assert "project_id" not in search_kwargs
 
     memory.save_semantic(text="t", label="l")
-    _, save_kwargs = tenant.save_semantic.call_args
+    _, save_kwargs = tenant.create_semantic.call_args
     assert save_kwargs["user_id"] == "u"
     assert "org_id" not in save_kwargs
     assert "project_id" not in save_kwargs

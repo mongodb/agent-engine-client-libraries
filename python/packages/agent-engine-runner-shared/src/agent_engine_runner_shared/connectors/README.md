@@ -93,8 +93,10 @@ server declarations do not create runtime routing. Secret values are never part 
 published catalog. The stable definition supports the parameter, body, and static
 credential presentations documented in the generator atlas.
 
-Unknown top-level tool arguments are ignored; arbitrary keys within a wrapped body are
-preserved according to its schema. Compiled schemas must contain strict JSON values so
+Unknown top-level tool arguments are rejected before any request, with an error that
+names them: dropping them would turn a misshaped write into an empty request the
+provider accepts. Arbitrary keys within a wrapped body are preserved according to its
+schema. Compiled schemas must contain strict JSON values so
 their published tool descriptions are serializable. The generated top-level argument
 envelope supports only `type`, `properties` and `required`; full JSON Schema composition
 remains available inside mapped properties such as a wrapped `body`. OAuth token

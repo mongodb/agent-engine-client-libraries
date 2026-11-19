@@ -271,6 +271,22 @@ export const ExecuteRequestSchema = z.object({
    * chunk per POST and today's retry semantics.
    */
   durable_ack_enabled: z.boolean().default(false),
+  /**
+   * True when the turn's chunks are recorded in the runner's own stream
+   * journal, which — not live delivery — is the durable copy: live delivery
+   * becomes best effort, so a full queue or an exhausted retry budget drops
+   * chunks instead of blocking producers, and settlement does not wait for
+   * delivery to drain. Takes precedence over `durable_ack_enabled` when both
+   * are set. Absent/false leaves the chunk path untouched.
+   */
+  stream_journal_enabled: z.boolean().default(false),
+  /**
+   * Generation this dispatch opened for the stream journal. The runner stamps
+   * it on every chunk and keys the journal by it, so a resume leg carries a
+   * higher generation and addresses a separate body. 0/absent disables
+   * journaling even when `stream_journal_enabled` is set.
+   */
+  stream_generation: z.number().int().nonnegative().default(0),
 });
 export type ExecuteRequest = z.infer<typeof ExecuteRequestSchema>;
 

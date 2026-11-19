@@ -2,9 +2,10 @@
 
 from unittest.mock import Mock, patch
 
+import httpx
 import pytest
 from agent_engine_sdk_memory._client import MemoryClient
-from agent_engine_sdk_memory.errors import MemoryIdentityError
+from agent_engine_sdk_memory.errors import MemoryIdentityError, MemoryServerError
 from agent_engine_sdk_memory.models import (
     ContextResponse,
     CreateEpisodicResult,
@@ -1310,10 +1311,12 @@ class TestProceduralLookupByName:
             id="mem-1",
             user_id="user-1",
             metadata={"k": "v"},
+            idempotency_key="edit-one",
         )
 
         patch_body = mock_httpx_client.patch.call_args[1]["json"]
         assert patch_body["metadata"] == {"k": "v"}
+        assert patch_body["idempotency_key"] == "edit-one"
 
     def test_update_procedural_omits_metadata_when_absent(self, mock_httpx_client):
         updated = {"id": "mem-1", "procedure": "my-proc"}
@@ -1332,6 +1335,25 @@ class TestProceduralLookupByName:
 
         patch_body = mock_httpx_client.patch.call_args[1]["json"]
         assert "metadata" not in patch_body
+
+    def test_update_procedural_forwards_atomic_preconditions(self, mock_httpx_client):
+        mock_httpx_client.patch.return_value = self._ok_response(
+            mock_httpx_client, {"id": "mem-1", "procedure": "my-proc"}
+        )
+        client = MemoryClient("http://localhost:8081")
+        client.update_procedural(
+            "org-1",
+            "proj-1",
+            id="mem-1",
+            user_id="user-1",
+            visibility="org",
+            if_user_id="user-1",
+            if_visibility="private",
+        )
+        kwargs = mock_httpx_client.patch.call_args.kwargs
+        assert kwargs["params"] == {"if_user_id": "user-1", "if_visibility": "private"}
+        assert kwargs["json"]["user_id"] == "user-1"
+        assert kwargs["json"]["visibility"] == "org"
 
     def test_delete_procedural_forwards_identity(self, mock_httpx_client):
         """user_id/visibility must reach both the by-name lookup GET and the
@@ -1505,3 +1527,144 @@ class TestMemoryIdUrlEncoding:
 
         mock_httpx_client.get.assert_not_called()
         mock_httpx_client.delete.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        httpx.Response(201, text="<html>proxy page</html>"),
+        httpx.Response(201, json=None),
+        httpx.Response(201, json={"unexpected": True}),
+    ],
+    ids=["non-JSON", "null", "missing fields"],
+)
+def test_malformed_success_body_raises_server_error(response):
+    client = MemoryClient(
+        "http://memory", transport=httpx.MockTransport(lambda _: response)
+    )
+
+    with pytest.raises(MemoryServerError, match="malformed write_turn response"):
+        client.write_turn(
+            session_id="s",
+            role="user",
+            content="hi",
+            org_id="o",
+            user_id="u",
+            project_id="p",
+        )
+
+
+def _client_answering(body):
+    return MemoryClient(
+        "http://memory",
+        transport=httpx.MockTransport(lambda _: httpx.Response(200, json=body)),
+    )
+
+
+# (client call that reads a collection, the collection's key, its valid item,
+#  the result for an empty collection)
+COLLECTION_CALLS = [
+    (
+        lambda c: c.fetch_semantic_memories(query="q", org_id="o", project_id="p"),
+        "memories",
+        {},
+        [],
+    ),
+    (
+        lambda c: c.fetch_episodic_memories(query="q", org_id="o", project_id="p"),
+        "memories",
+        {},
+        [],
+    ),
+    (
+        lambda c: c.fetch_taxonomic_memories(query="q", org_id="o", project_id="p"),
+        "memories",
+        {},
+        [],
+    ),
+    (
+        lambda c: c.fetch_procedural_memories(query="q", org_id="o", project_id="p"),
+        "memories",
+        {},
+        [],
+    ),
+    (
+        lambda c: c.discover_procedures(query="q", org_id="o", project_id="p"),
+        "memories",
+        {},
+        [],
+    ),
+    (lambda c: c.list_episodic(org_id="o", project_id="p"), "entries", {}, []),
+    (lambda c: c.get_distinct_domains(org_id="o", project_id="p"), "domains", "d", []),
+    (
+        lambda c: c.get_semantic(org_id="o", project_id="p", label="l"),
+        "entries",
+        {},
+        None,
+    ),
+    (
+        lambda c: c.get_taxonomic(org_id="o", project_id="p", domain="d"),
+        "entries",
+        {},
+        None,
+    ),
+    (
+        lambda c: c.get_procedural(org_id="o", project_id="p", procedure="x"),
+        "entries",
+        {},
+        None,
+    ),
+]
+COLLECTION_IDS = [
+    "search semantic",
+    "search episodic",
+    "search taxonomic",
+    "search procedural",
+    "discover procedures",
+    "list episodic",
+    "list domains",
+    "lookup semantic by label",
+    "lookup taxonomic",
+    "lookup procedure by name",
+]
+
+
+@pytest.mark.parametrize(
+    ("call", "key", "item", "empty"), COLLECTION_CALLS, ids=COLLECTION_IDS
+)
+@pytest.mark.parametrize(
+    "malformed", ["not an object", "missing", "null", "not a list", "bad item"]
+)
+def test_malformed_collection_raises_server_error(call, key, item, empty, malformed):
+    # A malformed success body must not read as "no results" or "not found".
+    body = {
+        "not an object": ["unexpected"],
+        "missing": {"count": 0},
+        "null": {key: None},
+        "not a list": {key: {}},
+        "bad item": {key: [1]},
+    }[malformed]
+
+    with pytest.raises(MemoryServerError):
+        call(_client_answering(body))
+
+
+@pytest.mark.parametrize(
+    ("call", "key", "item", "empty"), COLLECTION_CALLS, ids=COLLECTION_IDS
+)
+def test_empty_collection_is_a_normal_result(call, key, item, empty):
+    assert call(_client_answering({key: []})) == empty
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        lambda c: c.get_semantic(org_id="o", project_id="p", id="1"),
+        lambda c: c.get_procedural(org_id="o", project_id="p", id="1"),
+    ],
+    ids=["semantic by id", "procedure by id"],
+)
+def test_lookup_by_id_rejects_a_body_that_is_not_a_record(call):
+    with pytest.raises(MemoryServerError):
+        call(_client_answering(["unexpected"]))
+    assert call(_client_answering({"id": "1"})) == {"id": "1"}

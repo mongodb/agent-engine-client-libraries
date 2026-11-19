@@ -102,6 +102,96 @@ describe("MemoryClientAdapter routing", () => {
     const body = calls[0].body as Record<string, unknown>;
     expect(body.metadata).toEqual({ channel: "web" });
   });
+
+  it("preserves an accepted async operation and forwards its idempotency key", async () => {
+    const { fetchImpl, calls } = fakeFetch([
+      {
+        status: 202,
+        json: {
+          id: null,
+          label: "l",
+          has_embedding: false,
+          acknowledged: true,
+          operation_id: "operation-123",
+          operation_status: "queued",
+        },
+      },
+    ]);
+    const result = await adapter({ fetchImpl }).createSemantic({
+      label: "l",
+      text: "t",
+      userId: "u",
+      idempotencyKey: "semantic-idem-1",
+    });
+    expect((calls[0].body as Record<string, unknown>).idempotency_key).toBe(
+      "semantic-idem-1",
+    );
+    expect(result).toMatchObject({
+      id: null,
+      operation_id: "operation-123",
+      operation_status: "queued",
+    });
+  });
+
+  it.each([undefined, ""])(
+    "does not resubmit a lost response without a nonempty key (%s)",
+    async (idempotencyKey) => {
+      const { fetchImpl, calls } = fakeFetch([
+        new TypeError("Response lost after submission"),
+        {
+          status: 202,
+          json: {
+            id: null,
+            label: "l",
+            has_embedding: false,
+            acknowledged: true,
+            operation_id: "duplicate-operation",
+            operation_status: "queued",
+          },
+        },
+      ]);
+      await expect(
+        adapter({ fetchImpl }).createSemantic({
+          label: "l",
+          text: "t",
+          userId: "u",
+          idempotencyKey,
+        }),
+      ).rejects.toThrow();
+      expect(calls).toHaveLength(1);
+    },
+  );
+
+  it("resubmits a lost response with the same key and payload", async () => {
+    const receipt = {
+      id: null,
+      label: "l",
+      has_embedding: false,
+      acknowledged: true,
+      operation_id: "operation-123",
+      operation_status: "queued",
+    };
+    const { fetchImpl, calls } = fakeFetch([
+      new TypeError("Response lost after submission"),
+      { status: 202, json: receipt },
+    ]);
+    const result = await adapter({ fetchImpl }).createSemantic({
+      label: "l",
+      text: "t",
+      userId: "u",
+      idempotencyKey: "semantic-idem-1",
+    });
+    expect(calls).toHaveLength(2);
+    expect(calls[1].body).toEqual(calls[0].body);
+    expect((calls[1].body as Record<string, unknown>).idempotency_key).toBe(
+      "semantic-idem-1",
+    );
+    expect(result).toMatchObject({
+      id: null,
+      operation_id: "operation-123",
+      operation_status: "queued",
+    });
+  });
 });
 
 describe("MemoryClientAdapter error translation", () => {

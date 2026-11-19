@@ -1,0 +1,21 @@
+name: a2a-relay-agent
+entrypoint: a2a_relay_agent.agent:app
+
+# The relay has no LLM and no tools of its own: its single graph node forwards
+# the user's message to a peer agent over A2A and replies with the peer's
+# result. A2A must be enabled for the SDK to attach the A2A client; the peer
+# is addressed by name through the A2A_RELAY_TARGET env var (default
+# "Insurance Agent", the peer's App app_name; matching ignores case and
+# separators).
+a2a:
+  enabled: true
+  skills:
+    - name: relay
+      description: Forwards a message verbatim to a peer agent and returns its reply.
+
+features:
+  guardrails: false
+  memory: false
+
+network:
+  egress_mode: deny_all

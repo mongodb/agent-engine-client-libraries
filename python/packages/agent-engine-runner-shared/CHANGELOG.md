@@ -8,12 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
-- Spans go to the platform trace endpoint (`POST /internal/traces`) by default
-  whenever `OE_URL` is set, so the OE can redact PII in them. `AGENTIC_TRACE_EXPORTER`
-  no longer needs to be `1`; set it to `0` or `false` to keep the direct MongoDB
-  path, which stores spans without redaction. `0.11.14` is the Python floor
-  for span redaction. Earlier releases write spans straight to MongoDB unless
-  `AGENTIC_TRACE_EXPORTER=1`, and the platform cannot detect this.
+- Spans go to the platform trace endpoint (`POST /internal/traces`) whenever
+  `OE_URL` is set, so the OE can redact PII in them. `0.11.14` is the first
+  version that does this. Earlier releases write spans straight to MongoDB
+  unless `AGENTIC_TRACE_EXPORTER=1`, and the platform cannot detect this.
 - **Breaking:** the connector `tool.yaml` `auth` block no longer takes `type`.
   It names exactly one credential: `bearer: <secret>`, `basic: {username,
   password}`, `api_keys: [{env, location, name, prefix}]`, or
@@ -31,6 +29,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   credential.
 
 ### Removed
+- **Breaking:** `AGENTIC_TRACE_EXPORTER` no longer has any effect. Setting it
+  to `0` or `false` does not turn off the platform trace exporter.
 - Removed the unused pre-materialized connector bundle override
   (`AGENTIC_CONNECTOR_BUNDLE_PATH`) and the `load_connector_bundle` /
   `CONNECTOR_BUNDLE_PATH_ENV` exports. Connectors resolve only from

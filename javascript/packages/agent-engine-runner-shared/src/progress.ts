@@ -19,6 +19,7 @@
 import { randomUUID } from "node:crypto";
 
 import {
+  getCurrentEmitChunk,
   getCurrentExecutionId,
   getCurrentOeOwnerUrl,
   getCurrentOeUrl,
@@ -119,6 +120,20 @@ export async function emit(event: string, data: string): Promise<void> {
       `emit: event '${event}' is reserved for infrastructure use; ` +
         `choose a non-terminal event type such as 'step'`,
     );
+  }
+
+  // A journaled turn installs a request-scoped sink: the chunk is then
+  // sequenced and recorded on the turn's journal, so a replay is a complete
+  // copy of what the client saw. Outside the AER (a Tool Pod tool) there is no
+  // sink and progress keeps its own best-effort transport.
+  const sink = getCurrentEmitChunk();
+  if (sink !== null) {
+    try {
+      await sink(event, data);
+    } catch (exc) {
+      logger.debug(`emit: local sink failed: ${String(exc)}`);
+    }
+    return;
   }
 
   const executionId = getCurrentExecutionId();

@@ -145,6 +145,16 @@ export function explicitCheckpointId(ctx: RequestContext): string | undefined {
   return checkpointId?.startsWith("thread:") ? undefined : checkpointId;
 }
 
+/**
+ * Returned by interrupt settlement when the graph continues from its
+ * checkpoint without a resume value: every settled pause was answered by the
+ * platform, not through LangGraph's resume values.
+ */
+export const CONTINUE_FROM_CHECKPOINT = Symbol("continue from checkpoint");
+
+/** How the graph runs again after its pauses were answered. */
+export type GraphContinuation = Command | typeof CONTINUE_FROM_CHECKPOINT;
+
 export abstract class ExecutionSession {
   abstract readonly resumed: boolean;
   readonly threadId: string;
@@ -237,13 +247,13 @@ export abstract class ExecutionSession {
     response: string,
     messages: readonly unknown[],
     raised: readonly Interrupt[],
-  ): Promise<Command | AgentOutput | null>;
+  ): Promise<GraphContinuation | AgentOutput | null>;
 
   abstract streamInterrupt(
     config: RunnableConfig,
     captured: readonly Interrupt[],
     messages: readonly BaseMessage[],
-  ): Promise<Command | StreamEvent | null>;
+  ): Promise<GraphContinuation | StreamEvent | null>;
 
   abstract complete(): Promise<ExecutionMetadata | void>;
 

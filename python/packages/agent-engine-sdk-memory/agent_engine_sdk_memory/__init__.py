@@ -14,6 +14,7 @@ from agent_engine_sdk_memory.errors import (
     MemoryNotProvisionedError,
     MemoryNotSupportedError,
     MemoryRouteNotFoundError,
+    MemorySearchWarning,
     MemoryServerError,
 )
 from agent_engine_sdk_memory.memory import Memory
@@ -38,6 +39,7 @@ __all__ = [
     "MemoryNotProvisionedError",
     "MemoryNotSupportedError",
     "MemoryRouteNotFoundError",
+    "MemorySearchWarning",
     "MemoryServerError",
 ]
 __all__ += models.__all__

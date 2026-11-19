@@ -43,7 +43,15 @@ class WriteTurnResult(BaseModel):
 class CreateSemanticResult(BaseModel):
     """Result of creating a semantic memory."""
 
-    id: str = Field(..., description="Created document ID")
+    id: str | None = Field(
+        None, description="Created document ID when the write completed inline"
+    )
+    operation_id: str | None = Field(
+        None, description="Durable asynchronous consolidation operation ID"
+    )
+    operation_status: str | None = Field(
+        None, description="Asynchronous operation status when operation_id is present"
+    )
     label: str = Field(..., description="Label of the memory")
     has_embedding: bool = Field(..., description="Whether embedding was generated")
     acknowledged: bool = Field(
@@ -61,6 +69,13 @@ class BulkCreateSemanticResult(BaseModel):
     has_embeddings: bool = Field(..., description="Whether embeddings were generated")
     acknowledged: bool = Field(
         default=True, description="Whether operation was acknowledged"
+    )
+    accepted_operations: list[CreateSemanticResult] = Field(
+        default_factory=list[CreateSemanticResult],
+        description="Durable operations accepted for asynchronous consolidation",
+    )
+    idempotency_key: str | None = Field(
+        None, description="Batch key to retain when retrying the same ordered items"
     )
 
 

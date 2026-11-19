@@ -141,6 +141,7 @@ function makeServer(
   };
   server.durabilityOwnerId = "owner";
   server.chunkSeq = new Map();
+  server.durableAckSenders = new Map();
   server.ownerCallbackUrl = new Map();
   server.pendingSessionFinish = new Set();
   server.executeViaAgentStream = vi.fn(async () => {

@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import random
 import time
+from collections.abc import Generator
+from contextlib import contextmanager
 from types import TracebackType
 from typing import Any, cast
 
@@ -76,9 +78,39 @@ def raise_for_status(resp: httpx.Response) -> None:
         raise MemoryBadRequestError(
             message, status=status, code=code, response_text=response_text
         )
+    # The memory server puts ``str(exception)`` into a 5xx ``detail``, which can
+    # carry connection strings or other internals. Agents log these messages,
+    # so a server error names only its status; a non-JSON body (a proxy page)
+    # stays on ``response_text`` for debugging.
     raise MemoryServerError(
-        message, status=status, code=code, response_text=response_text
+        f"memory server error (HTTP {status})",
+        status=status,
+        code=code,
+        response_text=response_text,
     )
+
+
+@contextmanager
+def malformed_body_as_server_error(resp: httpx.Response, what: str) -> Generator[None]:
+    """Map a failure to parse a 2xx body inside the block to ``MemoryServerError``.
+
+    Wrap the code that reads ``resp.json()`` and validates it into result
+    models. A non-JSON body, a payload of the wrong shape (``.get`` on a list,
+    iteration over ``None``), or a pydantic ``ValidationError`` then reaches the
+    caller as the SDK's typed server error instead of a raw ``ValueError``,
+    ``TypeError`` or ``AttributeError``. ``what`` names the operation in the
+    message (e.g. ``"create semantic"``).
+    """
+    try:
+        yield
+    except (ValueError, TypeError, AttributeError) as exc:
+        # pydantic's ValidationError and json's JSONDecodeError both subclass
+        # ValueError.
+        raise MemoryServerError(
+            f"the memory server returned a malformed {what} response",
+            status=resp.status_code,
+            response_text=resp.text,
+        ) from exc
 
 
 class _HttpTransport:

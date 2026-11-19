@@ -184,6 +184,10 @@ class InterruptedActivities {
     }
   }
 
+  isAnswered(position: ActivityPosition): boolean {
+    return this.answered.has(JSON.stringify(activityPositionKey(position)));
+  }
+
   forStep(
     stepOrdinal: number,
     includeAnswered: boolean,
@@ -585,6 +589,22 @@ export function runWithOperationPathResolver<T>(
   return resolverStorage.run(resolver, fn);
 }
 
+/**
+ * The operation boundaries the current scope resolves to, or undefined when
+ * no framework resolver is bound.
+ *
+ * A framework adapter captures them before entering a nested framework unit
+ * that its resolver cannot place, such as a LangGraph functional task, and
+ * rebinds them inside with `runWithOperationPathResolver` so activities there
+ * keep the enclosing graph's position.
+ */
+export function currentOperationBoundaries():
+  | readonly ChildOperationBoundary[]
+  | undefined {
+  const resolver = resolverStorage.getStore();
+  return resolver === undefined ? undefined : [...resolver()];
+}
+
 export function childOperationBoundaryScope<T>(
   boundary: ChildOperationBoundary,
   fn: () => T,
@@ -646,6 +666,13 @@ export function markInterruptedActivitiesAnswered(
   positions: readonly ActivityPosition[],
 ): void {
   activeHolder()?.interrupted.markAnswered(positions);
+}
+
+/** Whether this attempt settled the pause at `position` with its answer. */
+export function interruptedActivityAnswered(
+  position: ActivityPosition,
+): boolean {
+  return activeHolder()?.interrupted.isAnswered(position) ?? false;
 }
 
 /** Record that this attempt pauses for a review the platform halted a call for. */
