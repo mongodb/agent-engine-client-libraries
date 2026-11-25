@@ -229,6 +229,68 @@ def test_build_context_serializes_format_style_and_include_memories(runtime_fact
     assert body["include_memories"] is True
 
 
+def _context_body_handler(body: dict):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=body)
+
+    return handler
+
+
+@pytest.mark.parametrize(
+    "runtime_factory",
+    [_gateway_runtime, _oe_runtime],
+    ids=["gateway", "oe"],
+)
+def test_build_context_include_memories_parses_null_formatted_context(runtime_factory):
+    rt = runtime_factory(
+        _context_body_handler(
+            {
+                "formatted_context": None,
+                "metadata": {
+                    "token_count": 4,
+                    "memory_counts": {"semantic": 1},
+                    "timing": {},
+                },
+                "selected_memories": [
+                    {
+                        "id": "m1",
+                        "content": "Prefers email",
+                        "source": "semantic",
+                        "timestamp": "2026-11-19T00:00:00Z",
+                    }
+                ],
+            }
+        )
+    )
+
+    resp = rt.build_context(query="q", user_id="u1", include_memories=True)
+
+    assert resp.formatted_context is None
+    assert [m.content for m in resp.selected_memories] == ["Prefers email"]
+
+
+@pytest.mark.parametrize(
+    "runtime_factory",
+    [_gateway_runtime, _oe_runtime],
+    ids=["gateway", "oe"],
+)
+def test_build_context_body_without_context_or_memories_raises_server_error(
+    runtime_factory,
+):
+    rt = runtime_factory(
+        _context_body_handler(
+            {
+                "formatted_context": None,
+                "metadata": {"token_count": 0},
+                "selected_memories": None,
+            }
+        )
+    )
+
+    with pytest.raises(MemoryServerError):
+        rt.build_context(query="q", user_id="u1", include_memories=True)
+
+
 @pytest.mark.parametrize(
     "runtime_factory",
     [_gateway_runtime, _oe_runtime],
@@ -250,7 +312,11 @@ def test_build_context_from_sources_path_body_and_parse():
         query="q",
         sources=[
             SourceSpec(source="stm", top_k=5),
-            SourceSpec(source="semantic", metadata_filter={"channel": "web"}),
+            SourceSpec(
+                source="semantic",
+                metadata_filter={"channel": "web"},
+                include_history=True,
+            ),
         ],
         user_id="u1",
         session_id="s1",
@@ -278,6 +344,7 @@ def test_build_context_from_sources_path_body_and_parse():
             "mode": "semantic",
             "metadata_filter": {"channel": "web"},
             "top_k": 20,
+            "include_history": True,
         },
     ]
     # Tenancy comes from the route/headers, never the body.
@@ -389,6 +456,15 @@ def test_search_semantic():
     assert "session_id" not in body
 
 
+def test_search_semantic_forwards_history_opt_in():
+    rec = _Recorder()
+    rt = _gateway_runtime(_memories_response(rec))
+
+    rt.search_semantic(query="q", user_id="u1", include_history=True)
+
+    assert json.loads(rec.requests[-1].content)["include_history"] is True
+
+
 def test_search_tolerates_null_memories():
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"memories": None})
@@ -431,6 +507,16 @@ def test_discover_procedures_reshapes():
     body = json.loads(rec.requests[-1].content)
     assert body["type"] == "procedural"
     assert body["tags"] == ["t"]
+    assert "include_history" not in body
+
+
+def test_discover_procedures_forwards_history_opt_in():
+    rec = _Recorder()
+    rt = _gateway_runtime(_memories_response(rec))
+
+    rt.discover_procedures(query="q", user_id="u1", include_history=True)
+
+    assert json.loads(rec.requests[-1].content)["include_history"] is True
 
 
 def test_discover_procedures_tolerates_null_metadata():

@@ -2,22 +2,19 @@
 Tracing setup for Runner SDK.
 
 Provides a simple interface to initialize OpenTelemetry with popular
-AI/LLM instrumentors like OpenInference, exporting traces to MongoDB and,
-when configured, OTLP.
+AI/LLM instrumentors like OpenInference.
 
-When enabled, traces are written to:
-1. MongoDB collection (if configured)
+When enabled, traces are sent to:
+1. The Orchestration Engine trace endpoint (when OE_URL is set)
 2. OTLP endpoint (if configured)
 """
 
 from __future__ import annotations
 
 import logging
-import math
 import os
 import re
-import threading
-from typing import TYPE_CHECKING, Callable, Optional
+from typing import Optional
 
 from opentelemetry import trace
 from opentelemetry.context import Context
@@ -30,43 +27,16 @@ from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapProp
 from .conversation import mark_recorded_by_caller
 from .exporters import (
     ContentPolicyOTLPSpanExporter,
-    MongoDBSpanExporter,
     PlatformSpanExporter,
     get_content_capture_mode,
 )
-
-if TYPE_CHECKING:
-    from pymongo.collection import Collection
-    from pymongo.mongo_client import MongoClient
 
 logger = logging.getLogger(__name__)
 
 # Track if tracing has been set up.
 _tracer_provider: Optional[TracerProvider] = None
 
-# MongoDB trace-store exporter state. The store connection can fail at pod
-# startup (e.g. a transient Atlas TLS error); without retry the pod permanently
-# lost database tracing for its whole lifetime — a single warning, no recovery.
-# `_mongodb_exporter_attached` tracks whether a MongoDB span
-# processor is live; `_mongodb_degraded` marks a configured-but-unreachable
-# store so /health can surface DEGRADED. The retry thread re-attempts the
-# connection in the background and attaches the exporter on recovery.
-_mongodb_exporter_attached: bool = False
-_mongodb_degraded: bool = False
-_retry_stop_event: Optional[threading.Event] = None
-_retry_thread: Optional[threading.Thread] = None
-# Client retained only when tracing OWNS it — a retry-recovery attach, or an
-# explicit take_client_ownership=True at setup — so shutdown_tracing can close
-# the pool after flushing the provider. A caller-provided collection is never
-# retained: its client may be shared with application code. Mirrors the
-# TypeScript `tracingMongoClient` lifecycle, which only closes self-created
-# clients.
-_tracing_mongo_client: Optional["MongoClient"] = None
-
-# Platform trace-exporter state. The exporter is on whenever OE_URL is set: the
-# guest sends spans to the OE instead of writing MongoDB directly.
-# `_platform_exporter` is retained so /health can report its recent export
-# results and shutdown can reset it.
+# Retained so /health can report recent export results and shutdown can reset it.
 _platform_exporter: Optional[PlatformSpanExporter] = None
 
 # Explicit BatchSpanProcessor sizing for the platform exporter. A larger queue
@@ -171,12 +141,7 @@ class ExecutionContextSpanProcessor(SpanProcessor):
         return True
 
 
-def setup_tracing(
-    service_name: str = "runner-sdk",
-    mongodb_collection: Optional["Collection"] = None,
-    *,
-    take_client_ownership: bool = False,
-) -> None:
+def setup_tracing(service_name: str = "runner-sdk") -> None:
     """Set up OpenTelemetry tracing with OpenInference.
 
     OpenInference instrumentors will automatically
@@ -184,27 +149,11 @@ def setup_tracing(
 
     Args:
         service_name: Name of your service (appears in traces).
-        mongodb_collection: MongoDB collection for traces (optional).
-        take_client_ownership: Whether shutdown_tracing() closes the MongoClient
-            behind mongodb_collection. Default False — the caller keeps the
-            client, which may be shared with application code, and shutdown
-            leaves it open. Pass True only when the client was created solely
-            for tracing (as TenantRuntime._setup_tracing does); it is then
-            closed after the provider flush. Clients attached later by
-            attach_mongodb_tracing() (trace-store retry recovery) are always
-            owned — see its docstring.
 
     Example:
         setup_tracing(service_name="my-agent")
-
-        # With MongoDB (the client stays yours — shutdown_tracing won't close it):
-        setup_tracing(
-            service_name="my-agent",
-            mongodb_collection=client["mydb"]["traces"],
-        )
     """
     global _tracer_provider
-    global _mongodb_exporter_attached, _mongodb_degraded, _tracing_mongo_client
 
     if _tracer_provider is not None:
         logger.debug("Tracing already initialized")
@@ -217,36 +166,20 @@ def setup_tracing(
 
     provider.add_span_processor(ExecutionContextSpanProcessor())
 
-    # Destination: the OE platform trace endpoint whenever OE_URL is set,
-    # otherwise the caller-supplied MongoDB collection. The OE is the platform
-    # trace path and takes precedence — a guest with both must not keep writing
-    # MongoDB directly.
     oe_url = os.getenv("OE_URL", "").strip()
     otlp_configured = _otlp_endpoint_configured()
     if oe_url:
         _attach_platform_exporter(provider, oe_url)
-    elif mongodb_collection is not None:
-        provider.add_span_processor(BatchSpanProcessor(MongoDBSpanExporter(mongodb_collection)))
-        _mongodb_exporter_attached = True
-        if take_client_ownership:
-            _tracing_mongo_client = mongodb_collection.database.client
-        _mongodb_degraded = False
-        logger.info(
-            f"Tracing: MongoDB output to {mongodb_collection.database.name}.{mongodb_collection.name}"
-        )
     elif not otlp_configured:
-        logger.warning(
-            "Tracing: no trace destination configured "
-            "(OE_URL unset, no MongoDB collection, no OTLP endpoint)"
-        )
+        logger.warning("Tracing: no trace destination configured (OE_URL unset, no OTLP endpoint)")
 
     # Set as global tracer provider before attempting the OTLP block below —
     # a broken/misconfigured OTLP setup (missing extra, bad endpoint) must not
-    # prevent MongoDB from receiving spans too.
+    # prevent the platform exporter from receiving spans too.
     trace.set_tracer_provider(provider)
 
     # Add OTLP exporter (if an endpoint was explicitly configured). It is
-    # additive and never replaces MongoDB. Content-capture
+    # additive to the platform exporter. Content-capture
     # redaction (AGENTIC_PLATFORM_OTEL_CONTENT_CAPTURE) applies only to this path.
     # Guarded: an accidentally-set OTEL_EXPORTER_OTLP_* env var (or a missing
     # `tracing` extra) must not take down tracing setup entirely.
@@ -268,7 +201,7 @@ def setup_tracing(
             logger.info(f"Tracing: OTLP output enabled (content-capture={content_capture_mode})")
         except Exception:
             logger.warning(
-                "Failed to set up OTLP exporter — OTLP export disabled, MongoDB tracing unaffected",
+                "Failed to set up OTLP exporter — OTLP export disabled, platform tracing unaffected",
                 exc_info=True,
             )
 
@@ -336,44 +269,8 @@ def _instrument_httpx() -> None:
         )
 
 
-def attach_mongodb_tracing(collection: "Collection") -> bool:
-    """Attach the MongoDB span exporter to the active tracer provider.
-
-    Called from the background retry loop once a failed trace-store connection
-    recovers. Idempotent — a no-op if a MongoDB exporter is already
-    live. New spans created after this call route to the store; spans emitted
-    while the store was unreachable are not retroactively recovered.
-
-    Returns True when ``collection`` was wired in as the export target — on
-    success this module takes ownership of the collection's client and
-    ``shutdown_tracing`` closes it. False means the call was a no-op (already
-    attached, or provider gone) and the caller still owns the client.
-    """
-    global _mongodb_exporter_attached, _mongodb_degraded, _tracing_mongo_client
-    if _mongodb_exporter_attached:
-        return False
-    provider = _tracer_provider
-    if provider is None:
-        logger.warning("Cannot attach MongoDB tracing: tracer provider not initialized")
-        return False
-    provider.add_span_processor(BatchSpanProcessor(MongoDBSpanExporter(collection)))
-    _mongodb_exporter_attached = True
-    _tracing_mongo_client = collection.database.client
-    _mongodb_degraded = False
-    logger.info(
-        f"Tracing: MongoDB output attached to {collection.database.name}.{collection.name} "
-        "(trace store recovered)"
-    )
-    return True
-
-
 def tracing_status() -> dict[str, str]:
-    """Snapshot of the trace exporters for /health.
-
-    ``database_exporter`` is ``attached`` (a MongoDB span processor is live),
-    ``degraded`` (a store URI was configured but the startup connection failed
-    and the background retry is in progress), or ``disabled`` (no store URI was
-    configured — an intentional configuration, not a degradation).
+    """Snapshot of the platform trace exporter for /health.
 
     ``platform_exporter`` is ``attached`` (spans are sent to the OE),
     ``degraded`` (the most recent export did not fully succeed), or
@@ -385,15 +282,7 @@ def tracing_status() -> dict[str, str]:
         platform = "degraded"
     else:
         platform = "attached"
-
-    if _mongodb_exporter_attached:
-        database = "attached"
-    elif _mongodb_degraded:
-        database = "degraded"
-    else:
-        database = "disabled"
-
-    return {"database_exporter": database, "platform_exporter": platform}
+    return {"platform_exporter": platform}
 
 
 # The run is [^"'] (any char except quotes): it still crosses embedded
@@ -409,7 +298,7 @@ _MONGO_URI_USERINFO_PATTERN = re.compile(
 def scrub_credentials(message: str) -> str:
     """Mask the userinfo of any ``mongodb://`` / ``mongodb+srv://`` URI in an
     error message. Driver parse/connect errors echo the raw connection string,
-    and the trace-store URI carries customer database credentials.
+    and connection URIs carry customer database credentials.
 
     The userinfo run is GREEDY up to the LAST '@' that a host-shaped token
     follows, so passwords containing an unescaped '@', space, or '/' are still
@@ -424,117 +313,8 @@ def scrub_credentials(message: str) -> str:
     return _MONGO_URI_USERINFO_PATTERN.sub(r"\1***@", message)
 
 
-def _get_retry_interval_seconds() -> float:
-    """Retry interval (seconds) for the background trace-store reconnection.
-
-    A positive finite AGENTIC_TRACE_STORE_RETRY_INTERVAL_SECONDS wins;
-    anything else (unset, unparsable, non-positive, inf/nan) falls back to
-    30s — the same semantics as the TypeScript getRetryIntervalSeconds().
-    """
-    try:
-        raw = float(os.getenv("AGENTIC_TRACE_STORE_RETRY_INTERVAL_SECONDS", ""))
-    except ValueError:
-        return 30.0
-    return raw if math.isfinite(raw) and raw > 0 else 30.0
-
-
-def start_mongodb_tracing_retry(
-    connect: "Callable[[], Optional[Collection]]",
-    interval: Optional[float] = None,
-) -> None:
-    """Retry the trace-store connection in the background.
-
-    ``connect`` builds and pings a fresh MongoClient, returning a live
-    Collection on success or raising on failure (the retry loop swallows the
-    exception and tries again). The first attempt is delayed by ``interval``
-    seconds (default: AGENTIC_TRACE_STORE_RETRY_INTERVAL_SECONDS, or 30s) —
-    the startup attempt already failed, so an immediate retry would just
-    re-hit the same transient condition. The thread is a daemon, so it
-    never blocks process exit; ``shutdown_tracing`` signals it to stop and
-    joins it (bounded) before tearing down the provider. No-op if the
-    exporter is already attached or a retry is already running.
-    """
-    global _retry_stop_event, _retry_thread, _mongodb_degraded
-    if _mongodb_exporter_attached:
-        return
-    if _retry_thread is not None and _retry_thread.is_alive():
-        return
-    if interval is None:
-        interval = _get_retry_interval_seconds()
-    _mongodb_degraded = True
-    _retry_stop_event = threading.Event()
-    _retry_thread = threading.Thread(
-        target=_retry_loop,
-        args=(connect, interval, _retry_stop_event),
-        name="agentic-trace-store-retry",
-        daemon=True,
-    )
-    _retry_thread.start()
-
-
-def _close_collection_client(collection: "Collection") -> None:
-    """Best-effort close of the MongoClient backing an unclaimed Collection."""
-    try:
-        collection.database.client.close()
-    except Exception:  # noqa: BLE001 - best-effort cleanup
-        pass
-
-
-def _retry_loop(
-    connect: "Callable[[], Optional[Collection]]",
-    interval: float,
-    stop_event: threading.Event,
-) -> None:
-    while not stop_event.wait(interval):
-        if _mongodb_exporter_attached:
-            return
-        try:
-            collection = connect()
-        except Exception as e:  # noqa: BLE001 - retry on any connection failure
-            logger.debug("Trace store retry failed: %s", scrub_credentials(str(e)))
-            continue
-        # shutdown_tracing() may have raced the blocking connect. If it did,
-        # close the client this attempt opened rather than attach to a
-        # provider that is gone — or replaced by a later setup_tracing().
-        if stop_event.is_set():
-            if collection is not None:
-                _close_collection_client(collection)
-            return
-        if collection is not None:
-            if not attach_mongodb_tracing(collection):
-                # Attach skipped (attached concurrently, or provider gone):
-                # nothing else owns this attempt's client — close it.
-                _close_collection_client(collection)
-            return
-
-
 def shutdown_tracing() -> None:
-    """Shutdown tracing and flush pending spans.
-
-    Closes the trace-store MongoClient only when tracing owns it
-    (take_client_ownership=True at setup, or a retry-attached client).
-    A caller-owned client passed to setup_tracing() stays open.
-    """
-    global _tracer_provider, _retry_stop_event, _retry_thread
-    global _mongodb_exporter_attached, _mongodb_degraded, _tracing_mongo_client
-    global _platform_exporter
-
-    # Signal the retry thread to stop, then wait (bounded) for it to exit
-    # before tearing down the provider it attaches exporters to. The loop
-    # re-checks the stop event after a blocking connect, so it exits promptly
-    # unless the connect itself is still blocked in the network — don't hang
-    # shutdown on that case: the thread is a daemon and closes the client it
-    # opened when it eventually wakes. The reference is kept while the thread
-    # is alive so a later start_mongodb_tracing_retry() no-ops instead of
-    # starting a duplicate loop against a half-torn-down provider.
-    if _retry_stop_event is not None:
-        _retry_stop_event.set()
-        _retry_stop_event = None
-    thread = _retry_thread
-    if thread is not None and thread.is_alive():
-        thread.join(timeout=2.0)
-    if thread is None or not thread.is_alive():
-        _retry_thread = None
+    global _tracer_provider, _platform_exporter
 
     if _tracer_provider is not None:
         _tracer_provider.shutdown()
@@ -542,19 +322,7 @@ def shutdown_tracing() -> None:
         _uninstrument_httpx()
         logger.info("Tracing shutdown complete")
 
-    # Close the store client only after the provider flush — the
-    # BatchSpanProcessor's final export still needs the pool.
-    if _tracing_mongo_client is not None:
-        try:
-            _tracing_mongo_client.close()
-        except Exception:  # noqa: BLE001 - best-effort cleanup
-            pass
-        _tracing_mongo_client = None
-
-    # Reset store-exporter state so a fresh setup_tracing() in the same
-    # process (e.g. tests) starts clean.
-    _mongodb_exporter_attached = False
-    _mongodb_degraded = False
+    # Reset exporter state so a fresh setup_tracing() starts clean.
     _platform_exporter = None
 
 

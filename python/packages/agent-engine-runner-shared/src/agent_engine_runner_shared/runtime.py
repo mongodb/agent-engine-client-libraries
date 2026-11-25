@@ -48,10 +48,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Product application name reported to MongoDB, so customers can attribute
-# Agent Engine traffic.
-_MONGO_APP_NAME = "Agent Engine"
-
 
 def _resolve_listen_host() -> str:
     """Resolve uvicorn's listen host from ``APP_HOST``, defaulting to
@@ -143,9 +139,7 @@ class TenantRuntime:
         app_name: str = "Agent",
         app_version: str = "1.0.0",
         mongodb_uri: Optional[str] = None,
-        database_name: Optional[str] = None,
         enable_tracing: bool | None = None,
-        traces_collection_name: str = "traces",
         enable_memory: bool | None = None,
         org_id: Optional[str] = None,
         project_id: Optional[str] = None,
@@ -157,9 +151,7 @@ class TenantRuntime:
             app_name: Application name
             app_version: Application version
             mongodb_uri: MongoDB URI (for OE execution logging)
-            database_name: Database name
             enable_tracing: Deprecated. Tracing is always enabled.
-            traces_collection_name: Collection name for trace storage
             enable_memory: Deprecated. Use agent.yaml features.memory instead.
             org_id: Deprecated and ignored. The org is taken from the
                 ``ORG_ID`` environment variable, which the platform injects.
@@ -187,8 +179,6 @@ class TenantRuntime:
 
         # Config
         self._mongodb_uri = mongodb_uri or get_env("MONGODB_URI")
-        self._database_name_override = database_name or None
-        self._traces_collection_name = traces_collection_name
         # Deprecation warnings are emitted after setup_logging() so the
         # logger.warning() companion in _warn_if_deprecated_constructor_arg
         # routes through the configured handlers (incl. structured logging).
@@ -397,90 +387,17 @@ class TenantRuntime:
         return True
 
     def _setup_tracing(self) -> None:
-        """Set up OpenTelemetry tracing.
-
-        If the trace-store database is unreachable at startup, a background
-        retry attaches the MongoDB exporter once connectivity recovers —
-        without a pod restart. The failure is
-        surfaced via /health (DEGRADED) and an ERROR log, not a single warning
-        that silently disappears into the pod log stream.
-        """
-
-        # Fallback scrub if the tracing import itself fails — in that case no
-        # store URI has been touched yet, so the message can't carry one.
-        def scrub(message: str) -> str:
-            return message
-
         try:
-            from agent_engine_runner_shared.tracing import (
-                scrub_credentials,
-                setup_tracing,
-                start_mongodb_tracing_retry,
-            )
+            from agent_engine_runner_shared.tracing import setup_tracing
 
-            scrub = scrub_credentials
-
-            if os.getenv("OE_URL", "").strip():
-                # The OE is the trace writer: the guest sends spans to it and
-                # opens no MongoDB trace-store connection.
-                setup_tracing(service_name=self.app_name)
-                logger.info("Tracing enabled")
-                return
-
-            def connect() -> Any:
-                from pymongo import MongoClient
-
-                from agent_engine_runner_shared.db_config import resolve_store_db_name
-
-                client = MongoClient(
-                    self._mongodb_uri,
-                    serverSelectionTimeoutMS=5000,
-                    appname=_MONGO_APP_NAME,
-                )
-                try:
-                    client.admin.command("ping")
-                    database_name = resolve_store_db_name(client, base=self._database_name_override)
-                    return client[database_name][self._traces_collection_name]
-                except Exception:
-                    try:
-                        client.close()
-                    except Exception:
-                        pass
-                    raise
-
-            mongodb_collection = None
-            store_unreachable = False
-            if self._mongodb_uri:
-                try:
-                    mongodb_collection = connect()
-                except Exception as e:
-                    store_unreachable = True
-                    logger.error(
-                        "Trace store unavailable at startup; will retry in "
-                        "the background. Error: %s",
-                        scrub(str(e)),
-                    )
-
-            setup_tracing(
-                service_name=self.app_name,
-                mongodb_collection=mongodb_collection,
-                # connect() built this client solely for tracing — tracing owns
-                # it and closes it at shutdown, like the retry-recovered one.
-                take_client_ownership=True,
-            )
-
-            if store_unreachable:
-                start_mongodb_tracing_retry(connect)
-
+            setup_tracing(service_name=self.app_name)
             logger.info("Tracing enabled")
         except ImportError:
             logger.warning(
                 "Tracing dependencies not installed. Install: pip install agent-engine-runner-shared[tracing]"
             )
         except Exception as e:
-            # Scrub defensively: a setup failure whose message echoes the raw
-            # store URI must never write its credentials to the log sink.
-            logger.warning(f"Tracing setup failed: {scrub(str(e))}")
+            logger.warning(f"Tracing setup failed: {e}")
 
     def _setup_memory(self) -> None:
         """Set up memory via MemoryClient (HTTP to OE)."""
@@ -909,6 +826,7 @@ class TenantRuntime:
         user_id: Optional[str] = None,
         visibility: Optional[str] = None,
         top_k: int = 10,
+        include_history: bool = False,
     ) -> List[Dict[str, Any]]:
         """
         Search semantic memories by query.
@@ -916,7 +834,10 @@ class TenantRuntime:
         Args:
             query: Search query text
             user_id: Optional user ID filter
+            visibility: Optional visibility filter
             top_k: Maximum number of results
+            include_history: Defaults to False (returns current versions only).
+                When True, retained predecessor versions are also searched.
 
         Returns:
             List of matching memories with label, text, and metadata
@@ -931,6 +852,7 @@ class TenantRuntime:
             user_id=user_id,
             visibility=visibility,
             top_k=top_k,
+            include_history=include_history,
         )
 
     def _require_memory_engine(self) -> Any:
@@ -1268,6 +1190,7 @@ class TenantRuntime:
         top_k: int = 10,
         similarity_threshold: float = 0.0,
         metadata_filter: Optional[Dict[str, Any]] = None,
+        include_history: bool = False,
     ) -> List[Dict[str, Any]]:
         """Discover procedures matching a query (lightweight results)."""
         if self._memory_engine is None or not self.org_id:
@@ -1285,6 +1208,8 @@ class TenantRuntime:
         )
         if metadata_filter is not None:
             kwargs["metadata_filter"] = metadata_filter
+        if include_history:
+            kwargs["include_history"] = True
 
         return self._memory_engine.discover_procedures(**kwargs)
 

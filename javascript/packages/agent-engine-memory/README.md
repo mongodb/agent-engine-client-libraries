@@ -83,6 +83,13 @@ const context = await app.memory.buildContext({ query: "how does the user like t
 App-bound memory is reachable only while handling a platform request (it needs
 the execution context's `OE_URL`).
 
+Semantic and procedural search return current versions by default. Pass
+`includeHistory: true` to `searchSemantic` or `discoverProcedures` to search
+retained versions within the same `topK` limit and authorized scope. Results
+keep lineage IDs plus version numbers and current-version flags in metadata.
+Historical search ranks matching versions and can return several versions from
+one lineage.
+
 ### Context token budget
 
 `buildContext({ maxTokens })` sets an optional gross context-construction budget

@@ -109,6 +109,7 @@ class FakeRuntime:
         user_id: str | None = None,
         visibility: str | None = None,
         top_k: int = 50,
+        include_history: bool = False,
     ) -> list[MemoryChunk]:
         self._record("search_semantic", locals())
         return []
@@ -147,6 +148,7 @@ class FakeRuntime:
         top_k: int = 10,
         similarity_threshold: float = 0.0,
         metadata_filter: dict[str, Any] | None = None,
+        include_history: bool = False,
     ) -> list[dict[str, Any]]:
         self._record("discover_procedures", locals())
         return []
@@ -471,6 +473,13 @@ def test_search_semantic_call_arg_overrides_bind() -> None:
     assert runtime.calls["search_semantic"]["user_id"] == "explicit"
 
 
+def test_search_semantic_forwards_history_opt_in() -> None:
+    runtime = FakeRuntime()
+    _bound(runtime).search_semantic(query="q", include_history=True)
+
+    assert runtime.calls["search_semantic"]["include_history"] is True
+
+
 def test_search_semantic_blank_call_arg_does_not_shadow_bind() -> None:
     runtime = FakeRuntime()
     m = _bound(runtime)
@@ -616,6 +625,14 @@ def test_discover_procedures_delegates_to_runtime() -> None:
     assert call["query"] == "q"
     assert call["tags"] == ["x"]
     assert call["user_id"] == "bound-user"
+    assert call["include_history"] is False
+
+
+def test_discover_procedures_forwards_history_opt_in() -> None:
+    runtime = FakeRuntime()
+    _bound(runtime).discover_procedures(query="q", include_history=True)
+
+    assert runtime.calls["discover_procedures"]["include_history"] is True
 
 
 def test_build_context_delegates_to_runtime_with_session() -> None:

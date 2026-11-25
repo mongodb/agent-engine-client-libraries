@@ -4,21 +4,16 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock
 
-from opentelemetry.sdk.trace import ReadableSpan
-from opentelemetry.trace import SpanContext, SpanKind, Status, StatusCode, TraceFlags
-
 from agent_engine_runner_shared.tracing.conversation import (
     ATTR_INPUT_MESSAGES_OFFSET,
     ATTR_INPUT_MESSAGES_RECORDED_BY,
     ATTR_INPUT_MESSAGES_STREAM,
     ATTR_INPUT_MESSAGES_TOTAL,
-    ATTR_RUNTIME_MODE,
     RECORDED_BY_CALLER,
     ConversationDeltaTracker,
     caller_records_conversation,
     mark_recorded_by_caller,
 )
-from agent_engine_runner_shared.tracing.exporters import MongoDBSpanExporter
 
 TRACE_ID = "12345678123456781234567812345678"
 
@@ -155,98 +150,6 @@ def test_tracker_bounds_the_number_of_conversations():
 
     resent = tracker.trim(_messages("hi"), trace_id="0" * 32, stream_id="aer")
     assert resent[ATTR_INPUT_MESSAGES_OFFSET] == 0
-
-
-def _span(attributes: dict[str, object]) -> MagicMock:
-    context = SpanContext(
-        trace_id=int(TRACE_ID, 16),
-        span_id=0x1234567812345678,
-        is_remote=False,
-        trace_flags=TraceFlags.SAMPLED,
-    )
-    span = MagicMock(spec=ReadableSpan)
-    span.get_span_context.return_value = context
-    span.parent = None
-    span.name = "ChatOpenAI"
-    span.kind = SpanKind.INTERNAL
-    span.start_time = 1000
-    span.end_time = 2000
-    span.status = Status(StatusCode.OK)
-    span.attributes = attributes
-    span.resource.attributes = {
-        "service.name": "my-agent",
-        ATTR_RUNTIME_MODE: "aer",
-    }
-    span.events = []
-    return span
-
-
-def test_mongodb_exporter_trims_each_written_span():
-    collection = MagicMock()
-    exporter = MongoDBSpanExporter(collection)
-
-    exporter.export([_span(_messages("hi"))])
-    exporter.export([_span(_messages("hi", "there"))])
-
-    first, second = collection.insert_many.call_args_list
-    first_attrs = first[0][0][0]["attributes"]
-    second_attrs = second[0][0][0]["attributes"]
-    assert _stored_contents(first_attrs) == ["hi"]
-    assert _stored_contents(second_attrs) == ["there"]
-    assert second_attrs[ATTR_INPUT_MESSAGES_OFFSET] == 1
-
-
-def test_mongodb_exporter_does_not_advance_progress_when_the_write_fails():
-    """A dropped batch must not make later spans omit messages it never stored."""
-    collection = MagicMock()
-    collection.insert_many.side_effect = [Exception("Connection failed"), None]
-    exporter = MongoDBSpanExporter(collection)
-
-    assert exporter.export([_span(_messages("hi"))]).name == "FAILURE"
-    assert exporter.export([_span(_messages("hi", "again"))]).name == "SUCCESS"
-
-    retried_attrs = collection.insert_many.call_args[0][0][0]["attributes"]
-    assert _stored_contents(retried_attrs) == ["hi", "again"]
-    assert retried_attrs[ATTR_INPUT_MESSAGES_OFFSET] == 0
-
-
-def _caller_recorded(attributes: dict[str, object]) -> dict[str, object]:
-    return {**attributes, ATTR_INPUT_MESSAGES_RECORDED_BY: RECORDED_BY_CALLER}
-
-
-def test_mongodb_exporter_drops_a_prompt_the_caller_records():
-    """The agent's span already stores it; the tool-pod copy is redundant."""
-    collection = MagicMock()
-    exporter = MongoDBSpanExporter(collection)
-    attributes = _caller_recorded(
-        {
-            **_messages("hi", "there"),
-            "input.value": '{"messages": [["user", "hi"]]}',
-            "input.mime_type": "application/json",
-        }
-    )
-
-    exporter.export([_span(attributes)])
-
-    stored = collection.insert_many.call_args[0][0][0]["attributes"]
-    assert _stored_contents(stored) == []
-    assert "input.value" not in stored
-    assert "input.mime_type" not in stored
-    assert stored[ATTR_INPUT_MESSAGES_RECORDED_BY] == RECORDED_BY_CALLER
-    assert ATTR_INPUT_MESSAGES_OFFSET not in stored
-
-
-def test_a_dropped_prompt_does_not_advance_the_tracked_conversation():
-    """A later tool-pod span that records its own prompt starts from the whole list."""
-    collection = MagicMock()
-    exporter = MongoDBSpanExporter(collection)
-
-    exporter.export([_span(_caller_recorded(_messages("hi", "there")))])
-    exporter.export([_span(_messages("asked a provider directly"))])
-
-    direct = collection.insert_many.call_args[0][0][0]["attributes"]
-    assert _stored_contents(direct) == ["asked a provider directly"]
-    assert direct[ATTR_INPUT_MESSAGES_OFFSET] == 0
 
 
 def test_mark_recorded_by_caller_marks_only_inside_the_context():

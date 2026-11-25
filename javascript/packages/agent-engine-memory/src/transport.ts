@@ -68,6 +68,7 @@ export interface MemoryRuntime {
     userId?: string | null;
     visibility?: string | null;
     topK?: number;
+    includeHistory?: boolean;
   }): Promise<MemoryChunk[]>;
 
   searchEpisodes(args: {
@@ -94,6 +95,7 @@ export interface MemoryRuntime {
     topK?: number;
     similarityThreshold?: number;
     metadataFilter?: Record<string, unknown> | null;
+    includeHistory?: boolean;
   }): Promise<Array<Record<string, unknown>>>;
 
   /** Optional: release underlying resources. */

@@ -25,6 +25,7 @@ from agent_engine_runner_shared.context import (
 from agent_engine_runner_shared.context import (
     get_current_user_id as _runner_get_current_user_id,
 )
+from agent_engine_runner_shared.deprecations import warn_trace_options_removed
 from agent_engine_runner_shared.hooks import register_llm
 from agent_engine_runner_shared.mcp_tools import (
     MCPConfigError,
@@ -248,7 +249,7 @@ class App(BaseApp):
         mongodb_uri: str | None = None,
         database_name: str | None = None,
         enable_tracing: bool | None = None,
-        traces_collection_name: str = "traces",
+        traces_collection_name: str | None = None,
         enable_memory: bool | None = None,
         org_id: str | None = None,
     ) -> None:
@@ -258,15 +259,21 @@ class App(BaseApp):
             app_name: Application name
             app_version: Application version
             mongodb_uri: MongoDB URI
-            database_name: Database name
+            database_name: Deprecated and ignored. Traces go only to the
+                Orchestration Engine, and the checkpointer database is chosen
+                by the platform. Passing this argument raises a
+                DeprecationWarning and will be removed in a future release.
             enable_tracing: Deprecated. Tracing is always enabled.
-            traces_collection_name: Collection name for trace storage
+            traces_collection_name: Deprecated and ignored. Traces go only to
+                the Orchestration Engine. Passing this argument raises a
+                DeprecationWarning and will be removed in a future release.
             enable_memory: Deprecated. Use agent.yaml features.memory instead.
             org_id: Deprecated and ignored. The org is taken from the
                 ``ORG_ID`` environment variable, which the platform injects.
                 Passing this argument raises a DeprecationWarning and will be
                 removed in a future release.
         """
+        warn_trace_options_removed(database_name, traces_collection_name)
         if org_id is not None:
             warnings.warn(
                 "App(org_id=...) is deprecated and ignored. "
@@ -282,9 +289,7 @@ class App(BaseApp):
             app_name=app_name,
             app_version=app_version,
             mongodb_uri=mongodb_uri,
-            database_name=database_name,
             enable_tracing=enable_tracing,
-            traces_collection_name=traces_collection_name,
             enable_memory=enable_memory,
             org_id=org_id,
         )

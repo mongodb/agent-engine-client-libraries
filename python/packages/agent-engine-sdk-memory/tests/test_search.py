@@ -1,7 +1,7 @@
 """Memory.search: cross-source fan-out, merge/ordering, adaptation, fail-loud."""
 
 import warnings
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 import pytest
@@ -20,7 +20,7 @@ def _chunk(source: MemorySource, score: float | None, id_: str = "i") -> MemoryC
         id=id_,
         content="c",
         source=source,
-        timestamp=datetime.now(timezone.utc),
+        timestamp=datetime.now(UTC),
         similarity_score=score,
     )
 
@@ -195,6 +195,17 @@ def test_search_still_raises_auth_errors_from_one_source():
     )
     with pytest.raises(MemoryAuthError):
         Memory(runtime=rt).search("q", sources=["semantic", "taxonomic"])
+
+
+def test_custom_runtime_without_include_history_parameter_still_works():
+    rt = _FakeRuntime(
+        semantic=[_chunk(MemorySource.SEMANTIC, 0.5, id_="s1")],
+        procedures=[{"procedure": "deploy", "description": "d", "score": 0.8}],
+    )
+    mem = Memory(runtime=rt)
+    assert [c.id for c in mem.search_semantic("q", user_id="u")] == ["s1"]
+    assert mem.discover_procedures("q", user_id="u")[0]["procedure"] == "deploy"
+    assert rt.calls == ["semantic", "procedural"]
 
 
 @pytest.mark.parametrize("status", [200, 502, 503, 504])

@@ -11,6 +11,7 @@ import logging
 import threading
 from collections.abc import Callable
 
+from agent_engine_runner_shared.context import bind_log_execution_id, get_log_execution_id
 from agent_engine_runner_shared.generated.workflow.v1.common_pb2 import (
     WORKFLOW_ERROR_CODE_NOT_FOUND,
     WORKFLOW_ERROR_CODE_STALE_FENCE,
@@ -102,8 +103,16 @@ class AttemptHeartbeat:
         self._stop.clear()
         self._ready.clear()
         self._startup_error = None
+        # A thread starts with an empty context, and the attempt names its
+        # own execution; the heartbeat reads no other execution state.
+        execution_id = self._request.workflow_identity.execution_id or get_log_execution_id()
+
+        def _run_bound() -> None:
+            with bind_log_execution_id(execution_id):
+                self._run()
+
         self._thread = threading.Thread(
-            target=self._run,
+            target=_run_bound,
             name=f"workflow-heartbeat-{self._request.attempt_id[:8]}",
             daemon=True,
         )

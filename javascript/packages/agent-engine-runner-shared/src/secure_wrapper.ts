@@ -370,7 +370,12 @@ function toolErrorMessage(error: unknown): string {
   return message || DURABLE_TOOL_FAILURE_FALLBACK;
 }
 
-function encodeDurableToolFailure(error: unknown): string {
+/**
+ * Encode a tool call's failure as a string a durable record can keep: its
+ * kind, redacted message and classification fields. {@link decodeToolFailure}
+ * rebuilds the same error type from it, in this process or another.
+ */
+export function encodeToolFailure(error: unknown): string {
   const payload: Record<string, unknown> = {
     kind: "execution",
     // Recorded with the durable outcome and replayed to the model on resume.
@@ -394,9 +399,13 @@ function encodeDurableToolFailure(error: unknown): string {
   return `${DURABLE_TOOL_FAILURE_PREFIX}${JSON.stringify(payload)}`;
 }
 
-function decodeDurableToolFailure(
+/**
+ * Rebuild the error {@link encodeToolFailure} recorded, with its class and
+ * fields. A string without the encoding's prefix is OE's own failure message.
+ */
+export function decodeToolFailure(
   message: string,
-  cause: Error,
+  cause?: Error,
 ): ToolExecutionError {
   if (!message.startsWith(DURABLE_TOOL_FAILURE_PREFIX)) {
     // Every failure a runner reports is prefixed, so this one is OE's own.
@@ -1375,6 +1384,18 @@ export class SecureToolWrapper {
   }
 
   /**
+   * Fail the rest of this execution's turn with `error`, as a platform
+   * failure inside a tool call does. The first recorded failure is kept.
+   *
+   * For tool-boundary code outside {@link executeTool}, such as a framework
+   * adapter's per-call checkpoint, whose failures the framework would
+   * otherwise hand to the model as an ordinary tool error.
+   */
+  recordPlatformFailure(error: ToolPlatformError): void {
+    this.platformFailure ??= error;
+  }
+
+  /**
    * Execute a tool call through OE.
    *
    * Flow:
@@ -1400,7 +1421,7 @@ export class SecureToolWrapper {
       }
       return await this.executeToolDurably(toolName, args, step, options);
     } catch (error) {
-      if (error instanceof ToolPlatformError) this.platformFailure ??= error;
+      if (error instanceof ToolPlatformError) this.recordPlatformFailure(error);
       throw error;
     }
   }
@@ -1498,10 +1519,10 @@ export class SecureToolWrapper {
           });
         }
         if (error instanceof ReplayedActivityFailedError) {
-          throw decodeDurableToolFailure(error.message, error);
+          throw decodeToolFailure(error.message, error);
         }
         if (error instanceof DurableToolActivityFailedError) {
-          throw decodeDurableToolFailure(error.message, error);
+          throw decodeToolFailure(error.message, error);
         }
         if (error instanceof WorkflowClientError) {
           // OE's workflow API failed around the call, possibly after the tool
@@ -1681,9 +1702,7 @@ export class SecureToolWrapper {
       if (error instanceof OAuthAuthorizationRequired) {
         if (oauthContinuation) {
           throw new DurableToolActivityFailedError(
-            encodeDurableToolFailure(
-              new ToolExecutionError(OAUTH_STILL_REQUIRED),
-            ),
+            encodeToolFailure(new ToolExecutionError(OAUTH_STILL_REQUIRED)),
             { cause: error },
           );
         }
@@ -1700,12 +1719,9 @@ export class SecureToolWrapper {
       if (options.isFrameworkControlFlow?.(error) === true) {
         throw new DurableActivityInterrupted(error);
       }
-      throw new DurableToolActivityFailedError(
-        encodeDurableToolFailure(error),
-        {
-          cause: error,
-        },
-      );
+      throw new DurableToolActivityFailedError(encodeToolFailure(error), {
+        cause: error,
+      });
     }
   }
 
@@ -1802,7 +1818,12 @@ export class SecureToolWrapper {
           "No suspend handler registered. Ensure the framework SDK calls registerSuspendHandler() before run().",
         );
       }
+      // OE strips the envelope of a bare reason/context payload, the legacy
+      // tool-review shape. The kind keeps the interrupt ID public, so the
+      // application answers this wait by ID and the answer cannot also
+      // satisfy a later wait in the same node.
       interrupt({
+        kind: "oauth_authorization",
         suspend_reason: "authorization_required",
         suspend_context: {
           authorization_url: response.elicitation.authorization_url,
@@ -1812,19 +1833,21 @@ export class SecureToolWrapper {
         },
       });
       // On a native resume interrupt() returns the Continue answer instead of
-      // pausing, so the token gate is asked once more; a second challenge fails
-      // rather than running the tool without a credential.
+      // pausing. The answer only wakes the call: the token gate is asked again
+      // at a fresh step, and a second challenge fails rather than running the
+      // tool without a credential.
+      this.observeOperationalStep(
+        Math.max(step, response.latest_step_number ?? step),
+      );
       response = await this.requestNativeApproval(
         toolName,
         args,
-        step,
+        this.nextOperationalStep(),
         options,
         effectiveIsLocal,
       );
       if (response.elicitation) {
-        throw new ToolExecutionError(
-          "OAuth authorization is still required after continuation",
-        );
+        throw new ToolExecutionError(OAUTH_STILL_REQUIRED);
       }
     }
 

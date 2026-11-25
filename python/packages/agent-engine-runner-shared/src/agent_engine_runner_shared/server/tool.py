@@ -15,7 +15,7 @@ import inspect
 import json
 import logging
 import time
-from contextlib import asynccontextmanager
+from contextlib import aclosing, asynccontextmanager
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Callable, Dict, List, Optional
 
 from agent_engine_sdk.models import LLMStreamChunk, LLMToolSchema, Message, ToolCallChunk
@@ -27,6 +27,7 @@ from agent_engine_runner_shared.caller_trace import (
     runner_trace_scope,
     trace_state_marks_runner_root,
 )
+from agent_engine_runner_shared.context import bind_log_execution_id
 from agent_engine_runner_shared.error_reporting import _redact_text
 from agent_engine_runner_shared.guardrails_evaluator import evaluate_guardrail_check
 from agent_engine_runner_shared.hooks import (
@@ -59,6 +60,7 @@ from agent_engine_runner_shared.server.metadata import applied_metadata_env, mer
 from agent_engine_runner_shared.server.oe_url import resolve_oe_url
 from agent_engine_runner_shared.server.owner_url import resolve_owner_url
 from agent_engine_runner_shared.span_kinds import OPENINFERENCE_SPAN_KIND, OpenInferenceSpanKind
+from agent_engine_runner_shared.structured_logging import execution_output_scope
 from agent_engine_runner_shared.tool_api_error import (
     classify_tool_api_error,
     redact_tool_error_text,
@@ -83,9 +85,10 @@ from agent_engine_runner_shared.utils import (
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Awaitable, Callable
+    from collections.abc import Awaitable, Callable
 
     from starlette.datastructures import Headers
+    from starlette.types import Send
 
     from agent_engine_runner_shared.context import OwnerUrlFailureState
     from agent_engine_runner_shared.runtime import TenantRuntime
@@ -224,6 +227,26 @@ def _llm_failure_error_code(error: Exception) -> Optional[str]:
     if is_llm_credential_rejection(error):
         return LLM_CREDENTIAL_REJECTED_ERROR_CODE
     return None
+
+
+class _ClosingStreamingResponse(StreamingResponse):
+    """Closes its generator in the response task when streaming stops.
+
+    On client disconnect Starlette stops iterating but never closes the
+    generator, so its cleanup would run later from the garbage collector in
+    another task's context: without the request's log binding, and holding
+    the drain registration until then.
+    """
+
+    def __init__(self, content: AsyncGenerator[str, None], **kwargs: Any) -> None:
+        super().__init__(content, **kwargs)
+        self._content = content
+
+    async def stream_response(self, send: "Send") -> None:
+        try:
+            await super().stream_response(send)
+        finally:
+            await self._content.aclose()
 
 
 class LLMRegistryLoadError(RuntimeError):
@@ -874,12 +897,15 @@ class ToolServer(ToolExecution, BaseServer):
             via the Runner SDK ``app.tool()`` decorator and execute with the pod's
             network and secret access.
             """
-            return await server._run_with_inbound_trace_context(
-                "tool.execute",
-                OpenInferenceSpanKind.TOOL,
-                http_request.headers,
-                lambda: server._handle_execute(request),
-            )
+            # Covers setup, tool resolution and metrics, which log outside the
+            # tool's execution context.
+            with execution_output_scope(request.execution_id):
+                return await server._run_with_inbound_trace_context(
+                    "tool.execute",
+                    OpenInferenceSpanKind.TOOL,
+                    http_request.headers,
+                    lambda: server._handle_execute(request),
+                )
 
         @app.post("/invoke_llm", response_model=LLMPodInvokeResponse)
         async def invoke_llm(
@@ -891,12 +917,13 @@ class ToolServer(ToolExecution, BaseServer):
             including token usage. Used by SecureWrappedLLM when streaming is not
             needed by the caller.
             """
-            return await server._run_with_inbound_trace_context(
-                "tool.invoke_llm",
-                OpenInferenceSpanKind.CHAIN,
-                http_request.headers,
-                lambda: server._handle_invoke_llm(request),
-            )
+            with execution_output_scope(request.execution_id):
+                return await server._run_with_inbound_trace_context(
+                    "tool.invoke_llm",
+                    OpenInferenceSpanKind.CHAIN,
+                    http_request.headers,
+                    lambda: server._handle_invoke_llm(request),
+                )
 
         @app.post("/invoke_llm/stream")
         async def invoke_llm_stream(
@@ -916,39 +943,50 @@ class ToolServer(ToolExecution, BaseServer):
             # iteration ever starts, the attach grace releases the
             # registration rather than leaking phantom work.
             registry = server.drain_registry
-            drain_handle = registry.begin_work(
-                request.execution_id, expect_attach=True, step_number=request.step_number
-            )
+            # The attach-grace timer copies this context, so its release
+            # warning names this request's execution and no other.
+            with bind_log_execution_id(request.execution_id):
+                drain_handle = registry.begin_work(
+                    request.execution_id, expect_attach=True, step_number=request.step_number
+                )
 
             async def _tracked_stream() -> AsyncGenerator[str, None]:
-                task = asyncio.current_task()
-                if not registry.attach_task(drain_handle, task):
-                    # The attach grace already released this registration (the
-                    # client stalled before iteration). Entering the provider
-                    # stream now would run work no drain can see — a completed
-                    # drain must remain trustworthy quiescence — so the stream
-                    # ends empty instead.
-                    logger.warning(
-                        "Refusing to stream for execution %s: stream registration "
-                        "was released before the consumer attached",
-                        request.execution_id,
-                    )
-                    return
-                try:
-                    async for chunk in server._stream_with_inbound_trace_context(
-                        "tool.invoke_llm.stream",
-                        OpenInferenceSpanKind.CHAIN,
-                        http_request.headers,
-                        # The boundary span is threaded in so a mid-stream
-                        # provider failure — surfaced as an error frame, never
-                        # thrown — can mark it ERROR.
-                        lambda span: server._handle_invoke_llm_stream(request, span),
-                    ):
-                        yield chunk
-                finally:
-                    registry.end_work(drain_handle)
+                # The body runs after the handler's binding has reset.
+                with execution_output_scope(request.execution_id):
+                    task = asyncio.current_task()
+                    if not registry.attach_task(drain_handle, task):
+                        # The attach grace already released this registration (the
+                        # client stalled before iteration). Entering the provider
+                        # stream now would run work no drain can see — a completed
+                        # drain must remain trustworthy quiescence — so the stream
+                        # ends empty instead.
+                        logger.warning(
+                            "Refusing to stream for execution %s: stream registration "
+                            "was released before the consumer attached",
+                            request.execution_id,
+                        )
+                        return
+                    try:
+                        # Closing a generator does not close the one its
+                        # `async for` was iterating, so each level closes the
+                        # next: cleanup then runs here, under this binding.
+                        async with aclosing(
+                            server._stream_with_inbound_trace_context(
+                                "tool.invoke_llm.stream",
+                                OpenInferenceSpanKind.CHAIN,
+                                http_request.headers,
+                                # The boundary span is threaded in so a mid-stream
+                                # provider failure — surfaced as an error frame, never
+                                # thrown — can mark it ERROR.
+                                lambda span: server._handle_invoke_llm_stream(request, span),
+                            )
+                        ) as stream:
+                            async for chunk in stream:
+                                yield chunk
+                    finally:
+                        registry.end_work(drain_handle)
 
-            return StreamingResponse(
+            return _ClosingStreamingResponse(
                 _tracked_stream(),
                 media_type="text/event-stream",
                 headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
@@ -959,12 +997,13 @@ class ToolServer(ToolExecution, BaseServer):
             request: GuardrailCheckRequest, http_request: Request
         ) -> GuardrailCheckResponse:
             """Evaluate selected guardrail policies for OE-controlled runtime content."""
-            return await server._run_with_inbound_trace_context(
-                "tool.guardrails_check",
-                OpenInferenceSpanKind.TOOL,
-                http_request.headers,
-                lambda: server._handle_guardrails_check(request),
-            )
+            with bind_log_execution_id(request.execution_id):
+                return await server._run_with_inbound_trace_context(
+                    "tool.guardrails_check",
+                    OpenInferenceSpanKind.TOOL,
+                    http_request.headers,
+                    lambda: server._handle_guardrails_check(request),
+                )
 
         @app.get("/tools", response_model=ToolsListResponse)
         async def list_tools() -> ToolsListResponse:
@@ -1035,8 +1074,8 @@ class ToolServer(ToolExecution, BaseServer):
         span_name: str,
         span_kind: OpenInferenceSpanKind,
         headers: "Headers",
-        chunks: "Callable[[Optional[Any]], AsyncIterator[str]]",
-    ) -> "AsyncIterator[str]":
+        chunks: "Callable[[Optional[Any]], AsyncGenerator[str, None]]",
+    ) -> "AsyncGenerator[str, None]":
         """Streaming variant of :meth:`_run_with_inbound_trace_context`.
 
         A ``StreamingResponse`` body runs after the route handler returns, so
@@ -1058,8 +1097,9 @@ class ToolServer(ToolExecution, BaseServer):
 
             from agent_engine_runner_shared.tracing import get_tracer
         except Exception:
-            async for chunk in chunks(None):
-                yield chunk
+            async with aclosing(chunks(None)) as stream:
+                async for chunk in stream:
+                    yield chunk
             return
 
         carrier = dict(headers.items())
@@ -1072,8 +1112,9 @@ class ToolServer(ToolExecution, BaseServer):
                 attributes={OPENINFERENCE_SPAN_KIND: span_kind.value},
             )
             with otel_trace.use_span(span, end_on_exit=True):
-                async for chunk in chunks(span):
-                    yield chunk
+                async with aclosing(chunks(span)) as stream:
+                    async for chunk in stream:
+                        yield chunk
 
     @with_metrics("tool_pod_guardrails_check", record_errors=False)
     async def _handle_guardrails_check(
@@ -1319,20 +1360,21 @@ class ToolServer(ToolExecution, BaseServer):
                 # _handle_invoke_llm above.
                 async with self._credential_isolation():
                     await self._ensure_llm_registry_loaded()
-                    async for stream_chunk in self._stream_llm_chunks(request):
-                        if not _stream_chunk_has_payload(stream_chunk):
-                            if stream_chunk.usage is not None:
-                                usage = stream_chunk.usage
-                            continue
-                        chunk_event = LLMPodStreamEvent(
-                            content=stream_chunk.content,
-                            tool_call_chunks=stream_chunk.tool_calls,
-                            id=stream_chunk.id,
-                            name=stream_chunk.name,
-                            response_metadata=stream_chunk.response_metadata,
-                            additional_kwargs=stream_chunk.additional_kwargs,
-                        )
-                        yield f"data: {chunk_event.model_dump_json(exclude_none=True)}\n\n"
+                    async with aclosing(self._stream_llm_chunks(request)) as stream_chunks:
+                        async for stream_chunk in stream_chunks:
+                            if not _stream_chunk_has_payload(stream_chunk):
+                                if stream_chunk.usage is not None:
+                                    usage = stream_chunk.usage
+                                continue
+                            chunk_event = LLMPodStreamEvent(
+                                content=stream_chunk.content,
+                                tool_call_chunks=stream_chunk.tool_calls,
+                                id=stream_chunk.id,
+                                name=stream_chunk.name,
+                                response_metadata=stream_chunk.response_metadata,
+                                additional_kwargs=stream_chunk.additional_kwargs,
+                            )
+                            yield f"data: {chunk_event.model_dump_json(exclude_none=True)}\n\n"
 
             # Final summary event
             duration_ms = (time.time() - start_time) * 1000

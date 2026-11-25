@@ -9,6 +9,7 @@
  * Mirrors Python's `ToolServer` in `server/tool.py`.
  */
 
+import { AsyncResource } from "node:async_hooks";
 import os from "node:os";
 import { once } from "node:events";
 import type { ServerResponse } from "node:http";
@@ -107,6 +108,10 @@ import {
 } from "../toolpod_handlers.js";
 import { resolveOeUrl } from "./oe_url.js";
 import { resolveOwnerUrl } from "./owner_url.js";
+import {
+  bindRequestExecution,
+  runWithRequestExecution,
+} from "./request_execution.js";
 import { runAsCallerRecordedConversation } from "../tracing/conversation.js";
 
 const logger = getLogger("agent_engine_runner_shared.server.tool");
@@ -192,17 +197,20 @@ export async function pipeSseLinesToResponse(
     throw err;
   }
 
-  const onResError = (err: Error): void => {
+  // Bound because a listener runs in the emitter's context, not the caller's.
+  // The warning, and whatever the abort triggers in the provider, belong to
+  // the caller's execution.
+  const onResError = AsyncResource.bind((err: Error): void => {
     logger.warn(`SSE response error: ${err.message}`);
     if (!ac.signal.aborted) ac.abort();
-  };
-  const onResClose = (): void => {
+  });
+  const onResClose = AsyncResource.bind((): void => {
     // Normal completion also emits `close` after `end()`; only abort when the
     // peer dropped the connection before we finished writing.
     if (!res.writableEnded && !ac.signal.aborted) {
       ac.abort();
     }
-  };
+  });
 
   // Without this listener, write/end on a destroyed socket becomes an
   // unhandled stream 'error' and terminates the Node process.
@@ -825,157 +833,171 @@ export class ToolServer extends BaseServer {
   registerRoutes(app: FastifyInstance): void {
     app.post("/execute", async (request, reply) => {
       const body = ToolPodExecuteRequestSchema.parse(request.body);
-      // Tool functions receive no AbortSignal (ServerToolFn takes only args),
-      // so a drain can only wait this work out: count-only registration, and
-      // outliving the deadline is an honest timed_out. Throws 409 if the
-      // execution was drained after OE dispatched. The step number makes the
-      // call addressable by the per-call interrupt even though tool functions
-      // have no signal channel (it reports not_cancellable honestly).
-      this.drainRegistry.beginWork(
-        body.execution_id,
-        undefined,
-        body.step_number,
-      );
-      try {
-        const result = await runWithInboundTraceContext(
-          {
-            name: TOOL_EXECUTE,
-            kind: OpenInferenceSpanKind.TOOL,
-            tracerName: TOOL_TRACER_NAME,
-            // The boundary opens before `runWithExecutionContext`, so the
-            // ExecutionContextSpanProcessor cannot stamp identity on it. Carry
-            // it here so the boundary keeps the same identity as its children
-            // and stays visible to the session/execution trace filters instead
-            // of being dropped while its children are returned. Mirrors the
-            // AER's `aer.execute` stamping.
-            attributes: {
-              "execution.id": body.execution_id,
-              "session.id": body.session_id,
-              "thread.id": body.session_id,
-            },
-          },
-          request.headers,
-          async (span) => {
-            const result = await this.handleExecute(body);
-            // The handler encodes a failed tool call as an error status rather
-            // than throwing, so mark the boundary from the outcome.
-            markBoundaryOutcome(span, result.status);
-            return result;
-          },
-        );
-        return reply.send(result);
-      } finally {
-        this.drainRegistry.endWork(
+      return runWithRequestExecution(request, body.execution_id, async () => {
+        // Tool functions receive no AbortSignal (ServerToolFn takes only args),
+        // so a drain can only wait this work out: count-only registration, and
+        // outliving the deadline is an honest timed_out. Throws 409 if the
+        // execution was drained after OE dispatched. The step number makes the
+        // call addressable by the per-call interrupt even though tool functions
+        // have no signal channel (it reports not_cancellable honestly).
+        this.drainRegistry.beginWork(
           body.execution_id,
           undefined,
           body.step_number,
         );
-      }
+        try {
+          const result = await runWithInboundTraceContext(
+            {
+              name: TOOL_EXECUTE,
+              kind: OpenInferenceSpanKind.TOOL,
+              tracerName: TOOL_TRACER_NAME,
+              // The boundary opens before `runWithExecutionContext`, so the
+              // ExecutionContextSpanProcessor cannot stamp identity on it. Carry
+              // it here so the boundary keeps the same identity as its children
+              // and stays visible to the session/execution trace filters instead
+              // of being dropped while its children are returned. Mirrors the
+              // AER's `aer.execute` stamping.
+              attributes: {
+                "execution.id": body.execution_id,
+                "session.id": body.session_id,
+                "thread.id": body.session_id,
+              },
+            },
+            request.headers,
+            async (span) => {
+              const result = await this.handleExecute(body);
+              // The handler encodes a failed tool call as an error status rather
+              // than throwing, so mark the boundary from the outcome.
+              markBoundaryOutcome(span, result.status);
+              return result;
+            },
+          );
+          return reply.send(result);
+        } finally {
+          this.drainRegistry.endWork(
+            body.execution_id,
+            undefined,
+            body.step_number,
+          );
+        }
+      });
     });
 
     const invokeLlmRoute = { bodyLimit: INVOKE_LLM_BODY_LIMIT_BYTES };
     app.post("/invoke_llm", invokeLlmRoute, async (request, reply) => {
       const body = LLMPodInvokeRequestSchema.parse(request.body);
-      const drainController = new AbortController();
-      this.drainRegistry.beginWork(
-        body.execution_id,
-        drainController,
-        body.step_number,
-      );
-      try {
-        const result = await runWithInboundTraceContext(
-          {
-            name: TOOL_INVOKE_LLM,
-            kind: OpenInferenceSpanKind.CHAIN,
-            tracerName: TOOL_TRACER_NAME,
-            // Opened before `runWithExecutionContext`, so stamp the identity
-            // the processor would otherwise add — see the /execute route. The
-            // invoke_llm request carries only an execution id (no session id),
-            // matching the context its children run under.
-            attributes: { "execution.id": body.execution_id },
-          },
-          request.headers,
-          async (span) => {
-            const result = await this.handleInvokeLlm(
-              body,
-              drainController.signal,
-            );
-            // A failed routed LLM call is encoded as an error status, not
-            // thrown, so mark the boundary from the outcome.
-            markBoundaryOutcome(span, result.status);
-            return result;
-          },
-        );
-        // Mirror Python's `_sync_usage_with_result` model validator: ensure
-        // `result.usage` is populated (OE reads `result["usage"]`), not just the
-        // top-level `usage`.
-        return reply.send(
-          normalizeLLMPodInvokeResponse(
-            LLMPodInvokeResponseSchema.parse(result),
-          ),
-        );
-      } finally {
-        this.drainRegistry.endWork(
+      return runWithRequestExecution(request, body.execution_id, async () => {
+        const drainController = new AbortController();
+        this.drainRegistry.beginWork(
           body.execution_id,
           drainController,
           body.step_number,
         );
-      }
+        try {
+          const result = await runWithInboundTraceContext(
+            {
+              name: TOOL_INVOKE_LLM,
+              kind: OpenInferenceSpanKind.CHAIN,
+              tracerName: TOOL_TRACER_NAME,
+              // Opened before `runWithExecutionContext`, so stamp the identity
+              // the processor would otherwise add — see the /execute route. The
+              // invoke_llm request carries only an execution id (no session id),
+              // matching the context its children run under.
+              attributes: { "execution.id": body.execution_id },
+            },
+            request.headers,
+            async (span) => {
+              const result = await this.handleInvokeLlm(
+                body,
+                drainController.signal,
+              );
+              // A failed routed LLM call is encoded as an error status, not
+              // thrown, so mark the boundary from the outcome.
+              markBoundaryOutcome(span, result.status);
+              return result;
+            },
+          );
+          // Mirror Python's `_sync_usage_with_result` model validator: ensure
+          // `result.usage` is populated (OE reads `result["usage"]`), not just the
+          // top-level `usage`.
+          return reply.send(
+            normalizeLLMPodInvokeResponse(
+              LLMPodInvokeResponseSchema.parse(result),
+            ),
+          );
+        } finally {
+          this.drainRegistry.endWork(
+            body.execution_id,
+            drainController,
+            body.step_number,
+          );
+        }
+      });
     });
 
     app.post("/invoke_llm/stream", invokeLlmRoute, async (request, reply) => {
       const body = LLMPodInvokeRequestSchema.parse(request.body);
-      // Checked here so a drained execution gets a 409 rather than an SSE
-      // error event after the stream has already started.
-      this.drainRegistry.checkAdmission(body.execution_id);
-      reply.hijack();
-      const res = reply.raw;
-      res.setHeader("Content-Type", "text/event-stream");
-      res.setHeader("Cache-Control", "no-cache");
-      res.setHeader("Connection", "keep-alive");
-      res.flushHeaders();
-      const drainController = new AbortController();
-      this.drainRegistry.beginWork(
+      return runWithRequestExecution(
+        request,
         body.execution_id,
-        drainController,
-        body.step_number,
-      );
-      // The registration is released when the generator has truly settled,
-      // not when the socket closes: a signal-ignoring generator can outlive
-      // force-close, and a drain must never report completed while provider
-      // work is still pending — it times out honestly instead (mirrors the
-      // Python twin, whose end_work runs only when the task unwinds).
-      //
-      // Hijack removes Fastify lifecycle management; pipe owns disconnect
-      // cancel, backpressure, and safe end so a dropped client cannot crash
-      // the shared tool pod. The drain signal rides
-      // the pipe's combined signal, so a drain unblocks the iterator even
-      // when the LLM adapter ignores the signal it was handed.
-      await pipeSseLinesToResponse(
-        res,
-        (signal) =>
-          streamWithInboundTraceContext(
+        async (flushOutput) => {
+          // Checked here so a drained execution gets a 409 rather than an SSE
+          // error event after the stream has already started.
+          this.drainRegistry.checkAdmission(body.execution_id);
+          reply.hijack();
+          const res = reply.raw;
+          res.setHeader("Content-Type", "text/event-stream");
+          res.setHeader("Cache-Control", "no-cache");
+          res.setHeader("Connection", "keep-alive");
+          res.flushHeaders();
+          const drainController = new AbortController();
+          this.drainRegistry.beginWork(
+            body.execution_id,
+            drainController,
+            body.step_number,
+          );
+          // The registration is released when the generator has truly settled,
+          // not when the socket closes: a signal-ignoring generator can outlive
+          // force-close, and a drain must never report completed while provider
+          // work is still pending — it times out honestly instead (mirrors the
+          // Python twin, whose end_work runs only when the task unwinds).
+          //
+          // Hijack removes Fastify lifecycle management; pipe owns disconnect
+          // cancel, backpressure, and safe end so a dropped client cannot crash
+          // the shared tool pod. The drain signal rides
+          // the pipe's combined signal, so a drain unblocks the iterator even
+          // when the LLM adapter ignores the signal it was handed.
+          await pipeSseLinesToResponse(
+            res,
+            (signal) =>
+              streamWithInboundTraceContext(
+                {
+                  name: TOOL_INVOKE_LLM_STREAM,
+                  kind: OpenInferenceSpanKind.CHAIN,
+                  tracerName: TOOL_TRACER_NAME,
+                  // Opened before `runWithExecutionContext`, so stamp the identity
+                  // the processor would otherwise add — see the /execute route.
+                  attributes: { "execution.id": body.execution_id },
+                },
+                request.headers,
+                // The boundary span is threaded in so a mid-stream provider failure
+                // — surfaced as an error frame, never thrown — can mark it ERROR.
+                (span) => this.handleInvokeLlmStream(body, signal, span),
+              ),
             {
-              name: TOOL_INVOKE_LLM_STREAM,
-              kind: OpenInferenceSpanKind.CHAIN,
-              tracerName: TOOL_TRACER_NAME,
-              // Opened before `runWithExecutionContext`, so stamp the identity
-              // the processor would otherwise add — see the /execute route.
-              attributes: { "execution.id": body.execution_id },
+              signal: drainController.signal,
+              // A force-closed stream returns before the generator unwinds,
+              // so output its cleanup writes is flushed here, on settlement.
+              onGeneratorSettled: () => {
+                this.drainRegistry.endWork(
+                  body.execution_id,
+                  drainController,
+                  body.step_number,
+                );
+                flushOutput();
+              },
             },
-            request.headers,
-            // The boundary span is threaded in so a mid-stream provider failure
-            // — surfaced as an error frame, never thrown — can mark it ERROR.
-            (span) => this.handleInvokeLlmStream(body, signal, span),
-          ),
-        {
-          signal: drainController.signal,
-          onGeneratorSettled: () =>
-            this.drainRegistry.endWork(
-              body.execution_id,
-              drainController,
-              body.step_number,
-            ),
+          );
         },
       );
     });
@@ -997,16 +1019,18 @@ export class ToolServer extends BaseServer {
     const guardrailRoute = { bodyLimit: INVOKE_LLM_BODY_LIMIT_BYTES };
     app.post("/guardrails/check", guardrailRoute, async (request, reply) => {
       const body = GuardrailCheckRequestSchema.parse(request.body);
-      // Count-only registration: the evaluation is synchronous and fast, so
-      // there is no abort channel to signal; a drain waits it out.
-      this.drainRegistry.beginWork(body.execution_id);
-      try {
-        return reply.send(
-          await this.handleGuardrailsCheck(body, request.headers),
-        );
-      } finally {
-        this.drainRegistry.endWork(body.execution_id);
-      }
+      return bindRequestExecution(request, body.execution_id, async () => {
+        // Count-only registration: the evaluation is synchronous and fast, so
+        // there is no abort channel to signal; a drain waits it out.
+        this.drainRegistry.beginWork(body.execution_id);
+        try {
+          return reply.send(
+            await this.handleGuardrailsCheck(body, request.headers),
+          );
+        } finally {
+          this.drainRegistry.endWork(body.execution_id);
+        }
+      });
     });
   }
 

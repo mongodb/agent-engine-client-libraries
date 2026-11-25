@@ -234,7 +234,7 @@ class TestSemanticMemory:
         assert call_args[1]["json"]["metadata"] == {"channel": "web"}
 
     def test_fetch_semantic_memories_uses_correct_endpoint(self, mock_httpx_client):
-        mock_response = Mock()
+        mock_response = Mock(status_code=200)
         mock_response.json.return_value = {"memories": []}
         mock_httpx_client.post.return_value = mock_response
 
@@ -252,7 +252,28 @@ class TestSemanticMemory:
             call_args[0][0] == "http://localhost:8081/api/v1/memory/retrieval/semantic"
         )
         assert call_args[1]["json"]["query"] == "test query"
+        assert call_args[1]["json"]["include_history"] is False
         assert isinstance(result, list)
+
+    def test_fetch_semantic_memories_forwards_history_opt_in(self, mock_httpx_client):
+        mock_response = Mock(status_code=200)
+        mock_response.json.return_value = {"memories": []}
+        mock_httpx_client.post.return_value = mock_response
+
+        MemoryClient("http://localhost:8081").fetch_semantic_memories(
+            query="test query",
+            org_id="org1",
+            project_id="proj1",
+            user_id="user1",
+            visibility="private",
+            include_history=True,
+        )
+
+        body = mock_httpx_client.post.call_args.kwargs["json"]
+        assert body["include_history"] is True
+        assert body["project_id"] == "proj1"
+        assert body["user_id"] == "user1"
+        assert body["visibility"] == "private"
 
     def test_get_semantic_by_label(self, mock_httpx_client):
         mock_response = Mock()
@@ -1527,6 +1548,56 @@ class TestMemoryIdUrlEncoding:
 
         mock_httpx_client.get.assert_not_called()
         mock_httpx_client.delete.assert_not_called()
+
+
+@pytest.mark.parametrize("include_history", [False, True])
+def test_procedural_client_forwards_history(mock_httpx_client, include_history):
+    response = Mock(status_code=200)
+    response.json.return_value = {"memories": []}
+    mock_httpx_client.post.return_value = response
+    client = MemoryClient("http://localhost:8081")
+    client.fetch_procedural_memories(
+        "q", "o", "p", user_id="u", include_history=include_history
+    )
+    body = mock_httpx_client.post.call_args.kwargs["json"]
+    assert body["include_history"] is include_history
+    assert (body["org_id"], body["project_id"], body["user_id"]) == ("o", "p", "u")
+
+
+@pytest.mark.parametrize("include_history", [False, True])
+def test_discover_procedures_client_forwards_history_opt_in(
+    mock_httpx_client, include_history
+):
+    response = Mock(status_code=200)
+    response.json.return_value = {
+        "memories": [
+            {
+                "id": "proc-1",
+                "content": "step body",
+                "similarity_score": 0.88,
+                "timestamp": "2026-06-11T00:00:00Z",
+                "metadata": {
+                    "procedure": "deploy-app",
+                    "version": 2,
+                    "is_latest": False,
+                    "memory_lineage_id": "lineage-1",
+                },
+            }
+        ]
+    }
+    mock_httpx_client.post.return_value = response
+    client = MemoryClient("http://localhost:8081")
+    rows = client.discover_procedures(
+        "q", "o", "p", user_id="u", include_history=include_history
+    )
+    body = mock_httpx_client.post.call_args.kwargs["json"]
+    assert ("include_history" in body) is include_history
+    if include_history:
+        assert body["include_history"] is True
+    assert rows[0]["id"] == "proc-1"
+    assert rows[0]["version"] == 2
+    assert rows[0]["is_latest"] is False
+    assert rows[0]["memory_lineage_id"] == "lineage-1"
 
 
 @pytest.mark.parametrize(

@@ -222,28 +222,43 @@ describe("SemanticMemory", () => {
     expect(body["metadata"]).toEqual({ channel: "web" });
   });
 
-  it("fetchSemanticMemories uses correct endpoint", async () => {
-    fetchMock.mockResolvedValueOnce(mockJsonResponse({ memories: [] }));
+  it.each([
+    [undefined, undefined],
+    [false, undefined],
+    [true, true],
+  ] as const)(
+    "fetchSemanticMemories handles includeHistory=%s",
+    async (includeHistory, expected) => {
+      fetchMock.mockResolvedValueOnce(mockJsonResponse({ memories: [] }));
 
-    const client = new MemoryClient("http://localhost:8081");
-    const result = await client.fetchSemanticMemories({
-      query: "test query",
-      orgId: "org1",
-      projectId: "proj1",
-      userId: "user1",
-      visibility: "org",
-    });
+      const client = new MemoryClient("http://localhost:8081");
+      const result = await client.fetchSemanticMemories({
+        query: "test query",
+        orgId: "org1",
+        projectId: "proj1",
+        userId: "user1",
+        visibility: "org",
+        ...(includeHistory !== undefined ? { includeHistory } : {}),
+      });
 
-    expect(fetchMock).toHaveBeenCalledOnce();
-    const url = getCallUrl(fetchMock.mock.calls[0]);
-    expect(url).toBe("http://localhost:8081/api/v1/memory/retrieval/semantic");
-    const body = getCallBody(fetchMock.mock.calls[0]);
-    expect(body["query"]).toBe("test query");
-    expect(body["project_id"]).toBe("proj1");
-    expect(body["user_id"]).toBe("user1");
-    expect(body["visibility"]).toBe("org");
-    expect(Array.isArray(result)).toBe(true);
-  });
+      expect(fetchMock).toHaveBeenCalledOnce();
+      const url = getCallUrl(fetchMock.mock.calls[0]);
+      expect(url).toBe(
+        "http://localhost:8081/api/v1/memory/retrieval/semantic",
+      );
+      const body = getCallBody(fetchMock.mock.calls[0]);
+      expect(body["query"]).toBe("test query");
+      expect(body["project_id"]).toBe("proj1");
+      expect(body["user_id"]).toBe("user1");
+      expect(body["visibility"]).toBe("org");
+      if (expected === undefined) {
+        expect("include_history" in body).toBe(false);
+      } else {
+        expect(body["include_history"]).toBe(expected);
+      }
+      expect(Array.isArray(result)).toBe(true);
+    },
+  );
 
   it("getSemantic by label", async () => {
     fetchMock.mockResolvedValueOnce(
@@ -580,6 +595,58 @@ describe("ContextBuilding", () => {
     const body = getCallBody(fetchMock.mock.calls[0]);
     expect(body["project_id"]).toBe("proj1");
     expect(result.formatted_context).toBe("Context text");
+  });
+
+  it("buildContext accepts selected memories in place of a formatted context", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({
+        formatted_context: null,
+        metadata: {
+          token_count: 4,
+          memory_counts: { semantic: 1 },
+          timing: {},
+        },
+        selected_memories: [
+          {
+            id: "m1",
+            content: "Prefers email",
+            source: "semantic",
+            timestamp: "2026-11-19T00:00:00Z",
+          },
+        ],
+      }),
+    );
+
+    const client = new MemoryClient("http://localhost:8081");
+    const result = await client.buildContext({
+      query: "test query",
+      orgId: "org1",
+      projectId: "proj1",
+    });
+
+    expect(result.formatted_context).toBeNull();
+    expect(result.selected_memories?.map((m) => m.content)).toEqual([
+      "Prefers email",
+    ]);
+  });
+
+  it("buildContext rejects a response with neither formatted context nor memories", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({
+        formatted_context: null,
+        metadata: { token_count: 0, memory_counts: {}, timing: {} },
+        selected_memories: null,
+      }),
+    );
+
+    const client = new MemoryClient("http://localhost:8081");
+    await expect(
+      client.buildContext({
+        query: "test query",
+        orgId: "org1",
+        projectId: "proj1",
+      }),
+    ).rejects.toThrow(/formatted_context or selected_memories/);
   });
 
   it("buildContext sends a null session_id when blank (sessionless context)", async () => {
@@ -940,10 +1007,69 @@ describe("ProceduralMemory", () => {
     expect(fetchMock).toHaveBeenCalledOnce();
     const body = getCallBody(fetchMock.mock.calls[0]);
     expect(body["project_id"]).toBe("proj1");
+    expect("include_history" in body).toBe(false);
     expect(result).toHaveLength(1);
     expect(result[0]?.["procedure"]).toBe("deploy-app");
     expect(result[0]?.["score"]).toBe(0.92);
     expect(result[0]?.["author"]).toBe("ci-bot");
+  });
+
+  it("discoverProcedures forwards include_history only when true and preserves lineage metadata", async () => {
+    fetchMock
+      .mockResolvedValueOnce(mockJsonResponse({ memories: [] }))
+      .mockResolvedValueOnce(
+        mockJsonResponse({
+          memories: [
+            {
+              id: "proc-v1",
+              content: "Step 1: build",
+              similarity_score: 0.91,
+              timestamp: "2026-06-11T00:00:00Z",
+              metadata: {
+                procedure: "deploy-app",
+                version: 1,
+                is_latest: false,
+                memory_lineage_id: "lineage-1",
+              },
+            },
+          ],
+        }),
+      );
+
+    const client = new MemoryClient(
+      "http://localhost:8081",
+      30,
+      {},
+      "/api/v1/projects/p1/memory",
+      undefined,
+      undefined,
+      0,
+      "aliased",
+    );
+    await client.discoverProcedures({
+      query: "how to deploy",
+      orgId: "",
+      projectId: "",
+      includeHistory: false,
+    });
+    const rows = await client.discoverProcedures({
+      query: "how to deploy",
+      orgId: "",
+      projectId: "",
+      includeHistory: true,
+    });
+
+    const firstBody = getCallBody(fetchMock.mock.calls[0]);
+    expect("include_history" in firstBody).toBe(false);
+    const secondBody = getCallBody(fetchMock.mock.calls[1]);
+    expect(secondBody["include_history"]).toBe(true);
+    expect(rows[0]).toMatchObject({
+      id: "proc-v1",
+      procedure: "deploy-app",
+      version: 1,
+      is_latest: false,
+      memory_lineage_id: "lineage-1",
+    });
   });
 
   it("fetchProceduralMemories uses retrieval endpoint", async () => {
@@ -1510,16 +1636,85 @@ describe("routeStyle: aliased (Gateway convention)", () => {
     );
   });
 
-  it("fetchSemanticMemories posts to /search with a type field", async () => {
-    fetchMock.mockResolvedValueOnce(mockJsonResponse({ memories: [] }));
-    await aliasedClient().fetchSemanticMemories({
-      query: "q",
-      orgId: "o",
-      projectId: "p",
-    });
-    expect(getCallUrl(fetchMock.mock.calls[0])).toBe(
-      "http://gw.test/api/v1/projects/p1/memory/search",
-    );
-    expect(getCallBody(fetchMock.mock.calls[0])["type"]).toBe("semantic");
-  });
+  it.each([
+    [undefined, undefined],
+    [false, undefined],
+    [true, true],
+  ] as const)(
+    "fetchSemanticMemories posts to /search with includeHistory=%s",
+    async (includeHistory, expected) => {
+      fetchMock.mockResolvedValueOnce(mockJsonResponse({ memories: [] }));
+      await aliasedClient().fetchSemanticMemories({
+        query: "q",
+        orgId: "o",
+        projectId: "p",
+        ...(includeHistory !== undefined ? { includeHistory } : {}),
+      });
+      expect(getCallUrl(fetchMock.mock.calls[0])).toBe(
+        "http://gw.test/api/v1/projects/p1/memory/search",
+      );
+      const body = getCallBody(fetchMock.mock.calls[0]);
+      expect(body["type"]).toBe("semantic");
+      if (expected === undefined) {
+        expect("include_history" in body).toBe(false);
+      } else {
+        expect(body["include_history"]).toBe(expected);
+      }
+    },
+  );
+
+  it.each([
+    [undefined, undefined],
+    [false, undefined],
+    [true, true],
+  ] as const)(
+    "fetchProceduralMemories posts to /search with includeHistory=%s",
+    async (includeHistory, expected) => {
+      fetchMock.mockResolvedValueOnce(mockJsonResponse({ memories: [] }));
+      await aliasedClient().fetchProceduralMemories({
+        query: "q",
+        orgId: "o",
+        projectId: "p",
+        ...(includeHistory !== undefined ? { includeHistory } : {}),
+      });
+      expect(getCallUrl(fetchMock.mock.calls[0])).toBe(
+        "http://gw.test/api/v1/projects/p1/memory/search",
+      );
+      const body = getCallBody(fetchMock.mock.calls[0]);
+      expect(body["type"]).toBe("procedural");
+      if (expected === undefined) {
+        expect("include_history" in body).toBe(false);
+      } else {
+        expect(body["include_history"]).toBe(expected);
+      }
+    },
+  );
+});
+
+describe("procedural history search", () => {
+  it.each([
+    [undefined, undefined],
+    [false, undefined],
+    [true, true],
+  ] as const)(
+    "forwards includeHistory %s",
+    async (includeHistory, expected) => {
+      fetchMock.mockResolvedValueOnce(mockJsonResponse({ memories: [] }));
+      const client = new MemoryClient("http://localhost:8081");
+      await client.fetchProceduralMemories({
+        query: "q",
+        orgId: "o",
+        projectId: "p",
+        userId: "u",
+        ...(includeHistory !== undefined ? { includeHistory } : {}),
+      });
+      const body = getCallBody(fetchMock.mock.calls[0]);
+      if (expected === undefined) {
+        expect("include_history" in body).toBe(false);
+      } else {
+        expect(body["include_history"]).toBe(expected);
+      }
+      expect(body["project_id"]).toBe("p");
+    },
+  );
 });

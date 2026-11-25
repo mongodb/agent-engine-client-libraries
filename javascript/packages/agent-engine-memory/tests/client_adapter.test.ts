@@ -33,11 +33,67 @@ function adapter(
 }
 
 describe("MemoryClientAdapter routing", () => {
-  it("uses the aliased /search route with a type body field", async () => {
-    const { fetchImpl, calls } = fakeFetch([{ json: { memories: [] } }]);
-    await adapter({ fetchImpl }).searchSemantic({ query: "q", userId: "u" });
+  it("uses the aliased /search route with a type body field and omits include_history by default", async () => {
+    const { fetchImpl, calls } = fakeFetch([
+      { json: { memories: [] } },
+      { json: { memories: [] } },
+    ]);
+    const client = adapter({ fetchImpl });
+    await client.searchSemantic({ query: "q", userId: "u" });
+    await client.searchSemantic({
+      query: "q",
+      userId: "u",
+      includeHistory: false,
+    });
     expect(calls[0].url).toBe("https://backend.test/api/v1/memory/search");
     expect((calls[0].body as Record<string, unknown>).type).toBe("semantic");
+    expect(
+      "include_history" in (calls[0].body as Record<string, unknown>),
+    ).toBe(false);
+    expect(
+      "include_history" in (calls[1].body as Record<string, unknown>),
+    ).toBe(false);
+  });
+
+  it("forwards includeHistory when enabled on semantic search", async () => {
+    const { fetchImpl, calls } = fakeFetch([{ json: { memories: [] } }]);
+    await adapter({ fetchImpl }).searchSemantic({
+      query: "q",
+      userId: "u",
+      includeHistory: true,
+    });
+    expect((calls[0].body as Record<string, unknown>).include_history).toBe(
+      true,
+    );
+  });
+
+  it("omits include_history on discoverProcedures unless enabled", async () => {
+    const { fetchImpl, calls } = fakeFetch([
+      { json: { memories: [] } },
+      { json: { memories: [] } },
+      { json: { memories: [] } },
+    ]);
+    const client = adapter({ fetchImpl });
+    await client.discoverProcedures({ query: "q", userId: "u" });
+    await client.discoverProcedures({
+      query: "q",
+      userId: "u",
+      includeHistory: false,
+    });
+    await client.discoverProcedures({
+      query: "q",
+      userId: "u",
+      includeHistory: true,
+    });
+    expect(
+      "include_history" in (calls[0].body as Record<string, unknown>),
+    ).toBe(false);
+    expect(
+      "include_history" in (calls[1].body as Record<string, unknown>),
+    ).toBe(false);
+    expect((calls[2].body as Record<string, unknown>).include_history).toBe(
+      true,
+    );
   });
 
   it("uses the aliased /turns route and forwards the idempotency key", async () => {

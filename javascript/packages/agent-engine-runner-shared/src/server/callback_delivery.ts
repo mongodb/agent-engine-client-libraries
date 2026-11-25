@@ -1,5 +1,6 @@
 /** Process-local executor callback delivery and redelivery. */
 
+import { runWithLogCorrelation } from "../log_correlation.js";
 import type { ExecutorCallbackRequest } from "../models.js";
 import { getLogger } from "../logger.js";
 import { postWithRetries, RetryablePostError } from "./http_retry.js";
@@ -172,10 +173,10 @@ export class CallbackDelivery {
 
   private startRedelivery(key: string, executionId: string): void {
     if (!this.tasks.has(key)) {
-      const task = this.redeliver(
-        key,
-        executionId,
-        this.retryController.signal,
+      // The callback, not the context that started the task, names the
+      // execution.
+      const task = runWithLogCorrelation(executionId, () =>
+        this.redeliver(key, executionId, this.retryController.signal),
       ).finally(() => {
         this.tasks.delete(key);
       });

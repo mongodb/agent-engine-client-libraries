@@ -265,6 +265,7 @@ export class MemoryClientAdapter implements MemoryRuntime, MemoryCrudClient {
         userId: args.userId,
         visibility: args.visibility,
         topK: args.topK,
+        includeHistory: args.includeHistory,
       });
       return rows.map((m) => MemoryChunkSchema.parse(m));
     } catch (e) {
@@ -323,6 +324,7 @@ export class MemoryClientAdapter implements MemoryRuntime, MemoryCrudClient {
         topK: args.topK,
         similarityThreshold: args.similarityThreshold,
         metadataFilter: args.metadataFilter,
+        includeHistory: args.includeHistory,
       });
     } catch (e) {
       throw this.mapError(e, true);

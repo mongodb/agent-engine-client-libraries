@@ -193,6 +193,7 @@ class TestAuthorizationRequiredInterrupt:
         assert response.elicitation.created is True
 
     def test_execute_tool_auth_required_triggers_interrupt(self):
+        """Native OAuth publishes an addressable interrupt, distinct from a legacy tool review."""
         wrapper = self._make_wrapper()
         interrupt_signal = RuntimeError("interrupt called")
         mock_interrupt = Mock(side_effect=interrupt_signal)
@@ -219,6 +220,7 @@ class TestAuthorizationRequiredInterrupt:
 
         mock_interrupt.assert_called_once_with(
             {
+                "kind": "oauth_authorization",
                 "suspend_reason": "authorization_required",
                 "suspend_context": {
                     "authorization_url": "https://auth.example.com/device",
@@ -259,7 +261,8 @@ class TestAuthorizationRequiredInterrupt:
             with pytest.raises(ToolExecutionError, match="still required after continuation"):
                 wrapper.execute_tool("demo_tool", {"value": 1})
 
-        assert approval.call_count == 2
+        # The recheck asks the gate at a fresh step, not the challenged one.
+        assert [call.kwargs["step"] for call in approval.call_args_list] == [1, 2]
         mock_interrupt.assert_called_once()
 
     def test_continue_after_consent_returns_the_tool_result(self):
@@ -273,10 +276,12 @@ class TestAuthorizationRequiredInterrupt:
         with patch(
             "agent_engine_runner_shared.secure_wrapper.request_oe_approval",
             side_effect=[self._auth_required(), granted],
-        ):
+        ) as approval:
             result = wrapper.execute_tool("demo_tool", {"value": 1})
 
+        # The consent answer is never the result; the fresh-step recheck is.
         assert result == '{"repos": ["qualification-repo"]}'
+        assert [call.kwargs["step"] for call in approval.call_args_list] == [1, 2]
         mock_interrupt.assert_called_once()
 
     def test_execute_tool_auth_required_without_handler_raises_runtime_error(self):

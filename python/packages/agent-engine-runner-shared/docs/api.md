@@ -88,6 +88,8 @@
   * [record\_current\_memory\_metadata](#agent_engine_runner_shared.context.record_current_memory_metadata)
   * [get\_current\_log\_origin](#agent_engine_runner_shared.context.get_current_log_origin)
   * [customer\_origin\_scope](#agent_engine_runner_shared.context.customer_origin_scope)
+  * [get\_log\_execution\_id](#agent_engine_runner_shared.context.get_log_execution_id)
+  * [bind\_log\_execution\_id](#agent_engine_runner_shared.context.bind_log_execution_id)
 * [agent\_engine\_runner\_shared.models](#agent_engine_runner_shared.models)
   * [ExecutionStatus](#agent_engine_runner_shared.models.ExecutionStatus)
   * [SuspendPayload](#agent_engine_runner_shared.models.SuspendPayload)
@@ -191,6 +193,8 @@
   * [ToolCallTimeoutError](#agent_engine_runner_shared.secure_wrapper.ToolCallTimeoutError)
   * [OperationalStepAllocator](#agent_engine_runner_shared.secure_wrapper.OperationalStepAllocator)
     * [allocation\_count](#agent_engine_runner_shared.secure_wrapper.OperationalStepAllocator.allocation_count)
+  * [encode\_tool\_failure](#agent_engine_runner_shared.secure_wrapper.encode_tool_failure)
+  * [decode\_tool\_failure](#agent_engine_runner_shared.secure_wrapper.decode_tool_failure)
   * [ExternalAPICallError](#agent_engine_runner_shared.secure_wrapper.ExternalAPICallError)
   * [LLMInvocationError](#agent_engine_runner_shared.secure_wrapper.LLMInvocationError)
   * [request\_oe\_approval](#agent_engine_runner_shared.secure_wrapper.request_oe_approval)
@@ -208,6 +212,7 @@
 * [agent\_engine\_runner\_shared.structured\_logging](#agent_engine_runner_shared.structured_logging)
   * [StructuredJSONFormatter](#agent_engine_runner_shared.structured_logging.StructuredJSONFormatter)
   * [LoggingStream](#agent_engine_runner_shared.structured_logging.LoggingStream)
+  * [execution\_output\_scope](#agent_engine_runner_shared.structured_logging.execution_output_scope)
   * [install\_structured\_logging](#agent_engine_runner_shared.structured_logging.install_structured_logging)
 * [agent\_engine\_runner\_shared.metrics](#agent_engine_runner_shared.metrics)
   * [LatencyStats](#agent_engine_runner_shared.metrics.LatencyStats)
@@ -296,9 +301,7 @@ The runtime discovers its role from RUNNER_MODE environment variable:
 def __init__(app_name: str = "Agent",
              app_version: str = "1.0.0",
              mongodb_uri: Optional[str] = None,
-             database_name: Optional[str] = None,
              enable_tracing: bool | None = None,
-             traces_collection_name: str = "traces",
              enable_memory: bool | None = None,
              org_id: Optional[str] = None,
              project_id: Optional[str] = None)
@@ -311,9 +314,7 @@ Initialize the runner runtime.
 - `app_name` - Application name
 - `app_version` - Application version
 - `mongodb_uri` - MongoDB URI (for OE execution logging)
-- `database_name` - Database name
 - `enable_tracing` - Deprecated. Tracing is always enabled.
-- `traces_collection_name` - Collection name for trace storage
 - `enable_memory` - Deprecated. Use agent.yaml features.memory instead.
 - `org_id` - Deprecated and ignored. The org is taken from the
   ``ORG_ID`` environment variable, which the platform injects.
@@ -611,7 +612,8 @@ Submit a semantic write and preserve its durable operation reference.
 def search_semantic(query: str,
                     user_id: Optional[str] = None,
                     visibility: Optional[str] = None,
-                    top_k: int = 10) -> List[Dict[str, Any]]
+                    top_k: int = 10,
+                    include_history: bool = False) -> List[Dict[str, Any]]
 ```
 
 Search semantic memories by query.
@@ -620,7 +622,10 @@ Search semantic memories by query.
 
 - `query` - Search query text
 - `user_id` - Optional user ID filter
+- `visibility` - Optional visibility filter
 - `top_k` - Maximum number of results
+- `include_history` - Defaults to False (returns current versions only).
+  When True, retained predecessor versions are also searched.
 
 
 **Returns**:
@@ -878,16 +883,15 @@ List episodic memories with optional filters.
 #### discover\_procedures
 
 ```python
-def discover_procedures(
-        query: str,
-        user_id: Optional[str] = None,
-        *,
-        visibility: Optional[str] = None,
-        tags: Optional[List[str]] = None,
-        top_k: int = 10,
-        similarity_threshold: float = 0.0,
-        metadata_filter: Optional[Dict[str,
-                                       Any]] = None) -> List[Dict[str, Any]]
+def discover_procedures(query: str,
+                        user_id: Optional[str] = None,
+                        *,
+                        visibility: Optional[str] = None,
+                        tags: Optional[List[str]] = None,
+                        top_k: int = 10,
+                        similarity_threshold: float = 0.0,
+                        metadata_filter: Optional[Dict[str, Any]] = None,
+                        include_history: bool = False) -> List[Dict[str, Any]]
 ```
 
 Discover procedures matching a query (lightweight results).
@@ -1714,6 +1718,30 @@ Mark the dynamic extent of customer agent/tool code for log attribution.
 
 Framework-internal. Nested scopes are a no-op. Missing origin means
 unclassified, not a proven platform-authored record.
+
+<a id="agent_engine_runner_shared.context.get_log_execution_id"></a>
+
+#### get\_log\_execution\_id
+
+```python
+def get_log_execution_id() -> Optional[str]
+```
+
+Framework-internal. Execution ID for log attribution: the execution
+context's ID if set, else the log-only binding.
+
+<a id="agent_engine_runner_shared.context.bind_log_execution_id"></a>
+
+#### bind\_log\_execution\_id
+
+```python
+@contextmanager
+def bind_log_execution_id(execution_id: Optional[str]) -> Iterator[None]
+```
+
+Framework-internal. A blank ID still binds, so work with no originating
+execution cannot inherit a caller's binding. Threads started inside the
+binding do not inherit it.
 
 Shared Pydantic models for Runner SDK components.
 
@@ -2967,6 +2995,35 @@ def allocation_count() -> int
 
 Count minted request slots independently of replayed step watermarks.
 
+<a id="agent_engine_runner_shared.secure_wrapper.encode_tool_failure"></a>
+
+#### encode\_tool\_failure
+
+```python
+def encode_tool_failure(error: Exception) -> str
+```
+
+Encode a tool call's failure as a string a durable record can keep.
+
+The string holds the failure's kind, its redacted message and its
+classification fields. ``decode_tool_failure`` rebuilds the same error type
+from it, in this process or another.
+
+<a id="agent_engine_runner_shared.secure_wrapper.decode_tool_failure"></a>
+
+#### decode\_tool\_failure
+
+```python
+def decode_tool_failure(message: str,
+                        cause: Optional[Exception] = None
+                        ) -> ToolExecutionError
+```
+
+Rebuild the error ``encode_tool_failure`` recorded, with its class and fields.
+
+A string without the encoding's prefix is OE's own failure message;
+``cause`` is the replayed activity failure that carried it, if any.
+
 <a id="agent_engine_runner_shared.secure_wrapper.ExternalAPICallError"></a>
 
 ## ExternalAPICallError
@@ -3336,9 +3393,10 @@ class StructuredJSONFormatter(logging.Formatter)
 Formats LogRecord instances as single-line JSON.
 
 Tenant context is read from agent-engine-runner-shared contextvars at format time so
-that records emitted from inside an execution carry executionId/sessionId
-automatically; records emitted outside execution (startup, idle) leave
-those fields ``null``.
+that records emitted from inside an execution, or inside a log-only
+binding, carry executionId automatically; records with neither (startup,
+idle) leave it ``null``. Captured stdout/stderr records instead carry the
+attribution their writer had when the line started.
 
 <a id="agent_engine_runner_shared.structured_logging.LoggingStream"></a>
 
@@ -3354,8 +3412,12 @@ Bare ``print()`` calls (and any other code writing directly to the
 captured stream) are rewritten as LogRecord instances tagged with
 ``agentic_log_source = "stdout"`` (or ``"stderr"``) so the formatter
 can mark them as such on the wire. Lines are buffered until newline,
-with a hard byte cap so a producer writing without ``\n`` cannot
-grow the buffer until OOM (see ``_MAX_BUFFER_BYTES``).
+one pending line per writer (workload scope + execution) so concurrent
+executions' partial writes neither merge nor take each other's IDs.
+Each pending line carries the attribution its writer had when the line
+started. Hard byte and writer caps stop a producer writing without
+``\n`` from growing the buffers until OOM (see ``_MAX_BUFFER_BYTES``,
+``_MAX_PENDING_BYTES`` and ``_MAX_PENDING_WRITERS``).
 
 Holds a reference to the wrapped *original* stream so that a re-install
 can recover and ``fileno()``/``buffer``/``encoding`` requests from
@@ -3367,6 +3429,25 @@ Inherits from ``IOBase`` rather than ``TextIOBase``: ``TextIOBase``
 declares ``encoding`` as a read-only C descriptor and we need a writable
 instance attribute to surface the wrapped stream's encoding to callers
 that probe ``sys.stdout.encoding`` (CLI helpers, click, rich).
+
+<a id="agent_engine_runner_shared.structured_logging.execution_output_scope"></a>
+
+#### execution\_output\_scope
+
+```python
+@contextmanager
+def execution_output_scope(execution_id: Optional[str]) -> Iterator[None]
+```
+
+Own the log binding and captured output of one workload request.
+
+Framework-internal. Use it only around a request that runs agent, tool
+or LLM code. On exit, partial stdout/stderr lines written in this scope
+are emitted under their writers' attribution. Tasks created inside the
+scope keep it after exit, and their later partial writes have no flushing
+owner until the stream budget evicts them, so side requests (drain,
+interrupt, guardrails, redelivery) that spawn such work use
+``bind_log_execution_id`` instead.
 
 <a id="agent_engine_runner_shared.structured_logging.install_structured_logging"></a>
 

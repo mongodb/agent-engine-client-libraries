@@ -11,13 +11,10 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import Enum
-from typing import Any
+from typing import Any, NotRequired
 
-from pydantic import BaseModel, Field
-from typing_extensions import (  # Pydantic requires this on Python < 3.12
-    NotRequired,
-    TypedDict,
-)
+from pydantic import BaseModel, Field, model_validator
+from typing_extensions import TypedDict  # Pydantic requires this on Python < 3.12
 
 TagScalar = str | int | float | bool
 
@@ -214,7 +211,7 @@ class ISGenerationResult(BaseModel):
 # =============================================================================
 
 
-class MemorySource(str, Enum):
+class MemorySource(str, Enum):  # noqa: UP042  # Preserve Enum.__str__ behavior.
     """Source type for memory chunks."""
 
     STM = "stm"
@@ -224,7 +221,7 @@ class MemorySource(str, Enum):
     PROCEDURAL = "procedural"
 
 
-class SearchSource(str, Enum):
+class SearchSource(str, Enum):  # noqa: UP042  # Preserve Enum.__str__ behavior.
     """A memory source that ``Memory.search`` can query.
 
     Mirrors ``MemorySource`` minus ``STM`` (short-term turns are not a search
@@ -237,7 +234,7 @@ class SearchSource(str, Enum):
     PROCEDURAL = "procedural"
 
 
-class RetrievalMode(str, Enum):
+class RetrievalMode(str, Enum):  # noqa: UP042  # Preserve Enum.__str__ behavior.
     """How a single source is searched in per-source context building.
 
     ``TEXT`` is lexical (``$search``), ``SEMANTIC`` is vector (``$vectorSearch``),
@@ -250,7 +247,7 @@ class RetrievalMode(str, Enum):
     HYBRID = "hybrid"
 
 
-class FormatStyle(str, Enum):
+class FormatStyle(str, Enum):  # noqa: UP042  # Preserve Enum.__str__ behavior.
     """Output format for built context.
 
     Mirrors the server's format styles: ``OPENAI`` is a chat-message list that
@@ -315,6 +312,15 @@ class SourceSpec(BaseModel):
         description=(
             "Number of candidates this source contributes (1-200). The server "
             "rejects values above its per-source maximum of 200."
+        ),
+    )
+
+    include_history: bool | None = Field(
+        default=None,
+        description=(
+            "Include retained predecessor versions for semantic or procedural "
+            "retrieval. Other "
+            "sources ignore this setting."
         ),
     )
 
@@ -439,12 +445,16 @@ class ContextResponse(BaseModel):
     """
     Final response model for context building.
 
-    Contains the formatted context and metadata about the retrieval process.
+    Contains the formatted context, or the selected memories when the request set
+    ``include_memories``, and metadata about the retrieval process.
     """
 
-    formatted_context: str | list[dict[str, Any]] = Field(
-        ...,
-        description="Formatted context as string or list of dicts",
+    formatted_context: str | list[dict[str, Any]] | None = Field(
+        default=None,
+        description=(
+            "Formatted context as string or list of dicts; "
+            "None when include_memories=True"
+        ),
     )
     metadata: ContextMetadata = Field(
         ...,
@@ -452,12 +462,25 @@ class ContextResponse(BaseModel):
     )
     selected_memories: list[MemoryChunk] | None = Field(
         default=None,
-        description="Selected memory chunks (only if include_memories=True)",
+        description=(
+            "Selected memory chunks, in place of formatted_context "
+            "(only if include_memories=True)"
+        ),
     )
 
     model_config = {
         "arbitrary_types_allowed": True,
     }
+
+    @model_validator(mode="after")
+    def _carries_formatted_context_or_selected_memories(self) -> ContextResponse:
+        # Both fields are optional, so without this a 2xx body carrying neither would
+        # parse as an empty context instead of raising MemoryServerError.
+        if self.formatted_context is None and self.selected_memories is None:
+            raise ValueError(
+                "ContextResponse needs formatted_context or selected_memories"
+            )
+        return self
 
 
 # =============================================================================

@@ -29,7 +29,10 @@ from urllib.parse import quote
 
 import httpx
 
-from agent_engine_sdk_memory._transport import _HttpTransport
+from agent_engine_sdk_memory._transport import (
+    _HttpTransport,
+    malformed_body_as_server_error,
+)
 from agent_engine_sdk_memory.errors import (
     MemoryBadRequestError,
     MemoryNotSupportedError,
@@ -318,7 +321,8 @@ class _HttpMemoryRuntime:
         if include_memories:
             body["include_memories"] = True
         resp = self._post(_CONTEXT_SUFFIX, body)
-        return ContextResponse.model_validate(resp.json())
+        with malformed_body_as_server_error(resp, "build_context"):
+            return ContextResponse.model_validate(resp.json())
 
     def build_context_from_sources(
         self,
@@ -364,7 +368,8 @@ class _HttpMemoryRuntime:
         if not collapse_duplicate_content:
             body["collapse_duplicate_content"] = False
         resp = self._post(_CONTEXT_FROM_SOURCES_SUFFIX, body)
-        return ContextResponse.model_validate(resp.json())
+        with malformed_body_as_server_error(resp, "build_context2"):
+            return ContextResponse.model_validate(resp.json())
 
     def _search(self, body: dict[str, Any]) -> list[MemoryChunk]:
         resp = self._post(_SEARCH_SUFFIX, body)
@@ -377,6 +382,7 @@ class _HttpMemoryRuntime:
         user_id: str | None = None,
         visibility: str | None = None,
         top_k: int = 50,
+        include_history: bool = False,
     ) -> list[MemoryChunk]:
         if self._profile.ranked_search_unsupported_reason is not None:
             raise MemoryNotSupportedError(
@@ -390,6 +396,8 @@ class _HttpMemoryRuntime:
         }
         if visibility is not None:
             body["visibility"] = visibility
+        if include_history:
+            body["include_history"] = True
         return self._search(body)
 
     def search_episodes(
@@ -454,6 +462,7 @@ class _HttpMemoryRuntime:
         top_k: int = 10,
         similarity_threshold: float = 0.0,
         metadata_filter: dict[str, Any] | None = None,
+        include_history: bool = False,
     ) -> list[dict[str, Any]]:
         if self._profile.ranked_search_unsupported_reason is not None:
             raise MemoryNotSupportedError(
@@ -472,6 +481,8 @@ class _HttpMemoryRuntime:
             body["tags"] = tags
         if metadata_filter is not None:
             body["metadata_filter"] = metadata_filter
+        if include_history:
+            body["include_history"] = True
         resp = self._post(_SEARCH_SUFFIX, body)
         results: list[dict[str, Any]] = []
         for m in self._transport.memories(resp):

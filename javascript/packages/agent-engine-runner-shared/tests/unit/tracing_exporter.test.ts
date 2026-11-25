@@ -1,7 +1,4 @@
 import { describe, test, expect, vi, beforeEach, afterEach } from "vitest";
-import { readFileSync, existsSync, mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 
 const mocks = vi.hoisted(() => ({
   logger: {
@@ -22,12 +19,9 @@ vi.mock("../../src/logger.js", () => ({
 
 import type { ReadableSpan, SpanExporter } from "@opentelemetry/sdk-trace-base";
 import type { ExportResult } from "@opentelemetry/core";
-import type { Collection } from "mongodb";
 
 import {
   ContentPolicyOTLPSpanExporter,
-  JSONLSpanExporter,
-  MongoDBSpanExporter,
   getContentCaptureMode,
   runInstrumentor,
   registerInstrumentor,
@@ -66,181 +60,14 @@ function exportAndWait(
   });
 }
 
-let tmpDir: string;
-
 beforeEach(() => {
-  tmpDir = mkdtempSync(join(tmpdir(), "tracing-"));
   mocks.logger.warn.mockClear();
   mocks.logger.error.mockClear();
   mocks.logger.info.mockClear();
 });
 
 afterEach(() => {
-  rmSync(tmpDir, { recursive: true, force: true });
   resetHooks();
-});
-
-describe("JSONLSpanExporter", () => {
-  test("writes a span to the file", async () => {
-    const traceFile = join(tmpDir, "traces.jsonl");
-    const exporter = new JSONLSpanExporter(traceFile);
-
-    const result = await exportAndWait(exporter, [makeMockSpan()]);
-
-    expect(result.code).toBe(0);
-    expect(existsSync(traceFile)).toBe(true);
-
-    const doc = JSON.parse(
-      readFileSync(traceFile, "utf-8").trimEnd().split("\n")[0] ?? "",
-    );
-    expect(doc["trace_id"]).toBe("12345678123456781234567812345678");
-    expect(doc["span_id"]).toBe("1234567812345678");
-    expect(doc["name"]).toBe("test_span");
-    expect(doc["attributes"]["key"]).toBe("value");
-  });
-
-  test("writes span links, and omits the field when there are none", async () => {
-    const traceFile = join(tmpDir, "traces.jsonl");
-    const exporter = new JSONLSpanExporter(traceFile);
-    const link = {
-      context: {
-        traceId: "abcdefabcdefabcdefabcdefabcdefab",
-        spanId: "000000000000beef",
-        traceFlags: 1,
-      },
-      attributes: { "langgraph.node": "branch_a" },
-    };
-
-    await exportAndWait(exporter, [
-      makeMockSpan({ links: [link] } as Partial<ReadableSpan>),
-      makeMockSpan(),
-    ]);
-
-    const [linked, plain] = readFileSync(traceFile, "utf-8")
-      .trimEnd()
-      .split("\n")
-      .map((line) => JSON.parse(line));
-    expect(linked["links"]).toEqual([
-      {
-        trace_id: "abcdefabcdefabcdefabcdefabcdefab",
-        span_id: "000000000000beef",
-        attributes: { "langgraph.node": "branch_a" },
-      },
-    ]);
-    expect(plain).not.toHaveProperty("links");
-  });
-
-  test("appends to an existing file across multiple exports", async () => {
-    const traceFile = join(tmpDir, "traces.jsonl");
-    const exporter = new JSONLSpanExporter(traceFile);
-
-    await exportAndWait(exporter, [makeMockSpan({ name: "test_span" })]);
-    await exportAndWait(exporter, [makeMockSpan({ name: "span_2" })]);
-
-    const lines = readFileSync(traceFile, "utf-8").trimEnd().split("\n");
-    expect(lines).toHaveLength(2);
-    expect(JSON.parse(lines[0] ?? "")["name"]).toBe("test_span");
-    expect(JSON.parse(lines[1] ?? "")["name"]).toBe("span_2");
-  });
-
-  test("handles an empty span list without writing the file", async () => {
-    const traceFile = join(tmpDir, "traces.jsonl");
-    const exporter = new JSONLSpanExporter(traceFile);
-
-    const result = await exportAndWait(exporter, []);
-
-    expect(result.code).toBe(0);
-    expect(existsSync(traceFile)).toBe(false);
-  });
-});
-
-describe("MongoDBSpanExporter", () => {
-  test("inserts a span via insertMany", async () => {
-    const insertMany = vi.fn().mockResolvedValue({ insertedCount: 1 });
-    const collection = { insertMany } as unknown as Collection;
-    const exporter = new MongoDBSpanExporter(collection);
-
-    const result = await exportAndWait(exporter, [makeMockSpan()]);
-
-    expect(result.code).toBe(0);
-    expect(insertMany).toHaveBeenCalledOnce();
-
-    const docs = insertMany.mock.calls[0]?.[0] as Record<string, unknown>[];
-    expect(docs).toHaveLength(1);
-    expect(docs[0]?.["trace_id"]).toBe("12345678123456781234567812345678");
-    expect(docs[0]?.["name"]).toBe("test_span");
-  });
-
-  test("handles an empty span list without calling insertMany", async () => {
-    const insertMany = vi.fn();
-    const collection = { insertMany } as unknown as Collection;
-    const exporter = new MongoDBSpanExporter(collection);
-
-    const result = await exportAndWait(exporter, []);
-
-    expect(result.code).toBe(0);
-    expect(insertMany).not.toHaveBeenCalled();
-  });
-
-  test("returns FAILURE when insertMany rejects", async () => {
-    const insertMany = vi
-      .fn()
-      .mockRejectedValue(new Error("Connection failed"));
-    const collection = { insertMany } as unknown as Collection;
-    const exporter = new MongoDBSpanExporter(collection);
-
-    const result = await exportAndWait(exporter, [makeMockSpan()]);
-
-    expect(result.code).toBe(1);
-  });
-
-  test("writes kind and status as their OTel names, not numbers", async () => {
-    const insertMany = vi.fn().mockResolvedValue({ insertedCount: 1 });
-    const collection = { insertMany } as unknown as Collection;
-    const exporter = new MongoDBSpanExporter(collection);
-
-    await exportAndWait(exporter, [
-      makeMockSpan({ kind: 1, status: { code: 2, message: "broke" } }),
-    ]);
-
-    const docs = insertMany.mock.calls[0]?.[0] as Record<string, unknown>[];
-    expect(docs[0]?.["kind"]).toBe("SERVER");
-    expect(docs[0]?.["status"]).toEqual({
-      code: "ERROR",
-      description: "broke",
-    });
-  });
-
-  test("maps the default INTERNAL / OK codes to names", async () => {
-    const insertMany = vi.fn().mockResolvedValue({ insertedCount: 1 });
-    const collection = { insertMany } as unknown as Collection;
-    const exporter = new MongoDBSpanExporter(collection);
-
-    await exportAndWait(exporter, [
-      makeMockSpan({ kind: 0, status: { code: 1 } }),
-    ]);
-
-    const docs = insertMany.mock.calls[0]?.[0] as Record<string, unknown>[];
-    expect(docs[0]?.["kind"]).toBe("INTERNAL");
-    expect((docs[0]?.["status"] as { code: string }).code).toBe("OK");
-  });
-
-  test("falls back to the numeric string for out-of-range kind/status", async () => {
-    const insertMany = vi.fn().mockResolvedValue({ insertedCount: 1 });
-    const collection = { insertMany } as unknown as Collection;
-    const exporter = new MongoDBSpanExporter(collection);
-
-    await exportAndWait(exporter, [
-      makeMockSpan({
-        kind: 99 as unknown as ReadableSpan["kind"],
-        status: { code: 42 as unknown as ReadableSpan["status"]["code"] },
-      }),
-    ]);
-
-    const docs = insertMany.mock.calls[0]?.[0] as Record<string, unknown>[];
-    expect(docs[0]?.["kind"]).toBe("99");
-    expect((docs[0]?.["status"] as { code: string }).code).toBe("42");
-  });
 });
 
 describe("buildResourceAttributes", () => {

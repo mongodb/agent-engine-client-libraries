@@ -271,16 +271,26 @@ export const ContextMetadataSchema = z.looseObject({
 });
 export type ContextMetadata = z.infer<typeof ContextMetadataSchema>;
 
-/** Response from a context build request containing formatted context and retrieval metadata. */
-export const ContextResponseSchema = z.looseObject({
-  formatted_context: z.union([
-    z.string(),
-    z.array(z.record(z.string(), z.unknown())),
-  ]),
-  metadata: ContextMetadataSchema,
-  // Mirrors Python `list[MemoryChunk] | None` (default None): the server sends
-  // `null` when include_memories=False (the only path any caller uses), so accept
-  // null as well as undefined/array.
-  selected_memories: z.array(MemoryChunkSchema).nullish(),
-});
+/**
+ * Response from a context build request: the formatted context, or with
+ * `include_memories` the selected memories in its place, plus retrieval metadata.
+ */
+export const ContextResponseSchema = z
+  .looseObject({
+    // `null` when include_memories=true: the server returns the selected memories
+    // instead of formatting them.
+    formatted_context: z
+      .union([z.string(), z.array(z.record(z.string(), z.unknown()))])
+      .nullish(),
+    metadata: ContextMetadataSchema,
+    // `null` unless include_memories=true.
+    selected_memories: z.array(MemoryChunkSchema).nullish(),
+  })
+  .refine(
+    (response) =>
+      response.formatted_context != null || response.selected_memories != null,
+    {
+      message: "context response needs formatted_context or selected_memories",
+    },
+  );
 export type ContextResponse = z.infer<typeof ContextResponseSchema>;

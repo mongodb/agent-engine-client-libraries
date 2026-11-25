@@ -10,6 +10,7 @@ records emitted outside an execution leave executionId/sessionId null.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import io
 import json
 import logging
@@ -1267,7 +1268,7 @@ def test_logging_stream_caps_unbounded_buffer():
     msg = captured[0].getMessage()
     assert msg.endswith("...(truncated)"), msg[-40:]
     assert len(msg.encode("utf-8")) <= sl._MAX_BUFFER_BYTES + len("...(truncated)")
-    assert stream._buffer == ""
+    assert not stream._pending
 
 
 def test_unwrap_logging_stream_is_recursive():
@@ -1346,3 +1347,251 @@ def test_aclose_stream_iter_attributes_customer_cleanup_logs(install_to_buffer):
     asyncio.run(_run())
     cleanup = next(r for r in _records(buf) if r["message"] == "cleanup line")
     assert cleanup["origin"] == "customer"
+
+
+def _enter_execution(execution_id: str, session_id: str):
+    return set_execution_context(execution_id, None, _OE_URL, session_id=session_id)
+
+
+def test_log_only_binding_tags_records_without_entering_execution_context(install_to_buffer):
+    from agent_engine_runner_shared.context import (
+        bind_log_execution_id,
+        get_current_execution_id,
+    )
+
+    buf = install_to_buffer()
+    with bind_log_execution_id("exec-log-only"):
+        assert get_current_execution_id() is None
+        logging.getLogger("runner_test").info("bound line")
+    logging.getLogger("runner_test").info("after binding")
+
+    recs = {r["message"]: r for r in _records(buf)}
+    assert recs["bound line"]["executionId"] == "exec-log-only"
+    assert recs["after binding"]["executionId"] is None
+
+
+def test_interleaved_partial_writes_keep_each_execution_line(install_to_buffer):
+    buf = install_to_buffer()
+    first = _enter_execution("exec-one", "sess-one")
+    sys.stdout.write("abc")
+    second = _enter_execution("exec-two", "sess-two")
+    sys.stdout.write("def\n")
+    clear_execution_context(second)
+    sys.stdout.write("\n")
+    clear_execution_context(first)
+
+    recs = {r["message"]: r for r in _records(buf) if r["source"] == "stdout"}
+    assert set(recs) == {"abc", "def"}
+    assert (recs["abc"]["executionId"], recs["abc"]["sessionId"]) == ("exec-one", "sess-one")
+    assert (recs["def"]["executionId"], recs["def"]["sessionId"]) == ("exec-two", "sess-two")
+
+
+def test_concurrent_thread_prints_keep_their_own_line_and_execution(install_to_buffer):
+    buf = install_to_buffer()
+    a_wrote, b_wrote = threading.Event(), threading.Event()
+
+    def writer_a() -> None:
+        tokens = _enter_execution("exec-a", "sess-a")
+        try:
+            sys.stdout.write("x")
+            a_wrote.set()
+            assert b_wrote.wait(5)
+            sys.stdout.write("\n")
+        finally:
+            clear_execution_context(tokens)
+
+    def writer_b() -> None:
+        assert a_wrote.wait(5)
+        tokens = _enter_execution("exec-b", "sess-b")
+        try:
+            sys.stdout.write("y\n")
+        finally:
+            clear_execution_context(tokens)
+            b_wrote.set()
+
+    threads = [threading.Thread(target=writer_a), threading.Thread(target=writer_b)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    recs = {r["message"]: r["executionId"] for r in _records(buf) if r["source"] == "stdout"}
+    assert recs == {"x": "exec-a", "y": "exec-b"}
+
+
+def test_flushed_partial_line_keeps_its_writer_attribution(install_to_buffer):
+    buf = install_to_buffer()
+    writer = _enter_execution("exec-writer", "sess-writer")
+    with customer_origin_scope():
+        sys.stdout.write("pending customer output")
+    clear_execution_context(writer)
+
+    flusher = _enter_execution("exec-flusher", "sess-flusher")
+    sys.stdout.flush()
+    clear_execution_context(flusher)
+
+    rec = next(r for r in _records(buf) if r["message"] == "pending customer output")
+    assert rec["executionId"] == "exec-writer"
+    assert rec["sessionId"] == "sess-writer"
+    assert rec["origin"] == "customer"
+
+
+def test_owner_exit_flushes_only_its_own_pending_output(install_to_buffer):
+    from agent_engine_runner_shared.structured_logging import execution_output_scope
+
+    buf = install_to_buffer()
+    with execution_output_scope("exec-shared"):
+        sys.stdout.write("sibling partial")
+        with execution_output_scope("exec-shared"):
+            sys.stdout.write("owner partial")
+        assert [r["message"] for r in _records(buf) if r["source"] == "stdout"] == ["owner partial"]
+        sys.stdout.write(" done\n")
+
+    recs = [(r["message"], r["executionId"]) for r in _records(buf) if r["source"] == "stdout"]
+    assert recs == [("owner partial", "exec-shared"), ("sibling partial done", "exec-shared")]
+
+
+async def test_late_partial_writes_after_owner_exit_stay_within_writer_budget(install_to_buffer):
+    from agent_engine_runner_shared import structured_logging as sl
+    from agent_engine_runner_shared.structured_logging import execution_output_scope
+
+    buf = install_to_buffer()
+    count = sl._MAX_PENDING_WRITERS + 8
+
+    async def late_write(gate: asyncio.Event, index: int) -> None:
+        await gate.wait()
+        sys.stdout.write(f"late-{index}")
+
+    for index in range(count):
+        gate = asyncio.Event()
+        with execution_output_scope(f"exec-late-{index}"):
+            task = asyncio.create_task(late_write(gate, index))
+        gate.set()
+        await task
+
+    stream = sys.stdout
+    assert isinstance(stream, LoggingStream)
+    assert len(stream._pending) == sl._MAX_PENDING_WRITERS
+    evicted = [r for r in _records(buf) if r["message"].startswith("late-")]
+    assert len(evicted) == count - sl._MAX_PENDING_WRITERS
+    for rec in evicted:
+        index = rec["message"].removeprefix("late-").removesuffix("...(truncated)")
+        assert rec["executionId"] == f"exec-late-{index}"
+
+
+def test_partial_writes_across_executions_stay_within_byte_budget(install_to_buffer):
+    from agent_engine_runner_shared import structured_logging as sl
+    from agent_engine_runner_shared.structured_logging import execution_output_scope
+
+    buf = install_to_buffer()
+    fragment = sl._MAX_BUFFER_BYTES - 1
+    writers = sl._MAX_PENDING_BYTES // fragment + 1
+    with contextlib.ExitStack() as scopes:
+        for index in range(writers):
+            scopes.enter_context(execution_output_scope(f"exec-big-{index}"))
+            sys.stdout.write("x" * fragment)
+
+        stream = sys.stdout
+        assert isinstance(stream, LoggingStream)
+        assert stream._pending_bytes <= sl._MAX_PENDING_BYTES
+        evicted = [r for r in _records(buf) if r["source"] == "stdout"]
+        assert [(r["executionId"], r["message"]) for r in evicted] == [
+            ("exec-big-0", "x" * fragment + "...(truncated)")
+        ]
+
+
+def test_lines_completed_after_a_partial_take_their_own_attribution(install_to_buffer):
+    buf = install_to_buffer()
+    tokens = _enter_execution("exec-origin", "sess-origin")
+    try:
+        with customer_origin_scope():
+            sys.stdout.write("customer partial")
+        sys.stdout.write(" end\nplatform line\n")
+    finally:
+        clear_execution_context(tokens)
+
+    recs = {r["message"]: r for r in _records(buf) if r["source"] == "stdout"}
+    assert recs["customer partial end"]["origin"] == "customer"
+    assert "origin" not in recs["platform line"]
+
+
+async def test_output_scope_closed_from_another_context_keeps_output_and_does_not_raise(
+    install_to_buffer,
+):
+    import contextvars
+
+    from agent_engine_runner_shared.structured_logging import execution_output_scope
+
+    buf = install_to_buffer()
+
+    async def stream():
+        with execution_output_scope("exec-abandoned"):
+            sys.stdout.write("pending at disconnect")
+            yield
+
+    generator = stream()
+    await generator.__anext__()
+    # The event loop finalizes an abandoned generator from another task.
+    await asyncio.create_task(generator.aclose(), context=contextvars.Context())
+
+    rec = next(r for r in _records(buf) if r["message"] == "pending at disconnect")
+    assert rec["executionId"] == "exec-abandoned"
+
+
+def test_flush_from_a_logging_filter_while_a_line_completes(install_to_buffer):
+    buf = install_to_buffer()
+
+    class FlushingFilter(logging.Filter):
+        def filter(self, record: logging.LogRecord) -> bool:
+            if getattr(record, "agentic_log_source", None) == "stdout":
+                sys.stdout.flush()
+            return True
+
+    root = logging.getLogger()
+    flushing = FlushingFilter()
+    root.addFilter(flushing)
+    tokens = _enter_execution("exec-filter", "sess-filter")
+    try:
+        sys.stdout.write("first")
+        sys.stdout.write(" line\nnext partial")
+    finally:
+        clear_execution_context(tokens)
+        root.removeFilter(flushing)
+
+    stream = sys.stdout
+    assert isinstance(stream, LoggingStream)
+    # The filter runs before the record reaches its handler, so the flushed
+    # partial line is written first; each line still ships exactly once.
+    assert sorted(r["message"] for r in _records(buf) if r["source"] == "stdout") == [
+        "first line",
+        "next partial",
+    ]
+    assert stream._pending == {}
+    assert stream._pending_bytes == 0
+
+
+def test_scope_exit_survives_a_raising_logging_filter(install_to_buffer):
+    from agent_engine_runner_shared import structured_logging as sl
+    from agent_engine_runner_shared.structured_logging import execution_output_scope
+
+    buf = install_to_buffer()
+
+    class RaisingFilter(logging.Filter):
+        def filter(self, record: logging.LogRecord) -> bool:
+            if record.getMessage() == "stdout partial":
+                raise RuntimeError("filter failed")
+            return True
+
+    root = logging.getLogger()
+    raising = RaisingFilter()
+    root.addFilter(raising)
+    try:
+        with execution_output_scope("exec-raising-filter"):
+            sys.stdout.write("stdout partial")
+            sys.stderr.write("stderr partial")
+    finally:
+        root.removeFilter(raising)
+
+    stderr = [r["message"] for r in _records(buf) if r["source"] == "stderr"]
+    assert stderr == ["stderr partial"]
+    assert sl._log_output_scope.get() is None

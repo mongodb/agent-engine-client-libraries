@@ -15,7 +15,12 @@ import {
   getCurrentSessionId,
   getCurrentWorkspaceId,
 } from "../context.js";
-import { DEFAULT_RECORD_SOURCE, MAX_TRACEBACK_BYTES } from "./constants.js";
+import { getLogCorrelation } from "../log_correlation.js";
+import {
+  DEFAULT_RECORD_SOURCE,
+  MAX_TRACEBACK_BYTES,
+  RECORD_ATTRIBUTION,
+} from "./constants.js";
 import type { FormatterEnv } from "./env.js";
 import { jsonSafeStringify, truncateUtf8 } from "./serialize.js";
 
@@ -33,6 +38,29 @@ const LEVEL_NAME_BY_LOG4JS: Record<string, string> = {
 
 function normalizeLevelName(levelStr: string): string {
   return LEVEL_NAME_BY_LOG4JS[levelStr] ?? levelStr;
+}
+
+export function getLogExecutionId(): string | null {
+  return getCurrentExecutionId() || getLogCorrelation();
+}
+
+/** Mirrors Python's `_LogAttribution`. */
+export interface LogAttribution {
+  executionId: string | null;
+  sessionId: string | null;
+  workspaceId: string | null;
+  traceId: string | null;
+  origin: string | null;
+}
+
+export function currentLogAttribution(): LogAttribution {
+  return {
+    executionId: getLogExecutionId(),
+    sessionId: getCurrentSessionId(),
+    workspaceId: getCurrentWorkspaceId(),
+    traceId: getCurrentTraceId(),
+    origin: getCurrentLogOrigin(),
+  };
 }
 
 interface ParsedMessage {
@@ -92,8 +120,11 @@ export function buildStructuredLayout(
 ): (event: LoggingEvent) => string {
   // Tenant context is read from the AsyncLocalStorage contextvars in
   // `context.ts` at layout time so records emitted from inside an
-  // execution carry executionId/sessionId automatically; records emitted
-  // outside an execution (startup, idle) leave those fields `null`.
+  // execution, or inside a log-only binding, carry executionId
+  // automatically; records with neither (startup, idle) leave it `null`.
+  // Captured stdout/stderr records instead carry the attribution their
+  // writer had when the line started, whole: a null field stays null rather
+  // than taking the flushing context's value.
   return (event: LoggingEvent): string => {
     const { message, extra, err } = parseEventData(event.data);
     // Intentional divergence from the Python formatter: structured_logging.py
@@ -122,6 +153,13 @@ export function buildStructuredLayout(
         ? (extra["source"] as string)
         : DEFAULT_RECORD_SOURCE;
     delete fields["source"];
+    const recorded = (extra as { [RECORD_ATTRIBUTION]?: LogAttribution })[
+      RECORD_ATTRIBUTION
+    ];
+    delete (fields as { [RECORD_ATTRIBUTION]?: LogAttribution })[
+      RECORD_ATTRIBUTION
+    ];
+    const attribution = recorded ?? currentLogAttribution();
 
     // Match Python's `record.filename` / `record.lineno` / `record.funcName`
     // (structured_logging.py:125-128): include caller-site info only for
@@ -143,8 +181,7 @@ export function buildStructuredLayout(
       if (event.functionName) fields["funcName"] = event.functionName;
     }
 
-    const origin = getCurrentLogOrigin();
-    const traceId = getCurrentTraceId();
+    const { origin, traceId } = attribution;
     return jsonSafeStringify({
       timestamp: event.startTime.toISOString(),
       level: normalizeLevelName(event.level.levelStr),
@@ -153,9 +190,9 @@ export function buildStructuredLayout(
       service: env.service,
       tenantId: env.tenantId,
       projectId: env.projectId,
-      workspaceId: getCurrentWorkspaceId() ?? env.workspaceIdEnv,
-      executionId: getCurrentExecutionId(),
-      sessionId: getCurrentSessionId(),
+      workspaceId: attribution.workspaceId ?? env.workspaceIdEnv,
+      executionId: attribution.executionId,
+      sessionId: attribution.sessionId,
       bootId: env.bootId,
       podName: env.podName,
       source,

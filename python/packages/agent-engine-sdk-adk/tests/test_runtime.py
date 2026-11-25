@@ -39,6 +39,17 @@ class TestAppDeprecation:
 
         assert MockRuntime.call_args.kwargs.get("org_id") is None
 
+    def test_deprecation_warning_on_removed_trace_options(self) -> None:
+        """App accepts the removed trace options and does not forward them."""
+        with patch("agent_engine_sdk_adk.runtime.TenantRuntime") as MockRuntime:
+            MockRuntime.return_value = MagicMock()
+            from agent_engine_sdk_adk.runtime import App
+
+            with pytest.warns(DeprecationWarning, match="database_name"):
+                App(app_name="test-agent", database_name="trace_db")
+
+        assert "database_name" not in MockRuntime.call_args.kwargs
+
 
 class TestAppRunner:
     def test_get_agent_uses_the_apps_stable_adk_runner(self) -> None:

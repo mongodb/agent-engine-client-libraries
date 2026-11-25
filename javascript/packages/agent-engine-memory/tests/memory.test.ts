@@ -268,6 +268,39 @@ describe("Memory facade orchestration", () => {
     expect(seenUser).toBe("bound-user");
   });
 
+  it("forwards includeHistory through the semantic runtime contract", async () => {
+    let seen: Parameters<MemoryRuntime["searchSemantic"]>[0] | undefined;
+    const runtime = stubRuntime().runtime;
+    runtime.searchSemantic = async (args) => {
+      seen = args;
+      return [];
+    };
+    await new Memory({ runtime }).searchSemantic({
+      query: "q",
+      userId: "u",
+      includeHistory: true,
+    });
+    expect(seen?.includeHistory).toBe(true);
+  });
+
+  it("forwards includeHistory through discoverProcedures only when enabled", async () => {
+    const seen: Array<Parameters<MemoryRuntime["discoverProcedures"]>[0]> = [];
+    const runtime = stubRuntime().runtime;
+    runtime.discoverProcedures = async (args) => {
+      seen.push(args);
+      return [];
+    };
+    const mem = new Memory({ runtime });
+    await mem.discoverProcedures({ query: "q", userId: "u" });
+    await mem.discoverProcedures({
+      query: "q",
+      userId: "u",
+      includeHistory: true,
+    });
+    expect("includeHistory" in seen[0]).toBe(false);
+    expect(seen[1]?.includeHistory).toBe(true);
+  });
+
   it("buildContext forwards explicit maxTokens to the runtime", async () => {
     let seen: Parameters<MemoryRuntime["buildContext"]>[0] | undefined;
     const runtime = stubRuntime().runtime;

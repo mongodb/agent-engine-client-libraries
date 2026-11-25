@@ -554,3 +554,29 @@ class TestInvokeAgentRetrySpanStatus:
         a2a_spans = [s for s in spans if s.name == "a2a.invoke_agent"]
         assert a2a_spans, "the a2a span must be emitted on failure"
         assert a2a_spans[-1].status.status_code == trace.StatusCode.ERROR
+
+
+class TestInvokeAgentTargetName:
+    """The trace UI labels the A2A step from a2a.target_agent_name."""
+
+    def _invoke(self, monkeypatch, response: dict) -> list:
+        provider = TracerProvider()
+        monkeypatch.setattr(trace, "_TRACER_PROVIDER", provider)
+        in_mem = InMemorySpanExporter()
+        provider.add_span_processor(SimpleSpanProcessor(in_mem))
+        client = AgentToAgent(oe_url="http://test:8000")
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = response
+        mock_resp.status_code = 200
+        with patch.object(client, "_ensure_client") as mock_ensure:
+            mock_ensure.return_value.post.return_value = mock_resp
+            client.invoke_agent(agent_id="ws-claims", message="hello")
+        return [s for s in in_mem.get_finished_spans() if s.name == "a2a.invoke_agent"]
+
+    def test_sets_target_agent_name_attribute(self, monkeypatch):
+        spans = self._invoke(monkeypatch, {**INVOKE_RESPONSE, "target_agent_name": "Claims Agent"})
+        assert spans[-1].attributes["a2a.target_agent_name"] == "Claims Agent"
+
+    def test_omits_attribute_when_oe_does_not_return_name(self, monkeypatch):
+        spans = self._invoke(monkeypatch, INVOKE_RESPONSE)
+        assert "a2a.target_agent_name" not in spans[-1].attributes

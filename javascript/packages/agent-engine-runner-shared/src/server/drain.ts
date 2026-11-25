@@ -42,6 +42,7 @@
 import { z } from "zod";
 import type { FastifyInstance } from "fastify";
 import { getLogger } from "../logger.js";
+import { bindRequestExecution } from "./request_execution.js";
 
 const logger = getLogger("agent_engine_runner_shared.server.drain");
 
@@ -589,7 +590,9 @@ export function registerDrainRoute(
     if (body.deadline_at_ms > Date.now() + registry.maxDeadlineMs) {
       return reply.code(400).send({ detail: "deadline exceeds maximum" });
     }
-    const verdict = registry.apply(body);
-    return reply.code(verdict.status).send(verdict.body);
+    return bindRequestExecution(request, body.execution_id, () => {
+      const verdict = registry.apply(body);
+      return reply.code(verdict.status).send(verdict.body);
+    });
   });
 }

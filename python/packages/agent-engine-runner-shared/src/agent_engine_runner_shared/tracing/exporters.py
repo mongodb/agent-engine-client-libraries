@@ -2,8 +2,6 @@
 Span Exporters for Runner SDK.
 
 Simple exporters that work with OpenInference instrumentation:
-- JSONLSpanExporter: Optional explicit local debugging exporter.
-- MongoDBSpanExporter: Writes to MongoDB collection (when configured).
 - PlatformSpanExporter: Sends spans to the Orchestration Engine, which stores
   them in the project traces collection.
 - ContentPolicyOTLPSpanExporter: Wraps an OTLP exporter, applying the
@@ -15,14 +13,12 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import datetime
-import json
 import logging
 import os
 import random
 import threading
 import time
-from pathlib import Path
-from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, Mapping, Sequence
+from typing import Any, Awaitable, Callable, Dict, Mapping, Sequence
 
 import httpx
 from opentelemetry.sdk.trace import Event, ReadableSpan
@@ -38,89 +34,7 @@ from agent_engine_runner_shared.tracing.conversation import (
     trace_stream,
 )
 
-if TYPE_CHECKING:
-    from pymongo.collection import Collection
-
 logger = logging.getLogger(__name__)
-
-
-def get_trace_path() -> Path:
-    """Get the trace file path from env vars or default."""
-    if file_env := os.getenv("AGENTIC_TRACES_FILE"):
-        path = Path(file_env)
-    elif base_dir := os.getenv("AGENTIC_OBSERVABILITY_DIR"):
-        path = Path(base_dir) / "traces.jsonl"
-    else:
-        path = Path("observability") / "traces.jsonl"
-
-    path.parent.mkdir(parents=True, exist_ok=True)
-    return path
-
-
-def _span_to_dict(span: ReadableSpan) -> Dict[str, Any]:
-    """Convert OpenTelemetry span to a dict for storage."""
-    ctx = span.get_span_context()
-    parent = span.parent
-
-    # Extract attributes
-    attributes = dict(span.attributes) if span.attributes else {}
-
-    # These attributes are emitted by agent-engine-runner-shared's span processor for
-    # correlation only. Trusted tenant/root scope is applied by OE from
-    # Execution records when events are read.
-    session_id = attributes.get("session.id") or attributes.get("session_id")
-    execution_id = attributes.get("execution.id") or attributes.get("execution_id")
-
-    doc = {
-        "trace_id": format(ctx.trace_id, "032x"),  # type: ignore[union-attr]  # ctx is set by get_span_context()
-        "span_id": format(ctx.span_id, "016x"),  # type: ignore[union-attr]
-        "name": span.name,
-        "kind": span.kind.name,
-        "start_time_ns": span.start_time,
-        "end_time_ns": span.end_time,
-        "duration_ns": (span.end_time or 0) - (span.start_time or 0),
-        "status": {
-            "code": span.status.status_code.name,
-            "description": span.status.description,
-        },
-        "attributes": attributes,
-        "resource": dict(span.resource.attributes)
-        if span.resource and span.resource.attributes
-        else {},
-    }
-
-    # Add session_id as top-level field for easier querying
-    if session_id:
-        doc["session_id"] = session_id
-
-    # Add execution_id as top-level field for easier querying
-    if execution_id:
-        doc["execution_id"] = execution_id
-
-    if parent:
-        doc["parent_span_id"] = format(parent.span_id, "016x")
-
-    if span.events:
-        doc["events"] = [
-            {
-                "name": e.name,
-                "timestamp_ns": e.timestamp,
-                "attributes": dict(e.attributes) if e.attributes else {},
-            }
-            for e in span.events
-        ]
-
-    if span.links:
-        doc["links"] = [
-            {
-                "trace_id": format(link.context.trace_id, "032x"),
-                "span_id": format(link.context.span_id, "016x"),
-                "attributes": dict(link.attributes) if link.attributes else {},
-            }
-            for link in span.links
-        ]
-
-    return doc
 
 
 def _conversation_attributes(
@@ -130,11 +44,7 @@ def _conversation_attributes(
     resource: Mapping[str, Any],
     tracker: ConversationDeltaTracker,
 ) -> Dict[str, Any] | None:
-    """Return the attributes to store for one span, or None to keep them as-is.
-
-    Shared by both export destinations so a span's conversation is deduplicated
-    the same way whichever store it reaches.
-    """
+    """Return the attributes to store for one span, or None to keep them as-is."""
     if attributes.get(ATTR_INPUT_MESSAGES_RECORDED_BY) == RECORDED_BY_CALLER:
         # The caller's span holds this prompt. Dropping it here and leaving the
         # tracker alone keeps a later tool-pod span — one that records its own
@@ -149,78 +59,12 @@ def _conversation_attributes(
     )
 
 
-def _trim_conversation(doc: Dict[str, Any], tracker: ConversationDeltaTracker) -> Dict[str, Any]:
-    """Keep only the input messages this call added (see tracing.conversation)."""
-    attributes = doc.get("attributes")
-    if not attributes:
-        return doc
-    trimmed = _conversation_attributes(
-        attributes,
-        trace_id=doc["trace_id"],
-        resource=doc.get("resource") or {},
-        tracker=tracker,
-    )
-    if trimmed is not None:
-        doc["attributes"] = trimmed
-    return doc
-
-
-class JSONLSpanExporter(SpanExporter):
-    """Exports spans to a JSONL file."""
-
-    def __init__(self, path: Path | None = None):
-        self._path = path
-        self._lock = threading.Lock()
-
-    def export(self, spans: Sequence[ReadableSpan]) -> SpanExportResult:
-        """Write spans to the JSONL file."""
-        if not spans:
-            return SpanExportResult.SUCCESS
-
-        path = self._path or get_trace_path()
-
-        try:
-            with self._lock:
-                with path.open("a", encoding="utf-8") as f:
-                    for span in spans:
-                        f.write(json.dumps(_span_to_dict(span), default=str) + "\n")
-            return SpanExportResult.SUCCESS
-        except Exception as e:
-            logger.error(f"Failed to write traces to {path}: {e}", exc_info=True)
-            return SpanExportResult.FAILURE
-
-
-class MongoDBSpanExporter(SpanExporter):
-    """Exports spans to a MongoDB collection."""
-
-    def __init__(self, collection: "Collection"):
-        self.collection = collection
-        self._conversations = ConversationDeltaTracker()
-
-    def export(self, spans: Sequence[ReadableSpan]) -> SpanExportResult:
-        """Insert spans as documents into MongoDB."""
-        if not spans:
-            return SpanExportResult.SUCCESS
-
-        try:
-            # Trim on a copy: a failed insert must not advance past messages the
-            # store never received, or later calls would omit them.
-            staged = self._conversations.copy()
-            docs = [_trim_conversation(_span_to_dict(span), staged) for span in spans]
-            self.collection.insert_many(docs)
-            self._conversations = staged
-            return SpanExportResult.SUCCESS
-        except Exception as e:
-            logger.error(f"Failed to write traces to MongoDB: {e}", exc_info=True)
-            return SpanExportResult.FAILURE
-
-
 # =============================================================================
 # Content-capture policy
 #
-# Mongo stays unredacted (customer's own BYOC DB, canonical for the
-# playground). This policy applies only to the OTLP path, which leaves the
-# process bound for a third-party tool.
+# The platform trace path stays unredacted (the customer's own project store,
+# canonical for the playground). This policy applies only to the OTLP path,
+# which leaves the process bound for a third-party tool.
 # =============================================================================
 
 _CONTENT_CAPTURE_ENV = "AGENTIC_PLATFORM_OTEL_CONTENT_CAPTURE"
@@ -451,11 +295,8 @@ def _with_attributes(span: ReadableSpan, attributes: Dict[str, Any]) -> Readable
 
 
 def _trim_span(span: ReadableSpan, tracker: ConversationDeltaTracker) -> ReadableSpan | None:
-    """Return ``span`` with only this call's new messages, or None if unchanged.
-
-    The span-level form of ``_trim_conversation``, for destinations that encode
-    the span rather than building a document from it.
-    """
+    """Return ``span`` with only this call's new messages (see
+    tracing.conversation), or None if unchanged."""
     attributes = span.attributes
     if not attributes:
         return None
@@ -545,10 +386,9 @@ class ContentPolicyOTLPSpanExporter(SpanExporter):
 # Platform trace exporter (Orchestration Engine /internal/traces)
 #
 # The guest sends OTLP-protobuf batches to the OE, which converts and stores
-# them in the project traces collection. This replaces the guest's direct
-# MongoDB write: it is the platform trace path, independent of customer OTLP
-# export, and carries unredacted spans so the playground can show prompts and
-# outputs as it did from Mongo.
+# them in the project traces collection. It is the platform trace path,
+# independent of customer OTLP export, and carries unredacted spans so the
+# playground can show prompts and outputs.
 # =============================================================================
 
 _PLATFORM_TRACE_INGEST_PATH = "/internal/traces"

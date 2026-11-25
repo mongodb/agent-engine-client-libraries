@@ -31,6 +31,7 @@ import type { FastifyInstance } from "fastify";
 
 import { getLogger } from "../logger.js";
 import type { DrainRegistry } from "./drain.js";
+import { bindRequestExecution } from "./request_execution.js";
 
 const logger = getLogger("agent_engine_runner_shared.server.callInterrupt");
 
@@ -73,12 +74,14 @@ export function registerCallInterruptRoute(
         return reply.code(403).send({ detail: "workspace mismatch" });
       }
     }
-    const outcome = registry.abortCall(body.execution_id, body.step_number);
-    // The runtime-side evidence of a per-call abort, mirroring the drain
-    // receiver's accepted/finalized markers.
-    logger.info(
-      `Call interrupt ${outcome} for execution ${body.execution_id} (step ${body.step_number})`,
-    );
-    return reply.send({ outcome });
+    return bindRequestExecution(request, body.execution_id, () => {
+      const outcome = registry.abortCall(body.execution_id, body.step_number);
+      // The runtime-side evidence of a per-call abort, mirroring the drain
+      // receiver's accepted/finalized markers.
+      logger.info(
+        `Call interrupt ${outcome} for execution ${body.execution_id} (step ${body.step_number})`,
+      );
+      return reply.send({ outcome });
+    });
   });
 }

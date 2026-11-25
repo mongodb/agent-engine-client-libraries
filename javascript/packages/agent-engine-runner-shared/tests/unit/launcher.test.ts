@@ -21,7 +21,13 @@
 
 import { describe, test, expect, beforeEach, afterEach, vi } from "vitest";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import {
+  mkdtempSync,
+  mkdirSync,
+  writeFileSync,
+  rmSync,
+  symlinkSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -234,8 +240,12 @@ interface SpawnResult {
   stderr: string;
 }
 
-function runLauncher(env: Record<string, string>, cwd?: string): SpawnResult {
-  const r = spawnSync(process.execPath, [LAUNCHER], {
+function runLauncher(
+  env: Record<string, string>,
+  cwd?: string,
+  launcher: string = LAUNCHER,
+): SpawnResult {
+  const r = spawnSync(process.execPath, [launcher], {
     // Pin STRUCTURED_LOGGING off unless the test opts in — otherwise a
     // developer env with STRUCTURED_LOGGING=true would make every case emit JSON.
     env: { ...process.env, STRUCTURED_LOGGING: "", ...env },
@@ -404,6 +414,26 @@ describe("runLauncher (subprocess)", () => {
     );
 
     const r = runLauncher({ AGENT_ENTRYPOINT: `${modulePath}:start` });
+
+    expect(r.status).toBe(0);
+    expect(r.stdout).toMatch(/START_INVOKED/);
+  });
+
+  test("runs when installed behind a symlinked package directory, as pnpm installs it", () => {
+    const modulePath = join(tmpModulesDir, "fake_module.mjs");
+    writeFileSync(
+      modulePath,
+      `export function start() { console.log('START_INVOKED') }\n`,
+    );
+    const linkedPackage = join(tmpModulesDir, "node_modules", "runner-shared");
+    mkdirSync(dirname(linkedPackage), { recursive: true });
+    symlinkSync(dirname(dirname(LAUNCHER)), linkedPackage);
+
+    const r = runLauncher(
+      { AGENT_ENTRYPOINT: `${modulePath}:start` },
+      undefined,
+      join(linkedPackage, "dist", "launcher.js"),
+    );
 
     expect(r.status).toBe(0);
     expect(r.stdout).toMatch(/START_INVOKED/);

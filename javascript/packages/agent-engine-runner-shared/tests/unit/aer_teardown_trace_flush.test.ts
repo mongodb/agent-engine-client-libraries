@@ -14,33 +14,14 @@ const mocks = vi.hoisted(() => ({
   },
 }));
 
-const mongo = vi.hoisted(() => {
-  const collection = {
-    insertMany: vi.fn().mockResolvedValue({ insertedCount: 1 }),
-    dbName: "testdb",
-    collectionName: "traces",
-  };
-  const dbObj = {
-    command: vi.fn(),
-    collection: vi.fn(() => collection),
-  };
-  const instance = {
-    connect: vi.fn().mockResolvedValue(undefined),
-    db: vi.fn(() => dbObj),
-    close: vi.fn().mockResolvedValue(undefined),
-  };
-  return { instance, dbObj, collection };
-});
+const exportControl = vi.hoisted(() => ({
+  bodies: [] as Uint8Array[],
+  onTraceExport: null as null | (() => Promise<void>),
+}));
 
 vi.mock("../../src/logger.js", () => ({
   getLogger: () => mocks.logger,
   setupLogging: vi.fn(),
-}));
-
-vi.mock("mongodb", () => ({
-  MongoClient: function () {
-    return mongo.instance;
-  },
 }));
 
 import { AERServer, setupTracing, shutdownTracing } from "../../src/index.js";
@@ -50,7 +31,8 @@ import type { ExecutorCallbackRequest } from "../../src/models.js";
 import { AER_EXECUTE } from "../../src/span_names.js";
 import { CallbackDelivery } from "../../src/server/callback_delivery.js";
 
-const URI = "mongodb://user:pass@host:27017";
+const OE_URL = "http://oe:8000";
+const TRACE_INGEST_PATH = "/internal/traces";
 const CALLER_TRACE_ID = "0af7651916cd43dd8448eb211c80319c";
 const TRACEPARENT = `00-${CALLER_TRACE_ID}-b7ad6b7169203331-01`;
 
@@ -90,21 +72,34 @@ function executeRequest(executionId: string): ExecuteRequest {
   } as ExecuteRequest;
 }
 
+function response(status: number): Response {
+  return {
+    status,
+    ok: status >= 200 && status < 300,
+    headers: { get: () => null },
+    arrayBuffer: async () => new ArrayBuffer(0),
+  } as unknown as Response;
+}
+
+function deliveredSpans(body: Uint8Array | undefined): string {
+  return body ? new TextDecoder().decode(body) : "";
+}
+
 describe("AER run root survives pod teardown", () => {
   beforeEach(async () => {
-    mongo.instance.connect.mockResolvedValue(undefined);
-    mongo.instance.close.mockResolvedValue(undefined);
-    mongo.instance.db.mockReturnValue(mongo.dbObj);
-    mongo.dbObj.command.mockReset();
-    mongo.dbObj.command.mockResolvedValue({ ok: 1 });
-    mongo.dbObj.collection.mockReturnValue(mongo.collection);
-    mongo.collection.insertMany.mockReset();
-    mongo.collection.insertMany.mockResolvedValue({ insertedCount: 1 });
-    await setupTracing({
-      serviceName: "aer-teardown",
-      mongodbUri: URI,
-      mongodbDatabaseName: "testdb",
+    exportControl.bodies = [];
+    exportControl.onTraceExport = null;
+    const fetchImpl = vi.fn(async (url: string, init: RequestInit) => {
+      if (String(url).includes(TRACE_INGEST_PATH)) {
+        exportControl.bodies.push(init.body as Uint8Array);
+        if (exportControl.onTraceExport) await exportControl.onTraceExport();
+      }
+      return response(200);
     });
+    vi.stubGlobal("fetch", fetchImpl);
+
+    process.env["OE_URL"] = OE_URL;
+    await setupTracing({ serviceName: "aer-teardown" });
   });
 
   afterEach(async () => {
@@ -112,6 +107,7 @@ describe("AER run root survives pod teardown", () => {
     trace.disable();
     propagation.disable();
     context.disable();
+    delete process.env["OE_URL"];
     vi.unstubAllGlobals();
     vi.restoreAllMocks();
   });
@@ -134,15 +130,19 @@ describe("AER run root survives pod teardown", () => {
       expect(res.statusCode).toBe(200);
 
       let releaseExport!: () => void;
-      mongo.collection.insertMany.mockImplementationOnce(
-        () =>
-          new Promise((resolve) => {
-            releaseExport = () => resolve({ insertedCount: 1 });
-          }),
-      );
+      let signalExportStarted!: () => void;
+      const exportStarted = new Promise<void>((resolve) => {
+        signalExportStarted = resolve;
+      });
+      exportControl.onTraceExport = () => {
+        signalExportStarted();
+        return new Promise<void>((resolve) => {
+          releaseExport = resolve;
+        });
+      };
+
       const dispatched = forceFlushTracing(5_000);
-      await new Promise((resolve) => setTimeout(resolve, 20));
-      expect(mongo.collection.insertMany).toHaveBeenCalledTimes(1);
+      await exportStarted;
 
       let settled = false;
       const shutdown = shutdownTracing().then(() => {
@@ -155,10 +155,7 @@ describe("AER run root survives pod teardown", () => {
       await dispatched;
       await shutdown;
       expect(settled).toBe(true);
-      const docs = mongo.collection.insertMany.mock.calls.flatMap(
-        (call) => call[0] as Array<{ name: string }>,
-      );
-      expect(docs.some((doc) => doc.name === AER_EXECUTE)).toBe(true);
+      expect(deliveredSpans(exportControl.bodies[0])).toContain(AER_EXECUTE);
     });
   }
 });

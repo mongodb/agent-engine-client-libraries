@@ -359,12 +359,14 @@ class AppBoundRuntime:
         user_id: str | None = None,
         visibility: str | None = None,
         top_k: int = 50,
+        include_history: bool = False,
     ) -> list[MemoryChunk]:
         results = self._runtime.search_semantic(
             query=query,
             user_id=user_id,
             visibility=visibility,
             top_k=top_k,
+            include_history=include_history,
         )
         return [_chunk(d, MemorySource.SEMANTIC) for d in results]
 
@@ -414,6 +416,7 @@ class AppBoundRuntime:
         top_k: int = 10,
         similarity_threshold: float = 0.0,
         metadata_filter: dict[str, Any] | None = None,
+        include_history: bool = False,
     ) -> list[dict[str, Any]]:
         return self._runtime.discover_procedures(
             query=query,
@@ -423,6 +426,7 @@ class AppBoundRuntime:
             top_k=top_k,
             similarity_threshold=similarity_threshold,
             metadata_filter=metadata_filter,
+            include_history=include_history,
         )
 
 

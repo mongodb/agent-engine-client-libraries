@@ -98,6 +98,8 @@ from agent_engine_runner_shared.secure_wrapper import (
     ToolExecutionError,
     ToolOutcomeUnknownError,
     ToolPlatformError,
+    decode_tool_failure,
+    encode_tool_failure,
     extract_usage,
 )
 from agent_engine_runner_shared.structured_logging import (
@@ -195,6 +197,8 @@ __all__ = [
     "ToolOutcomeUnknownError",
     "ToolPlatformError",
     "ExternalAPICallError",
+    "decode_tool_failure",
+    "encode_tool_failure",
     # Utilities
     "extract_usage",
     # Utilities

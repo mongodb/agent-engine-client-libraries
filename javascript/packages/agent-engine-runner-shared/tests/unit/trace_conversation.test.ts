@@ -18,11 +18,14 @@ import {
   SimpleSpanProcessor,
 } from "@opentelemetry/sdk-trace-base";
 import type { ReadableSpan, Span } from "@opentelemetry/sdk-trace-base";
-import type { Collection } from "mongodb";
+import type {
+  IExportTraceServiceResponse,
+  ISerializer,
+} from "@opentelemetry/otlp-transformer";
 
 import { ExecutionContextSpanProcessor } from "../../src/tracing/setup.js";
 
-import { MongoDBSpanExporter } from "../../src/index.js";
+import { PlatformSpanExporter } from "../../src/index.js";
 import {
   ATTR_INPUT_MESSAGES_OFFSET,
   ATTR_INPUT_MESSAGES_RECORDED_BY,
@@ -185,7 +188,35 @@ describe("ConversationDeltaTracker", () => {
   });
 });
 
-describe("MongoDBSpanExporter conversation trimming", () => {
+function recordingExporter(): {
+  exporter: PlatformSpanExporter;
+  stored: Array<Record<string, unknown>>;
+} {
+  const stored: Array<Record<string, unknown>> = [];
+  const encoder = new TextEncoder();
+  const decoder = new TextDecoder();
+  const serializer: ISerializer<ReadableSpan[], IExportTraceServiceResponse> = {
+    serializeRequest: (spans) =>
+      encoder.encode(JSON.stringify(spans.map((span) => span.attributes))),
+    deserializeResponse: () => ({}),
+  };
+  const fetchImpl = async (_url: string, init: RequestInit) => {
+    stored.push(...JSON.parse(decoder.decode(init.body as Uint8Array)));
+    return {
+      status: 200,
+      headers: { get: () => null },
+      arrayBuffer: async () => new ArrayBuffer(0),
+    } as unknown as Response;
+  };
+  const exporter = new PlatformSpanExporter("http://oe:8000", {
+    fetchImpl: fetchImpl as unknown as typeof fetch,
+    tlsOptions: () => undefined,
+    serializer,
+  });
+  return { exporter, stored };
+}
+
+describe("PlatformSpanExporter caller-recorded prompts", () => {
   function makeSpan(attributes: Record<string, unknown>): ReadableSpan {
     return {
       spanContext: () => ({
@@ -210,68 +241,14 @@ describe("MongoDBSpanExporter conversation trimming", () => {
     } as unknown as ReadableSpan;
   }
 
-  function exportAndWait(exporter: MongoDBSpanExporter, spans: ReadableSpan[]) {
+  function exportAndWait(
+    exporter: PlatformSpanExporter,
+    spans: ReadableSpan[],
+  ) {
     return new Promise<void>((resolve) => {
       exporter.export(spans, () => resolve());
     });
   }
-
-  function docsOf(
-    insertMany: ReturnType<typeof vi.fn>,
-    call: number,
-  ): Record<string, unknown> {
-    const args = insertMany.mock.calls[call]?.[0] as
-      | Array<Record<string, unknown>>
-      | undefined;
-    return args?.[0] ?? {};
-  }
-
-  test("trims each written span", async () => {
-    const insertMany = vi.fn().mockResolvedValue(undefined);
-    const exporter = new MongoDBSpanExporter({
-      insertMany,
-    } as unknown as Collection);
-
-    await exportAndWait(exporter, [makeSpan(messages("hi"))]);
-    await exportAndWait(exporter, [makeSpan(messages("hi", "there"))]);
-
-    const first = docsOf(insertMany, 0);
-    const second = docsOf(insertMany, 1);
-    expect(
-      storedContents(first["attributes"] as Record<string, unknown>),
-    ).toEqual(["hi"]);
-    expect(
-      storedContents(second["attributes"] as Record<string, unknown>),
-    ).toEqual(["there"]);
-    expect(
-      (second["attributes"] as Record<string, unknown>)[
-        ATTR_INPUT_MESSAGES_OFFSET
-      ],
-    ).toBe(1);
-  });
-
-  test("does not advance progress when the write fails", async () => {
-    const insertMany = vi
-      .fn()
-      .mockRejectedValueOnce(new Error("Connection failed"))
-      .mockResolvedValue(undefined);
-    const exporter = new MongoDBSpanExporter({
-      insertMany,
-    } as unknown as Collection);
-
-    await exportAndWait(exporter, [makeSpan(messages("hi"))]);
-    await exportAndWait(exporter, [makeSpan(messages("hi", "again"))]);
-
-    const retried = docsOf(insertMany, 1);
-    expect(
-      storedContents(retried["attributes"] as Record<string, unknown>),
-    ).toEqual(["hi", "again"]);
-    expect(
-      (retried["attributes"] as Record<string, unknown>)[
-        ATTR_INPUT_MESSAGES_OFFSET
-      ],
-    ).toBe(0);
-  });
 
   function callerRecorded(
     attributes: Record<string, unknown>,
@@ -283,10 +260,7 @@ describe("MongoDBSpanExporter conversation trimming", () => {
   }
 
   test("drops a prompt the caller records", async () => {
-    const insertMany = vi.fn().mockResolvedValue(undefined);
-    const exporter = new MongoDBSpanExporter({
-      insertMany,
-    } as unknown as Collection);
+    const { exporter, stored } = recordingExporter();
 
     await exportAndWait(exporter, [
       makeSpan(
@@ -298,22 +272,18 @@ describe("MongoDBSpanExporter conversation trimming", () => {
       ),
     ]);
 
-    const stored = docsOf(insertMany, 0)["attributes"] as Record<
-      string,
-      unknown
-    >;
-    expect(storedContents(stored)).toEqual([]);
-    expect(stored["input.value"]).toBeUndefined();
-    expect(stored["input.mime_type"]).toBeUndefined();
-    expect(stored[ATTR_INPUT_MESSAGES_RECORDED_BY]).toBe(RECORDED_BY_CALLER);
-    expect(stored[ATTR_INPUT_MESSAGES_OFFSET]).toBeUndefined();
+    const attributes = stored[0] ?? {};
+    expect(storedContents(attributes)).toEqual([]);
+    expect(attributes["input.value"]).toBeUndefined();
+    expect(attributes["input.mime_type"]).toBeUndefined();
+    expect(attributes[ATTR_INPUT_MESSAGES_RECORDED_BY]).toBe(
+      RECORDED_BY_CALLER,
+    );
+    expect(attributes[ATTR_INPUT_MESSAGES_OFFSET]).toBeUndefined();
   });
 
   test("a dropped prompt does not advance the tracked conversation", async () => {
-    const insertMany = vi.fn().mockResolvedValue(undefined);
-    const exporter = new MongoDBSpanExporter({
-      insertMany,
-    } as unknown as Collection);
+    const { exporter, stored } = recordingExporter();
 
     await exportAndWait(exporter, [
       makeSpan(callerRecorded(messages("hi", "there"))),
@@ -322,10 +292,7 @@ describe("MongoDBSpanExporter conversation trimming", () => {
       makeSpan(messages("asked a provider directly")),
     ]);
 
-    const direct = docsOf(insertMany, 1)["attributes"] as Record<
-      string,
-      unknown
-    >;
+    const direct = stored[1] ?? {};
     expect(storedContents(direct)).toEqual(["asked a provider directly"]);
     expect(direct[ATTR_INPUT_MESSAGES_OFFSET]).toBe(0);
   });
@@ -335,13 +302,11 @@ describe("ExecutionContextSpanProcessor", () => {
   async function storedModelAttributes(
     callerRecords: boolean,
   ): Promise<Record<string, unknown>> {
-    const insertMany = vi.fn().mockResolvedValue(undefined);
+    const { exporter, stored } = recordingExporter();
     const provider = new BasicTracerProvider({
       spanProcessors: [
         new ExecutionContextSpanProcessor(),
-        new SimpleSpanProcessor(
-          new MongoDBSpanExporter({ insertMany } as unknown as Collection),
-        ),
+        new SimpleSpanProcessor(exporter),
       ],
     });
     const tracer = provider.getTracer("test");
@@ -355,11 +320,8 @@ describe("ExecutionContextSpanProcessor", () => {
     span.setAttribute("input.value", '{"messages": [["user", "hi"]]}');
     span.end();
 
-    await vi.waitFor(() => expect(insertMany).toHaveBeenCalled());
-    const docs = insertMany.mock.calls[0]?.[0] as Array<
-      Record<string, unknown>
-    >;
-    return docs[0]?.["attributes"] as Record<string, unknown>;
+    await vi.waitFor(() => expect(stored).toHaveLength(1));
+    return stored[0] ?? {};
   }
 
   test("stores no prompt for a span the processor marked", async () => {

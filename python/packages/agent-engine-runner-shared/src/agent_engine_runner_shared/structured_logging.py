@@ -20,17 +20,22 @@ import re
 import sys
 import threading
 import traceback as tb_mod
+from collections.abc import Iterator
+from contextlib import contextmanager, suppress
+from contextvars import ContextVar
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from io import IOBase
 from types import TracebackType
-from typing import IO, Any, Callable, Dict, Optional, cast
+from typing import IO, Any, Callable, Dict, NamedTuple, Optional, Tuple, cast
 
 from agent_engine_runner_shared.context import (
-    get_current_execution_id,
+    bind_log_execution_id,
     get_current_log_origin,
     get_current_session_id,
     get_current_trace_id,
     get_current_workspace_id,
+    get_log_execution_id,
 )
 
 # Map RUNNER_MODE values to the canonical service identifier on the log line.
@@ -61,6 +66,43 @@ _MAX_TRACEBACK_BYTES = 8192
 # log line and far below a runaway producer.
 _MAX_BUFFER_BYTES = 65536
 
+# Cap on pending partial-line bytes across all writers. Sized for many
+# concurrent executions streaming unterminated output, so normal load does not
+# force-split healthy lines.
+_MAX_PENDING_BYTES = 16 * _MAX_BUFFER_BYTES
+
+# Cap on distinct writers holding a partial line. A task that inherits a
+# finished execution's scope can still write after the owner flushed, so
+# without a key cap those fragments would accumulate with no cleanup owner.
+_MAX_PENDING_WRITERS = 64
+
+# Attribution snapshot attached to captured stdout/stderr records, so a line
+# keeps its writer's identity whoever completes or flushes it.
+_RECORD_ATTRIBUTION_ATTR = "agentic_log_attribution"
+
+_TRUNCATION_MARKER = "...(truncated)"
+
+
+class _LogAttribution(NamedTuple):
+    execution_id: Optional[str]
+    session_id: Optional[str]
+    workspace_id: Optional[str]
+    trace_id: Optional[str]
+    origin: Optional[str]
+
+
+def _current_attribution() -> _LogAttribution:
+    return _LogAttribution(
+        execution_id=get_log_execution_id(),
+        session_id=get_current_session_id(),
+        workspace_id=get_current_workspace_id(),
+        trace_id=get_current_trace_id(),
+        origin=get_current_log_origin(),
+    )
+
+
+_log_output_scope: ContextVar[Optional[object]] = ContextVar("log_output_scope", default=None)
+
 
 def _env(name: str) -> Optional[str]:
     val = os.environ.get(name)
@@ -90,9 +132,10 @@ class StructuredJSONFormatter(logging.Formatter):
     """Formats LogRecord instances as single-line JSON.
 
     Tenant context is read from agent-engine-runner-shared contextvars at format time so
-    that records emitted from inside an execution carry executionId/sessionId
-    automatically; records emitted outside execution (startup, idle) leave
-    those fields ``null``.
+    that records emitted from inside an execution, or inside a log-only
+    binding, carry executionId automatically; records with neither (startup,
+    idle) leave it ``null``. Captured stdout/stderr records instead carry the
+    attribution their writer had when the line started.
     """
 
     def __init__(self, mode: Optional[str] = None) -> None:
@@ -125,6 +168,9 @@ class StructuredJSONFormatter(logging.Formatter):
         )
 
         source = getattr(record, _RECORD_SOURCE_ATTR, _DEFAULT_RECORD_SOURCE)
+        attribution: _LogAttribution = (
+            getattr(record, _RECORD_ATTRIBUTION_ATTR, None) or _current_attribution()
+        )
 
         fields: Dict[str, Any] = {"component": self._component}
         if source == _DEFAULT_RECORD_SOURCE:
@@ -161,18 +207,17 @@ class StructuredJSONFormatter(logging.Formatter):
             "service": self._service,
             "tenantId": self._tenant_id,
             "projectId": self._project_id,
-            "workspaceId": get_current_workspace_id() or self._workspace_id_env,
-            "executionId": get_current_execution_id(),
-            "sessionId": get_current_session_id(),
+            "workspaceId": attribution.workspace_id or self._workspace_id_env,
+            "executionId": attribution.execution_id,
+            "sessionId": attribution.session_id,
             "bootId": self._boot_id,
             "podName": self._pod_name,
             "source": source,
             "fields": fields,
         }
-        origin = get_current_log_origin()
-        if origin is not None:
-            entry["origin"] = origin
-        trace_id = get_current_trace_id()
+        if attribution.origin is not None:
+            entry["origin"] = attribution.origin
+        trace_id = attribution.trace_id
         if trace_id and re.fullmatch(r"[0-9a-f]{32}", trace_id) and trace_id != "0" * 32:
             entry["traceId"] = trace_id
 
@@ -193,6 +238,17 @@ def _within_json_depth(value: Any, depth: int = 0) -> bool:
     return all(_within_json_depth(child, depth + 1) for child in children)
 
 
+# (workload output scope, execution ID) of the code writing a partial line.
+_WriterKey = Tuple[Optional[object], Optional[str]]
+
+
+@dataclass
+class _PendingLine:
+    attribution: _LogAttribution
+    text: str = ""
+    size: int = 0
+
+
 class LoggingStream(IOBase):
     """Replacement for ``sys.stdout``/``sys.stderr`` that routes writes through logging.
 
@@ -200,8 +256,12 @@ class LoggingStream(IOBase):
     captured stream) are rewritten as LogRecord instances tagged with
     ``agentic_log_source = "stdout"`` (or ``"stderr"``) so the formatter
     can mark them as such on the wire. Lines are buffered until newline,
-    with a hard byte cap so a producer writing without ``\\n`` cannot
-    grow the buffer until OOM (see ``_MAX_BUFFER_BYTES``).
+    one pending line per writer (workload scope + execution) so concurrent
+    executions' partial writes neither merge nor take each other's IDs.
+    Each pending line carries the attribution its writer had when the line
+    started. Hard byte and writer caps stop a producer writing without
+    ``\\n`` from growing the buffers until OOM (see ``_MAX_BUFFER_BYTES``,
+    ``_MAX_PENDING_BYTES`` and ``_MAX_PENDING_WRITERS``).
 
     Holds a reference to the wrapped *original* stream so that a re-install
     can recover and ``fileno()``/``buffer``/``encoding`` requests from
@@ -226,7 +286,10 @@ class LoggingStream(IOBase):
         self._logger = logger
         self._level = level
         self._source = source
-        self._buffer = ""
+        # Rewritten on every write, so budget eviction drops the writer that
+        # wrote least recently.
+        self._pending: Dict[_WriterKey, _PendingLine] = {}
+        self._pending_bytes = 0
         self._lock = threading.RLock()
         self._wrapped = wrapped
         wrapped_encoding = getattr(wrapped, "encoding", None) if wrapped is not None else None
@@ -264,35 +327,69 @@ class LoggingStream(IOBase):
         if not text:
             return 0
         with self._lock:
-            self._buffer += text
-            while "\n" in self._buffer:
-                line, self._buffer = self._buffer.split("\n", 1)
+            key: _WriterKey = (_log_output_scope.get(), get_log_execution_id())
+            pending = self._pending.pop(key, None) or _PendingLine(
+                attribution=_current_attribution()
+            )
+            self._pending_bytes -= pending.size
+            lines = (pending.text + text).split("\n")
+            tail = lines.pop()
+            # Settle the pending state before emitting: a logging filter or
+            # handler may flush this stream while a line is emitted.
+            emits: list[tuple[str, _LogAttribution]] = []
+            attribution = pending.attribution
+            for line in lines:
                 if line.strip():
-                    self._emit(line)
+                    emits.append((line, attribution))
+                # Every later line starts under the writer's current context.
+                attribution = _current_attribution()
             # Force-emit a truncated record if a producer is writing without
             # newlines — mirrors the exc_traceback truncation pattern. Slice
             # by UTF-8 byte count so the cap reflects what Fluent Bit ships.
-            encoded = self._buffer.encode("utf-8")
+            encoded = tail.encode("utf-8")
             if len(encoded) > _MAX_BUFFER_BYTES:
                 truncated = (
-                    encoded[:_MAX_BUFFER_BYTES].decode("utf-8", errors="ignore") + "...(truncated)"
+                    encoded[:_MAX_BUFFER_BYTES].decode("utf-8", errors="ignore")
+                    + _TRUNCATION_MARKER
                 )
-                self._emit(truncated)
-                self._buffer = ""
+                emits.append((truncated, attribution))
+                tail, encoded = "", b""
+            if tail:
+                self._pending[key] = _PendingLine(attribution, tail, len(encoded))
+                self._pending_bytes += len(encoded)
+            while self._pending and (
+                self._pending_bytes > _MAX_PENDING_BYTES
+                or len(self._pending) > _MAX_PENDING_WRITERS
+            ):
+                oldest = self._pending.pop(next(iter(self._pending)))
+                self._pending_bytes -= oldest.size
+                if oldest.text.strip():
+                    emits.append((oldest.text + _TRUNCATION_MARKER, oldest.attribution))
+            for line, line_attribution in emits:
+                self._emit(line, line_attribution)
             return len(text)
 
     def flush(self) -> None:
         with self._lock:
+            self._flush_matching(lambda _key: True)
+
+    def _flush_scope(self, scope: object) -> None:
+        with self._lock:
+            self._flush_matching(lambda key: key[0] is scope)
+
+    def _flush_matching(self, matches: Callable[[_WriterKey], bool]) -> None:
+        flushed = [self._pending.pop(key) for key in list(self._pending) if matches(key)]
+        self._pending_bytes -= sum(pending.size for pending in flushed)
+        for pending in flushed:
             # Whitespace-only buffer content is uninteresting — emitting a
             # JSON record with ``message: "   "`` adds noise and makes
             # downstream filters work harder. Same rule as write()'s
             # per-line ``if line.strip()`` filter; do not 'fix' by
             # removing the strip.
-            if self._buffer.strip():
-                self._emit(self._buffer)
-            self._buffer = ""
+            if pending.text.strip():
+                self._emit(pending.text, pending.attribution)
 
-    def _emit(self, line: str) -> None:
+    def _emit(self, line: str, attribution: _LogAttribution) -> None:
         level = self._level
         if self._source == "stdout":
             try:
@@ -321,7 +418,41 @@ class LoggingStream(IOBase):
             None,
         )
         setattr(record, _RECORD_SOURCE_ATTR, self._source)
+        setattr(record, _RECORD_ATTRIBUTION_ATTR, attribution)
         self._logger.handle(record)
+
+
+@contextmanager
+def execution_output_scope(execution_id: Optional[str]) -> Iterator[None]:
+    """Own the log binding and captured output of one workload request.
+
+    Framework-internal. Use it only around a request that runs agent, tool
+    or LLM code. On exit, partial stdout/stderr lines written in this scope
+    are emitted under their writers' attribution. Tasks created inside the
+    scope keep it after exit, and their later partial writes have no flushing
+    owner until the stream budget evicts them, so side requests (drain,
+    interrupt, guardrails, redelivery) that spawn such work use
+    ``bind_log_execution_id`` instead.
+    """
+    scope = object()
+    token = _log_output_scope.set(scope)
+    try:
+        with bind_log_execution_id(execution_id):
+            yield
+    finally:
+        try:
+            for stream in (sys.stdout, sys.stderr):
+                if isinstance(stream, LoggingStream):
+                    # Best-effort: a raising logging filter must not fail the
+                    # request or skip the other stream.
+                    with suppress(Exception):
+                        stream._flush_scope(scope)
+        finally:
+            try:
+                _log_output_scope.reset(token)
+            except ValueError:
+                # Same cross-context finalization as bind_log_execution_id.
+                pass
 
 
 def _unwrap_logging_stream(stream: IO[str]) -> IO[str]:

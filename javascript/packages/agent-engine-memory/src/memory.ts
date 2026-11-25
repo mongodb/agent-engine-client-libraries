@@ -420,6 +420,7 @@ export class Memory {
     userId?: string | null;
     visibility?: string | null;
     topK?: number;
+    includeHistory?: boolean;
   }): Promise<MemoryChunk[]> {
     const resolved = this.resolve({
       userId: args.userId,
@@ -430,6 +431,7 @@ export class Memory {
       userId: resolved.userId,
       visibility: args.visibility,
       topK: args.topK ?? 50,
+      includeHistory: args.includeHistory ?? false,
     });
   }
 
@@ -613,6 +615,7 @@ export class Memory {
     topK?: number;
     similarityThreshold?: number;
     metadataFilter?: Record<string, unknown> | null;
+    includeHistory?: boolean;
   }): Promise<Array<Record<string, unknown>>> {
     const resolved = this.resolve({
       userId: args.userId,
@@ -626,6 +629,7 @@ export class Memory {
       topK: args.topK ?? 10,
       similarityThreshold: args.similarityThreshold ?? 0.0,
       metadataFilter: args.metadataFilter,
+      ...(args.includeHistory ? { includeHistory: true } : {}),
     });
   }
 

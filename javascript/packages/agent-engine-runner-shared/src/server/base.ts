@@ -16,7 +16,12 @@ import type {
   BaseExecutionCallback,
   RequestContext,
 } from "@mongodb-js/agent-engine-sdk";
+import { runWithLogCorrelation } from "../log_correlation.js";
 import { getLogger } from "../logger.js";
+import {
+  redactToolErrorText,
+  requestNamedCredentialValues,
+} from "../tool_api_error.js";
 import { Metrics } from "../metrics.js";
 import { HealthStatus, type HealthResponse } from "../models.js";
 import { tracingStatus } from "../tracing/index.js";
@@ -26,6 +31,7 @@ import { resolveCorsPolicy } from "./cors.js";
 import { registerAuthHook } from "./auth.js";
 import { DrainRegistry, registerDrainRoute } from "./drain.js";
 import { registerCallInterruptRoute } from "./callInterrupt.js";
+import { getRequestExecutionId } from "./request_execution.js";
 import { markStartupComplete } from "../startup_state.js";
 
 const logger = getLogger("agent_engine_runner_shared.server.base");
@@ -188,17 +194,31 @@ export abstract class BaseServer {
     // other callers may retry as a transient infra failure rather than reject
     // as a bad payload. Non-Zod errors keep their explicit `statusCode`
     // (e.g. the 400/504 set by the AER execute path) or default to 500.
-    app.setErrorHandler((error, _request, reply) => {
+    app.setErrorHandler((error, request, reply) => {
       if (error instanceof ZodError) {
         return reply
           .status(422)
           .send({ error: "Validation failed", detail: error.issues });
       }
-      const err = error as { statusCode?: number; message?: string };
+      const err = error as {
+        statusCode?: number;
+        message?: string;
+        name?: string;
+        stack?: string;
+      };
       const statusCode = err.statusCode ?? 500;
       const message = err.message ?? "Internal Server Error";
       if (statusCode >= 500) {
-        logger.error({ err: error }, `Unhandled error: ${message}`);
+        // Graph builder and provider errors can carry credentials.
+        const credentials = requestNamedCredentialValues();
+        const redact = (text: string): string =>
+          redactToolErrorText(text, credentials);
+        const logged = new Error(redact(message));
+        logged.name = err.name ?? logged.name;
+        logged.stack = err.stack && redact(err.stack);
+        runWithLogCorrelation(getRequestExecutionId(request), () =>
+          logger.error({ err: logged }, `Unhandled error: ${logged.message}`),
+        );
       }
       return reply.status(statusCode).send({ error: message });
     });
@@ -224,11 +244,10 @@ export abstract class BaseServer {
     app.get("/health", async (): Promise<HealthResponse> => {
       // Probes check the HTTP status code (2xx = pass), not the body, so a
       // `degraded` status surfaces the state for observability without
-      // triggering a pod restart — e.g. the trace store being unreachable at
-      // startup while the pod keeps serving traffic.
+      // triggering a pod restart — e.g. trace exports to the OE failing while
+      // the pod keeps serving traffic.
       const tracing = tracingStatus();
       const status =
-        tracing.database_exporter === "degraded" ||
         tracing.platform_exporter === "degraded"
           ? HealthStatus.DEGRADED
           : HealthStatus.HEALTHY;

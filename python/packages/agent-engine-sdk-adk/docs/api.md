@@ -86,7 +86,7 @@ def __init__(app_name: str,
              mongodb_uri: str | None = None,
              database_name: str | None = None,
              enable_tracing: bool | None = None,
-             traces_collection_name: str = "traces",
+             traces_collection_name: str | None = None,
              enable_memory: bool | None = None,
              org_id: str | None = None) -> None
 ```
@@ -98,9 +98,14 @@ Initialize the App.
 - `app_name` - Application name
 - `app_version` - Application version
 - `mongodb_uri` - MongoDB URI
-- `database_name` - Database name
+- `database_name` - Deprecated and ignored. Traces go only to the
+  Orchestration Engine, and the checkpointer database is chosen
+  by the platform. Passing this argument raises a
+  DeprecationWarning and will be removed in a future release.
 - `enable_tracing` - Deprecated. Tracing is always enabled.
-- `traces_collection_name` - Collection name for trace storage
+- `traces_collection_name` - Deprecated and ignored. Traces go only to
+  the Orchestration Engine. Passing this argument raises a
+  DeprecationWarning and will be removed in a future release.
 - `enable_memory` - Deprecated. Use agent.yaml features.memory instead.
 - `org_id` - Deprecated and ignored. The org is taken from the
   ``ORG_ID`` environment variable, which the platform injects.

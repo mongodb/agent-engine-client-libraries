@@ -209,6 +209,15 @@ one filter apply to every source it reads.
 and so on) return ranked records instead of assembled prose, for when you want to
 inspect or post-process them yourself.
 
+Semantic and procedural search return current versions by default. Pass
+`include_history=True` to `search_semantic(...)` or `discover_procedures(...)`
+(or set `include_history=True` on a `semantic` or `procedural` `SourceSpec` in
+`build_context_from_sources(...)`) to search retained predecessor versions
+within the same `top_k` limit and authorized scope. Results keep
+`memory_lineage_id`, `version`, and `is_latest` in `metadata`; historical search
+ranks matching versions together and can return several versions from one
+lineage.
+
 ### What scopes a memory
 
 Every record carries the identity it was written under, and every read is
@@ -474,7 +483,8 @@ a fetch cost or a promised output size: after retrieval and ranking, the server
 subtracts a 500-token formatting reserve, then greedily selects whole memory
 chunks that fit in the remainder. Positive values at or below 500 leave no budget for
 memories. Values above 500 can still yield empty context when no chunk fits.
-`metadata.token_count` reports formatted output only and excludes the reserve.
+`metadata.token_count` reports formatted output only and excludes the reserve;
+with `include_memories=True` it counts the returned memories' content.
 Omit `max_tokens` to keep prior behavior.
 
 `format_style` and `include_memories`. `build_context` and
@@ -485,9 +495,10 @@ raise `ValueError` locally. Omitted, the server infers the format from its
 configured model. One caveat: the server currently re-infers when the explicit
 value matches its default model type, so an explicit `"openai"` is honored
 verbatim only on servers with an OpenAI-family model configured; `"claude"` and
-`"jinja2"` are always honored. `include_memories=True` populates the response's
-`selected_memories` with the post-budget `MemoryChunk` list, so you can inspect
-exactly which memories were selected. Both require a hosted or direct HTTP
+`"jinja2"` are always honored. `include_memories=True` returns the post-budget
+`MemoryChunk` list in the response's `selected_memories` instead of a formatted
+context: `formatted_context` is `None`, so use it when you format the memories
+yourself. Both require a hosted or direct HTTP
 connection; app-bound mode raises `MemoryNotSupportedError` when either is set.
 
 Per-source context — `build_context_from_sources`. Where `build_context`

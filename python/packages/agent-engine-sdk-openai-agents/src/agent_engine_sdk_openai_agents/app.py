@@ -23,6 +23,7 @@ from agent_engine_runner_shared.context import customer_origin_scope
 from agent_engine_runner_shared.context import (
     get_current_user_id as _runner_get_current_user_id,
 )
+from agent_engine_runner_shared.deprecations import warn_trace_options_removed
 from agent_engine_runner_shared.hooks import (
     entrypoint_scope,
     register_llm,
@@ -96,12 +97,12 @@ class App(BaseApp):
         mongodb_uri: str | None = None,
         database_name: str | None = None,
     ) -> None:
+        warn_trace_options_removed(database_name)
         super().__init__(name=app_name)
         self._runtime = TenantRuntime(
             app_name=app_name,
             app_version=app_version,
             mongodb_uri=mongodb_uri,
-            database_name=database_name,
         )
         # User code: nothing enforces that the entrypoint returns an Agent.
         self._builder: Callable[[], object] | None = None

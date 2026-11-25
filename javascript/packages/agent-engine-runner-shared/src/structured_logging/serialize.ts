@@ -3,6 +3,8 @@
  * a crash-proof JSON stringifier and a UTF-8-aware truncator.
  */
 
+import { TRUNCATION_MARKER } from "./constants.js";
+
 /**
  * Stringify the structured-logging envelope with the same robustness Python gets from
  * `json.dumps(entry, default=str)`. Two failure modes the bare
@@ -54,5 +56,5 @@ export function truncateUtf8(text: string, maxBytes: number): string {
   if (buf.length <= maxBytes) return text;
   let cut = maxBytes;
   while (cut > 0 && ((buf[cut] ?? 0) & 0xc0) === 0x80) cut--;
-  return buf.subarray(0, cut).toString("utf-8") + "...(truncated)";
+  return buf.subarray(0, cut).toString("utf-8") + TRUNCATION_MARKER;
 }

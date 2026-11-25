@@ -30,7 +30,7 @@ packages = ["src/insurance_agent"]
 [dependency-groups]
 dev = [
     "pyright>=1.1.411",
-    "ruff>=0.16.9",
+    "ruff>=0.17.4",
 ]
 
 [tool.uv.sources]

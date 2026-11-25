@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `encodeToolFailure` and `decodeToolFailure`: a framework adapter can keep a
+  tool call's failure in its own checkpoint and rethrow it later, in this
+  process or another, with the same error type and fields.
+- `SecureToolWrapper.recordPlatformFailure`: a framework adapter can end the
+  turn for a failure in its own tool-call machinery, such as a checkpoint
+  write, as a platform failure inside a tool call does.
 - Local debug mode for TypeScript agents: when the operator's local-only debug
   mode stamps `MDBAE_LOCAL_MODE=true`, the runtime opens Node's built-in
   inspector on `127.0.0.1:${MDBAE_LOCAL_PORT:-5678}` without waiting for a
@@ -22,6 +28,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bindings, and exposes the shared AER and Tool Pod runtime views.
 
 ### Changed
+- **Breaking:** the package now requires Node.js 24.22.3 or later. `engines.node`
+  was `>=24`, so a consumer on an earlier 24.x installed it and ran the Brotli
+  decoder from before the CVE-2026-111497 fix. npm reports the new floor as
+  `EBADENGINE`: a warning by default, an install error under `engine-strict`.
 - Spans go to the platform trace endpoint (`POST /internal/traces`) whenever
   `OE_URL` is set. `0.11.13` is the first version that does this; earlier
   versions write spans straight to MongoDB.
@@ -51,10 +61,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   adapter's two-phase model-step/tool-step stamping.
 
 ### Removed
+- **Breaking:** the runner sends spans only to the Orchestration Engine
+  (`POST $OE_URL/internal/traces`) and, when `OTEL_EXPORTER_OTLP_*` is set, to
+  that OTLP endpoint. It no longer writes spans to MongoDB or to a local JSONL
+  file. A runner without `OE_URL` stores no traces unless an OTLP endpoint is
+  configured, and logs one warning when neither is.
 - **Breaking:** `AGENTIC_TRACE_EXPORTER` no longer has any effect. Setting it
   to `0` or `false` does not turn off the platform trace exporter.
+- **Breaking:** `MongoDBSpanExporter`, `JSONLSpanExporter`, `getTracePath`,
+  `attachMongoTracing`, and `platformTraceExporterEnabled` are removed, along
+  with the `AGENTIC_TRACES_FILE` and `AGENTIC_TRACE_STORE_RETRY_INTERVAL_SECONDS`
+  settings.
+- **Breaking:** `SetupTracingArgs` no longer accepts `mongodbUri`,
+  `mongodbDatabaseName`, or `mongodbCollectionName`, and `TenantRuntimeOptions`
+  no longer accepts `databaseName` or `tracesCollectionName`.
+  `TenantRuntimeOptions.mongodbUri` remains for framework SDKs.
+- **Breaking:** `tracingStatus()` and the `/health` response's
+  `details.tracing` no longer include `database_exporter`; they report only
+  `platform_exporter`.
 
 ### Fixed
+- Agent spans now reach the customer trace export destination. The OTLP leg
+  sent traces as OTLP/JSON, which the orchestration engine's trace intake
+  rejects; it now sends OTLP/protobuf, matching the Python runner.
+- The OAuth consent interrupt on a native checkpoint execution carries
+  `kind: "oauth_authorization"`, so OE publishes its interrupt ID and the
+  application answers it in `resume_map`; the answer can no longer satisfy a
+  later wait. After the answer the tool asks OE for its token again at a fresh
+  step, and a second consent requirement fails before the provider is called.
+- AER and Tool Pod log records written outside agent or tool code now carry
+  `executionId` when they belong to a known execution, so filtering logs by
+  execution finds setup failures, cleanup, callback retries, guardrail
+  warnings and stream handling. Partial stdout/stderr lines from concurrent
+  executions are no longer merged or tagged with another execution's ID, and
+  trace export failures no longer carry the ID of whichever execution first
+  ended a span.
 - Connector tools now capture the tenant environment for each Tool Pod
   invocation, so concurrent calls cannot exchange request-scoped secrets.
   Connector callables invoked outside a Tool Pod invocation now fail closed;

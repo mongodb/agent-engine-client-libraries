@@ -2,13 +2,12 @@
 Unit tests for the span exporters.
 
 Tests that OpenTelemetry spans are correctly exported to:
-- JSONL files (development/debugging)
-- MongoDB collection (production)
+- The Orchestration Engine platform exporter (wiring only; see
+  test_platform_tracing_exporter.py for its delivery behavior)
 - OTLP (opt-in, content-capture redacted)
 """
 
 import http.server
-import json
 import sys
 import threading
 from unittest.mock import MagicMock, Mock
@@ -30,11 +29,7 @@ from agent_engine_runner_shared.tls_client import (
     create_async_httpx_client_with_tls,
     create_httpx_client_with_tls,
 )
-from agent_engine_runner_shared.tracing import (
-    ContentPolicyOTLPSpanExporter,
-    JSONLSpanExporter,
-    MongoDBSpanExporter,
-)
+from agent_engine_runner_shared.tracing import ContentPolicyOTLPSpanExporter
 from agent_engine_runner_shared.tracing.conversation import (
     ATTR_INPUT_MESSAGES_RECORDED_BY,
     RECORDED_BY_CALLER,
@@ -46,157 +41,6 @@ from agent_engine_runner_shared.tracing.setup import (
     _build_resource_attributes,
     _run_instrumentor,
 )
-
-
-@pytest.fixture
-def mock_span():
-    """Create a mock OpenTelemetry span."""
-    context = SpanContext(
-        trace_id=0x12345678123456781234567812345678,
-        span_id=0x1234567812345678,
-        is_remote=False,
-        trace_flags=TraceFlags.SAMPLED,
-    )
-
-    span = MagicMock(spec=ReadableSpan)
-    span.get_span_context.return_value = context
-    span.parent = None
-    span.name = "test_span"
-    span.kind = SpanKind.INTERNAL
-    span.start_time = 1000
-    span.end_time = 2000
-    span.status = Status(StatusCode.OK)
-    span.attributes = {"key": "value"}
-    span.resource.attributes = {"service.name": "test_service"}
-    span.events = []
-    span.links = []
-
-    return span
-
-
-# =============================================================================
-# JSONL Exporter Tests
-# =============================================================================
-
-
-def test_jsonl_exporter_writes_span(mock_span, tmp_path):
-    """Test that JSONL exporter writes span to file."""
-    trace_file = tmp_path / "traces.jsonl"
-    exporter = JSONLSpanExporter(path=trace_file)
-
-    result = exporter.export([mock_span])
-
-    assert result.name == "SUCCESS"
-    assert trace_file.exists()
-
-    with open(trace_file) as f:
-        doc = json.loads(f.readline())
-
-    assert doc["trace_id"] == "12345678123456781234567812345678"
-    assert doc["span_id"] == "1234567812345678"
-    assert doc["name"] == "test_span"
-    assert doc["kind"] == "INTERNAL"
-    assert doc["attributes"]["key"] == "value"
-
-
-def test_jsonl_exporter_appends(mock_span, tmp_path):
-    """Test that JSONL exporter appends to existing file."""
-    trace_file = tmp_path / "traces.jsonl"
-    exporter = JSONLSpanExporter(path=trace_file)
-
-    exporter.export([mock_span])
-    mock_span.name = "span_2"
-    exporter.export([mock_span])
-
-    with open(trace_file) as f:
-        lines = f.readlines()
-
-    assert len(lines) == 2
-    assert json.loads(lines[0])["name"] == "test_span"
-    assert json.loads(lines[1])["name"] == "span_2"
-
-
-def test_jsonl_exporter_handles_empty(tmp_path):
-    """Test that exporter handles empty span list."""
-    trace_file = tmp_path / "traces.jsonl"
-    exporter = JSONLSpanExporter(path=trace_file)
-
-    result = exporter.export([])
-
-    assert result.name == "SUCCESS"
-    assert not trace_file.exists()
-
-
-# =============================================================================
-# MongoDB Exporter Tests
-# =============================================================================
-
-
-def test_mongodb_exporter_inserts_span(mock_span):
-    """Test that MongoDB exporter inserts span."""
-    collection = MagicMock()
-    exporter = MongoDBSpanExporter(collection)
-
-    result = exporter.export([mock_span])
-
-    assert result.name == "SUCCESS"
-    assert collection.insert_many.called
-
-    docs = collection.insert_many.call_args[0][0]
-    assert len(docs) == 1
-    assert docs[0]["trace_id"] == "12345678123456781234567812345678"
-    assert docs[0]["name"] == "test_span"
-
-
-def test_mongodb_exporter_omits_links_when_span_has_none(mock_span):
-    collection = MagicMock()
-    MongoDBSpanExporter(collection).export([mock_span])
-
-    assert "links" not in collection.insert_many.call_args[0][0][0]
-
-
-def test_mongodb_exporter_writes_span_links(mock_span):
-    linked = SpanContext(
-        trace_id=0xABCDEF, span_id=0xBEEF, is_remote=False, trace_flags=TraceFlags.SAMPLED
-    )
-    mock_span.links = [Link(linked, {"langgraph.node": "branch_a"})]
-    collection = MagicMock()
-    MongoDBSpanExporter(collection).export([mock_span])
-
-    assert collection.insert_many.call_args[0][0][0]["links"] == [
-        {
-            "trace_id": format(0xABCDEF, "032x"),
-            "span_id": format(0xBEEF, "016x"),
-            "attributes": {"langgraph.node": "branch_a"},
-        }
-    ]
-
-
-def test_mongodb_exporter_does_not_hoist_untrusted_root_context(mock_span):
-    """Root observability fields are added by OE from executions, not span attributes."""
-    mock_span.attributes = {
-        "session.id": "child-session",
-        "execution.id": "child-exec",
-        "root.session.id": "forged-root-session",
-        "root.execution.id": "forged-root-exec",
-        "workspace.id": "forged-workspace",
-        "org.id": "forged-org",
-        "project.id": "forged-project",
-    }
-    collection = MagicMock()
-    exporter = MongoDBSpanExporter(collection)
-
-    result = exporter.export([mock_span])
-
-    assert result.name == "SUCCESS"
-    docs = collection.insert_many.call_args[0][0]
-    assert docs[0]["session_id"] == "child-session"
-    assert docs[0]["execution_id"] == "child-exec"
-    assert "root_session_id" not in docs[0]
-    assert "root_execution_id" not in docs[0]
-    assert "workspace_id" not in docs[0]
-    assert "org_id" not in docs[0]
-    assert "project_id" not in docs[0]
 
 
 def test_execution_context_span_processor_sets_correlation_attributes():
@@ -237,55 +81,6 @@ def test_execution_context_span_processor_marks_a_prompt_the_caller_records():
         ExecutionContextSpanProcessor().on_start(span)
 
     span.set_attribute.assert_any_call(ATTR_INPUT_MESSAGES_RECORDED_BY, RECORDED_BY_CALLER)
-
-
-def test_a_model_span_under_an_invoke_llm_request_stores_no_prompt():
-    """End to end: the processor marks the span, the exporter drops the prompt."""
-    collection = MagicMock()
-    provider = TracerProvider()
-    provider.add_span_processor(ExecutionContextSpanProcessor())
-    provider.add_span_processor(SimpleSpanProcessor(MongoDBSpanExporter(collection)))
-    tracer = provider.get_tracer("test")
-
-    with tracer.start_as_current_span("tool.invoke_llm.stream"):
-        with caller_records_conversation():
-            with tracer.start_as_current_span("ChatOpenAI") as model_span:
-                model_span.set_attribute("llm.input_messages.0.message.role", "user")
-                model_span.set_attribute("llm.input_messages.0.message.content", "hi")
-                model_span.set_attribute("input.value", '{"messages": [["user", "hi"]]}')
-
-    model_docs = [
-        call[0][0][0]
-        for call in collection.insert_many.call_args_list
-        if call[0][0][0]["name"] == "ChatOpenAI"
-    ]
-    assert len(model_docs) == 1
-    attributes = model_docs[0]["attributes"]
-    assert not any(name.startswith("llm.input_messages.") for name in attributes)
-    assert "input.value" not in attributes
-    assert attributes[ATTR_INPUT_MESSAGES_RECORDED_BY] == RECORDED_BY_CALLER
-
-
-def test_mongodb_exporter_handles_empty():
-    """Test that exporter handles empty span list."""
-    collection = MagicMock()
-    exporter = MongoDBSpanExporter(collection)
-
-    result = exporter.export([])
-
-    assert result.name == "SUCCESS"
-    assert not collection.insert_many.called
-
-
-def test_mongodb_exporter_handles_error(mock_span):
-    """Test that exporter handles MongoDB errors gracefully."""
-    collection = MagicMock()
-    collection.insert_many.side_effect = Exception("Connection failed")
-    exporter = MongoDBSpanExporter(collection)
-
-    result = exporter.export([mock_span])
-
-    assert result.name == "FAILURE"
 
 
 # =============================================================================
@@ -474,7 +269,7 @@ def test_otlp_exporter_redacts_content_by_default(monkeypatch, content_bearing_s
     (exported_link,) = exported.links
     assert exported_link.context.span_id == 0x3
     assert dict(exported_link.attributes) == {"langgraph.node": "branch_a"}
-    # The original span (as goes to Mongo/JSONL) is untouched.
+    # The platform trace keeps the original content; only the OTLP copy is redacted.
     assert content_bearing_span.attributes["input.value"] == "what is the customer's SSN?"
     assert content_bearing_span.attributes["api_key"] == "sk-should-not-leak"
     assert content_bearing_span.events[0].attributes["tool.parameters"] == '{"query": "secret"}'
@@ -801,20 +596,41 @@ def test_redaction_preserves_dropped_attributes_and_events_counts():
 def isolated_tracer_provider(monkeypatch):
     """Ensure setup_tracing()'s module-level singleton doesn't leak across tests."""
     monkeypatch.setattr(tracing_setup, "_tracer_provider", None)
-    # These tests exercise the MongoDB / OTLP paths; an ambient OE_URL would
-    # route setup_tracing() to the platform exporter instead.
     monkeypatch.delenv("OE_URL", raising=False)
     yield tracing_setup
     if tracing_setup._tracer_provider is not None:
         tracing_setup.shutdown_tracing()
 
 
+class _FakePlatformExporter(InMemorySpanExporter):
+    """Stands in for PlatformSpanExporter so setup wiring is testable without HTTP."""
+
+    def __init__(self, url: str) -> None:
+        super().__init__()
+        self.url = url
+        self.last_error = None
+
+
+@pytest.fixture
+def fake_platform_exporter(monkeypatch):
+    """Point OE_URL at a fake platform exporter and return it once constructed."""
+    created: list[_FakePlatformExporter] = []
+
+    def _factory(url: str) -> _FakePlatformExporter:
+        exporter = _FakePlatformExporter(url)
+        created.append(exporter)
+        return exporter
+
+    monkeypatch.setenv("OE_URL", "http://oe:8000")
+    monkeypatch.setattr(tracing_setup, "PlatformSpanExporter", _factory)
+    return created
+
+
 def test_setup_tracing_omits_otlp_when_no_endpoint_configured(
-    monkeypatch, isolated_tracer_provider, tmp_path
+    monkeypatch, isolated_tracer_provider
 ):
     monkeypatch.delenv("OTEL_EXPORTER_OTLP_ENDPOINT", raising=False)
     monkeypatch.delenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", raising=False)
-    monkeypatch.setenv("AGENTIC_OBSERVABILITY_DIR", str(tmp_path))
     mock_otlp_cls = MagicMock()
     monkeypatch.setattr(
         "opentelemetry.exporter.otlp.proto.http.trace_exporter.OTLPSpanExporter",
@@ -826,24 +642,10 @@ def test_setup_tracing_omits_otlp_when_no_endpoint_configured(
     assert not mock_otlp_cls.called
 
 
-def test_setup_tracing_does_not_write_local_jsonl(monkeypatch, isolated_tracer_provider, tmp_path):
-    monkeypatch.setenv("AGENTIC_OBSERVABILITY_DIR", str(tmp_path))
-
-    isolated_tracer_provider.setup_tracing(service_name="svc-no-local-traces")
-    provider = isolated_tracer_provider._tracer_provider
-    tracer = provider.get_tracer("test")
-    with tracer.start_as_current_span("not-written-locally"):
-        pass
-    isolated_tracer_provider.shutdown_tracing()
-
-    assert not (tmp_path / "traces.jsonl").exists()
-
-
-def test_setup_tracing_dual_writes_to_mongo_and_otlp_when_configured(
-    monkeypatch, isolated_tracer_provider, tmp_path
+def test_setup_tracing_sends_to_platform_and_otlp_when_configured(
+    monkeypatch, isolated_tracer_provider, fake_platform_exporter
 ):
     monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://collector.internal:4318")
-    monkeypatch.setenv("AGENTIC_OBSERVABILITY_DIR", str(tmp_path))
     otlp_inner = MagicMock(spec=SpanExporter)
     otlp_inner.export.return_value = SpanExportResult.SUCCESS
     mock_otlp_cls = MagicMock(return_value=otlp_inner)
@@ -851,47 +653,36 @@ def test_setup_tracing_dual_writes_to_mongo_and_otlp_when_configured(
         "opentelemetry.exporter.otlp.proto.http.trace_exporter.OTLPSpanExporter",
         mock_otlp_cls,
     )
-    collection = MagicMock()
 
-    isolated_tracer_provider.setup_tracing(
-        service_name="svc-dual-write", mongodb_collection=collection
-    )
+    isolated_tracer_provider.setup_tracing(service_name="svc-dual-export")
     provider = isolated_tracer_provider._tracer_provider
     tracer = provider.get_tracer("test")
-    with tracer.start_as_current_span("dual-write-span"):
+    with tracer.start_as_current_span("dual-export-span"):
         pass
+    provider.force_flush()
+    (platform,) = fake_platform_exporter
+    platform_span_names = {span.name for span in platform.get_finished_spans()}
     isolated_tracer_provider.shutdown_tracing()
 
-    assert mock_otlp_cls.called
-    assert collection.insert_many.called
-    assert otlp_inner.export.called
-    mongo_span_names = {
-        doc["name"] for call in collection.insert_many.call_args_list for doc in call[0][0]
-    }
     otlp_span_names = {
         span.name for call in otlp_inner.export.call_args_list for span in call[0][0]
     }
-    assert "dual-write-span" in mongo_span_names
-    assert "dual-write-span" in otlp_span_names
+    assert "dual-export-span" in platform_span_names
+    assert "dual-export-span" in otlp_span_names
 
 
 def test_setup_tracing_survives_otlp_construction_failure(
-    monkeypatch, isolated_tracer_provider, tmp_path, caplog
+    monkeypatch, isolated_tracer_provider, fake_platform_exporter, caplog
 ):
     """A broken/misconfigured OTLP setup (missing extra, bad endpoint, ...)
-    must not prevent MongoDB from being registered — previously the
-    exception propagated before `trace.set_tracer_provider()` ran at all."""
+    must not prevent the platform exporter from receiving spans."""
     monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://collector.internal:4318")
-    monkeypatch.setenv("AGENTIC_OBSERVABILITY_DIR", str(tmp_path))
     monkeypatch.setattr(
         "opentelemetry.exporter.otlp.proto.http.trace_exporter.OTLPSpanExporter",
         MagicMock(side_effect=RuntimeError("boom")),
     )
-    collection = MagicMock()
 
-    isolated_tracer_provider.setup_tracing(
-        service_name="svc-otlp-broken", mongodb_collection=collection
-    )
+    isolated_tracer_provider.setup_tracing(service_name="svc-otlp-broken")
 
     # set_tracer_provider() is only honored once per process by the OTel API,
     # so other tests in this run may already hold the global registration —
@@ -902,18 +693,18 @@ def test_setup_tracing_survives_otlp_construction_failure(
     tracer = provider.get_tracer("test")
     with tracer.start_as_current_span("still-works"):
         pass
-    isolated_tracer_provider.shutdown_tracing()
+    (platform,) = fake_platform_exporter
+    provider.force_flush()
 
-    assert collection.insert_many.called
+    assert [span.name for span in platform.get_finished_spans()] == ["still-works"]
     assert "Failed to set up OTLP exporter" in caplog.text
 
 
 def test_setup_tracing_logs_warning_when_full_content_capture(
-    monkeypatch, isolated_tracer_provider, tmp_path, caplog
+    monkeypatch, isolated_tracer_provider, caplog
 ):
     monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://collector.internal:4318")
     monkeypatch.setenv("AGENTIC_PLATFORM_OTEL_CONTENT_CAPTURE", "full")
-    monkeypatch.setenv("AGENTIC_OBSERVABILITY_DIR", str(tmp_path))
     monkeypatch.setattr(
         "opentelemetry.exporter.otlp.proto.http.trace_exporter.OTLPSpanExporter",
         MagicMock(return_value=MagicMock(spec=SpanExporter)),
@@ -925,11 +716,10 @@ def test_setup_tracing_logs_warning_when_full_content_capture(
 
 
 def test_setup_tracing_does_not_warn_when_metadata_only(
-    monkeypatch, isolated_tracer_provider, tmp_path, caplog
+    monkeypatch, isolated_tracer_provider, caplog
 ):
     monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://collector.internal:4318")
     monkeypatch.delenv("AGENTIC_PLATFORM_OTEL_CONTENT_CAPTURE", raising=False)
-    monkeypatch.setenv("AGENTIC_OBSERVABILITY_DIR", str(tmp_path))
     monkeypatch.setattr(
         "opentelemetry.exporter.otlp.proto.http.trace_exporter.OTLPSpanExporter",
         MagicMock(return_value=MagicMock(spec=SpanExporter)),
@@ -951,10 +741,7 @@ def test_get_current_trace_context_no_active_span():
     assert span_id is None
 
 
-def test_get_current_trace_context_returns_active_span_ids(
-    isolated_tracer_provider, tmp_path, monkeypatch
-):
-    monkeypatch.setenv("AGENTIC_OBSERVABILITY_DIR", str(tmp_path))
+def test_get_current_trace_context_returns_active_span_ids(isolated_tracer_provider, monkeypatch):
     isolated_tracer_provider.setup_tracing(service_name="svc-trace-ctx")
     tracer = isolated_tracer_provider.get_tracer("test")
 
@@ -991,11 +778,10 @@ def _serve_capturing_header_handler():
 
 
 def test_httpx_instrumentation_injects_traceparent_when_tracing_enabled(
-    isolated_tracer_provider, tmp_path, monkeypatch
+    isolated_tracer_provider, monkeypatch
 ):
     """setup_tracing() globally instruments httpx, so any client constructed
     anywhere in the process propagates the active span via traceparent."""
-    monkeypatch.setenv("AGENTIC_OBSERVABILITY_DIR", str(tmp_path))
     isolated_tracer_provider.setup_tracing(service_name="svc-httpx-instr")
 
     server, thread = _serve_capturing_header_handler()
@@ -1097,12 +883,11 @@ async def test_async_platform_http_client_propagates_without_emitting_transport_
 
 
 def test_httpx_instrumentation_still_injects_header_without_a_parent_span(
-    isolated_tracer_provider, tmp_path, monkeypatch
+    isolated_tracer_provider, monkeypatch
 ):
     """The instrumentor wraps every request in its own client span, so a
     traceparent is sent even with no application span in context — it just
     starts a fresh, uncorrelated trace rather than extending an existing one."""
-    monkeypatch.setenv("AGENTIC_OBSERVABILITY_DIR", str(tmp_path))
     isolated_tracer_provider.setup_tracing(service_name="svc-httpx-no-span")
 
     server, thread = _serve_capturing_header_handler()
@@ -1119,10 +904,9 @@ def test_httpx_instrumentation_still_injects_header_without_a_parent_span(
         thread.join(timeout=5)
 
 
-def test_httpx_not_instrumented_when_tracing_never_configured(tmp_path, monkeypatch):
+def test_httpx_not_instrumented_when_tracing_never_configured(monkeypatch):
     """Matches the opt-in, no-op-when-unconfigured invariant: without a
     setup_tracing() call, httpx sends no traceparent and nothing crashes."""
-    monkeypatch.setenv("AGENTIC_OBSERVABILITY_DIR", str(tmp_path))
     instrumentor = HTTPXClientInstrumentor()
     if instrumentor.is_instrumented_by_opentelemetry:
         instrumentor.uninstrument()
@@ -1140,9 +924,8 @@ def test_httpx_not_instrumented_when_tracing_never_configured(tmp_path, monkeypa
         thread.join(timeout=5)
 
 
-def test_shutdown_tracing_uninstruments_httpx(isolated_tracer_provider, tmp_path, monkeypatch):
+def test_shutdown_tracing_uninstruments_httpx(isolated_tracer_provider, monkeypatch):
     """After shutdown_tracing(), httpx clients stop injecting traceparent."""
-    monkeypatch.setenv("AGENTIC_OBSERVABILITY_DIR", str(tmp_path))
     isolated_tracer_provider.setup_tracing(service_name="svc-httpx-shutdown")
     isolated_tracer_provider.shutdown_tracing()
 

@@ -112,6 +112,10 @@ import {
 } from "./chunk_types.js";
 import { resolveOeUrl } from "./oe_url.js";
 import { resolveOwnerUrl } from "./owner_url.js";
+import {
+  runWithExecutionOutput,
+  runWithRequestExecution,
+} from "./request_execution.js";
 import { discardResponseBody, postWithRetries } from "./http_retry.js";
 import {
   StreamJournalManager,
@@ -855,33 +859,37 @@ export class AERServer extends BaseServer {
 
     app.post("/execute", async (request, reply) => {
       const body = ExecuteRequestSchema.parse(request.body);
-      // Throws 409 if the execution was drained after OE dispatched.
-      this.drainRegistry.beginWork(body.execution_id);
-      try {
-        const result = await this.executeWithInboundTraceContext(
-          body,
-          request.headers,
-        );
-        const responseBody = AERExecuteResponseSchema.parse(result);
-        const finishCallback = getPendingSessionFinishes(this).get(
-          body.execution_id,
-        );
-        getPendingSessionFinishes(this).delete(body.execution_id);
-        if (finishCallback !== undefined) {
-          // After the response is flushed, never before: the OE blocks on this
-          // call and turns a transport error into a 502 that overwrites the
-          // finished run's result. Guard on status too - an error thrown or a
-          // client disconnect after this point must not still release.
-          reply.raw.once("finish", () => {
-            if (reply.raw.statusCode < 400) {
-              void this.releaseFinishedSession(body, finishCallback);
-            }
-          });
+      return runWithRequestExecution(request, body.execution_id, async () => {
+        // Throws 409 if the execution was drained after OE dispatched.
+        this.drainRegistry.beginWork(body.execution_id);
+        try {
+          const result = await this.executeWithInboundTraceContext(
+            body,
+            request.headers,
+          );
+          const responseBody = AERExecuteResponseSchema.parse(result);
+          const finishCallback = getPendingSessionFinishes(this).get(
+            body.execution_id,
+          );
+          getPendingSessionFinishes(this).delete(body.execution_id);
+          if (finishCallback !== undefined) {
+            // After the response is flushed, never before: the OE blocks on this
+            // call and turns a transport error into a 502 that overwrites the
+            // finished run's result. Guard on status too - an error thrown or a
+            // client disconnect after this point must not still release.
+            reply.raw.once("finish", () => {
+              if (reply.raw.statusCode < 400) {
+                void runWithExecutionOutput(body.execution_id, () =>
+                  this.releaseFinishedSession(body, finishCallback),
+                );
+              }
+            });
+          }
+          return reply.send(responseBody);
+        } finally {
+          this.endWorkForExecution(body.execution_id);
         }
-        return reply.send(responseBody);
-      } finally {
-        this.endWorkForExecution(body.execution_id);
-      }
+      });
     });
 
     app.get(

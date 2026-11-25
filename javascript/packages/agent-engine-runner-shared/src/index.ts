@@ -120,6 +120,8 @@ export {
   type OperationalStepSource,
   CALL_INTERRUPTED_ARTIFACT_KEY,
   OAUTH_AUTHORIZATION_ACTIVITY_NAME,
+  decodeToolFailure,
+  encodeToolFailure,
 } from "./secure_wrapper.js";
 export {
   GUARDRAIL_REVIEW_PROTOCOL_VERSION,

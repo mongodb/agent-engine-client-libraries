@@ -74,10 +74,6 @@
     - [synchronizeLlm()](#api-synchronizellm)
     - [synchronizeTool()](#api-synchronizetool)
   - [ExternalAPICallError](#api-externalapicallerror)
-  - [JSONLSpanExporter](#api-jsonlspanexporter)
-    - [export()](#api-export-1)
-    - [forceFlush()](#api-forceflush-1)
-    - [shutdown()](#api-shutdown-1)
   - [LLMInvocationError](#api-llminvocationerror)
   - [LLMInvocationOptions](#api-llminvocationoptions)
     - [toJSON()](#api-tojson)
@@ -104,11 +100,6 @@
     - [recordError()](#api-recorderror)
     - [recordLatency()](#api-recordlatency)
     - [reset()](#api-reset)
-  - [MongoDBSpanExporter](#api-mongodbspanexporter)
-    - [drain()](#api-drain-1)
-    - [export()](#api-export-2)
-    - [forceFlush()](#api-forceflush-2)
-    - [shutdown()](#api-shutdown-2)
   - [NodeExecutionLogger](#api-nodeexecutionlogger)
     - [onNodeEnd()](#api-onnodeend)
     - [onNodeError()](#api-onnodeerror)
@@ -122,9 +113,9 @@
   - [OutputValidationPolicyEngine](#api-outputvalidationpolicyengine)
     - [evaluate()](#api-evaluate)
   - [PlatformSpanExporter](#api-platformspanexporter)
-    - [export()](#api-export-3)
-    - [forceFlush()](#api-forceflush-3)
-    - [shutdown()](#api-shutdown-3)
+    - [export()](#api-export-1)
+    - [forceFlush()](#api-forceflush-1)
+    - [shutdown()](#api-shutdown-1)
   - [PolicyDeniedException](#api-policydeniedexception)
   - [ReplayedActivityFailedError](#api-replayedactivityfailederror)
   - [RuntimeAgentConfig](#api-runtimeagentconfig)
@@ -139,6 +130,7 @@
     - [executeTool()](#api-executetool)
     - [nextOperationalStep()](#api-nextoperationalstep)
     - [observeOperationalStep()](#api-observeoperationalstep)
+    - [recordPlatformFailure()](#api-recordplatformfailure)
     - [throwIfPlatformFailed()](#api-throwifplatformfailed)
   - [TenantRuntime](#api-tenantruntime)
     - [buildGraph()](#api-buildgraph)
@@ -150,7 +142,7 @@
     - [getToolMetadata()](#api-gettoolmetadata)
     - [registerAndRun()](#api-registerandrun)
     - [registerTool()](#api-registertool)
-    - [shutdown()](#api-shutdown-4)
+    - [shutdown()](#api-shutdown-2)
     - [usesPerInvocationBuild()](#api-usesperinvocationbuild)
     - [warmUpAgent()](#api-warmupagent)
   - [TerminalExecutionError](#api-terminalexecutionerror)
@@ -484,7 +476,6 @@
   - [allocateActivityPosition()](#api-allocateactivityposition)
   - [allocateToolEffectPosition()](#api-allocatetooleffectposition)
   - [appliesToStage()](#api-appliestostage)
-  - [attachMongoTracing()](#api-attachmongotracing)
   - [attemptStartRequestFromExecute()](#api-attemptstartrequestfromexecute)
   - [authHeaderNames()](#api-authheadernames)
   - [boundText()](#api-boundtext)
@@ -505,10 +496,12 @@
   - [currentOperationPath()](#api-currentoperationpath)
   - [currentPendingChildOperationBatch()](#api-currentpendingchildoperationbatch)
   - [currentStepOrdinal()](#api-currentstepordinal)
+  - [decodeToolFailure()](#api-decodetoolfailure)
   - [discoverMcpTools()](#api-discovermcptools)
   - [emit()](#api-emit)
   - [emitStep()](#api-emitstep)
   - [encodeProtoJson()](#api-encodeprotojson)
+  - [encodeToolFailure()](#api-encodetoolfailure)
   - [ensureUtc()](#api-ensureutc)
   - [entrypointScope()](#api-entrypointscope)
   - [entrypointScopeAsync()](#api-entrypointscopeasync)
@@ -570,7 +563,6 @@
   - [getStoreDbName()](#api-getstoredbname)
   - [getSuspendHandler()](#api-getsuspendhandler)
   - [getToolReadTimeout()](#api-gettoolreadtimeout)
-  - [getTracePath()](#api-gettracepath)
   - [getTracer()](#api-gettracer)
   - [getWorkflowAdapter()](#api-getworkflowadapter)
   - [guardrailReviewWaitId()](#api-guardrailreviewwaitid)
@@ -1927,7 +1919,8 @@ discoverProcedures(args): Promise<Record<string, unknown>[]>;
 
 | Parameter | Type |
 | :------ | :------ |
-| `args` | \{ `metadataFilter?`: `Record`\<`string`, `unknown`\> \| `null`; `query`: `string`; `similarityThreshold?`: `number`; `tags?`: `string`[] \| `null`; `topK?`: `number`; `userId?`: `string` \| `null`; `visibility?`: `string` \| `null`; \} |
+| `args` | \{ `includeHistory?`: `boolean`; `metadataFilter?`: `Record`\<`string`, `unknown`\> \| `null`; `query`: `string`; `similarityThreshold?`: `number`; `tags?`: `string`[] \| `null`; `topK?`: `number`; `userId?`: `string` \| `null`; `visibility?`: `string` \| `null`; \} |
+| `args.includeHistory?` | `boolean` |
 | `args.metadataFilter?` | `Record`\<`string`, `unknown`\> \| `null` |
 | `args.query` | `string` |
 | `args.similarityThreshold?` | `number` |
@@ -2048,7 +2041,8 @@ searchSemantic(args): Promise<object[]>;
 
 | Parameter | Type |
 | :------ | :------ |
-| `args` | \{ `query`: `string`; `topK?`: `number`; `userId?`: `string` \| `null`; `visibility?`: `string` \| `null`; \} |
+| `args` | \{ `includeHistory?`: `boolean`; `query`: `string`; `topK?`: `number`; `userId?`: `string` \| `null`; `visibility?`: `string` \| `null`; \} |
+| `args.includeHistory?` | `boolean` |
 | `args.query` | `string` |
 | `args.topK?` | `number` |
 | `args.userId?` | `string` \| `null` |
@@ -3050,7 +3044,7 @@ new ExternalAPICallError(
 
 **Overrides**
 
-[`ToolExecutionError`](#api-toolexecutionerror).[`constructor`](#api-constructor-47)
+[`ToolExecutionError`](#api-toolexecutionerror).[`constructor`](#api-constructor-45)
 
 #### Properties
 
@@ -3067,103 +3061,6 @@ new ExternalAPICallError(
 
 ***
 
-<a id="api-jsonlspanexporter"></a>
-
-### JSONLSpanExporter
-
-#### Implements
-
-- `SpanExporter`
-
-<a id="api-constructor-21"></a>
-
-#### Constructor
-
-```ts
-new JSONLSpanExporter(path?): JSONLSpanExporter;
-```
-
-**Parameters**
-
-| Parameter | Type |
-| :------ | :------ |
-| `path?` | `string` |
-
-**Returns**
-
-[`JSONLSpanExporter`](#api-jsonlspanexporter)
-
-#### Methods
-
-<a id="api-export-1"></a>
-
-##### export()
-
-```ts
-export(spans, resultCallback): void;
-```
-
-Called to export sampled ReadableSpans.
-
-**Parameters**
-
-| Parameter | Type | Description |
-| :------ | :------ | :------ |
-| `spans` | `ReadableSpan`[] | the list of sampled Spans to be exported. |
-| `resultCallback` | (`result`) => `void` | - |
-
-**Returns**
-
-`void`
-
-**Implementation of**
-
-```ts
-SpanExporter.export
-```
-
-<a id="api-forceflush-1"></a>
-
-##### forceFlush()
-
-```ts
-forceFlush(): Promise<void>;
-```
-
-Immediately export all spans
-
-**Returns**
-
-`Promise`\<`void`\>
-
-**Implementation of**
-
-```ts
-SpanExporter.forceFlush
-```
-
-<a id="api-shutdown-1"></a>
-
-##### shutdown()
-
-```ts
-shutdown(): Promise<void>;
-```
-
-Stops the exporter.
-
-**Returns**
-
-`Promise`\<`void`\>
-
-**Implementation of**
-
-```ts
-SpanExporter.shutdown
-```
-
-***
-
 <a id="api-llminvocationerror"></a>
 
 ### LLMInvocationError
@@ -3172,7 +3069,7 @@ SpanExporter.shutdown
 
 - `Error`
 
-<a id="api-constructor-22"></a>
+<a id="api-constructor-21"></a>
 
 #### Constructor
 
@@ -3213,7 +3110,7 @@ Error.constructor
 
 Explicit provider/model options passed with an LLM invocation.
 
-<a id="api-constructor-23"></a>
+<a id="api-constructor-22"></a>
 
 #### Constructor
 
@@ -3312,7 +3209,7 @@ Mirrors Python's LLMRegistryLoadError.
 
 - `Error`
 
-<a id="api-constructor-24"></a>
+<a id="api-constructor-23"></a>
 
 #### Constructor
 
@@ -3345,7 +3242,7 @@ Error.constructor
 
 Framework-neutral LLM response.
 
-<a id="api-constructor-25"></a>
+<a id="api-constructor-24"></a>
 
 #### Constructor
 
@@ -3420,7 +3317,7 @@ underlying provider (OpenAI, Gemini, Anthropic, etc.). Implemented as
 a class to mirror `LLMResponse` in agent-engine-sdk and to host the
 `fromResponse` / `toResponse` / `extractUsage` conversion methods.
 
-<a id="api-constructor-26"></a>
+<a id="api-constructor-25"></a>
 
 #### Constructor
 
@@ -3531,7 +3428,7 @@ content extraction.
 
 Typed token-usage metadata for LLM calls.
 
-<a id="api-constructor-27"></a>
+<a id="api-constructor-26"></a>
 
 #### Constructor
 
@@ -3618,7 +3515,7 @@ Returns LangChain's expected usage-metadata keys.
 
 Typed final tool call requested by an LLM.
 
-<a id="api-constructor-28"></a>
+<a id="api-constructor-27"></a>
 
 #### Constructor
 
@@ -3676,7 +3573,7 @@ Returns a LangChain-compatible tool-call dict (excludes index).
 
 Serializable bound-tool schema forwarded with an LLM call.
 
-<a id="api-constructor-29"></a>
+<a id="api-constructor-28"></a>
 
 #### Constructor
 
@@ -3737,7 +3634,7 @@ Returns the schema in the shape LangChain bind_tools expects.
 
 - `Error`
 
-<a id="api-constructor-30"></a>
+<a id="api-constructor-29"></a>
 
 #### Constructor
 
@@ -3773,7 +3670,7 @@ Raised when remote MCP configuration cannot be resolved.
 
 - `Error`
 
-<a id="api-constructor-31"></a>
+<a id="api-constructor-30"></a>
 
 #### Constructor
 
@@ -3809,7 +3706,7 @@ Raised when a remote MCP tool returns an MCP error result or a transport failure
 
 - `Error`
 
-<a id="api-constructor-32"></a>
+<a id="api-constructor-31"></a>
 
 #### Constructor
 
@@ -3839,7 +3736,7 @@ Error.constructor
 
 ### Metrics
 
-<a id="api-constructor-33"></a>
+<a id="api-constructor-32"></a>
 
 #### Constructor
 
@@ -3928,124 +3825,6 @@ static reset(): void;
 
 ***
 
-<a id="api-mongodbspanexporter"></a>
-
-### MongoDBSpanExporter
-
-#### Implements
-
-- `SpanExporter`
-
-<a id="api-constructor-34"></a>
-
-#### Constructor
-
-```ts
-new MongoDBSpanExporter(collection): MongoDBSpanExporter;
-```
-
-**Parameters**
-
-| Parameter | Type |
-| :------ | :------ |
-| `collection` | `Collection` |
-
-**Returns**
-
-[`MongoDBSpanExporter`](#api-mongodbspanexporter)
-
-#### Methods
-
-<a id="api-drain-1"></a>
-
-##### drain()
-
-```ts
-drain(): Promise<void>;
-```
-
-Await every insert this exporter started but has not finished.
-
-`BatchSpanProcessor.forceFlush()` drains only the spans still buffered: an
-export its timer already started is invisible to it, so the flush can
-resolve while that insert is still pending. A caller about to make the
-process disappear (a session-finish release) awaits this so it does not
-release on a flush that only looked complete. Best-effort and never
-rejects — a failed insert is already reported through its result callback.
-
-**Returns**
-
-`Promise`\<`void`\>
-
-<a id="api-export-2"></a>
-
-##### export()
-
-```ts
-export(spans, resultCallback): void;
-```
-
-Called to export sampled ReadableSpans.
-
-**Parameters**
-
-| Parameter | Type | Description |
-| :------ | :------ | :------ |
-| `spans` | `ReadableSpan`[] | the list of sampled Spans to be exported. |
-| `resultCallback` | (`result`) => `void` | - |
-
-**Returns**
-
-`void`
-
-**Implementation of**
-
-```ts
-SpanExporter.export
-```
-
-<a id="api-forceflush-2"></a>
-
-##### forceFlush()
-
-```ts
-forceFlush(): Promise<void>;
-```
-
-Immediately export all spans
-
-**Returns**
-
-`Promise`\<`void`\>
-
-**Implementation of**
-
-```ts
-SpanExporter.forceFlush
-```
-
-<a id="api-shutdown-2"></a>
-
-##### shutdown()
-
-```ts
-shutdown(): Promise<void>;
-```
-
-Stops the exporter.
-
-**Returns**
-
-`Promise`\<`void`\>
-
-**Implementation of**
-
-```ts
-SpanExporter.shutdown
-```
-
-***
-
 <a id="api-nodeexecutionlogger"></a>
 
 ### NodeExecutionLogger
@@ -4054,7 +3833,7 @@ SpanExporter.shutdown
 
 - `NullExecutionCallback`
 
-<a id="api-constructor-35"></a>
+<a id="api-constructor-33"></a>
 
 #### Constructor
 
@@ -4238,7 +4017,7 @@ before the first await.
 
 - [`OperationalStepSource`](#api-operationalstepsource)
 
-<a id="api-constructor-36"></a>
+<a id="api-constructor-34"></a>
 
 #### Constructor
 
@@ -4318,7 +4097,7 @@ Contract implemented by native and future remote guardrail engines.
 
 - [`GuardrailPolicyEngine`](#api-guardrailpolicyengine)
 
-<a id="api-constructor-37"></a>
+<a id="api-constructor-35"></a>
 
 #### Constructor
 
@@ -4394,7 +4173,7 @@ without failing the rest of its batch.
 
 - `SpanExporter`
 
-<a id="api-constructor-38"></a>
+<a id="api-constructor-36"></a>
 
 #### Constructor
 
@@ -4455,7 +4234,7 @@ Most recent export error, or null when the last export fully succeeded.
 
 #### Methods
 
-<a id="api-export-3"></a>
+<a id="api-export-1"></a>
 
 ##### export()
 
@@ -4482,7 +4261,7 @@ Called to export sampled ReadableSpans.
 SpanExporter.export
 ```
 
-<a id="api-forceflush-3"></a>
+<a id="api-forceflush-1"></a>
 
 ##### forceFlush()
 
@@ -4509,7 +4288,7 @@ included too; the caller bounds the wait with its own timeout.
 SpanExporter.forceFlush
 ```
 
-<a id="api-shutdown-3"></a>
+<a id="api-shutdown-1"></a>
 
 ##### shutdown()
 
@@ -4539,7 +4318,7 @@ SpanExporter.shutdown
 
 - `Error`
 
-<a id="api-constructor-39"></a>
+<a id="api-constructor-37"></a>
 
 #### Constructor
 
@@ -4586,7 +4365,7 @@ Error.constructor
 
 - [`WorkflowClientError`](#api-workflowclienterror)
 
-<a id="api-constructor-40"></a>
+<a id="api-constructor-38"></a>
 
 #### Constructor
 
@@ -4607,7 +4386,7 @@ new ReplayedActivityFailedError(code, message): ReplayedActivityFailedError;
 
 **Overrides**
 
-[`WorkflowClientError`](#api-workflowclienterror).[`constructor`](#api-constructor-53)
+[`WorkflowClientError`](#api-workflowclienterror).[`constructor`](#api-constructor-51)
 
 #### Properties
 
@@ -4629,7 +4408,7 @@ TS getters under camelCase names; Python field names on
 `AgentFeatureConfig` are preserved verbatim so wire/log parity is
 maintained.
 
-<a id="api-constructor-41"></a>
+<a id="api-constructor-39"></a>
 
 #### Constructor
 
@@ -4737,7 +4516,7 @@ Return a feature flag value, falling back to `defaultValue` when omitted.
 
 ### SecureLLMProxy
 
-<a id="api-constructor-42"></a>
+<a id="api-constructor-40"></a>
 
 #### Constructor
 
@@ -4892,7 +4671,7 @@ Static — can be called without a proxy instance (e.g. after parallel streaming
 
 ### SecureToolWrapper
 
-<a id="api-constructor-43"></a>
+<a id="api-constructor-41"></a>
 
 #### Constructor
 
@@ -5028,6 +4807,31 @@ Raise the allocator watermark (e.g. from OE latest_step_number).
 
 `void`
 
+<a id="api-recordplatformfailure"></a>
+
+##### recordPlatformFailure()
+
+```ts
+recordPlatformFailure(error): void;
+```
+
+Fail the rest of this execution's turn with `error`, as a platform
+failure inside a tool call does. The first recorded failure is kept.
+
+For tool-boundary code outside [executeTool](#api-executetool), such as a framework
+adapter's per-call checkpoint, whose failures the framework would
+otherwise hand to the model as an ordinary tool error.
+
+**Parameters**
+
+| Parameter | Type |
+| :------ | :------ |
+| `error` | [`ToolPlatformError`](#api-toolplatformerror) |
+
+**Returns**
+
+`void`
+
 <a id="api-throwifplatformfailed"></a>
 
 ##### throwIfPlatformFailed()
@@ -5062,7 +4866,7 @@ graph builder and starts the per-mode Fastify server.
 
 - [`ITenantRuntime`](#api-itenantruntime)
 
-<a id="api-constructor-44"></a>
+<a id="api-constructor-42"></a>
 
 #### Constructor
 
@@ -5293,7 +5097,7 @@ tool objects — that is the responsibility of the framework SDK.
 
 `void`
 
-<a id="api-shutdown-4"></a>
+<a id="api-shutdown-2"></a>
 
 ##### shutdown()
 
@@ -5301,7 +5105,7 @@ tool objects — that is the responsibility of the framework SDK.
 shutdown(): Promise<void>;
 ```
 
-Close the tracing MongoClient. Idempotent — safe to call from multiple
+Shut down tracing, flushing buffered spans. Idempotent — safe to call from multiple
 signal handlers. TS-only addition: Python's uvicorn handles SIGTERM
 itself, so the Python `TenantRuntime` has no equivalent method.
 
@@ -5362,7 +5166,7 @@ model call and durable step (see [SecureToolWrapper.throwIfPlatformFailed](#api-
 
 - [`ToolPlatformError`](#api-toolplatformerror)
 
-<a id="api-constructor-45"></a>
+<a id="api-constructor-43"></a>
 
 #### Constructor
 
@@ -5383,7 +5187,7 @@ new TerminalExecutionError(error, options?): TerminalExecutionError;
 
 **Overrides**
 
-[`ToolPlatformError`](#api-toolplatformerror).[`constructor`](#api-constructor-49)
+[`ToolPlatformError`](#api-toolplatformerror).[`constructor`](#api-constructor-47)
 
 #### Properties
 
@@ -5407,7 +5211,7 @@ the developer to debug governance instead of their tool.
 
 - [`ToolExecutionError`](#api-toolexecutionerror)
 
-<a id="api-constructor-46"></a>
+<a id="api-constructor-44"></a>
 
 #### Constructor
 
@@ -5435,7 +5239,7 @@ new ToolCallTimeoutError(
 
 **Overrides**
 
-[`ToolExecutionError`](#api-toolexecutionerror).[`constructor`](#api-constructor-47)
+[`ToolExecutionError`](#api-toolexecutionerror).[`constructor`](#api-constructor-45)
 
 #### Properties
 
@@ -5465,7 +5269,7 @@ Raised when tool execution fails.
 - [`ToolPlatformError`](#api-toolplatformerror)
 - [`ExternalAPICallError`](#api-externalapicallerror)
 
-<a id="api-constructor-47"></a>
+<a id="api-constructor-45"></a>
 
 #### Constructor
 
@@ -5510,7 +5314,7 @@ written for the model reading it.
 
 - [`ToolExecutionError`](#api-toolexecutionerror)
 
-<a id="api-constructor-48"></a>
+<a id="api-constructor-46"></a>
 
 #### Constructor
 
@@ -5531,7 +5335,7 @@ new ToolOutcomeUnknownError(error, options?): ToolOutcomeUnknownError;
 
 **Overrides**
 
-[`ToolExecutionError`](#api-toolexecutionerror).[`constructor`](#api-constructor-47)
+[`ToolExecutionError`](#api-toolexecutionerror).[`constructor`](#api-constructor-45)
 
 #### Properties
 
@@ -5560,7 +5364,7 @@ model call and durable step (see [SecureToolWrapper.throwIfPlatformFailed](#api-
 
 - [`TerminalExecutionError`](#api-terminalexecutionerror)
 
-<a id="api-constructor-49"></a>
+<a id="api-constructor-47"></a>
 
 #### Constructor
 
@@ -5581,7 +5385,7 @@ new ToolPlatformError(error, options?): ToolPlatformError;
 
 **Overrides**
 
-[`ToolExecutionError`](#api-toolexecutionerror).[`constructor`](#api-constructor-47)
+[`ToolExecutionError`](#api-toolexecutionerror).[`constructor`](#api-constructor-45)
 
 #### Properties
 
@@ -5599,7 +5403,7 @@ new ToolPlatformError(error, options?): ToolPlatformError;
 
 - `BaseServer`
 
-<a id="api-constructor-50"></a>
+<a id="api-constructor-48"></a>
 
 #### Constructor
 
@@ -5875,7 +5679,7 @@ BaseServer.run
 
 - `Error`
 
-<a id="api-constructor-51"></a>
+<a id="api-constructor-49"></a>
 
 #### Constructor
 
@@ -5905,7 +5709,7 @@ Error.constructor
 
 ### WorkflowClient
 
-<a id="api-constructor-52"></a>
+<a id="api-constructor-50"></a>
 
 #### Constructor
 
@@ -6069,7 +5873,7 @@ startAttempt(request): Promise<AttemptContext | null>;
 
 - [`ReplayedActivityFailedError`](#api-replayedactivityfailederror)
 
-<a id="api-constructor-53"></a>
+<a id="api-constructor-51"></a>
 
 #### Constructor
 
@@ -7047,12 +6851,9 @@ Public options for `registerAndRun`.
 
 #### Properties
 
-| Property | Type | Description |
-| :------ | :------ | :------ |
-| <a id="api-property-mongodbcollectionname"></a> `mongodbCollectionName?` | `string` | Collection name within `mongodbDatabaseName`. Defaults to `"traces"`. |
-| <a id="api-property-mongodbdatabasename"></a> `mongodbDatabaseName?` | `string` \| `null` | Explicit database override. Omit to use the platform store default. |
-| <a id="api-property-mongodburi"></a> `mongodbUri?` | `string` \| `null` | URI for the trace store. When provided, `setupTracing` builds the MongoClient, pings `admin`, and resolves the `(database, collection)` itself. Python's `TenantRuntime._setup_tracing` does this synchronously and passes the collection in; Node's driver is fundamentally async so the connect + ping live here instead. After a connection failure, a background retry attaches the MongoDB exporter once the store recovers — same recovery shape as Python. |
-| <a id="api-property-servicename"></a> `serviceName?` | `string` | - |
+| Property | Type |
+| :------ | :------ |
+| <a id="api-property-servicename"></a> `serviceName?` | `string` |
 
 ***
 
@@ -7081,11 +6882,9 @@ Public options for `registerAndRun`.
 | :------ | :------ | :------ |
 | <a id="api-property-appname-3"></a> `appName?` | `string` | Application name. Defaults to `"Agent"`. |
 | <a id="api-property-appversion-2"></a> `appVersion?` | `string` | Application version. Defaults to `"1.0.0"`. |
-| <a id="api-property-databasename"></a> `databaseName?` | `string` \| `null` | Explicit database name for trace storage. Defaults to the platform store. |
-| <a id="api-property-mongodburi-1"></a> `mongodbUri?` | `string` \| `null` | MongoDB URI used for trace persistence. Falls back to `MONGODB_URI`. |
+| <a id="api-property-mongodburi"></a> `mongodbUri?` | `string` \| `null` | MongoDB URI exposed to framework SDKs via `getMongodbUri()`. Falls back to `MONGODB_URI`. |
 | <a id="api-property-orgid-3"></a> ~~`orgId?`~~ | `string` \| `null` | **Deprecated** Ignored. The org is taken from the `ORG_ID` env var, which the platform injects. |
 | <a id="api-property-projectid-3"></a> ~~`projectId?`~~ | `string` \| `null` | **Deprecated** Ignored. The project is taken from the `PROJECT_ID` env var, which the platform injects. |
-| <a id="api-property-tracescollectionname"></a> `tracesCollectionName?` | `string` | Collection name for trace storage. Defaults to `"traces"`. |
 
 ***
 
@@ -11672,32 +11471,6 @@ whitespace-insensitive). Mirrors `GuardrailRuntimePolicy.applies_to_stage`.
 
 ***
 
-<a id="api-attachmongotracing"></a>
-
-### attachMongoTracing()
-
-```ts
-function attachMongoTracing(collection): void;
-```
-
-Wire the recovered trace-store collection into the lazy Mongo exporter
-registered at setup time. Called from the background retry loop
-once a failed connection recovers. Idempotent — a no-op if already attached.
-New spans created after this call route to the store; spans emitted while the
-store was unreachable are not retroactively recovered.
-
-#### Parameters
-
-| Parameter | Type |
-| :------ | :------ |
-| `collection` | `Collection` |
-
-#### Returns
-
-`void`
-
-***
-
 <a id="api-attemptstartrequestfromexecute"></a>
 
 ### attemptStartRequestFromExecute()
@@ -12181,6 +11954,30 @@ function currentStepOrdinal(): number;
 
 ***
 
+<a id="api-decodetoolfailure"></a>
+
+### decodeToolFailure()
+
+```ts
+function decodeToolFailure(message, cause?): ToolExecutionError;
+```
+
+Rebuild the error [encodeToolFailure](#api-encodetoolfailure) recorded, with its class and
+fields. A string without the encoding's prefix is OE's own failure message.
+
+#### Parameters
+
+| Parameter | Type |
+| :------ | :------ |
+| `message` | `string` |
+| `cause?` | `Error` |
+
+#### Returns
+
+[`ToolExecutionError`](#api-toolexecutionerror)
+
+***
+
 <a id="api-discovermcptools"></a>
 
 ### discoverMcpTools()
@@ -12294,6 +12091,30 @@ hand-rolling serialization.
 | :------ | :------ |
 | `schema` | `GenMessage`\<`T`\> |
 | `message` | `T` |
+
+#### Returns
+
+`string`
+
+***
+
+<a id="api-encodetoolfailure"></a>
+
+### encodeToolFailure()
+
+```ts
+function encodeToolFailure(error): string;
+```
+
+Encode a tool call's failure as a string a durable record can keep: its
+kind, redacted message and classification fields. [decodeToolFailure](#api-decodetoolfailure)
+rebuilds the same error type from it, in this process or another.
+
+#### Parameters
+
+| Parameter | Type |
+| :------ | :------ |
+| `error` | `unknown` |
 
 #### Returns
 
@@ -13007,7 +12828,7 @@ drains each processor's buffer, but a batch processor ships on a timer and
 does not track an export it already started: a span it removed from the
 buffer and is still shipping is invisible to it, so the flush can resolve
 before that write lands. Await each exporter's own in-flight work too — the
-platform exporter, the Mongo store, and (when configured) OTLP — so the
+platform exporter and (when configured) OTLP — so the
 caller does not release on a false flush. Returns true when tracing is not
 initialized or the flush completed within the timeout; false when it timed
 out or raised.
@@ -13739,22 +13560,6 @@ Uses RUNNER_TOOL_READ_TIMEOUT env var, defaults to 600.0 seconds.
 #### Returns
 
 `number`
-
-***
-
-<a id="api-gettracepath"></a>
-
-### getTracePath()
-
-```ts
-function getTracePath(): string;
-```
-
-Resolve the on-disk trace file path from env vars (mirrors Python).
-
-#### Returns
-
-`string`
 
 ***
 
@@ -16545,8 +16350,7 @@ function scrubCredentials(message): string;
 ```
 
 Mask the userinfo of any `mongodb://` / `mongodb+srv://` URI embedded in a
-credential-bearing error message (driver parse/connect errors echo the raw
-connection string).
+credential-bearing error message.
 
 The userinfo run is GREEDY up to the LAST '@' that a host-shaped token
 follows, so passwords containing an unescaped '@', space, or '/' are still
@@ -16560,7 +16364,7 @@ fail-closed direction, a leak is not recoverable. Keep in sync with
 
 Accepts `unknown` and coerces: error paths hand this whatever a rejection
 carried (string throws, objects without a string `message`, undefined) —
-it must never throw itself, or a degraded trace store turns into a
+it must never throw itself, or a logged setup failure turns into a
 startup failure.
 
 #### Parameters
@@ -17014,11 +16818,7 @@ Return detached tool descriptions without credentials or transport metadata.
 function tracingStatus(): object;
 ```
 
-Exporter states reported by `/health`.
-
-`database_exporter` is `"attached"` when a MongoDB processor is live,
-`"degraded"` while a configured store is unreachable and retrying, or
-`"disabled"` when no store URI was configured.
+Exporter state reported by `/health`.
 
 `platform_exporter` is `"attached"` when traces are sent to the OE,
 `"degraded"` after an incomplete export, or `"disabled"` when `OE_URL` is
@@ -17030,7 +16830,6 @@ unset. OTLP may still be configured in the disabled state.
 
 | Name | Type |
 | :------ | :------ |
-| `database_exporter` | `string` |
 | `platform_exporter` | `string` |
 
 ***

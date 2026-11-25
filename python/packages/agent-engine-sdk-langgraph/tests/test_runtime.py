@@ -94,6 +94,13 @@ class TestApp:
             app = App(app_name="Test Agent", org_id="hardcoded_org")
         assert app._runtime.org_id == "env_org"
 
+    def test_deprecation_warning_on_removed_trace_options(self):
+        """App still accepts the removed trace options and warns for each."""
+        with pytest.warns(DeprecationWarning, match="database_name"):
+            App(app_name="Test Agent", database_name="trace_db")
+        with pytest.warns(DeprecationWarning, match="traces_collection_name"):
+            App(app_name="Test Agent", traces_collection_name="spans")
+
     def test_init_reads_agent_config_from_agent_yaml(self, monkeypatch, tmp_path):
         """App exposes the parsed agent.yaml loaded from the working directory."""
         monkeypatch.chdir(tmp_path)
@@ -2447,8 +2454,21 @@ class TestAppDeepAgent:
 
 
 @pytest.mark.anyio
-async def test_oauth_task_cache_rejects_changed_call_arguments() -> None:
-    """A cached framework slot must fail before delivering another call's data or repeating effects."""
+@pytest.mark.parametrize("durable", [True, False], ids=["durable", "native"])
+@pytest.mark.parametrize(
+    ("recorded", "changed"),
+    [("a", "changed"), (1, True), ({1: "x"}, {True: "x"})],
+    ids=["value", "1-to-true", "key-1-to-true"],
+)
+async def test_oauth_task_cache_rejects_changed_call_arguments(
+    durable: bool, recorded: object, changed: object
+) -> None:
+    """A cached framework slot must fail before delivering another call's data or repeating effects.
+
+    Python treats 1 and True as equal, as values and as dict keys, but they are
+    different JSON arguments.
+    """
+    from contextlib import nullcontext
     from typing import TypedDict
 
     from agent_engine_runner_shared.generated.workflow.v1.common_pb2 import (
@@ -2459,11 +2479,12 @@ async def test_oauth_task_cache_rejects_changed_call_arguments() -> None:
     )
     from agent_engine_runner_shared.secure_wrapper import ToolExecutionError
     from agent_engine_runner_shared.workflow import attempt_context_scope
+    from agent_engine_sdk import RequestContext
     from langgraph.checkpoint.memory import InMemorySaver
     from langgraph.graph import END, START, StateGraph
     from langgraph.types import Command, interrupt
 
-    from agent_engine_sdk_langgraph.runtime import _with_durable_oauth_task
+    from agent_engine_sdk_langgraph.runtime import _with_oauth_task
 
     class State(TypedDict):
         results: dict
@@ -2476,14 +2497,15 @@ async def test_oauth_task_cache_rejects_changed_call_arguments() -> None:
         effects.append(arguments["case"])
         return {"requested": arguments["case"]}, None
 
-    _, call = _with_durable_oauth_task(resource, tool_name="cache-binding")
+    _, call = _with_oauth_task(resource, tool_name="cache-binding")
 
     async def node(state):
         """Reproduce changed worker admission into the framework's positional cache."""
         keys = ["a", "b"]
         results = {
             key: await call(
-                case="changed" if reverse and key == "a" else key, tool_call_id=key
+                case=(changed if reverse else recorded) if key == "a" else key,
+                tool_call_id=key,
             )
             for key in keys
         }
@@ -2497,19 +2519,83 @@ async def test_oauth_task_cache_rejects_changed_call_arguments() -> None:
     graph = builder.compile(checkpointer=InMemorySaver())
     config: RunnableConfig = {"configurable": {"thread_id": "cache-binding"}}
     initial_state: State = {"results": {}}
+    if not durable:
+        config["configurable"]["request_context"] = RequestContext(
+            session_id="native-binding"
+        )
     attempt = AttemptContext(
         workflow_identity=WorkflowIdentity(execution_id="execution"),
         attempt_id="attempt",
         fencing_token=1,
     )
-    with attempt_context_scope(attempt):
+    with attempt_context_scope(attempt) if durable else nullcontext():
         first = await graph.ainvoke(initial_state, config)
         reverse = True
         with pytest.raises(ToolExecutionError, match="arguments changed"):
             await graph.ainvoke(
                 Command(resume={first["__interrupt__"][0].id: True}), config
             )
-    assert effects == ["a", "b"]
+    assert effects == [recorded, "b"]
+
+
+@pytest.mark.anyio
+async def test_durable_oauth_replays_an_unchanged_dict_subclass_argument() -> None:
+    """An unchanged durable call with a dict-subclass argument returns its recorded result after a later wait."""
+    from typing import TypedDict
+
+    from agent_engine_runner_shared.generated.workflow.v1.common_pb2 import (
+        WorkflowIdentity,
+    )
+    from agent_engine_runner_shared.generated.workflow.v1.runtime_pb2 import (
+        AttemptContext,
+    )
+    from agent_engine_runner_shared.workflow import attempt_context_scope
+    from langgraph.checkpoint.memory import InMemorySaver
+    from langgraph.graph import END, START, StateGraph
+    from langgraph.types import Command, interrupt
+
+    from agent_engine_sdk_langgraph.runtime import _with_oauth_task
+
+    class Options(dict):
+        """A dict subclass, which the attempt scratch reads back as a plain dict."""
+
+    class State(TypedDict):
+        result: dict
+
+    effects: list[dict] = []
+
+    def resource(**arguments):
+        """Record the provider call and return the options it received."""
+        effects.append(dict(arguments["options"]))
+        return {"options": dict(arguments["options"])}, None
+
+    _, call = _with_oauth_task(resource, tool_name="subclass-arguments")
+
+    async def node(state):
+        """Call the tool, then wait for the application, which replays this node."""
+        result, _ = await call(options=Options(limit=1), tool_call_id="call-1")
+        interrupt("continue")
+        return {"result": result}
+
+    builder = StateGraph(State)
+    builder.add_node("tool", node)
+    builder.add_edge(START, "tool")
+    builder.add_edge("tool", END)
+    graph = builder.compile(checkpointer=InMemorySaver())
+    config: RunnableConfig = {"configurable": {"thread_id": "durable-subclass"}}
+    attempt = AttemptContext(
+        workflow_identity=WorkflowIdentity(execution_id="execution"),
+        attempt_id="attempt",
+        fencing_token=1,
+    )
+    initial_state: State = {"result": {}}
+    with attempt_context_scope(attempt):
+        waiting = await graph.ainvoke(initial_state, config)
+        result = await graph.ainvoke(
+            Command(resume={waiting["__interrupt__"][0].id: True}), config
+        )
+    assert result["result"] == {"options": {"limit": 1}}
+    assert effects == [{"limit": 1}]
 
 
 @pytest.mark.anyio
@@ -2529,7 +2615,7 @@ async def test_oauth_reordered_cache_replays_sync_owner_off_event_loop() -> None
     from langgraph.graph import END, START, StateGraph
     from langgraph.types import Command, interrupt
 
-    from agent_engine_sdk_langgraph.runtime import _with_durable_oauth_task
+    from agent_engine_sdk_langgraph.runtime import _with_oauth_task
 
     class State(TypedDict):
         results: dict
@@ -2544,7 +2630,7 @@ async def test_oauth_reordered_cache_replays_sync_owner_off_event_loop() -> None
         owner_calls.append(arguments["case"])
         return {"requested": arguments["case"]}, None
 
-    _, call = _with_durable_oauth_task(replay_owner, tool_name="reordered-replay")
+    _, call = _with_oauth_task(replay_owner, tool_name="reordered-replay")
 
     async def node(state):
         """Reverse admission after the pause so each cached slot belongs to its sibling."""
@@ -2574,3 +2660,723 @@ async def test_oauth_reordered_cache_replays_sync_owner_off_event_loop() -> None
 
     assert final["results"] == {"a": {"requested": "a"}, "b": {"requested": "b"}}
     assert owner_calls == ["a", "b", "b", "a"]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("synchronous", [False, True], ids=["async", "sync"])
+@pytest.mark.parametrize("identified", [False, True], ids=["positional", "call-id"])
+async def test_native_oauth_task_rejects_reordered_tool_identity(
+    synchronous: bool,
+    identified: bool,
+) -> None:
+    """Reordered named tools cannot repeat effects or exchange results at a saved native slot."""
+    from typing import TypedDict
+
+    from agent_engine_runner_shared.secure_wrapper import ToolExecutionError
+    from agent_engine_sdk import RequestContext
+    from langgraph.checkpoint.memory import InMemorySaver
+    from langgraph.graph import END, START, StateGraph
+    from langgraph.types import Command, interrupt
+
+    from agent_engine_sdk_langgraph.runtime import _with_oauth_task
+
+    class State(TypedDict):
+        results: list
+
+    effects = []
+    reverse = False
+
+    def resource(name):
+        """Name the independent resource effect, keeping both calls' arguments identical."""
+
+        def execute(**arguments):
+            """Observe a real dispatch, outside the framework's cached response."""
+            effects.append(name)
+            return {"tool": name}, None
+
+        return _with_oauth_task(execute, tool_name=name)
+
+    tools = [resource("github"), resource("calendar")]
+
+    async def node(state):
+        """Reverse admission only after both named resource tasks are checkpointed."""
+        results = []
+        ordered = reversed(tools) if reverse else tools
+        for index, (sync, asynchronous) in enumerate(ordered):
+            arguments: dict[str, int | str] = {"value": 1}
+            if identified:
+                arguments["tool_call_id"] = f"call-{index}"
+            results.append(await asynchronous(**arguments))
+        interrupt("continue")
+        return {"results": results}
+
+    def sync_node(state):
+        """Exercise the same admission order through a synchronous graph worker."""
+        ordered = reversed(tools) if reverse else tools
+        results = [
+            sync(value=1, **({"tool_call_id": f"call-{index}"} if identified else {}))
+            for index, (sync, _) in enumerate(ordered)
+        ]
+        interrupt("continue")
+        return {"results": results}
+
+    builder = StateGraph(State)
+    builder.add_node("tools", sync_node if synchronous else node)
+    builder.add_edge(START, "tools")
+    builder.add_edge("tools", END)
+    graph = builder.compile(checkpointer=InMemorySaver())
+    config: RunnableConfig = {
+        "configurable": {
+            "thread_id": "native-order",
+            "request_context": RequestContext(session_id="native-order"),
+        }
+    }
+    initial_state: State = {"results": []}
+    first = await graph.ainvoke(initial_state, config)
+    reverse = True
+    with pytest.raises(ToolExecutionError, match="identity changed"):
+        await graph.ainvoke(
+            Command(resume={first["__interrupt__"][0].id: True}), config
+        )
+    assert effects == ["github", "calendar"]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "changed_arguments", [False, True], ids=["identity", "arguments"]
+)
+async def test_native_oauth_reorder_binds_an_interrupted_slot_before_dispatch(
+    changed_arguments: bool,
+) -> None:
+    """An unfinished consent slot cannot redispatch its completed sibling after reordered admission."""
+    import asyncio
+    import threading
+    from typing import TypedDict
+
+    from agent_engine_runner_shared.secure_wrapper import ToolExecutionError
+    from agent_engine_sdk import RequestContext
+    from langgraph.checkpoint.memory import InMemorySaver
+    from langgraph.graph import END, START, StateGraph
+    from langgraph.types import Command, interrupt
+
+    from agent_engine_sdk_langgraph.runtime import _with_oauth_task
+
+    class State(TypedDict):
+        results: list
+
+    effects = []
+    reverse = False
+    ready_done = threading.Event()
+
+    def ready_resource(**arguments):
+        """Observe the sibling effect that already completed before consent."""
+        effects.append("ready")
+        return {"tool": "ready"}, None
+
+    def pending_resource(**arguments):
+        """Keep this task unfinished at the existing native consent boundary."""
+        # Pause only after the sibling's child checkpoint has completed, so the
+        # first turn always records one finished and one unfinished slot.
+        assert ready_done.wait(timeout=5)
+        interrupt("consent")
+        effects.append("pending")
+        return {"tool": "pending"}, None
+
+    _, ready_call = _with_oauth_task(ready_resource, tool_name="ready")
+    _, pending = _with_oauth_task(pending_resource, tool_name="pending")
+
+    async def ready(**arguments):
+        """Signal the pending sibling once this call's child checkpoint has returned."""
+        try:
+            return await ready_call(**arguments)
+        finally:
+            ready_done.set()
+
+    async def node(state):
+        """Admit both siblings, then swap the unfinished and completed native positions."""
+        calls = (
+            [ready, pending] if reverse and not changed_arguments else [pending, ready]
+        )
+        results = await asyncio.gather(
+            *(
+                call(
+                    value=2 if reverse and changed_arguments and call is pending else 1
+                )
+                for call in calls
+            )
+        )
+        return {"results": results}
+
+    builder = StateGraph(State)
+    builder.add_node("tools", node)
+    builder.add_edge(START, "tools")
+    builder.add_edge("tools", END)
+    graph = builder.compile(checkpointer=InMemorySaver())
+    config: RunnableConfig = {
+        "configurable": {
+            "thread_id": "native-partial",
+            "request_context": RequestContext(session_id="native-partial"),
+        }
+    }
+    initial_state: State = {"results": []}
+    first = await graph.ainvoke(initial_state, config)
+    assert effects == ["ready"]
+    reverse = True
+    with pytest.raises(
+        ToolExecutionError,
+        match="arguments changed" if changed_arguments else "identity changed",
+    ):
+        await graph.ainvoke(
+            Command(resume={first["__interrupt__"][0].id: True}), config
+        )
+    assert effects == ["ready"]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("streaming", [False, True], ids=["invoke", "stream"])
+@pytest.mark.parametrize("sibling", [False, True], ids=["single", "branched"])
+async def test_native_oauth_task_completes_with_serial_concurrency(
+    streaming: bool, sibling: bool
+) -> None:
+    """A one-permit native graph returns its resource response without a nested-task deadlock."""
+    import asyncio
+    from typing import TypedDict
+
+    from agent_engine_sdk import RequestContext
+    from langgraph.checkpoint.memory import InMemorySaver
+    from langgraph.graph import END, START, StateGraph
+
+    from agent_engine_sdk_langgraph.runtime import _with_oauth_task
+
+    class State(TypedDict):
+        result: dict
+
+    effects = []
+
+    def resource(**arguments):
+        """Expose the actual effect and response independently of framework control."""
+        effects.append(arguments["value"])
+        return {"value": arguments["value"]}, None
+
+    _, call = _with_oauth_task(resource, tool_name="serial")
+
+    async def node(state):
+        """Await the configured connector in an ordinary single-node graph."""
+        result, _ = await call(value=7)
+        return {"result": result}
+
+    builder = StateGraph(State)
+    builder.add_node("tool", node)
+    builder.add_edge(START, "tool")
+    builder.add_edge("tool", END)
+    if sibling:
+
+        async def ordinary(state):
+            """Keep another graph task queued under the same caller's one-permit executor."""
+            return {}
+
+        builder.add_node("ordinary", ordinary)
+        builder.add_edge(START, "ordinary")
+        builder.add_edge("ordinary", END)
+    graph = builder.compile(checkpointer=InMemorySaver())
+    config: RunnableConfig = {
+        "max_concurrency": 1,
+        "configurable": {
+            "thread_id": "native-serial",
+            "request_context": RequestContext(session_id="native-serial"),
+        },
+    }
+
+    initial_state: State = {"result": {}}
+
+    async def run():
+        """Exercise both native runner transports with a bounded completion oracle."""
+        if not streaming:
+            return await graph.ainvoke(initial_state, config)
+        values = [
+            value
+            async for value in graph.astream(
+                initial_state, config, stream_mode="values"
+            )
+        ]
+        return values[-1]
+
+    result = await asyncio.wait_for(run(), timeout=3)
+    assert result["result"] == {"value": 7}
+    assert effects == [7]
+
+
+@pytest.mark.anyio
+async def test_stateless_native_oauth_keeps_direct_execution() -> None:
+    """Disabling native checkpointing still permits an already-authorized resource call."""
+    from typing import TypedDict
+
+    from agent_engine_sdk import RequestContext
+    from langgraph.graph import END, START, StateGraph
+
+    from agent_engine_sdk_langgraph.runtime import _with_oauth_task
+
+    class State(TypedDict):
+        result: dict
+
+    effects = []
+
+    def resource(**arguments):
+        """Return a genuine resource response without recording a native checkpoint."""
+        effects.append(arguments["value"])
+        return {"value": arguments["value"]}, None
+
+    _, call = _with_oauth_task(resource, tool_name="stateless")
+
+    async def node(state):
+        """Call the configured connector in a platform-context graph with no saver."""
+        result, _ = await call(value=3)
+        return {"result": result}
+
+    builder = StateGraph(State)
+    builder.add_node("tool", node)
+    builder.add_edge(START, "tool")
+    builder.add_edge("tool", END)
+    graph = builder.compile(checkpointer=False)
+    config: RunnableConfig = {
+        "configurable": {"request_context": RequestContext(session_id="stateless")}
+    }
+    initial_state: State = {"result": {}}
+    result = await graph.ainvoke(initial_state, config)
+    assert result["result"] == {"value": 3}
+    assert effects == [3]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "unsupported", ["scratchpad", "saver"], ids=["no-scratchpad", "loop-bound-saver"]
+)
+async def test_native_oauth_without_a_usable_child_checkpoint_runs_directly(
+    monkeypatch: pytest.MonkeyPatch, unsupported: str
+) -> None:
+    """Native consent still completes when the child checkpoint cannot be used.
+
+    Without LangGraph's private scratchpad, or with an application saver whose
+    async methods are bound to the caller's event loop, the call runs directly.
+    """
+    import asyncio
+    from collections.abc import AsyncIterator
+    from typing import TypedDict
+
+    from agent_engine_sdk import RequestContext
+    from langgraph.checkpoint.base import BaseCheckpointSaver
+    from langgraph.checkpoint.memory import InMemorySaver
+    from langgraph.graph import END, START, StateGraph
+    from langgraph.types import Command, interrupt
+
+    from agent_engine_sdk_langgraph import runtime
+
+    class LoopBoundSaver(BaseCheckpointSaver):
+        """Serve async calls only on the event loop that first used the saver."""
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.inner = InMemorySaver()
+            self.loop: asyncio.AbstractEventLoop | None = None
+
+        def bound(self) -> InMemorySaver:
+            """Fail like a saver whose connection belongs to another event loop."""
+            loop = asyncio.get_running_loop()
+            self.loop = self.loop or loop
+            if loop is not self.loop:
+                raise RuntimeError("saver is bound to another event loop")
+            return self.inner
+
+        def get_next_version(self, current, channel):
+            return self.inner.get_next_version(current, channel)
+
+        def get_tuple(self, config):
+            return self.inner.get_tuple(config)
+
+        def list(self, config, **kwargs):
+            return self.inner.list(config, **kwargs)
+
+        def put(self, config, checkpoint, metadata, new_versions):
+            return self.inner.put(config, checkpoint, metadata, new_versions)
+
+        def put_writes(self, config, writes, task_id, task_path=""):
+            return self.inner.put_writes(config, writes, task_id, task_path)
+
+        async def aget_tuple(self, config):
+            return self.bound().get_tuple(config)
+
+        async def alist(self, config, **kwargs) -> AsyncIterator:
+            for item in self.bound().list(config, **kwargs):
+                yield item
+
+        async def aput(self, config, checkpoint, metadata, new_versions):
+            return self.bound().put(config, checkpoint, metadata, new_versions)
+
+        async def aput_writes(self, config, writes, task_id, task_path=""):
+            return self.bound().put_writes(config, writes, task_id, task_path)
+
+    if unsupported == "scratchpad":
+        monkeypatch.setattr(runtime, "CONFIG_KEY_SCRATCHPAD", None)
+        checkpointer: BaseCheckpointSaver = InMemorySaver()
+    else:
+        checkpointer = LoopBoundSaver()
+
+    class State(TypedDict):
+        result: dict
+
+    effects: list[int] = []
+
+    def resource(**arguments):
+        """Pause for consent, then produce the real result on continuation."""
+        interrupt("consent")
+        effects.append(arguments["value"])
+        return {"value": arguments["value"]}, None
+
+    _, call = runtime._with_oauth_task(resource, tool_name="fallback")
+
+    async def node(state):
+        """Call the connector in a checkpointed platform graph."""
+        result, _ = await call(value=5)
+        return {"result": result}
+
+    builder = StateGraph(State)
+    builder.add_node("tool", node)
+    builder.add_edge(START, "tool")
+    builder.add_edge("tool", END)
+    graph = builder.compile(checkpointer=checkpointer)
+    config: RunnableConfig = {
+        "configurable": {
+            "thread_id": "native-fallback",
+            "request_context": RequestContext(session_id="native-fallback"),
+        }
+    }
+    initial_state: State = {"result": {}}
+    paused = await asyncio.wait_for(graph.ainvoke(initial_state, config), timeout=5)
+    assert effects == []
+    result = await asyncio.wait_for(
+        graph.ainvoke(Command(resume={paused["__interrupt__"][0].id: True}), config),
+        timeout=5,
+    )
+    assert result["result"] == {"value": 5}
+    assert effects == [5]
+
+
+@pytest.mark.anyio
+async def test_native_oauth_tuple_arguments_resume_after_consent() -> None:
+    """An unchanged call whose arguments hold a tuple resumes and replays instead of failing as changed."""
+    from typing import TypedDict
+
+    from agent_engine_sdk import RequestContext
+    from langgraph.checkpoint.memory import InMemorySaver
+    from langgraph.graph import END, START, StateGraph
+    from langgraph.types import Command, interrupt
+
+    from agent_engine_sdk_langgraph.runtime import _with_oauth_task
+
+    class State(TypedDict):
+        result: dict
+
+    effects: list[object] = []
+
+    def resource(**arguments):
+        """Pause for consent, then return the requested repositories."""
+        interrupt("consent")
+        effects.append(arguments["repos"])
+        return {"repos": list(arguments["repos"])}, None
+
+    _, call = _with_oauth_task(resource, tool_name="tuple-arguments")
+
+    async def node(state):
+        """Pass a tuple argument, which the checkpoint serializer stores as a list."""
+        result, _ = await call(repos=("a", "b"), tool_call_id="call-1")
+        # A later application wait replays this node and its recorded call.
+        interrupt("continue")
+        return {"result": result}
+
+    builder = StateGraph(State)
+    builder.add_node("tool", node)
+    builder.add_edge(START, "tool")
+    builder.add_edge("tool", END)
+    graph = builder.compile(checkpointer=InMemorySaver())
+    config: RunnableConfig = {
+        "configurable": {
+            "thread_id": "native-tuple",
+            "request_context": RequestContext(session_id="native-tuple"),
+        }
+    }
+    initial_state: State = {"result": {}}
+    consent = await graph.ainvoke(initial_state, config)
+    waiting = await graph.ainvoke(
+        Command(resume={consent["__interrupt__"][0].id: True}), config
+    )
+    assert len(effects) == 1
+    result = await graph.ainvoke(
+        Command(resume={waiting["__interrupt__"][0].id: True}), config
+    )
+    assert result["result"] == {"repos": ["a", "b"]}
+    assert len(effects) == 1
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("streaming", [False, True], ids=["invoke", "stream"])
+@pytest.mark.parametrize("consent", [False, True], ids=["authorized", "consent"])
+async def test_native_sync_oauth_tool_inside_async_node_resumes_consent(
+    streaming: bool, consent: bool
+) -> None:
+    """The public sync tool API must work on an async graph's event-loop thread."""
+    from typing import TypedDict
+
+    from agent_engine_sdk import RequestContext
+    from langchain_core.tools import StructuredTool
+    from langgraph.checkpoint.memory import InMemorySaver
+    from langgraph.graph import END, START, StateGraph
+    from langgraph.types import Command, interrupt
+
+    from agent_engine_sdk_langgraph.runtime import _with_oauth_task
+
+    class State(TypedDict):
+        result: dict
+
+    effects: list[int] = []
+
+    def resource(value: int):
+        """Produce the real result only after the checkpoint's consent is answered."""
+        if consent:
+            interrupt("consent")
+        effects.append(value)
+        return {"value": value}, None
+
+    sync, asynchronous = _with_oauth_task(resource, tool_name="native-sync")
+    tool = StructuredTool.from_function(
+        func=sync,
+        coroutine=asynchronous,
+        name="native-sync",
+        description="Read the authorized resource",
+        response_format="content_and_artifact",
+    )
+
+    async def node(state: State):
+        """Call the existing synchronous tool interface from an async application node."""
+        return {"result": tool.invoke({"value": 7})}
+
+    builder = StateGraph(State)
+    builder.add_node("tool", node)
+    builder.add_edge(START, "tool")
+    builder.add_edge("tool", END)
+    graph = builder.compile(checkpointer=InMemorySaver())
+    config: RunnableConfig = {
+        "configurable": {
+            "thread_id": "native-sync-in-async",
+            "request_context": RequestContext(session_id="native-sync-in-async"),
+        }
+    }
+    initial: State = {"result": {}}
+
+    async def run(value):
+        """Collect the completed checkpoint state through either graph transport."""
+        if not streaming:
+            return await graph.ainvoke(value, config)
+        states = [
+            state async for state in graph.astream(value, config, stream_mode="values")
+        ]
+        return states[-1]
+
+    result = await run(initial)
+    if consent:
+        assert effects == []
+        result = await run(Command(resume={result["__interrupt__"][0].id: True}))
+    assert result["result"] == {"value": 7}
+    assert effects == [7]
+
+
+@pytest.mark.anyio
+async def test_native_oauth_toolnode_resumes_after_reordered_admission() -> None:
+    """Stable ToolNode calls retain their own checkpoints when callback scheduling changes."""
+    import asyncio
+    import json
+    import threading
+    from typing import Annotated, TypedDict
+
+    from agent_engine_sdk import RequestContext
+    from langchain_core.callbacks import BaseCallbackHandler
+    from langchain_core.messages import AIMessage, BaseMessage, ToolMessage
+    from langchain_core.tools import InjectedToolCallId, StructuredTool
+    from langgraph.checkpoint.memory import InMemorySaver
+    from langgraph.graph import END, START, StateGraph
+    from langgraph.graph.message import add_messages
+    from langgraph.prebuilt import ToolNode
+    from langgraph.types import Command, interrupt
+
+    from agent_engine_sdk_langgraph.runtime import _with_oauth_task
+
+    class State(TypedDict):
+        messages: Annotated[list[BaseMessage], add_messages]
+
+    loop_thread = threading.get_ident()
+    callback_threads: list[int] = []
+
+    class Callback(BaseCallbackHandler):
+        def on_tool_start(self, serialized, input_str, **kwargs):
+            """Observe production's non-inline callback executor before native admission."""
+            callback_threads.append(threading.get_ident())
+
+    effects: list[str] = []
+    reverse = False
+    admitted = asyncio.Event()
+
+    def resource(case: str, tool_call_id: Annotated[str, InjectedToolCallId]):
+        """Leave one sibling pending while independently observing completed API effects."""
+        if case == "b":
+            interrupt("consent")
+        effects.append(case)
+        return {"owner": case}, None
+
+    sync, asynchronous = _with_oauth_task(resource, tool_name="repositories")
+
+    async def ordered(**arguments):
+        """Force opposite admission on resume, as non-inline tool callbacks may do."""
+        first = "b" if reverse else "a"
+        if arguments["case"] != first:
+            await admitted.wait()
+            return await asynchronous(**arguments)
+        try:
+            return await asynchronous(**arguments)
+        finally:
+            admitted.set()
+
+    tool = StructuredTool.from_function(
+        func=sync,
+        coroutine=ordered,
+        name="repositories",
+        description="Read a user's repositories",
+        response_format="content_and_artifact",
+    )
+    builder = StateGraph(State)
+    builder.add_node("tools", ToolNode([tool]))
+    builder.add_edge(START, "tools")
+    builder.add_edge("tools", END)
+    graph = builder.compile(checkpointer=InMemorySaver())
+    config: RunnableConfig = {
+        "callbacks": [Callback()],
+        "configurable": {
+            "thread_id": "native-toolnode-admission",
+            "request_context": RequestContext(session_id="native-toolnode-admission"),
+        },
+    }
+    initial: State = {
+        "messages": [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {"id": "lookup-a", "name": tool.name, "args": {"case": "a"}},
+                    {"id": "lookup-b", "name": tool.name, "args": {"case": "b"}},
+                ],
+            )
+        ]
+    }
+    paused = await graph.ainvoke(initial, config)
+    assert effects == ["a"]
+    reverse = True
+    admitted = asyncio.Event()
+    result = await graph.ainvoke(
+        Command(resume={paused["__interrupt__"][0].id: True}), config
+    )
+    assert effects == ["a", "b"]
+    actual = {}
+    for message in result["messages"]:
+        if isinstance(message, ToolMessage):
+            assert isinstance(message.content, str)
+            actual[message.tool_call_id] = json.loads(message.content)
+    assert actual == {"lookup-a": {"owner": "a"}, "lookup-b": {"owner": "b"}}
+    assert callback_threads and all(
+        thread != loop_thread for thread in callback_threads
+    )
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "platform", [False, True], ids=["own-failure", "platform-failure"]
+)
+async def test_native_oauth_failure_replay_on_a_replacement_runtime(
+    platform: bool,
+) -> None:
+    """A call's own failure is raised again with its type, without a second provider call.
+
+    A platform failure is not the call's outcome, so it is not recorded and the
+    replacement runtime calls the provider again.
+    """
+    from typing import TypedDict
+
+    from agent_engine_runner_shared import (
+        ExternalAPICallError,
+        ToolExecutionError,
+        ToolPlatformError,
+    )
+    from agent_engine_runner_shared.tool_api_error import ToolAPIError
+    from agent_engine_sdk import RequestContext
+    from langgraph.checkpoint.memory import InMemorySaver
+    from langgraph.graph import END, START, StateGraph
+    from langgraph.types import Command, interrupt
+
+    from agent_engine_sdk_langgraph.runtime import _with_oauth_task
+
+    class State(TypedDict):
+        done: bool
+
+    provider_calls: list[str] = []
+    failures: list[ToolExecutionError] = []
+    rejected = ToolAPIError(
+        provider_type="github", classification="AUTH_FAILED", http_status=401
+    )
+
+    def resource(owner: str, tool_call_id: str):
+        """Fail as the provider rejects the delegated token, or as OE loses the result."""
+        provider_calls.append(owner)
+        if platform:
+            raise ToolPlatformError("OE did not acknowledge tool result settlement")
+        raise ExternalAPICallError(f"GitHub has no user {owner}", rejected)
+
+    def runtime_graph(checkpointer: InMemorySaver):
+        """Build the graph a runner process compiles, with its own tool wrapper."""
+        _, call = _with_oauth_task(resource, tool_name="list_repositories")
+
+        async def node(state: State):
+            """Report the call's failure, then wait so the node runs again on resume."""
+            try:
+                await call(owner="alice", tool_call_id="call-alice")
+            except ToolExecutionError as error:
+                failures.append(error)
+            interrupt("continue")
+            return {"done": True}
+
+        builder = StateGraph(State)
+        builder.add_node("calls", node)
+        builder.add_edge(START, "calls")
+        builder.add_edge("calls", END)
+        return builder.compile(checkpointer=checkpointer)
+
+    # One saver stands in for the MongoDB checkpointer both runners share.
+    checkpointer = InMemorySaver()
+    config: RunnableConfig = {
+        "configurable": {
+            "thread_id": "native-failure",
+            "request_context": RequestContext(session_id="native-failure"),
+        }
+    }
+    initial: State = {"done": False}
+    paused = await runtime_graph(checkpointer).ainvoke(initial, config)
+    result = await runtime_graph(checkpointer).ainvoke(
+        Command(resume={paused["__interrupt__"][0].id: True}), config
+    )
+
+    assert result["done"] is True
+    assert len(failures) == 2
+    if platform:
+        assert provider_calls == ["alice", "alice"]
+        assert all(type(failure) is ToolPlatformError for failure in failures)
+        return
+    assert provider_calls == ["alice"]
+    for failure in failures:
+        assert type(failure) is ExternalAPICallError
+        assert str(failure) == "Tool execution error: GitHub has no user alice"
+        assert failure.tool_api_error == rejected

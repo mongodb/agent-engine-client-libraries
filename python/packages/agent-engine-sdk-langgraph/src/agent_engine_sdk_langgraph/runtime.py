@@ -12,7 +12,9 @@ import os
 import threading
 import warnings
 from collections.abc import Callable, Iterable, Sequence
-from functools import wraps
+from dataclasses import is_dataclass, replace
+from functools import cache, wraps
+from itertools import count
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any, Literal, cast, overload
 
@@ -29,9 +31,13 @@ from agent_engine_runner_shared import (
     SuspendPayload,
     TenantRuntime,
     ToolExecutionError,
+    ToolPlatformError,
+    decode_tool_failure,
+    encode_tool_failure,
     request_session_finish,
 )
 from agent_engine_runner_shared.context import get_current_wrapper
+from agent_engine_runner_shared.deprecations import warn_trace_options_removed
 from agent_engine_runner_shared.generated.workflow.v1.common_pb2 import OperationPath
 from agent_engine_runner_shared.mcp_tools import (
     MCPConfigError,
@@ -71,13 +77,28 @@ from agent_engine_sdk import (
 from agent_engine_sdk_memory import Memory
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import ToolMessage
+from langchain_core.runnables import RunnableConfig
+from langchain_core.runnables.config import ContextThreadPoolExecutor
 from langchain_core.tools import StructuredTool
 from langchain_core.tools import tool as lc_tool
+from langgraph.checkpoint.base import BaseCheckpointSaver
+from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 from langgraph.config import get_config
+from langgraph.constants import CONFIG_KEY_CHECKPOINTER
 from langgraph.errors import GraphBubbleUp
-from langgraph.func import task
+from langgraph.func import entrypoint, task
 from langgraph.prebuilt.tool_node import msg_content_output
+
+try:
+    # LangGraph has no public form of the per-task scratchpad. Native OAuth
+    # checkpoints need its call counter (the position of a call without an ID)
+    # and its subgraph counter (to keep the child's explicit namespace). Without
+    # it, native calls run directly: consent still rechecks the token gate, but
+    # a continuation in a new process calls the provider again.
+    from langgraph._internal._constants import CONFIG_KEY_SCRATCHPAD
+except ImportError:  # pragma: no cover - depends on the installed LangGraph
+    CONFIG_KEY_SCRATCHPAD = None
 
 from agent_engine_sdk_langgraph.platform_checkpointer import PlatformCheckpointer
 from agent_engine_sdk_langgraph.secure_llm import SecureWrappedLLM
@@ -176,77 +197,296 @@ def _with_durable_tool_result_identity(
     return invoke
 
 
-def _with_durable_oauth_task(
+def _native_checkpoint_saver(
+    configurable: dict[str, Any],
+) -> BaseCheckpointSaver[Any] | None:
+    """Return the saver a native OAuth child checkpoint can use, or None to run the call directly.
+
+    The child needs LangGraph's private task scratchpad, and it runs on its own
+    event loop in a worker thread, so the saver must serve async calls without
+    binding to the caller's loop: MongoDBSaver and InMemorySaver do. Anything
+    else logs one warning and the call runs directly, without a recorded result.
+    """
+    from langgraph.checkpoint.mongodb import MongoDBSaver
+
+    scratchpad = (
+        None
+        if CONFIG_KEY_SCRATCHPAD is None
+        else configurable.get(CONFIG_KEY_SCRATCHPAD)
+    )
+    if not (
+        is_dataclass(scratchpad)
+        and callable(getattr(scratchpad, "call_counter", None))
+        and callable(getattr(scratchpad, "subgraph_counter", None))
+    ):
+        _warn_native_checkpoint_unsupported(
+            "this LangGraph version has no compatible task scratchpad"
+        )
+        return None
+    checkpointer = configurable.get(CONFIG_KEY_CHECKPOINTER)
+    saver = (
+        checkpointer.native
+        if isinstance(checkpointer, PlatformCheckpointer)
+        else checkpointer
+    )
+    if saver is None:
+        _warn_native_checkpoint_unsupported("the graph has no native checkpointer")
+        return None
+    if not isinstance(saver, (MongoDBSaver, InMemorySaver)):
+        _warn_native_checkpoint_unsupported(
+            f"a {type(saver).__name__} checkpointer may be bound to the caller's event loop"
+        )
+        return None
+    return saver
+
+
+@cache
+def _warn_native_checkpoint_unsupported(reason: str) -> None:
+    """Log once per reason that native OAuth calls run unrecorded and unisolated in their node."""
+    logger.warning(
+        "Native checkpoint OAuth tools run in their graph node without recording "
+        "their result, and a consent answer can satisfy a later interrupt in that "
+        "node: %s",
+        reason,
+    )
+
+
+def _same_arguments(left: Any, right: Any) -> bool:
+    """Return whether two argument values match in both type and value.
+
+    Python equality treats True, 1 and 1.0 as equal, but they are different
+    JSON arguments to the provider. TypeScript also tells true from 1; 1 and
+    1.0 are one number there, so Python is deliberately stricter. A replay
+    compares a call with its own stored arguments, which keep their types, so
+    the stricter check does not reject a genuine replay. Dict keys are compared
+    the same way, since they serialize as "true", "1" and "1.0". Containers
+    match by kind: the checkpoint serializer reads a dict or list subclass back
+    as a plain dict or list.
+    """
+    if isinstance(left, dict) and isinstance(right, dict):
+        # A lookup finds an equal key of another type, so compare the stored key.
+        right_keys = {key: key for key in right}
+        return len(left) == len(right) and all(
+            key in right_keys
+            and type(right_keys[key]) is type(key)
+            and _same_arguments(value, right[key])
+            for key, value in left.items()
+        )
+    if isinstance(left, list) and isinstance(right, list):
+        return len(left) == len(right) and all(map(_same_arguments, left, right))
+    return type(left) is type(right) and bool(left == right)
+
+
+def _with_oauth_task(
     wrapped_func: Callable[..., Any], *, tool_name: str
 ) -> tuple[Callable[..., Any], Callable[..., Any]]:
     """Isolate each OAuth wait from sibling ToolNode calls while OE retains effect identity.
 
-    A completed framework task carries only the genuine resource result. Its
-    parent can pause again without consuming the consent answer. Native calls
-    retain their existing path until the compatibility slice.
+    Durable tasks carry genuine resource results. Their parent can pause again
+    without consuming the consent answer. On a native checkpoint execution each
+    call runs as a child entrypoint whose checkpoint, under the graph's own
+    saver, records the tool, its arguments and its result or its own failure,
+    keyed by tool-call ID. A direct call without an ID is keyed by its
+    position, so it also requires stable call order. Returns the sync and async
+    tool functions.
     """
 
-    @task(name=f"delegated_oauth_{tool_name}")
-    def dispatch(arguments: dict[str, Any], segments: list[tuple[str, int]]) -> Any:
+    def execute(arguments: dict[str, Any], segments: list[tuple[str, int]]) -> Any:
         """Keep OE activities at the original graph path despite the task's native namespace."""
         path = OperationPath()
         for name, ordinal in segments:
             path.segments.add(name=name, ordinal=ordinal)
         with operation_path_scope(path):
-            return arguments, wrapped_func(**dict(arguments))
+            return tool_name, arguments, wrapped_func(**dict(arguments))
 
-    def restore(arguments: dict[str, Any], outcome: Any) -> tuple[Any, Any]:
-        """Bind a task-cache result to its original call and restore its content/artifact pair."""
-        recorded_arguments, result = outcome
-        if recorded_arguments != arguments:
-            if current_attempt_context() is not None and recorded_arguments.get(
-                "tool_call_id"
-            ) != arguments.get("tool_call_id"):
-                # Native task slots follow worker admission. OE owns the
-                # durable call identity, including its already-answered wait.
-                # Reenter that owner instead of returning a sibling's cache.
-                return wrapped_func(**dict(arguments))
+    dispatch = task(name=f"delegated_oauth_{tool_name}")(execute)
+
+    def validate_identity(
+        recorded_name: str,
+        recorded_arguments: dict[str, Any],
+        arguments: dict[str, Any],
+    ) -> None:
+        """Reject a checkpoint slot belonging to another tool or another argument set."""
+        if recorded_name != tool_name:
+            raise ToolExecutionError(
+                "OAuth tool identity changed during checkpoint replay"
+            )
+        if not _same_arguments(recorded_arguments, arguments):
             raise ToolExecutionError(
                 "OAuth tool arguments changed during checkpoint replay"
             )
+
+    @task(name="delegated_oauth_identity")
+    def native_identity(
+        name: str, arguments: dict[str, Any]
+    ) -> tuple[str, dict[str, Any]]:
+        """Checkpoint call identity before the native resource task can pause or produce an effect."""
+        return name, arguments
+
+    @entrypoint()
+    def native_bound_call(call_input: dict[str, Any]) -> Any:
+        """Retain the pre-effect binding and resource operation in one native child checkpoint.
+
+        Returns the tool name, arguments, result and the call's own failure as
+        ``encode_tool_failure`` records it (None when the call succeeded).
+        """
+        # Reentry may load the child's old input. Current caller arguments are
+        # request configuration, so they still detect a changed unfinished slot.
+        arguments, segments = get_config().get("configurable", {})[
+            "_agent_engine_oauth_call"
+        ]
+        recorded_name, recorded_arguments = native_identity(
+            tool_name, call_input["arguments"]
+        ).result()
+        validate_identity(recorded_name, recorded_arguments, arguments)
+        try:
+            return (*execute(arguments, segments), None)
+        except ToolPlatformError:
+            # The platform, not the call, failed, and the tool may have run.
+            # Recording it would replay a platform fault as the call's outcome.
+            raise
+        except ToolExecutionError as error:
+            # The call's own failure completes the child, so a rerun of the node
+            # reports it again instead of calling the provider once more.
+            # Pauses and policy denials are not tool errors and stay unrecorded.
+            return tool_name, arguments, None, encode_tool_failure(error)
+
+    def native_config(
+        arguments: dict[str, Any], segments: list[tuple[str, int]]
+    ) -> RunnableConfig:
+        """Bind an independent native child to its ToolNode ID or direct-call position."""
+        parent_config = get_config()
+        parent_values = parent_config.get("configurable", {})
+        # _native_checkpoint_saver() admits a native call only when the
+        # scratchpad key exists.
+        scratchpad_key = cast(str, CONFIG_KEY_SCRATCHPAD)
+        scratchpad = parent_values[scratchpad_key]
+        ordinal = scratchpad.call_counter()
+        call_id = arguments.get("tool_call_id")
+        # ToolNode callbacks can reorder worker admission without changing the
+        # model's calls. Hash its injected ID into a delimiter-safe namespace;
+        # direct calls without an ID retain their positional replay contract.
+        slot = (
+            "tool:" + hashlib.sha256(call_id.encode()).hexdigest()
+            if isinstance(call_id, str) and call_id
+            else str(ordinal)
+        )
+        configurable = {
+            **parent_values,
+            "_agent_engine_oauth_call": (arguments, segments),
+            "checkpoint_ns": f"{parent_values.get('checkpoint_ns', '')}|delegated_oauth:{slot}",
+            # This call already has an explicit namespace. Prevent the child
+            # loop from adding another automatic subgraph ordinal to it.
+            scratchpad_key: replace(scratchpad, subgraph_counter=count().__next__),
+        }
+        configurable.pop("checkpoint_id", None)
+        return {**parent_config, "max_concurrency": 0, "configurable": configurable}
+
+    def native_dispatch(arguments: dict[str, Any], config: RunnableConfig) -> Any:
+        """Start or resume this native call's checkpoint without waiting for a parent executor permit."""
+        saved = native_bound_call.get_state(config)
+        child_input = None if saved.created_at is not None else {"arguments": arguments}
+        return asyncio.run(native_bound_call.ainvoke(child_input, config=config))
+
+    def restore(arguments: dict[str, Any], outcome: Any) -> tuple[Any, Any]:
+        """Bind a task-cache result to its original call and restore its content/artifact pair."""
+        recorded_name, recorded_arguments, result = outcome
+        if (
+            recorded_name == tool_name
+            and recorded_arguments != arguments
+            and current_attempt_context() is not None
+            and recorded_arguments.get("tool_call_id") != arguments.get("tool_call_id")
+        ):
+            # Native task slots follow worker admission. OE owns the durable
+            # call identity, including its already-answered wait. Reenter that
+            # owner instead of returning a sibling's cache.
+            return wrapped_func(**dict(arguments))
+        validate_identity(recorded_name, recorded_arguments, arguments)
         # Scratch JSON normalizes tuples to lists. The outer pair is platform
         # metadata; arbitrary resource content remains inside the result.
         content, artifact = result
         return content, artifact
 
-    def position() -> list[tuple[str, int]] | None:
-        """Capture the graph position before entering the framework task, or use direct execution."""
-        if current_attempt_context() is None:
-            return None
+    def restore_native(arguments: dict[str, Any], outcome: Any) -> tuple[Any, Any]:
+        """Return a native child's recorded result, or raise its recorded failure with its type."""
+        recorded_name, recorded_arguments, result, failure = outcome
+        if failure is None:
+            return restore(arguments, (recorded_name, recorded_arguments, result))
+        validate_identity(recorded_name, recorded_arguments, arguments)
+        raise decode_tool_failure(failure)
+
+    def position() -> (
+        tuple[list[tuple[str, int]], BaseCheckpointSaver[Any] | None] | None
+    ):
+        """Capture the graph position and native saver before entering the framework task.
+
+        Returns None for direct execution. The saver is None on a durable
+        execution, where OE history owns the call.
+        """
         try:
-            get_config()
+            config = get_config()
         except RuntimeError:
             return None
-        return [
+        saver = None
+        if current_attempt_context() is None:
+            values = config.get("configurable") or {}
+            if not isinstance(
+                values.get("request_context"), RequestContext
+            ) or not values.get(CONFIG_KEY_CHECKPOINTER):
+                # Flat tools and stateless graphs need no checkpoint boundary.
+                return None
+            saver = _native_checkpoint_saver(values)
+            if saver is None:
+                return None
+        segments = [
             (segment.name, segment.ordinal)
             for segment in current_operation_path().segments
         ]
+        return segments, saver
+
+    def canonical(saver: BaseCheckpointSaver[Any], arguments: dict[str, Any]) -> Any:
+        """Return the arguments as the child checkpoint reads them back.
+
+        The saver's serializer stores a tuple as a list. Comparing and running
+        the call with the stored form keeps an unchanged call from looking
+        changed when a continuation reads its recorded arguments.
+        """
+        return saver.serde.loads_typed(saver.serde.dumps_typed(arguments))
 
     @wraps(wrapped_func)
     def invoke(**kwargs: Any) -> Any:
-        """Run a synchronous OAuth call in its isolated task when inside a durable graph."""
-        segments = position()
-        return (
-            wrapped_func(**kwargs)
-            if segments is None
-            else restore(kwargs, dispatch(kwargs, segments).result())
-        )
+        """Run a synchronous call through OE durable history or its existing native checkpoint."""
+        located = position()
+        if located is None:
+            return wrapped_func(**kwargs)
+        segments, saver = located
+        if saver is None:
+            return restore(kwargs, dispatch(kwargs, segments).result())
+        kwargs = canonical(saver, kwargs)
+        # A sync tool may run inside an async application node. Keep the
+        # child's event loop on its own worker while preserving request context.
+        config = native_config(kwargs, segments)
+        with ContextThreadPoolExecutor(max_workers=1) as executor:
+            outcome = executor.submit(native_dispatch, kwargs, config).result()
+        return restore_native(kwargs, outcome)
 
     @wraps(wrapped_func)
     async def ainvoke(**kwargs: Any) -> Any:
-        """Admit the task in graph order and restore synchronous OE replay off the event loop."""
-        segments = position()
-        if segments is None:
+        """Reserve native admission before yielding and keep synchronous OE replay off the event loop."""
+        located = position()
+        if located is None:
             return await asyncio.to_thread(wrapped_func, **kwargs)
-        outcome = await dispatch(kwargs, segments)
-        # A reordered cached slot reenters the synchronous OE/Memory owner.
-        # Keep that I/O off the loop while preserving its request ContextVars.
-        return await asyncio.to_thread(restore, kwargs, outcome)
+        segments, saver = located
+        if saver is None:
+            outcome = await dispatch(kwargs, segments)
+            # A reordered cached slot reenters the synchronous OE/Memory owner.
+            # Keep that I/O off the loop while preserving its request ContextVars.
+            return await asyncio.to_thread(restore, kwargs, outcome)
+        kwargs = canonical(saver, kwargs)
+        config = native_config(kwargs, segments)
+        return restore_native(
+            kwargs, await asyncio.to_thread(native_dispatch, kwargs, config)
+        )
 
     return invoke, ainvoke
 
@@ -278,7 +518,7 @@ def _args_schema_with_injected_tool_call_id(args_schema: Any) -> Any:
     # validate_default=True (or any path that validates before LangChain injects
     # the id) does not reject the field. LangChain still recognizes the
     # InjectedToolCallId metadata and fills it with the real id at call time.
-    injected_field = (Annotated[str | None, InjectedToolCallId], None)
+    injected_field = cast(Any, (Annotated[str | None, InjectedToolCallId], None))
 
     if isinstance(args_schema, type) and issubclass(args_schema, BaseModel):
         return create_model(
@@ -478,7 +718,7 @@ class App(BaseApp):
         mongodb_uri: str | None = None,
         database_name: str | None = None,
         enable_tracing: bool | None = None,
-        traces_collection_name: str = "traces",
+        traces_collection_name: str | None = None,
         enable_memory: bool | None = None,
         org_id: str | None = None,
         checkpoint_allowed_types: Iterable[type | tuple[str, str]] | None = None,
@@ -489,9 +729,14 @@ class App(BaseApp):
             app_name: Application name
             app_version: Application version
             mongodb_uri: MongoDB URI
-            database_name: Database name
+            database_name: Deprecated and ignored. Traces go only to the
+                Orchestration Engine, and the checkpointer database is chosen
+                by the platform. Passing this argument raises a
+                DeprecationWarning and will be removed in a future release.
             enable_tracing: Deprecated. Tracing is always enabled.
-            traces_collection_name: Collection name for trace storage
+            traces_collection_name: Deprecated and ignored. Traces go only to
+                the Orchestration Engine. Passing this argument raises a
+                DeprecationWarning and will be removed in a future release.
             enable_memory: Deprecated. Use agent.yaml features.memory instead.
             org_id: Deprecated and ignored. The org is taken from the
                 ``ORG_ID`` environment variable, which the platform injects.
@@ -508,6 +753,7 @@ class App(BaseApp):
                 classes and ``(module, name)`` string pairs.
         """
         checkpoint_allowlist = _checkpoint_allowlist(checkpoint_allowed_types)
+        warn_trace_options_removed(database_name, traces_collection_name)
         if org_id is not None:
             warnings.warn(
                 "App(org_id=...) is deprecated and ignored. "
@@ -522,9 +768,7 @@ class App(BaseApp):
             app_name=app_name,
             app_version=app_version,
             mongodb_uri=mongodb_uri,
-            database_name=database_name,
             enable_tracing=enable_tracing,
-            traces_collection_name=traces_collection_name,
             enable_memory=enable_memory,
             org_id=org_id,
         )
@@ -1971,7 +2215,7 @@ class App(BaseApp):
 
             oauth_coroutine = None
             if provider:
-                wrapper_func, oauth_coroutine = _with_durable_oauth_task(
+                wrapper_func, oauth_coroutine = _with_oauth_task(
                     wrapper_func, tool_name=tool_name
                 )
 

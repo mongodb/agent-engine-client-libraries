@@ -51,6 +51,7 @@ from agent_engine_runner_shared import tls_client
 from agent_engine_runner_shared.checkpoint_workspace import resolve_checkpoint_workspace_id
 from agent_engine_runner_shared.context import (
     OwnerUrlFailureState,
+    bind_log_execution_id,
     clear_execution_context,
     close_session_finish_latch,
     current_execution_id,
@@ -123,7 +124,12 @@ from agent_engine_runner_shared.server.stream_journal import (
 )
 from agent_engine_runner_shared.span_kinds import OPENINFERENCE_SPAN_KIND, OpenInferenceSpanKind
 from agent_engine_runner_shared.span_names import AER_BUILD_AGENT
+from agent_engine_runner_shared.structured_logging import execution_output_scope
 from agent_engine_runner_shared.tls_client import create_async_httpx_client_with_tls
+from agent_engine_runner_shared.tool_api_error import (
+    redact_tool_error_text,
+    request_named_credential_values,
+)
 from agent_engine_runner_shared.utils import (
     PROGRESS_TIMEOUT_SECS,
     filter_thinking_tokens,
@@ -857,14 +863,19 @@ class AERServer(BaseServer):
             completion or HITL suspension back to the OE via callback.
             """
             drain_registry = server.drain_registry
-            # Raises 409 if the execution was drained after OE dispatched.
-            drain_handle = drain_registry.begin_work(request.execution_id, asyncio.current_task())
-            try:
-                response = await server._execute_with_inbound_trace_context(
-                    request, http_request.headers
+            # The scope spans metrics and cleanup that log after the execution
+            # context clears; setting the ID here does not enter that context.
+            with execution_output_scope(request.execution_id):
+                # Raises 409 if the execution was drained after OE dispatched.
+                drain_handle = drain_registry.begin_work(
+                    request.execution_id, asyncio.current_task()
                 )
-            finally:
-                drain_registry.end_work(drain_handle)
+                try:
+                    response = await server._execute_with_inbound_trace_context(
+                        request, http_request.headers
+                    )
+                finally:
+                    drain_registry.end_work(drain_handle)
             # Release the session's compute only as a background task, i.e.
             # after this response is sent: the OE may kill this pod with zero
             # grace once it honours the finish request.
@@ -1604,7 +1615,16 @@ class AERServer(BaseServer):
         except Exception as e:
             if not prep_complete:
                 # Pre-stream setup failures (build, registrations, routing,
-                # heartbeat) fail closed and propagate unconverted.
+                # heartbeat) fail closed and propagate unconverted. The server
+                # logs the traceback outside the request's log binding, so
+                # record the failure here with the execution's ID. Graph
+                # builder and provider errors can carry credentials.
+                logger.error(
+                    "AER: execution %s setup failed: %s: %s",
+                    request.execution_id[:8],
+                    type(e).__name__,
+                    redact_tool_error_text(str(e), request_named_credential_values()),
+                )
                 raise
             if isinstance(e, DurableAckError):
                 # A sender failure surfaced during production (budget
@@ -2762,50 +2782,56 @@ class AERServer(BaseServer):
         reason: either would otherwise die with the pod. Best-effort throughout
         - a failure just leaves the pods to the idle sweep.
         """
-        origin = callback_body or {}
-        if not await self._callback_delivery.wait_for_terminal(
-            request.execution_id,
-            attempt_id=origin.get("attempt_id"),
-            attempt_fence=origin.get("attempt_fence"),
-        ):
-            return
+        # Runs after the /execute route's log binding has reset.
+        with bind_log_execution_id(request.execution_id):
+            origin = callback_body or {}
+            if not await self._callback_delivery.wait_for_terminal(
+                request.execution_id,
+                attempt_id=origin.get("attempt_id"),
+                attempt_fence=origin.get("attempt_fence"),
+            ):
+                return
 
-        writer = getattr(self.runtime, "_memory_writer", None)
-        if writer is not None:
-            deadline = time.monotonic() + SESSION_FINISH_MEMORY_DRAIN_TIMEOUT_S
-            while writer.pending_writes and time.monotonic() < deadline:
-                await asyncio.sleep(0.05)
-            if writer.pending_writes:
-                logger.warning(
-                    "Session finish: %d memory write(s) still pending after %.0fs; releasing anyway",
-                    writer.pending_writes,
-                    SESSION_FINISH_MEMORY_DRAIN_TIMEOUT_S,
+            writer = getattr(self.runtime, "_memory_writer", None)
+            if writer is not None:
+                deadline = time.monotonic() + SESSION_FINISH_MEMORY_DRAIN_TIMEOUT_S
+                while writer.pending_writes and time.monotonic() < deadline:
+                    await asyncio.sleep(0.05)
+                if writer.pending_writes:
+                    logger.warning(
+                        "Session finish: %d memory write(s) still pending after %.0fs; releasing anyway",
+                        writer.pending_writes,
+                        SESSION_FINISH_MEMORY_DRAIN_TIMEOUT_S,
+                    )
+            # Flush trace spans before the OE frees this pod: /finish triggers a
+            # zero-grace teardown, so spans still queued in the BatchSpanProcessor
+            # would otherwise be lost. Best-effort and bounded: the synchronous
+            # flush runs off the event loop (the pod keeps serving health,
+            # session-history, and drain requests while it waits) and the await has
+            # its own deadline, so a stalled exporter cannot hold the release open.
+            try:
+                from agent_engine_runner_shared.tracing import force_flush_tracing
+
+                flushed = await asyncio.wait_for(
+                    asyncio.to_thread(force_flush_tracing, SESSION_FINISH_TRACE_FLUSH_TIMEOUT_MS),
+                    timeout=SESSION_FINISH_TRACE_FLUSH_TIMEOUT_MS / 1000,
                 )
-        # Flush trace spans before the OE frees this pod: /finish triggers a
-        # zero-grace teardown, so spans still queued in the BatchSpanProcessor
-        # would otherwise be lost. Best-effort and bounded: the synchronous
-        # flush runs off the event loop (the pod keeps serving health,
-        # session-history, and drain requests while it waits) and the await has
-        # its own deadline, so a stalled exporter cannot hold the release open.
-        try:
-            from agent_engine_runner_shared.tracing import force_flush_tracing
-
-            flushed = await asyncio.wait_for(
-                asyncio.to_thread(force_flush_tracing, SESSION_FINISH_TRACE_FLUSH_TIMEOUT_MS),
-                timeout=SESSION_FINISH_TRACE_FLUSH_TIMEOUT_MS / 1000,
-            )
-            if not flushed:
+                if not flushed:
+                    logger.warning(
+                        "Trace flush before session release timed out; some spans may be lost"
+                    )
+            except asyncio.TimeoutError:
                 logger.warning(
                     "Trace flush before session release timed out; some spans may be lost"
                 )
-        except asyncio.TimeoutError:
-            logger.warning("Trace flush before session release timed out; some spans may be lost")
-        except Exception:
-            logger.debug("Trace flush before session release failed", exc_info=True)
+            except Exception:
+                logger.debug("Trace flush before session release failed", exc_info=True)
 
-        url = f"{request.platform_api_url.rstrip('/')}/executions/{request.execution_id}/finish"
-        try:
-            client = await self._get_client(request.platform_api_url)
-            await post_json_with_retries(client, url, {})
-        except Exception as exc:
-            logger.warning("Session finish request failed for %s: %s", request.execution_id, exc)
+            url = f"{request.platform_api_url.rstrip('/')}/executions/{request.execution_id}/finish"
+            try:
+                client = await self._get_client(request.platform_api_url)
+                await post_json_with_retries(client, url, {})
+            except Exception as exc:
+                logger.warning(
+                    "Session finish request failed for %s: %s", request.execution_id, exc
+                )

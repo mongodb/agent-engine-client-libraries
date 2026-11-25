@@ -553,3 +553,38 @@ def customer_origin_scope() -> Iterator[None]:
         yield
     finally:
         _current_customer_origin.reset(token)
+
+
+# =========================================================================
+# Log-only execution binding
+# =========================================================================
+
+# Read only by structured logging. Owner-URL routing, memory headers and span
+# attributes read current_execution_id, so request setup, cleanup and side
+# requests bind here instead of widening the set/clear execution window.
+_log_execution_id: ContextVar[Optional[str]] = ContextVar("log_execution_id", default=None)
+
+
+def get_log_execution_id() -> Optional[str]:
+    """Framework-internal. Execution ID for log attribution: the execution
+    context's ID if set, else the log-only binding."""
+    return current_execution_id.get() or _log_execution_id.get()
+
+
+@contextmanager
+def bind_log_execution_id(execution_id: Optional[str]) -> Iterator[None]:
+    """Framework-internal. A blank ID still binds, so work with no originating
+    execution cannot inherit a caller's binding. Threads started inside the
+    binding do not inherit it.
+    """
+    token = _log_execution_id.set(execution_id if execution_id and execution_id.strip() else None)
+    try:
+        yield
+    finally:
+        try:
+            _log_execution_id.reset(token)
+        except ValueError:
+            # An abandoned async generator is finalized in another context,
+            # which discards this binding anyway; raising here would replace
+            # the exception the block is exiting with.
+            pass

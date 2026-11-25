@@ -7,8 +7,6 @@ batch the OE rejects as too large, and dropping only what it cannot deliver.
 
 import asyncio
 import threading
-from types import SimpleNamespace
-from unittest.mock import MagicMock
 
 import pytest
 from opentelemetry import trace
@@ -22,7 +20,9 @@ from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanE
 
 import agent_engine_runner_shared.tracing.setup as tracing_setup
 from agent_engine_runner_shared import TenantRuntime
+from agent_engine_runner_shared.tracing.conversation import caller_records_conversation
 from agent_engine_runner_shared.tracing.exporters import PlatformSpanExporter
+from agent_engine_runner_shared.tracing.setup import ExecutionContextSpanProcessor
 
 
 def _make_spans(count: int, pad_bytes: int = 0):
@@ -199,6 +199,28 @@ def test_export_drops_a_prompt_the_caller_stores():
     assert "input.value" not in sent
     assert "input.mime_type" not in sent
     # The marker is how the reader finds the copy the caller stored.
+    assert sent["agent_engine.internal.input_messages.recorded_by"] == "caller"
+
+
+def test_a_model_span_under_an_invoke_llm_request_sends_no_prompt():
+    """End to end: the processor marks the span, the exporter drops the prompt."""
+    exporter, client = _exporter(lambda _body: _Response(200))
+    provider = TracerProvider()
+    provider.add_span_processor(ExecutionContextSpanProcessor())
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    tracer = provider.get_tracer("test")
+
+    with tracer.start_as_current_span("tool.invoke_llm.stream"):
+        with caller_records_conversation():
+            with tracer.start_as_current_span("ChatOpenAI") as model_span:
+                model_span.set_attribute("llm.input_messages.0.message.role", "user")
+                model_span.set_attribute("llm.input_messages.0.message.content", "hi")
+                model_span.set_attribute("input.value", '{"messages": [["user", "hi"]]}')
+
+    # SimpleSpanProcessor exports each span on end; the model span ends first.
+    sent = _sent_attributes(client.requests[0]["content"])[0]
+    assert _sent_contents(sent) == []
+    assert "input.value" not in sent
     assert sent["agent_engine.internal.input_messages.recorded_by"] == "caller"
 
 
@@ -607,62 +629,29 @@ def test_default_client_factory_is_the_async_platform_client():
 @pytest.fixture
 def isolated_tracing(monkeypatch):
     monkeypatch.setattr(tracing_setup, "_tracer_provider", None)
-    monkeypatch.setattr(tracing_setup, "_mongodb_exporter_attached", False)
-    monkeypatch.setattr(tracing_setup, "_mongodb_degraded", False)
-    monkeypatch.setattr(tracing_setup, "_retry_stop_event", None)
-    monkeypatch.setattr(tracing_setup, "_retry_thread", None)
-    monkeypatch.setattr(tracing_setup, "_tracing_mongo_client", None)
     monkeypatch.setattr(tracing_setup, "_platform_exporter", None)
     monkeypatch.delenv("OE_URL", raising=False)
+    monkeypatch.delenv("OTEL_EXPORTER_OTLP_ENDPOINT", raising=False)
+    monkeypatch.delenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", raising=False)
     yield tracing_setup
     tracing_setup.shutdown_tracing()
 
 
-def test_setup_tracing_installs_platform_exporter_by_default(monkeypatch, isolated_tracing):
+def test_setup_tracing_installs_platform_exporter_when_oe_url_set(monkeypatch, isolated_tracing):
     monkeypatch.setenv("OE_URL", "http://oe:8000")
 
     isolated_tracing.setup_tracing(service_name="svc-platform")
 
-    assert isolated_tracing._platform_exporter is not None
-    assert isolated_tracing._mongodb_exporter_attached is False
-    assert isolated_tracing.tracing_status() == {
-        "database_exporter": "disabled",
-        "platform_exporter": "attached",
-    }
+    assert isolated_tracing.tracing_status() == {"platform_exporter": "attached"}
 
 
-@pytest.mark.parametrize("legacy_optout", [None, "0", "false"])
-def test_setup_tracing_prefers_oe_url_over_a_mongodb_collection(
-    monkeypatch, isolated_tracing, legacy_optout
-):
-    monkeypatch.setenv("OE_URL", "http://oe:8000")
-    if legacy_optout is None:
-        monkeypatch.delenv("AGENTIC_TRACE_EXPORTER", raising=False)
-    else:
-        monkeypatch.setenv("AGENTIC_TRACE_EXPORTER", legacy_optout)
-    collection = MagicMock()
+def test_setup_tracing_without_oe_url_warns_once(isolated_tracing, caplog):
+    with caplog.at_level("WARNING"):
+        isolated_tracing.setup_tracing(service_name="svc-no-oe")
+        isolated_tracing.setup_tracing(service_name="svc-no-oe")
 
-    isolated_tracing.setup_tracing(service_name="svc-both", mongodb_collection=collection)
-
-    assert isolated_tracing._platform_exporter is not None
-    assert isolated_tracing._mongodb_exporter_attached is False
-    assert isolated_tracing.tracing_status() == {
-        "database_exporter": "disabled",
-        "platform_exporter": "attached",
-    }
-
-
-def test_setup_tracing_without_oe_url_uses_mongodb(isolated_tracing):
-    collection = MagicMock()
-
-    isolated_tracing.setup_tracing(service_name="svc-mongo", mongodb_collection=collection)
-
-    assert isolated_tracing._mongodb_exporter_attached is True
-    assert isolated_tracing._platform_exporter is None
-    assert isolated_tracing.tracing_status() == {
-        "database_exporter": "attached",
-        "platform_exporter": "disabled",
-    }
+    assert isolated_tracing.tracing_status() == {"platform_exporter": "disabled"}
+    assert caplog.text.count("no trace destination configured") == 1
 
 
 def test_platform_exporter_status_degrades_on_drop_and_recovers(isolated_tracing):
@@ -720,7 +709,6 @@ def test_platform_exporter_unreachable_oe_loses_spans_and_reports_degraded(isola
     assert len(client.requests) > 1
     assert exporter.last_error is not None
     assert isolated_tracing.tracing_status()["platform_exporter"] == "degraded"
-    assert isolated_tracing._mongodb_exporter_attached is False
 
 
 def test_platform_exporter_sustained_503_backpressure_degrades_then_recovers(isolated_tracing):
@@ -756,80 +744,31 @@ def test_force_flush_tracing_is_true_when_uninitialized(isolated_tracing):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("legacy_optout", [None, "0", "false"])
-def test_runtime_setup_tracing_skips_the_mongo_store_when_oe_url_is_set(monkeypatch, legacy_optout):
-    """Routing spans through OE avoids writing each trace to both stores."""
+@pytest.mark.parametrize("oe_url", ["http://oe:8000", None])
+def test_runtime_setup_tracing_never_opens_a_mongo_client(monkeypatch, oe_url):
+    """The OE is the only trace writer: a MONGODB_URI must not lead the guest
+    to open a trace-store connection, with or without OE_URL."""
     import pymongo
 
     import agent_engine_runner_shared.tracing as tracing_pkg
 
-    monkeypatch.setenv("OE_URL", "http://oe:8000")
-    if legacy_optout is None:
-        monkeypatch.delenv("AGENTIC_TRACE_EXPORTER", raising=False)
+    if oe_url:
+        monkeypatch.setenv("OE_URL", oe_url)
     else:
-        monkeypatch.setenv("AGENTIC_TRACE_EXPORTER", legacy_optout)
+        monkeypatch.delenv("OE_URL", raising=False)
+    monkeypatch.setenv("MONGODB_URI", "mongodb://trace-store:27017")
 
     setup_calls: list[dict] = []
     monkeypatch.setattr(tracing_pkg, "setup_tracing", lambda **kwargs: setup_calls.append(kwargs))
 
-    mongo_calls = {"n": 0}
-
     def _unexpected_mongo_client(*_args, **_kwargs):
-        mongo_calls["n"] += 1
-        raise RuntimeError("opened a Mongo trace-store client despite the platform exporter")
+        raise AssertionError("opened a Mongo client while setting up tracing")
 
     monkeypatch.setattr(pymongo, "MongoClient", _unexpected_mongo_client)
 
     runtime = TenantRuntime.__new__(TenantRuntime)
     runtime.app_name = "svc"
-    runtime._mongodb_uri = "mongodb://trace-store:27017"
-    runtime._database_name_override = None
-    runtime._traces_collection_name = "traces"
 
     runtime._setup_tracing()
 
-    assert mongo_calls["n"] == 0
     assert setup_calls == [{"service_name": "svc"}]
-
-
-def _runtime_for_tracing(mode_name: str) -> TenantRuntime:
-    from agent_engine_runner_shared import RuntimeMode
-
-    runtime = TenantRuntime.__new__(TenantRuntime)
-    runtime.app_name = "svc"
-    runtime.mode = RuntimeMode(mode_name)
-    runtime._mongodb_uri = "mongodb://trace-store:27017"
-    runtime._database_name_override = "testdb"
-    runtime._traces_collection_name = "traces"
-    return runtime
-
-
-def test_runtime_trace_store_sets_platform_appname(monkeypatch):
-    import pymongo
-
-    import agent_engine_runner_shared.tracing as tracing_pkg
-
-    monkeypatch.delenv("OE_URL", raising=False)
-
-    captured: dict = {}
-
-    class _FakeDB:
-        def __getitem__(self, _name):
-            return object()
-
-    class _FakeClient:
-        def __init__(self, uri, **kwargs):
-            captured["uri"] = uri
-            captured.update(kwargs)
-            self.admin = SimpleNamespace(command=lambda *a, **k: {"ok": 1})
-
-        def __getitem__(self, _name):
-            return _FakeDB()
-
-    monkeypatch.setattr(pymongo, "MongoClient", _FakeClient)
-    monkeypatch.setattr(tracing_pkg, "setup_tracing", lambda **kwargs: None)
-
-    _runtime_for_tracing("aer")._setup_tracing()
-
-    assert captured["appname"] == "Agent Engine"
-    assert captured["serverSelectionTimeoutMS"] == 5000

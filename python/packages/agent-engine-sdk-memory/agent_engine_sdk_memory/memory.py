@@ -598,6 +598,7 @@ class Memory:
         user_id: str | None = None,
         visibility: str | None = None,
         top_k: int = 50,
+        include_history: bool = False,
     ) -> list[MemoryChunk]:
         """Search semantic memories.
 
@@ -605,6 +606,9 @@ class Memory:
             visibility: When supplied, the ambient (runtime-context) principal
                 is not auto-substituted for ``user_id``; the caller must supply
                 one explicitly if a user-scoped filter is needed.
+            include_history: Defaults to ``False``, returning current versions
+                only. Set ``True`` to also search retained predecessor versions
+                within ``top_k``.
         """
         resolved = self._resolve(user_id=user_id, visibility=visibility)
         return self._runtime.search_semantic(
@@ -612,6 +616,7 @@ class Memory:
             user_id=resolved["user_id"],
             visibility=visibility,
             top_k=top_k,
+            **({"include_history": True} if include_history else {}),
         )
 
     def get_semantic(
@@ -844,6 +849,7 @@ class Memory:
         top_k: int = 10,
         similarity_threshold: float = 0.0,
         metadata_filter: dict[str, Any] | None = None,
+        include_history: bool = False,
     ) -> list[dict[str, Any]]:
         """Discover procedures matching a query without loading full content.
 
@@ -855,6 +861,9 @@ class Memory:
                 Keys here are not validated against the declared set -- an
                 undeclared or misspelled path is not rejected and silently
                 yields no or degraded matches.
+            include_history: Defaults to ``False``, returning current versions
+                only. Set ``True`` to also search retained predecessor versions
+                within ``top_k``.
         """
         resolved = self._resolve(user_id=user_id, visibility=visibility)
         return self._runtime.discover_procedures(
@@ -865,6 +874,7 @@ class Memory:
             top_k=top_k,
             similarity_threshold=similarity_threshold,
             metadata_filter=metadata_filter,
+            **({"include_history": True} if include_history else {}),
         )
 
     def get_procedure(
@@ -876,6 +886,17 @@ class Memory:
         include_deleted: bool = False,
     ) -> Any | None:
         """Get a full procedural memory by procedure name.
+
+        Procedure names are unique per user within a project, so several users
+        can hold a procedure of the same name. Without a visibility (or with
+        ``"private"``), this returns the caller's own procedure: ``user_id`` or
+        the bound user. With ``visibility="shared"`` or ``"org"``, it returns the
+        most recently updated procedure of that name from any user. Pass
+        ``user_id`` to choose the owner, or list procedures to see all of them.
+
+        The name is matched within the first page of the most recently updated
+        procedures, so in a project with many procedures an older match may not
+        be found.
 
         Raises:
             MemoryNotSupportedError: If this handle has no CRUD client configured.
@@ -1099,8 +1120,8 @@ class Memory:
                 configured; ``"claude"`` and ``"jinja2"`` are always honored.
             include_memories: When ``True``, the response's
                 ``selected_memories`` carries the post-budget ``MemoryChunk``
-                list alongside ``formatted_context``, so callers can inspect
-                exactly which memories were selected.
+                list instead of a formatted context, and ``formatted_context``
+                is ``None``. Use it to format the memories yourself.
         """
         require_positive_max_tokens(max_tokens)
         require_valid_format_style(format_style)
@@ -1170,7 +1191,7 @@ class Memory:
                 :meth:`build_context`.
             include_memories: When ``True``, the response's
                 ``selected_memories`` carries the post-budget ``MemoryChunk``
-                list; see :meth:`build_context`.
+                list instead of a formatted context; see :meth:`build_context`.
             collapse_duplicate_content: When ``True`` (default), collapse
                 duplicate content — exact text matches and near-duplicates —
                 when merging results. Set ``False`` to receive every candidate

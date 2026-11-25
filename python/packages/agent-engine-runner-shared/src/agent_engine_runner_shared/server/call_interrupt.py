@@ -34,6 +34,7 @@ from typing import Mapping, Optional
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
+from agent_engine_runner_shared.context import bind_log_execution_id
 from agent_engine_runner_shared.server.drain import CallInterruptOutcome, DrainRegistry
 
 logger = logging.getLogger(__name__)
@@ -88,13 +89,14 @@ def register_call_interrupt_route(
                 raise HTTPException(status_code=400, detail="workspace_id required")
             if request.workspace_id != workspace_id:
                 raise HTTPException(status_code=403, detail="workspace mismatch")
-        outcome = registry.abort_call(request.execution_id, request.step_number)
-        # The runtime-side evidence of a per-call abort, mirroring the drain
-        # receiver's accepted/finalized markers.
-        logger.info(
-            "Call interrupt %s for execution %s (step %d)",
-            outcome.value,
-            request.execution_id,
-            request.step_number,
-        )
+        with bind_log_execution_id(request.execution_id):
+            outcome = registry.abort_call(request.execution_id, request.step_number)
+            # The runtime-side evidence of a per-call abort, mirroring the drain
+            # receiver's accepted/finalized markers.
+            logger.info(
+                "Call interrupt %s for execution %s (step %d)",
+                outcome.value,
+                request.execution_id,
+                request.step_number,
+            )
         return CallInterruptResponse(outcome=outcome)

@@ -261,7 +261,8 @@ Save a semantic memory (fact, customer profile).
 def search_semantic(query: str,
                     user_id: str | None = None,
                     visibility: str | None = None,
-                    top_k: int = 50) -> list[MemoryChunk]
+                    top_k: int = 50,
+                    include_history: bool = False) -> list[MemoryChunk]
 ```
 
 Search semantic memories.
@@ -271,6 +272,9 @@ Search semantic memories.
 - `visibility` - When supplied, the ambient (runtime-context) principal
   is not auto-substituted for ``user_id``; the caller must supply
   one explicitly if a user-scoped filter is needed.
+- `include_history` - Defaults to ``False``, returning current versions
+  only. Set ``True`` to also search retained predecessor versions
+  within ``top_k``.
 
 <a id="agent_engine_sdk_memory.memory.Memory.get_semantic"></a>
 
@@ -450,15 +454,15 @@ List all knowledge-base domains.
 #### discover\_procedures
 
 ```python
-def discover_procedures(
-        query: str,
-        user_id: str | None = None,
-        *,
-        visibility: str | None = None,
-        tags: list[str] | None = None,
-        top_k: int = 10,
-        similarity_threshold: float = 0.0,
-        metadata_filter: dict[str, Any] | None = None) -> list[dict[str, Any]]
+def discover_procedures(query: str,
+                        user_id: str | None = None,
+                        *,
+                        visibility: str | None = None,
+                        tags: list[str] | None = None,
+                        top_k: int = 10,
+                        similarity_threshold: float = 0.0,
+                        metadata_filter: dict[str, Any] | None = None,
+                        include_history: bool = False) -> list[dict[str, Any]]
 ```
 
 Discover procedures matching a query without loading full content.
@@ -472,6 +476,9 @@ Discover procedures matching a query without loading full content.
   Keys here are not validated against the declared set -- an
   undeclared or misspelled path is not rejected and silently
   yields no or degraded matches.
+- `include_history` - Defaults to ``False``, returning current versions
+  only. Set ``True`` to also search retained predecessor versions
+  within ``top_k``.
 
 <a id="agent_engine_sdk_memory.memory.Memory.get_procedure"></a>
 
@@ -486,6 +493,17 @@ def get_procedure(procedure_name: str,
 ```
 
 Get a full procedural memory by procedure name.
+
+Procedure names are unique per user within a project, so several users
+can hold a procedure of the same name. Without a visibility (or with
+``"private"``), this returns the caller's own procedure: ``user_id`` or
+the bound user. With ``visibility="shared"`` or ``"org"``, it returns the
+most recently updated procedure of that name from any user. Pass
+``user_id`` to choose the owner, or list procedures to see all of them.
+
+The name is matched within the first page of the most recently updated
+procedures, so in a project with many procedures an older match may not
+be found.
 
 **Raises**:
 
@@ -677,8 +695,8 @@ provided, a non-blank ``session_id`` wins.
   configured; ``"claude"`` and ``"jinja2"`` are always honored.
 - `include_memories` - When ``True``, the response's
   ``selected_memories`` carries the post-budget ``MemoryChunk``
-  list alongside ``formatted_context``, so callers can inspect
-  exactly which memories were selected.
+  list instead of a formatted context, and ``formatted_context``
+  is ``None``. Use it to format the memories yourself.
 
 <a id="agent_engine_sdk_memory.memory.Memory.build_context_from_sources"></a>
 
@@ -725,7 +743,7 @@ when the ``stm`` source is requested.
   :meth:`build_context`.
 - `include_memories` - When ``True``, the response's
   ``selected_memories`` carries the post-budget ``MemoryChunk``
-  list; see :meth:`build_context`.
+  list instead of a formatted context; see :meth:`build_context`.
 - `collapse_duplicate_content` - When ``True`` (default), collapse
   duplicate content — exact text matches and near-duplicates —
   when merging results. Set ``False`` to receive every candidate
@@ -1290,7 +1308,8 @@ class ContextResponse(BaseModel)
 
 Final response model for context building.
 
-Contains the formatted context and metadata about the retrieval process.
+Contains the formatted context, or the selected memories when the request set
+``include_memories``, and metadata about the retrieval process.
 
 <a id="agent_engine_sdk_memory.models.CustomMemorySaveResult"></a>
 

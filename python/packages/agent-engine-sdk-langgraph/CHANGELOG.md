@@ -7,7 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Deprecated
+- `App(database_name=...)` and `App(traces_collection_name=...)` are ignored.
+  They only chose where the runner wrote traces to MongoDB, and the runner now
+  sends traces only to the Orchestration Engine and an optional OTLP endpoint.
+  The checkpointer database is unaffected. Both arguments still parse so an
+  agent that sets them keeps starting, and passing either raises a
+  `DeprecationWarning`; they will be removed in a future release.
+
 ### Fixed
+- Delegated OAuth tools on native checkpoint executions (durable workflow off,
+  MongoDB checkpointer) continue after consent and return the real API result,
+  for invoke and stream. Each completed call and its result are kept in a child
+  checkpoint bound to the call's tool-call ID (its position when it has none),
+  so a run continued in a new process returns the stored result, or raises the
+  call's own recorded failure with its error type, instead of calling the
+  provider again. A recorded call whose tool or arguments changed
+  fails before any provider call. Stateless graphs, flat tools and durable
+  executions are unchanged.
 - Cancelling a turn on a non-durable Deep Agent keeps the session's earlier
   conversation. The cancelled-turn checkpoint copied the thread's stored channel
   values, which omit a `DeltaChannel` between snapshots, so it carried only the

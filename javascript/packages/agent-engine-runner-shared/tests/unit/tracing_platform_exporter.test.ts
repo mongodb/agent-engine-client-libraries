@@ -23,30 +23,9 @@ const mocks = vi.hoisted(() => ({
   },
 }));
 
-const mongo = vi.hoisted(() => {
-  const collection = {
-    insertMany: vi.fn().mockResolvedValue({ insertedCount: 1 }),
-    dbName: "testdb",
-    collectionName: "traces",
-  };
-  const dbObj = { command: vi.fn(), collection: vi.fn(() => collection) };
-  const instance = {
-    connect: vi.fn().mockResolvedValue(undefined),
-    db: vi.fn(() => dbObj),
-    close: vi.fn().mockResolvedValue(undefined),
-  };
-  return { instance, dbObj, collection };
-});
-
 vi.mock("../../src/logger.js", () => ({
   getLogger: () => mocks.logger,
   setupLogging: vi.fn(),
-}));
-
-vi.mock("mongodb", () => ({
-  MongoClient: function () {
-    return mongo.instance;
-  },
 }));
 
 import {
@@ -696,17 +675,10 @@ describe("PlatformSpanExporter", () => {
   });
 });
 
-const URI = "mongodb://user:pass@host:27017";
-
 describe("setupTracing platform exporter wiring", () => {
   beforeEach(() => {
     for (const k of ["info", "error", "warn", "debug"] as const)
       mocks.logger[k].mockClear();
-    mongo.instance.connect.mockClear();
-    mongo.instance.close.mockResolvedValue(undefined);
-    mongo.instance.db.mockReturnValue(mongo.dbObj);
-    mongo.dbObj.collection.mockReturnValue(mongo.collection);
-    mongo.dbObj.command.mockReset();
   });
 
   afterEach(async () => {
@@ -723,13 +695,10 @@ describe("setupTracing platform exporter wiring", () => {
 
     await setupTracing({ serviceName: "svc-platform" });
 
-    expect(tracingStatus()).toEqual({
-      database_exporter: "disabled",
-      platform_exporter: "attached",
-    });
+    expect(tracingStatus()).toEqual({ platform_exporter: "attached" });
   });
 
-  test("an unreachable OE loses the batch and reports degraded, with no Mongo fallback", async () => {
+  test("an unreachable OE loses the batch and reports degraded", async () => {
     process.env["OE_URL"] = "http://oe:8000";
     const fetchImpl = vi.fn(async () => {
       throw new Error("refused");
@@ -748,7 +717,6 @@ describe("setupTracing platform exporter wiring", () => {
     expect(result.code).toBe(1);
     expect(fetchImpl.mock.calls.length).toBeGreaterThan(1);
     expect(exporter.lastError).not.toBeNull();
-    expect(mongo.collection.insertMany).not.toHaveBeenCalled();
   });
 
   test("sustained 503 backpressure drops the batch, then a clean export recovers", async () => {
@@ -772,45 +740,6 @@ describe("setupTracing platform exporter wiring", () => {
     saturated = false;
     expect((await exportAndWait(exporter, makeSpans(1))).code).toBe(0);
     expect(exporter.lastError).toBeNull();
-  });
-
-  test.each([undefined, "0", "false"])(
-    "prefers OE_URL over a MongoDB collection (AGENTIC_TRACE_EXPORTER=%s)",
-    async (legacyOptout) => {
-      process.env["OE_URL"] = "http://oe:8000";
-      if (legacyOptout === undefined) {
-        delete process.env["AGENTIC_TRACE_EXPORTER"];
-      } else {
-        process.env["AGENTIC_TRACE_EXPORTER"] = legacyOptout;
-      }
-
-      await setupTracing({
-        serviceName: "svc-both",
-        mongodbUri: URI,
-        mongodbDatabaseName: "testdb",
-      });
-
-      expect(tracingStatus()).toEqual({
-        database_exporter: "disabled",
-        platform_exporter: "attached",
-      });
-      expect(mongo.instance.connect).not.toHaveBeenCalled();
-    },
-  );
-
-  test("without OE_URL the MongoDB exporter is used", async () => {
-    mongo.dbObj.command.mockResolvedValue({ ok: 1 });
-
-    await setupTracing({
-      serviceName: "svc-mongo",
-      mongodbUri: URI,
-      mongodbDatabaseName: "testdb",
-    });
-
-    expect(tracingStatus()).toEqual({
-      database_exporter: "attached",
-      platform_exporter: "disabled",
-    });
   });
 
   test("forceFlushTracing waits for an export the schedule timer already dispatched", async () => {

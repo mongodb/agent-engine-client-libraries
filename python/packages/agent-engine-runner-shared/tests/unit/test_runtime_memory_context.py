@@ -5,6 +5,7 @@ from typing import Any
 from unittest.mock import Mock
 
 import pytest
+from agent_engine_sdk_memory.errors import MemoryConnectionError, MemoryServerError
 
 from agent_engine_runner_shared import TenantRuntime
 from agent_engine_runner_shared.context import clear_execution_context, set_execution_context
@@ -539,6 +540,39 @@ class TestRuntimeMemoryContext:
         assert result == []
         call_kwargs = runtime._memory_engine.discover_procedures.call_args[1]
         assert call_kwargs["project_id"] == "proj1"
+
+    @pytest.mark.parametrize(
+        "failure",
+        [
+            MemoryServerError("Search index unavailable", status=503, code="search_unavailable"),
+            MemoryConnectionError("Database unavailable"),
+            RuntimeError("Embedding provider unavailable"),
+        ],
+    )
+    def test_discover_procedures_propagates_configured_failure(self, monkeypatch, failure):
+        monkeypatch.setenv("ORG_ID", "org1")
+        monkeypatch.setenv("PROJECT_ID", "proj1")
+        runtime = TenantRuntime(app_name="Test")
+        runtime._memory_engine = Mock()
+        runtime._memory_engine.discover_procedures.side_effect = failure
+
+        with pytest.raises(type(failure)) as raised:
+            runtime.discover_procedures(query="deploy", user_id="user_123")
+
+        assert raised.value is failure
+
+    @pytest.mark.parametrize("missing", ["engine", "organization"])
+    def test_discover_procedures_disabled_returns_empty(self, monkeypatch, missing):
+        monkeypatch.setenv("ORG_ID", "org1")
+        monkeypatch.setenv("PROJECT_ID", "proj1")
+        runtime = TenantRuntime(app_name="Test")
+        engine = Mock()
+        runtime._memory_engine = None if missing == "engine" else engine
+        if missing == "organization":
+            runtime.org_id = ""
+
+        assert runtime.discover_procedures(query="deploy", user_id="user_123") == []
+        engine.discover_procedures.assert_not_called()
 
     def test_save_procedure_uses_runtime_project_id(self, monkeypatch):
         """TenantRuntime supplies its project_id to procedural writes."""

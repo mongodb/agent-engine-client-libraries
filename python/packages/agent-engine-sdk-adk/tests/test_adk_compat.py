@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import re
 import sys
+import tomllib
 from collections.abc import AsyncGenerator
 from pathlib import Path
 
 import pytest
-import tomllib
 from google.adk.agents import LlmAgent
 from google.adk.agents.context import Context
 from google.adk.workflow import START, BaseNode, Node, Workflow, node

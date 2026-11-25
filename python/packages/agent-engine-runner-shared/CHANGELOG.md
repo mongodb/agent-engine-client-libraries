@@ -7,11 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `encode_tool_failure` and `decode_tool_failure`: a framework adapter can keep
+  a tool call's failure in its own checkpoint and raise it again later, in this
+  process or another, with the same error type and fields.
+
 ### Changed
-- Spans go to the platform trace endpoint (`POST /internal/traces`) whenever
-  `OE_URL` is set, so the OE can redact PII in them. `0.11.14` is the first
-  version that does this. Earlier releases write spans straight to MongoDB
-  unless `AGENTIC_TRACE_EXPORTER=1`, and the platform cannot detect this.
+- Spans go to the platform trace endpoint (`POST /internal/traces`) by default
+  whenever `OE_URL` is set. `0.11.14` is the first version that does this.
+  Earlier releases write spans straight to MongoDB unless
+  `AGENTIC_TRACE_EXPORTER=1`, and the platform cannot detect this.
 - **Breaking:** the connector `tool.yaml` `auth` block no longer takes `type`.
   It names exactly one credential: `bearer: <secret>`, `basic: {username,
   password}`, `api_keys: [{env, location, name, prefix}]`, or
@@ -28,9 +33,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   operations the first compile skipped can appear as tools; they send no
   credential.
 
+### Deprecated
+- The LangGraph and ADK `App`s accept `database_name` and
+  `traces_collection_name`, and the OpenAI Agents `App` accepts `database_name`,
+  as ignored arguments. Each raises a `DeprecationWarning` and will be removed
+  in a future release.
+
 ### Removed
+- **Breaking:** the runner sends spans only to the Orchestration Engine
+  (`POST $OE_URL/internal/traces`) and, when `OTEL_EXPORTER_OTLP_*` is set, to
+  that OTLP endpoint. It no longer writes spans to MongoDB or to a local JSONL
+  file. A runner without `OE_URL` stores no traces unless an OTLP endpoint is
+  configured, and logs one warning when neither is.
 - **Breaking:** `AGENTIC_TRACE_EXPORTER` no longer has any effect. Setting it
   to `0` or `false` does not turn off the platform trace exporter.
+- **Breaking:** `MongoDBSpanExporter`, `JSONLSpanExporter`, `get_trace_path`,
+  `attach_mongodb_tracing`, `start_mongodb_tracing_retry`, and
+  `platform_trace_exporter_enabled` are removed, along with the
+  `AGENTIC_TRACES_FILE` and `AGENTIC_TRACE_STORE_RETRY_INTERVAL_SECONDS`
+  settings.
+- **Breaking:** `setup_tracing()` no longer accepts `mongodb_collection` or
+  `take_client_ownership`. `TenantRuntime` no longer accepts `database_name` or
+  `traces_collection_name`. `mongodb_uri` remains for the checkpointer and
+  sessions.
+- **Breaking:** `tracing_status()` and the `/health` response's
+  `details.tracing` no longer include `database_exporter`; they report only
+  `platform_exporter`.
 - Removed the unused pre-materialized connector bundle override
   (`AGENTIC_CONNECTOR_BUNDLE_PATH`) and the `load_connector_bundle` /
   `CONNECTOR_BUNDLE_PATH_ENV` exports. Connectors resolve only from
@@ -51,6 +79,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   handshake per callback.
 
 ### Fixed
+- A native OAuth consent pause carries `kind: oauth_authorization`, so the
+  Orchestration Engine publishes its interrupt ID and the application answers
+  it in `resume_map`; the consent answer can no longer satisfy a later
+  application wait. After consent the token gate is asked again at a fresh
+  step instead of the challenged one.
+- AER and Tool Pod log records written outside agent or tool code now carry
+  `executionId` when they belong to a known execution, so filtering logs by
+  execution finds setup failures, cleanup, callback retries, guardrail
+  warnings and stream handling. Partial stdout/stderr lines from concurrent
+  executions are no longer merged or tagged with another execution's ID.
 - Uncaught exceptions in agent code now emit one filterable `level=ERROR`
   record instead of only `WARNING`. Ordinary stderr writes with no
   associated exception (deprecation warnings, retry banners) stay `WARNING`,

@@ -354,8 +354,8 @@ class BaseServer(ABC):
 
             Probes check the HTTP status code (2xx = pass), not the body, so a
             ``degraded`` status surfaces the state for observability without
-            triggering a pod restart — e.g. the trace store being unreachable
-            at startup while the pod keeps serving traffic.
+            triggering a pod restart — e.g. the OE rejecting or not accepting
+            recent trace exports while the pod keeps serving traffic.
             """
             try:
                 from agent_engine_runner_shared.tracing import tracing_status
@@ -364,13 +364,12 @@ class BaseServer(ABC):
             except ImportError:
                 # The tracing extra is optional (TenantRuntime and the AER
                 # execute path both tolerate its absence); without it the
-                # database exporter is definitionally unconfigured — the pod
+                # platform exporter is definitionally unconfigured — the pod
                 # is healthy, not degraded.
-                tracing = {"database_exporter": "disabled"}
+                tracing = {"platform_exporter": "disabled"}
             status = (
                 HealthStatus.DEGRADED
-                if tracing.get("database_exporter") == "degraded"
-                or tracing.get("platform_exporter") == "degraded"
+                if tracing.get("platform_exporter") == "degraded"
                 else HealthStatus.HEALTHY
             )
             return HealthResponse(

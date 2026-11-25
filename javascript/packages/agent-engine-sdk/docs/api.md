@@ -904,7 +904,7 @@ bootstrap(): void;
 ```ts
 buildContext(params): Promise<{
 [key: string]: unknown;
-  formatted_context: string | Record<string, unknown>[];
+  formatted_context?: string | Record<string, unknown>[] | null;
   metadata: {
    [key: string]: unknown;
      memory_counts: Record<string, number>;
@@ -941,7 +941,7 @@ Omitted `enabledSources` defaults to episodic and semantic; include
 
 `Promise`\<\{
 \[`key`: `string`\]: `unknown`;
-  `formatted_context`: `string` \| `Record`\<`string`, `unknown`\>[];
+  `formatted_context?`: `string` \| `Record`\<`string`, `unknown`\>[] \| `null`;
   `metadata`: \{
    \[`key`: `string`\]: `unknown`;
      `memory_counts`: `Record`\<`string`, `number`\>;
@@ -1215,7 +1215,8 @@ discoverProcedures(params): Promise<Record<string, unknown>[]>;
 
 | Parameter | Type |
 | :------ | :------ |
-| `params` | \{ `metadataFilter?`: `Record`\<`string`, `unknown`\> \| `null`; `orgId`: `string`; `projectId`: `string`; `query`: `string`; `signal?`: `AbortSignal`; `similarityThreshold?`: `number`; `tags?`: `string`[] \| `null`; `topK?`: `number`; `userId?`: `string` \| `null`; `visibility?`: `string` \| `null`; \} |
+| `params` | \{ `includeHistory?`: `boolean`; `metadataFilter?`: `Record`\<`string`, `unknown`\> \| `null`; `orgId`: `string`; `projectId`: `string`; `query`: `string`; `signal?`: `AbortSignal`; `similarityThreshold?`: `number`; `tags?`: `string`[] \| `null`; `topK?`: `number`; `userId?`: `string` \| `null`; `visibility?`: `string` \| `null`; \} |
+| `params.includeHistory?` | `boolean` |
 | `params.metadataFilter?` | `Record`\<`string`, `unknown`\> \| `null` |
 | `params.orgId` | `string` |
 | `params.projectId` | `string` |
@@ -1269,7 +1270,8 @@ fetchProceduralMemories(params): Promise<object[]>;
 
 | Parameter | Type |
 | :------ | :------ |
-| `params` | \{ `orgId`: `string`; `projectId`: `string`; `query`: `string`; `signal?`: `AbortSignal`; `tags?`: `string`[] \| `null`; `topK?`: `number`; `userId?`: `string` \| `null`; `visibility?`: `string` \| `null`; \} |
+| `params` | \{ `includeHistory?`: `boolean`; `orgId`: `string`; `projectId`: `string`; `query`: `string`; `signal?`: `AbortSignal`; `tags?`: `string`[] \| `null`; `topK?`: `number`; `userId?`: `string` \| `null`; `visibility?`: `string` \| `null`; \} |
+| `params.includeHistory?` | `boolean` |
 | `params.orgId` | `string` |
 | `params.projectId` | `string` |
 | `params.query` | `string` |
@@ -1295,7 +1297,8 @@ fetchSemanticMemories(params): Promise<object[]>;
 
 | Parameter | Type |
 | :------ | :------ |
-| `params` | \{ `orgId`: `string`; `projectId`: `string`; `query`: `string`; `signal?`: `AbortSignal`; `topK?`: `number`; `userId?`: `string` \| `null`; `visibility?`: `string` \| `null`; \} |
+| `params` | \{ `includeHistory?`: `boolean`; `orgId`: `string`; `projectId`: `string`; `query`: `string`; `signal?`: `AbortSignal`; `topK?`: `number`; `userId?`: `string` \| `null`; `visibility?`: `string` \| `null`; \} |
+| `params.includeHistory?` | `boolean` |
 | `params.orgId` | `string` |
 | `params.projectId` | `string` |
 | `params.query` | `string` |
@@ -2823,7 +2826,7 @@ Metadata about a context build response (token counts, per-source counts, timing
 
 ```ts
 const ContextResponseSchema: ZodObject<{
-  formatted_context: ZodUnion<readonly [ZodString, ZodArray<ZodRecord<ZodString, ZodUnknown>>]>;
+  formatted_context: ZodOptional<ZodNullable<ZodUnion<readonly [ZodString, ZodArray<ZodRecord<ZodString, ZodUnknown>>]>>>;
   metadata: ZodObject<{
      memory_counts: ZodDefault<ZodRecord<ZodString, ZodNumber>>;
      timing: ZodDefault<ZodRecord<ZodString, ZodNumber>>;
@@ -2847,7 +2850,8 @@ const ContextResponseSchema: ZodObject<{
 }, $loose>;
 ```
 
-Response from a context build request containing formatted context and retrieval metadata.
+Response from a context build request: the formatted context, or with
+`include_memories` the selected memories in its place, plus retrieval metadata.
 
 ***
 

@@ -4008,13 +4008,13 @@ class TestDurableToolFailureRedaction:
     def test_encoded_failure_message_is_redacted(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from agent_engine_runner_shared.secure_wrapper import (
             _DURABLE_TOOL_FAILURE_PREFIX,
-            _decode_durable_tool_failure,
-            _encode_durable_tool_failure,
+            decode_tool_failure,
+            encode_tool_failure,
         )
 
         monkeypatch.setenv("WAREHOUSE_API_TOKEN", "wh-7f3e9a")
         key = "sk-" + "Ab3dEf6hIj9kLm2nOp5qRs"
-        encoded = _encode_durable_tool_failure(
+        encoded = encode_tool_failure(
             RuntimeError(f"mongodb+srv://app:Pa55w0rd@c0.example.net key {key} token wh-7f3e9a")
         )
 
@@ -4024,34 +4024,34 @@ class TestDurableToolFailureRedaction:
         )
         assert payload["message"] == expected
         assert "Pa55w0rd" not in encoded and key not in encoded and "wh-7f3e9a" not in encoded
-        assert _decode_durable_tool_failure(encoded, RuntimeError(encoded)).error == expected
+        assert decode_tool_failure(encoded, RuntimeError(encoded)).error == expected
 
     def test_encoded_external_api_failure_message_is_redacted(self) -> None:
         from agent_engine_runner_shared.secure_wrapper import (
             ExternalAPICallError,
-            _decode_durable_tool_failure,
-            _encode_durable_tool_failure,
+            decode_tool_failure,
+            encode_tool_failure,
         )
         from agent_engine_runner_shared.tool_api_error import ToolAPIError
 
         key = "sk-" + "Ab3dEf6hIj9kLm2nOp5qRs"
-        encoded = _encode_durable_tool_failure(
+        encoded = encode_tool_failure(
             ExternalAPICallError(f"rejected {key}", ToolAPIError(classification="AUTH_FAILED"))
         )
 
-        decoded = _decode_durable_tool_failure(encoded, RuntimeError(encoded))
+        decoded = decode_tool_failure(encoded, RuntimeError(encoded))
         assert key not in encoded
         assert isinstance(decoded, ExternalAPICallError)
         assert decoded.error == "rejected sk-<redacted>"
 
     def test_encoded_benign_failure_message_is_unchanged(self) -> None:
         from agent_engine_runner_shared.secure_wrapper import (
-            _decode_durable_tool_failure,
-            _encode_durable_tool_failure,
+            decode_tool_failure,
+            encode_tool_failure,
         )
 
         message = "mixed inclusion and exclusion projection"
-        encoded = _encode_durable_tool_failure(ValueError(message))
-        decoded = _decode_durable_tool_failure(encoded, RuntimeError(encoded))
+        encoded = encode_tool_failure(ValueError(message))
+        decoded = decode_tool_failure(encoded, RuntimeError(encoded))
 
         assert decoded.error == message

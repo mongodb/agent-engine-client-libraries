@@ -24,6 +24,27 @@ export const MAX_TRACEBACK_BYTES = 8192;
 /** @internal — exported only for tests; not part of the public API. */
 export const MAX_BUFFER_BYTES = 65536;
 
+// Sized for many concurrent executions streaming unterminated output, so
+// normal load does not force-split healthy lines. Mirrors Python's
+// `_MAX_PENDING_BYTES`.
+/** @internal — exported only for tests; not part of the public API. */
+export const MAX_PENDING_BYTES = 16 * MAX_BUFFER_BYTES;
+
+// Async work that inherits a finished request's scope can still write after
+// the owner flushed, so without a writer cap those fragments would accumulate
+// with no cleanup owner. Mirrors Python's `_MAX_PENDING_WRITERS`.
+/** @internal — exported only for tests; not part of the public API. */
+export const MAX_PENDING_WRITERS = 64;
+
+export const TRUNCATION_MARKER = "...(truncated)";
+
+// Carries a captured line's starting attribution to the layout, so the line
+// ships its writer's identity whoever completes or flushes it. A symbol so it
+// never reaches `fields`.
+export const RECORD_ATTRIBUTION: unique symbol = Symbol.for(
+  "agent_engine_runner_shared.log_attribution",
+);
+
 // Source value attached to log records by LoggingStream. For records that
 // come straight from `logger.*` (i.e. not stdout/stderr capture) we default
 // to `node-logging`. Mirrors the Python `_RECORD_SOURCE_ATTR` /

@@ -334,6 +334,7 @@ class MemoryEngineProtocol(Protocol):
         top_k: int = 10,
         similarity_threshold: float = 0.0,
         metadata_filter: Optional[Dict[str, Any]] = None,
+        include_history: bool = False,
         **kwargs: Any,
     ) -> List[Dict[str, Any]]:
         """Discover procedures matching a query (lightweight results)."""

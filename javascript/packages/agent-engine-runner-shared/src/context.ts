@@ -21,6 +21,10 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
 import { redactText } from "./error_reporting.js";
+import {
+  runWithLogCorrelation,
+  runWithLogOutputScope,
+} from "./log_correlation.js";
 import type { ToolAuthorization } from "./models.js";
 
 export interface ExecutionStore {
@@ -498,4 +502,18 @@ export function getCallAbortSignal(): AbortSignal | undefined {
 /** Run one callback-routed tool body with its per-call abort signal attached. */
 export function runWithCallAbortSignal<T>(signal: AbortSignal, fn: () => T): T {
   return callAbortStorage.run(signal, fn);
+}
+
+/**
+ * For process-wide work that reaches a request's context only by accident,
+ * such as a timer first armed inside that request.
+ *
+ * @internal — exported for tracing/ consumers; not part of the public API.
+ */
+export function runOutsideExecution<T>(fn: () => T): T {
+  return storage.run(EMPTY_STORE, () =>
+    customerOriginStorage.run(false, () =>
+      runWithLogOutputScope(null, () => runWithLogCorrelation(null, fn)),
+    ),
+  );
 }

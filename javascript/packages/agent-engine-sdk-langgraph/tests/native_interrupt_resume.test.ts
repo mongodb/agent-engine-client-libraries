@@ -22,7 +22,6 @@ import {
   resetHooks,
   runWithExecutionContext,
   SecureToolWrapper,
-  ToolExecutionError,
 } from "@mongodb-js/agent-engine-runner-shared";
 import { describe, expect, it, vi } from "vitest";
 import { z } from "zod";
@@ -377,99 +376,6 @@ describe("LangGraphBaseAgent native interrupt resume", () => {
       expect(received).toEqual([answer]);
       expect(typeof received[0]).toBe(typeof answer);
       expect(Array.isArray(received[0])).toBe(Array.isArray(answer));
-    },
-  );
-
-  it.each([
-    {
-      consented: false,
-      expected:
-        "error: Tool execution error: OAuth authorization is still required after continuation",
-    },
-    { consented: true, expected: '["qualification-repo"]' },
-  ])(
-    "never runs an OAuth tool without a token after Continue (consented: $consented)",
-    async ({ consented, expected }) => {
-      registerSuspendHandler(interrupt as never);
-      const challenge = {
-        proceed: false,
-        reason: "authorization required",
-        status: "suspend",
-        elicitation: {
-          elicitation_id: "elic-1",
-          authorization_url: "https://idp.example/authorize?state=elic-1",
-          message: "Connect Keycloak",
-          created: true,
-        },
-      };
-      // Before consent the resumed node is challenged again, and once more
-      // after interrupt() returns the answer; after consent its gate proceeds.
-      const replies: unknown[] = consented
-        ? [
-            challenge,
-            {
-              proceed: true,
-              status: "success",
-              result: '["qualification-repo"]',
-              duration_ms: 1,
-            },
-          ]
-        : [challenge, challenge, challenge];
-      const approvals = replies.length;
-      const fetchMock = vi.fn(async () =>
-        Promise.resolve(
-          new Response(JSON.stringify(replies.shift()), {
-            status: 200,
-            headers: { "Content-Type": "application/json" },
-          }),
-        ),
-      );
-      vi.stubGlobal("fetch", fetchMock);
-      const wrapper = new SecureToolWrapper("http://oe:8000", "exec-oauth");
-      const received: JsonValue[] = [];
-      const graph = new StateGraph(MessagesAnnotation)
-        .addNode("tool", async () => {
-          try {
-            received.push(
-              (await wrapper.executeTool(
-                "list_repos",
-                {},
-                { provider: "keycloak", scopes: ["repo"], isLocal: false },
-              )) as JsonValue,
-            );
-          } catch (error) {
-            if (!(error instanceof ToolExecutionError)) throw error;
-            received.push(`error: ${error.message}`);
-          }
-          return { messages: [new AIMessage({ content: "tool done" })] };
-        })
-        .addEdge(START, "tool")
-        .addEdge("tool", END)
-        .compile({ checkpointer: new MemorySaver() });
-      const agent = new LangGraphBaseAgent(graph as never);
-
-      try {
-        const { data, metadata } = await suspend(agent, "oauth-continue");
-        const interrupts = data["interrupts"] as Array<{
-          id: string;
-          value: Record<string, JsonValue>;
-        }>;
-        const pendingInterrupt = mustGet(interrupts[0]);
-        expect(pendingInterrupt.value["suspend_reason"]).toBe(
-          "authorization_required",
-        );
-
-        const events = await resume(agent, "oauth-continue", metadata, {
-          [pendingInterrupt.id]: { decision: "approve" },
-        });
-
-        expect(events.map((event) => event.event)).toEqual(["result"]);
-        expect(received).toEqual([expected]);
-        expect(fetchMock).toHaveBeenCalledTimes(approvals);
-      } finally {
-        vi.unstubAllGlobals();
-        resetHooks();
-      }
     },
   );
 

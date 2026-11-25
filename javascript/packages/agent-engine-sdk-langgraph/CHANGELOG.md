@@ -7,7 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **Breaking:** the package now requires Node.js 24.22.3 or later. `engines.node`
+  was `>=24`, so a consumer on an earlier 24.x installed it and ran the Brotli
+  decoder from before the CVE-2026-111497 fix. npm reports the new floor as
+  `EBADENGINE`: a warning by default, an install error under `engine-strict`.
+
 ### Fixed
+- A delegated OAuth tool on a native checkpoint execution keeps its call and
+  result in its own child checkpoint, bound to the tool-call ID (or to its
+  position when the call has none). When the node runs again, after a later
+  wait or on a replacement runner, the call returns the stored result, or
+  reports its own recorded failure, instead of calling the provider again, and a changed tool or changed arguments fail
+  before any provider call. Each call's consent wait is its own interrupt;
+  parallel calls that need consent are asked one after another. If the child
+  checkpoint cannot be read or saved, the turn fails instead of handing the
+  model an error it could answer by calling the tool again.
 - Cancelling a turn on a non-durable Deep Agent keeps the session's earlier
   conversation. The cancelled-turn checkpoint copied the thread's stored channel
   values, which omit a `DeltaChannel` between snapshots, so it carried only the
@@ -43,6 +58,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   workspace resolver returning `null` or `undefined` now fails closed;
   explicitly unscoped local runtimes continue to read bare-key checkpoints.
 - Session-history messages for human-authored turns now report role `"user"` instead of `"human"`, matching the live invoke/stream `Message.role` vocabulary.
+
+### Removed
+- **Breaking:** `AppOptions` no longer accepts `databaseName` or
+  `tracesCollectionName`. They only chose where the runner wrote traces to
+  MongoDB, and the runner now sends traces only to the Orchestration Engine and
+  an optional OTLP endpoint. The checkpointer database is unaffected.
 
 ### Added
 - Connector tools from `agent.yaml` now register as remote AER tools in AER

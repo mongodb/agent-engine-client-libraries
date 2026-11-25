@@ -56,9 +56,18 @@ import {
 } from "../../src/structured_logging.js";
 import { setupLogging, getLogger } from "../../src/logger.js";
 import {
+  getCurrentExecutionId,
+  getCurrentSessionId,
   runWithCustomerOrigin,
   runWithExecutionContext,
 } from "../../src/context.js";
+import { runWithLogCorrelation } from "../../src/log_correlation.js";
+import type { FastifyRequest } from "fastify";
+import { runWithRequestExecution } from "../../src/server/request_execution.js";
+import {
+  MAX_PENDING_BYTES,
+  MAX_PENDING_WRITERS,
+} from "../../src/structured_logging/constants.js";
 
 // Tests that call `fx.install()` directly (bypassing setupLogging) MUST use
 // log4js.getLogger rather than agent_engine_runner_shared/logger.ts's getLogger
@@ -1386,4 +1395,331 @@ test("origin is customer inside scope", () => {
   expect(customer?.origin).toBe("customer");
   expect(printed?.origin).toBe("customer");
   expect(after).not.toHaveProperty("origin");
+});
+
+// ---------------------------------------------------------------------------
+// Execution-ID attribution outside the execution context. Mirrors the Python
+// LoggingStream attribution tests.
+// ---------------------------------------------------------------------------
+
+const TRACE_A = "0123456789abcdef0123456789abcdef";
+
+function inExecution<T>(
+  executionId: string,
+  sessionId: string,
+  fn: () => T,
+): T {
+  return runWithExecutionContext(
+    {
+      executionId,
+      sessionId,
+      traceId: TRACE_A,
+      wrapper: null,
+      oeUrl: "http://oe",
+    },
+    fn,
+  );
+}
+
+function stdoutRecords(fx: Fixture): JsonRecord[] {
+  return fx.records.filter((r) => r.source === "stdout");
+}
+
+function activeCaptures(): { stdout: LoggingStream; stderr: LoggingStream } {
+  return (globalThis as unknown as Record<symbol, unknown>)[
+    Symbol.for("agent_engine_runner_shared.structured_logging_active_captures")
+  ] as { stdout: LoggingStream; stderr: LoggingStream };
+}
+
+function flushActiveCaptures(): void {
+  activeCaptures().stdout.flush();
+  activeCaptures().stderr.flush();
+}
+
+const fakeRequest = (): FastifyRequest => ({}) as FastifyRequest;
+
+test("log-only binding tags records without entering execution context", () => {
+  const fx = setupCapture();
+  fx.install();
+  runWithLogCorrelation("exec-log-only", () => {
+    expect(getCurrentExecutionId()).toBeNull();
+    expect(getCurrentSessionId()).toBeNull();
+    lg("runner_test").info("bound line");
+    runWithLogCorrelation("exec-inner", () =>
+      lg("runner_test").info("inner line"),
+    );
+    lg("runner_test").info("restored line");
+  });
+  lg("runner_test").info("after binding");
+
+  const ids = Object.fromEntries(
+    fx.records.map((r) => [r.message, r.executionId]),
+  );
+  expect(ids["bound line"]).toBe("exec-log-only");
+  expect(ids["inner line"]).toBe("exec-inner");
+  expect(ids["restored line"]).toBe("exec-log-only");
+  expect(ids["after binding"]).toBeNull();
+});
+
+test.each(["", "   "])(
+  "a blank execution ID (%j) clears an inherited binding",
+  (blank) => {
+    const fx = setupCapture();
+    fx.install();
+    runWithLogCorrelation("exec-outer", () =>
+      runWithLogCorrelation(blank, () =>
+        lg("runner_test").info("no originating execution"),
+      ),
+    );
+    const rec = fx.records.find(
+      (r) => r.message === "no originating execution",
+    );
+    expect(rec?.executionId).toBeNull();
+  },
+);
+
+test("interleaved partial writes keep each execution's line", () => {
+  const fx = setupCapture();
+  fx.install();
+  inExecution("exec-one", "sess-one", () => {
+    process.stdout.write("abc");
+    inExecution("exec-two", "sess-two", () => process.stdout.write("def\n"));
+    process.stdout.write("\n");
+  });
+
+  const recs = Object.fromEntries(
+    stdoutRecords(fx).map((r) => [r.message, [r.executionId, r.sessionId]]),
+  );
+  expect(recs).toEqual({
+    abc: ["exec-one", "sess-one"],
+    def: ["exec-two", "sess-two"],
+  });
+});
+
+test("concurrent executions' partial stdout and stderr writes stay apart", async () => {
+  const fx = setupCapture();
+  fx.install();
+  const aWrote = Promise.withResolvers<void>();
+  const bWrote = Promise.withResolvers<void>();
+
+  await Promise.all([
+    inExecution("exec-a", "sess-a", async () => {
+      process.stdout.write("out-a");
+      process.stderr.write("err-a");
+      aWrote.resolve();
+      await bWrote.promise;
+      process.stdout.write("\n");
+      process.stderr.write("\n");
+    }),
+    inExecution("exec-b", "sess-b", async () => {
+      await aWrote.promise;
+      process.stdout.write("out-b\n");
+      process.stderr.write("err-b\n");
+      bWrote.resolve();
+    }),
+  ]);
+
+  const recs = Object.fromEntries(
+    fx.records
+      .filter((r) => r.source === "stdout" || r.source === "stderr")
+      .map((r) => [r.message, r.executionId]),
+  );
+  expect(recs).toEqual({
+    "out-a": "exec-a",
+    "err-a": "exec-a",
+    "out-b": "exec-b",
+    "err-b": "exec-b",
+  });
+});
+
+test("a flushed partial line keeps its writer's whole attribution", () => {
+  const fx = setupCapture();
+  fx.install();
+  inExecution("exec-writer", "sess-writer", () =>
+    runWithCustomerOrigin(() =>
+      process.stdout.write("pending customer output"),
+    ),
+  );
+  runWithExecutionContext(
+    {
+      executionId: "exec-flusher",
+      sessionId: "sess-flusher",
+      traceId: "abcdef0123456789abcdef0123456789",
+      wrapper: null,
+      oeUrl: "http://oe",
+    },
+    flushActiveCaptures,
+  );
+
+  const rec = fx.records.find((r) => r.message === "pending customer output");
+  expect(rec).toMatchObject({
+    executionId: "exec-writer",
+    sessionId: "sess-writer",
+    traceId: TRACE_A,
+    origin: "customer",
+  });
+});
+
+test("an untagged partial line stays untagged when a tagged execution writes or flushes", () => {
+  const fx = setupCapture();
+  fx.install();
+  process.stdout.write("boot partial");
+  inExecution("exec-tagged", "sess-tagged", () =>
+    runWithCustomerOrigin(() => {
+      process.stdout.write("tagged line\n");
+      flushActiveCaptures();
+    }),
+  );
+
+  const boot = fx.records.find((r) => r.message === "boot partial");
+  expect(boot).toMatchObject({ executionId: null, sessionId: null });
+  expect(boot).not.toHaveProperty("traceId");
+  expect(boot).not.toHaveProperty("origin");
+  const tagged = fx.records.find((r) => r.message === "tagged line");
+  expect(tagged).toMatchObject({
+    executionId: "exec-tagged",
+    origin: "customer",
+  });
+});
+
+test("lines completed after a partial take their own attribution", () => {
+  const fx = setupCapture();
+  fx.install();
+  inExecution("exec-origin", "sess-origin", () => {
+    runWithCustomerOrigin(() => process.stdout.write("customer partial"));
+    process.stdout.write(" end\nplatform line\n");
+  });
+
+  const recs = Object.fromEntries(stdoutRecords(fx).map((r) => [r.message, r]));
+  expect(recs["customer partial end"]?.origin).toBe("customer");
+  expect(recs["platform line"]).not.toHaveProperty("origin");
+});
+
+test("a request's exit flushes only the partial output written in that request", async () => {
+  const fx = setupCapture();
+  fx.install();
+  await runWithRequestExecution(fakeRequest(), "exec-shared", async () => {
+    process.stdout.write("sibling partial");
+    await runWithRequestExecution(fakeRequest(), "exec-shared", async () => {
+      process.stdout.write("owner partial");
+    });
+    expect(stdoutRecords(fx).map((r) => r.message)).toEqual(["owner partial"]);
+    process.stdout.write(" done\n");
+  });
+
+  expect(stdoutRecords(fx).map((r) => [r.message, r.executionId])).toEqual([
+    ["owner partial", "exec-shared"],
+    ["sibling partial done", "exec-shared"],
+  ]);
+});
+
+test("late partial writes after a request ends stay within the writer budget", async () => {
+  const fx = setupCapture();
+  fx.install();
+  const count = MAX_PENDING_WRITERS + 8;
+  for (let index = 0; index < count; index++) {
+    const gate = Promise.withResolvers<void>();
+    let late!: Promise<void>;
+    await runWithRequestExecution(
+      fakeRequest(),
+      `exec-late-${index}`,
+      async () => {
+        late = gate.promise.then(() => {
+          process.stdout.write(`late-${index}`);
+        });
+      },
+    );
+    gate.resolve();
+    await late;
+  }
+
+  const evicted = stdoutRecords(fx).filter((r) =>
+    r.message.startsWith("late-"),
+  );
+  expect(evicted).toHaveLength(count - MAX_PENDING_WRITERS);
+  for (const rec of evicted) {
+    expect(rec.message).toMatch(/\.\.\.\(truncated\)$/);
+    const index = rec.message.slice("late-".length, -"...(truncated)".length);
+    expect(rec.executionId).toBe(`exec-late-${index}`);
+  }
+  flushActiveCaptures();
+});
+
+test("partial writes across executions stay within the byte budget", () => {
+  const fx = setupCapture();
+  fx.install();
+  const fragment = MAX_BUFFER_BYTES - 1;
+  const writers = Math.floor(MAX_PENDING_BYTES / fragment) + 1;
+  for (let index = 0; index < writers; index++) {
+    runWithLogCorrelation(`exec-big-${index}`, () =>
+      process.stdout.write("x".repeat(fragment)),
+    );
+  }
+
+  expect(stdoutRecords(fx).map((r) => [r.executionId, r.message])).toEqual([
+    ["exec-big-0", "x".repeat(fragment) + "...(truncated)"],
+  ]);
+  flushActiveCaptures();
+});
+
+test("eviction drops the writer that wrote least recently, not the one that started first", () => {
+  const fx = setupCapture();
+  fx.install();
+  const write = (executionId: string, text: string): void => {
+    runWithLogCorrelation(executionId, () => process.stdout.write(text));
+  };
+  for (let index = 0; index < MAX_PENDING_WRITERS; index++) {
+    write(`exec-${index}`, `line-${index}`);
+  }
+  write("exec-0", " still streaming");
+  write("exec-new", "line-new");
+
+  expect(stdoutRecords(fx).map((r) => [r.executionId, r.message])).toEqual([
+    ["exec-1", "line-1...(truncated)"],
+  ]);
+  flushActiveCaptures();
+});
+
+test("a flush from inside an appender ships each line exactly once", () => {
+  const messages: string[] = [];
+  const flushingLogger = {
+    info(_extra: object, message: string) {
+      messages.push(message);
+      stream.flush();
+    },
+  } as unknown as Logger;
+  const stream = new LoggingStream(flushingLogger, "info", "stdout");
+
+  stream.write("first");
+  stream.write(" line\nnext partial");
+  stream.flush();
+
+  expect(messages.sort()).toEqual(["first line", "next partial"]);
+});
+
+test("a request still returns and flushes stderr when flushing stdout throws", async () => {
+  const fx = setupCapture();
+  fx.install();
+  const flushStdout = vi
+    .spyOn(activeCaptures().stdout, "flushScope")
+    .mockImplementation(() => {
+      throw new Error("appender failed");
+    });
+
+  const result = runWithRequestExecution(
+    fakeRequest(),
+    "exec-raising",
+    async () => {
+      process.stdout.write("stdout partial");
+      process.stderr.write("stderr partial");
+      return "ok";
+    },
+  );
+
+  await expect(result).resolves.toBe("ok");
+  expect(
+    fx.records.filter((r) => r.source === "stderr").map((r) => r.message),
+  ).toEqual(["stderr partial"]);
+  flushStdout.mockRestore();
+  flushActiveCaptures();
 });

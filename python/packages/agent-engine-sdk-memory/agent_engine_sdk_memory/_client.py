@@ -460,6 +460,7 @@ class MemoryClient:
         user_id: str | None = None,
         visibility: str | None = None,
         top_k: int = 50,
+        include_history: bool = False,
         **kwargs: Any,
     ) -> list[MemoryChunk]:
         """Search semantic memories."""
@@ -470,6 +471,7 @@ class MemoryClient:
             "user_id": user_id,
             "visibility": visibility,
             "top_k": top_k,
+            "include_history": include_history,
         }
 
         resp = self._send(
@@ -1129,6 +1131,7 @@ class MemoryClient:
         top_k: int = 10,
         similarity_threshold: float = 0.0,
         metadata_filter: dict[str, Any] | None = None,
+        include_history: bool = False,
         **kwargs: Any,
     ) -> list[dict[str, Any]]:
         """Discover procedures matching a query (lightweight results)."""
@@ -1144,6 +1147,8 @@ class MemoryClient:
         }
         if metadata_filter:
             body["metadata_filter"] = metadata_filter
+        if include_history:
+            body["include_history"] = True
 
         resp = self._send(
             self._client.post,
@@ -1156,15 +1161,27 @@ class MemoryClient:
             memories_data = _require_list(
                 _require_object(resp.json()).get("memories"), dict
             )
-            return [
-                {
-                    "procedure": m.get("metadata", {}).get("procedure", ""),
+            results: list[dict[str, Any]] = []
+            for m in memories_data:
+                raw_meta = m.get("metadata")
+                meta: dict[str, Any] = (
+                    cast("dict[str, Any]", raw_meta)
+                    if isinstance(raw_meta, dict)
+                    else {}
+                )
+                item: dict[str, Any] = {
+                    **meta,
+                    "procedure": meta.get("procedure", ""),
                     "content": m.get("content", ""),
                     "score": m.get("similarity_score", 0.0),
-                    **m.get("metadata", {}),
                 }
-                for m in memories_data
-            ]
+                if m.get("id") is not None:
+                    item["id"] = m.get("id")
+                ts = m.get("timestamp") or m.get("created_at") or m.get("updated_at")
+                if ts is not None:
+                    item["timestamp"] = ts
+                results.append(item)
+            return results
 
     def fetch_procedural_memories(
         self,
@@ -1176,6 +1193,7 @@ class MemoryClient:
         visibility: str | None = None,
         tags: list[str] | None = None,
         top_k: int = 50,
+        include_history: bool = False,
         **kwargs: Any,
     ) -> list[MemoryChunk]:
         """Fetch procedural memories by query (full content)."""
@@ -1187,6 +1205,7 @@ class MemoryClient:
             "project_id": project_id,
             "tags": tags,
             "top_k": top_k,
+            "include_history": include_history,
         }
 
         resp = self._send(

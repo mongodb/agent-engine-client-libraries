@@ -1,7 +1,4 @@
-import { appendFileSync, mkdirSync, renameSync, statSync } from "node:fs";
-import { dirname, join } from "node:path";
-
-import { SpanKind, SpanStatusCode, type Attributes } from "@opentelemetry/api";
+import type { Attributes } from "@opentelemetry/api";
 import type { ExportResult } from "@opentelemetry/core";
 import {
   ProtobufTraceSerializer,
@@ -9,8 +6,6 @@ import {
   type ISerializer,
 } from "@opentelemetry/otlp-transformer";
 import type { ReadableSpan, SpanExporter } from "@opentelemetry/sdk-trace-base";
-
-import type { Collection } from "mongodb";
 
 import { getLogger } from "../logger.js";
 import { fetchPlatform, getFetchOptionsWithTLS } from "../tls_client.js";
@@ -29,132 +24,6 @@ const logger = getLogger("agent_engine_runner_shared.tracing");
 const EXPORT_SUCCESS = 0;
 const EXPORT_FAILED = 1;
 
-const MAX_TRACE_FILE_BYTES = 50 * 1024 * 1024;
-
-function rotateIfNeeded(path: string): void {
-  try {
-    const stat = statSync(path, { throwIfNoEntry: false });
-    if (stat && stat.size >= MAX_TRACE_FILE_BYTES) {
-      renameSync(path, path + ".1");
-    }
-  } catch {
-    return;
-  }
-}
-
-/** Resolve the on-disk trace file path from env vars (mirrors Python). */
-export function getTracePath(): string {
-  let path: string;
-  if (process.env["AGENTIC_TRACES_FILE"]) {
-    path = process.env["AGENTIC_TRACES_FILE"];
-  } else if (process.env["AGENTIC_OBSERVABILITY_DIR"]) {
-    path = join(process.env["AGENTIC_OBSERVABILITY_DIR"], "traces.jsonl");
-  } else {
-    path = join("observability", "traces.jsonl");
-  }
-  mkdirSync(dirname(path), { recursive: true });
-  return path;
-}
-
-function spanToDoc(span: ReadableSpan): Record<string, unknown> {
-  const ctx = span.spanContext();
-  const attributes: Record<string, unknown> = { ...span.attributes };
-  const sessionId = attributes["session.id"] ?? attributes["session_id"];
-  const executionId = attributes["execution.id"] ?? attributes["execution_id"];
-
-  const doc: Record<string, unknown> = {
-    trace_id: ctx.traceId,
-    span_id: ctx.spanId,
-    name: span.name,
-    kind: SpanKind[span.kind] ?? String(span.kind),
-    start_time_ns: hrtimeToNs(span.startTime),
-    end_time_ns: hrtimeToNs(span.endTime),
-    duration_ns: hrtimeDurationNs(span.startTime, span.endTime),
-    status: {
-      code: SpanStatusCode[span.status.code] ?? String(span.status.code),
-      description: span.status.message ?? null,
-    },
-    attributes,
-    resource: { ...(span.resource.attributes ?? {}) },
-  };
-
-  if (sessionId !== undefined) doc["session_id"] = sessionId;
-  if (executionId !== undefined) doc["execution_id"] = executionId;
-
-  if (span.parentSpanContext?.spanId) {
-    doc["parent_span_id"] = span.parentSpanContext.spanId;
-  }
-
-  if (span.events && span.events.length > 0) {
-    doc["events"] = span.events.map((e) => ({
-      name: e.name,
-      timestamp_ns: hrtimeToNs(e.time),
-      attributes: { ...(e.attributes ?? {}) },
-    }));
-  }
-
-  if (span.links && span.links.length > 0) {
-    doc["links"] = span.links.map((l) => ({
-      trace_id: l.context.traceId,
-      span_id: l.context.spanId,
-      attributes: { ...(l.attributes ?? {}) },
-    }));
-  }
-
-  return doc;
-}
-
-function hrtimeToNs(t: [number, number]): number {
-  return t[0] * 1e9 + t[1];
-}
-
-function hrtimeDurationNs(
-  start: [number, number],
-  end: [number, number],
-): number {
-  return hrtimeToNs(end) - hrtimeToNs(start);
-}
-
-export class JSONLSpanExporter implements SpanExporter {
-  private readonly path: string | null;
-
-  constructor(path?: string) {
-    this.path = path ?? null;
-  }
-
-  export(
-    spans: ReadableSpan[],
-    resultCallback: (result: ExportResult) => void,
-  ): void {
-    if (spans.length === 0) {
-      resultCallback({ code: EXPORT_SUCCESS });
-      return;
-    }
-    const target = this.path ?? getTracePath();
-    try {
-      rotateIfNeeded(target);
-      const lines =
-        spans.map((s) => JSON.stringify(spanToDoc(s))).join("\n") + "\n";
-      appendFileSync(target, lines, { encoding: "utf-8" });
-      resultCallback({ code: EXPORT_SUCCESS });
-    } catch (err) {
-      logger.error(
-        { path: target, err: (err as Error).message },
-        "Failed to write traces",
-      );
-      resultCallback({ code: EXPORT_FAILED, error: err as Error });
-    }
-  }
-
-  shutdown(): Promise<void> {
-    return Promise.resolve();
-  }
-
-  forceFlush(): Promise<void> {
-    return Promise.resolve();
-  }
-}
-
 function conversationAttributes(
   attributes: Record<string, unknown>,
   tracker: ConversationDeltaTracker,
@@ -168,89 +37,6 @@ function conversationAttributes(
     return null;
   }
   return tracker.trim(attributes, traceId, traceStream(resource));
-}
-
-export class MongoDBSpanExporter implements SpanExporter {
-  private conversations = new ConversationDeltaTracker();
-  /**
-   * Inserts this exporter started but has not finished. `BatchSpanProcessor`
-   * ships on a timer and does not track the export it already started, so its
-   * `forceFlush()` can resolve while one of these is still pending; see
-   * {@link drain}.
-   */
-  private readonly inFlight = new Set<Promise<void>>();
-
-  constructor(private readonly collection: Collection) {}
-
-  export(
-    spans: ReadableSpan[],
-    resultCallback: (result: ExportResult) => void,
-  ): void {
-    if (spans.length === 0) {
-      resultCallback({ code: EXPORT_SUCCESS });
-      return;
-    }
-    const staged = this.conversations.copy();
-    const docs = spans.map((s) => this.trimConversation(spanToDoc(s), staged));
-    const write = this.collection
-      .insertMany(docs)
-      .then(() => {
-        this.conversations = staged;
-        resultCallback({ code: EXPORT_SUCCESS });
-      })
-      .catch((err: Error) => {
-        logger.error({ err: err.message }, "Failed to write traces to MongoDB");
-        resultCallback({ code: EXPORT_FAILED, error: err });
-      });
-    this.inFlight.add(write);
-    void write.finally(() => {
-      this.inFlight.delete(write);
-    });
-  }
-
-  /**
-   * Await every insert this exporter started but has not finished.
-   *
-   * `BatchSpanProcessor.forceFlush()` drains only the spans still buffered: an
-   * export its timer already started is invisible to it, so the flush can
-   * resolve while that insert is still pending. A caller about to make the
-   * process disappear (a session-finish release) awaits this so it does not
-   * release on a flush that only looked complete. Best-effort and never
-   * rejects — a failed insert is already reported through its result callback.
-   */
-  async drain(): Promise<void> {
-    while (this.inFlight.size > 0) {
-      await Promise.allSettled([...this.inFlight]);
-    }
-  }
-
-  private trimConversation(
-    doc: Record<string, unknown>,
-    tracker: ConversationDeltaTracker,
-  ): Record<string, unknown> {
-    const attributes = doc["attributes"] as Record<string, unknown> | undefined;
-    if (!attributes) {
-      return doc;
-    }
-    const trimmed = conversationAttributes(
-      attributes,
-      tracker,
-      String(doc["trace_id"]),
-      (doc["resource"] ?? {}) as Record<string, unknown>,
-    );
-    if (trimmed !== null) {
-      doc["attributes"] = trimmed;
-    }
-    return doc;
-  }
-
-  shutdown(): Promise<void> {
-    return Promise.resolve();
-  }
-
-  forceFlush(): Promise<void> {
-    return Promise.resolve();
-  }
 }
 
 const CONTENT_CAPTURE_ENV = "AGENTIC_PLATFORM_OTEL_CONTENT_CAPTURE";

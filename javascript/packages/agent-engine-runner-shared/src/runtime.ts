@@ -9,11 +9,9 @@
  *
  * Scope deltas vs. Python (see `AGENTS.md` for rationale):
  *   - No memory-server mode (`RuntimeMode` has `AER` and `TOOL`).
- *   - `setupTracing` owns the MongoClient build (async). Python builds it
- *     inline in `_setup_tracing` (sync pymongo).
  *   - `shutdown()` and SIGTERM/SIGINT wiring are TS additions — Python's
- *     uvicorn handles signals itself; here we explicitly close the tracing
- *     MongoClient before exit.
+ *     uvicorn handles signals itself; here we explicitly shut down tracing
+ *     before exit.
  */
 
 import inspector from "node:inspector";
@@ -115,12 +113,8 @@ export interface TenantRuntimeOptions {
   appName?: string;
   /** Application version. Defaults to `"1.0.0"`. */
   appVersion?: string;
-  /** MongoDB URI used for trace persistence. Falls back to `MONGODB_URI`. */
+  /** MongoDB URI exposed to framework SDKs via `getMongodbUri()`. Falls back to `MONGODB_URI`. */
   mongodbUri?: string | null;
-  /** Explicit database name for trace storage. Defaults to the platform store. */
-  databaseName?: string | null;
-  /** Collection name for trace storage. Defaults to `"traces"`. */
-  tracesCollectionName?: string;
   /** @deprecated Ignored. The org is taken from the `ORG_ID` env var, which the platform injects. */
   orgId?: string | null;
   /** @deprecated Ignored. The project is taken from the `PROJECT_ID` env var, which the platform injects. */
@@ -159,13 +153,11 @@ export class TenantRuntime implements ITenantRuntime {
 
   private readonly agentConfig: RuntimeAgentConfig;
   private readonly mongodbUri: string | null;
-  private readonly databaseNameOverride: string | undefined;
-  private readonly tracesCollectionName: string;
 
   // Guards `shutdown()` against concurrent signal-handler invocations.
   private shutdownStarted = false;
 
-  // In-flight tracing setup. `initTracing` kicks the async Mongo wiring off in
+  // In-flight tracing setup. `initTracing` kicks the async setup off in
   // the constructor; `runAsync` awaits this before binding the server so the
   // global tracer provider is attached before the first request can land
   // (matching the deterministic effect of Python's synchronous `_setup_tracing`).
@@ -176,8 +168,6 @@ export class TenantRuntime implements ITenantRuntime {
       appName = "Agent",
       appVersion = "1.0.0",
       mongodbUri,
-      databaseName,
-      tracesCollectionName = "traces",
       orgId,
       projectId,
     } = opts;
@@ -222,8 +212,6 @@ export class TenantRuntime implements ITenantRuntime {
       ? new MemoryWriter(new AppBoundRuntime())
       : null;
     this.mongodbUri = mongodbUri ?? process.env["MONGODB_URI"] ?? null;
-    this.databaseNameOverride = databaseName || undefined;
-    this.tracesCollectionName = tracesCollectionName;
 
     // Tracing is always on so every runtime mode emits consistent spans.
     this.initTracing();
@@ -250,21 +238,17 @@ export class TenantRuntime implements ITenantRuntime {
   // =========================================================================
 
   private initTracing(): void {
-    // Python builds the Mongo collection synchronously here, but Node's
-    // `mongodb` driver `connect()` is async — so the collection wiring lives
-    // inside `setupTracing`. Kick it off from the constructor and retain the
-    // promise: `runAsync` awaits `tracingReady` before binding the server, so
-    // the global tracer provider is attached before the first request lands
-    // (deterministic, unlike a bare fire-and-forget). A failed setup is logged
-    // and swallowed so a degraded trace store never blocks serving traffic.
+    // `setupTracing` is async (it lazily imports the OTLP exporter). Kick it off
+    // from the constructor and retain the promise: `runAsync` awaits
+    // `tracingReady` before binding the server, so the global tracer provider
+    // is attached before the first request lands (deterministic, unlike a bare
+    // fire-and-forget). A failed setup is logged and swallowed so tracing never
+    // blocks serving traffic.
     this.tracingReady = setupTracing({
       serviceName: this.appName,
-      mongodbUri: this.mongodbUri,
-      mongodbDatabaseName: this.databaseNameOverride,
-      mongodbCollectionName: this.tracesCollectionName,
     }).catch((e) => {
-      // Scrub defensively: a setup failure whose message echoes the raw store
-      // URI must never write its credentials to the log sink. Rejections may
+      // Scrub defensively: a setup failure whose message echoes a connection
+      // string must never write its credentials to the log sink. Rejections may
       // carry non-Error values (string throws) — keep their text so it gets
       // scrubbed rather than dropped.
       logger.warn(
@@ -378,7 +362,7 @@ export class TenantRuntime implements ITenantRuntime {
   // =========================================================================
 
   /**
-   * Close the tracing MongoClient. Idempotent — safe to call from multiple
+   * Shut down tracing, flushing buffered spans. Idempotent — safe to call from multiple
    * signal handlers. TS-only addition: Python's uvicorn handles SIGTERM
    * itself, so the Python `TenantRuntime` has no equivalent method.
    */

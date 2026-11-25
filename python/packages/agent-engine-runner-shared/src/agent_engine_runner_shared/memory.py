@@ -902,6 +902,7 @@ def search_semantic_memory(
     user_id: Optional[str] = None,
     visibility: Optional[str] = None,
     top_k: int = 10,
+    include_history: bool = False,
 ) -> List[Dict[str, Any]]:
     """
     Search semantic memories by query.
@@ -910,8 +911,12 @@ def search_semantic_memory(
         memory_engine: The MemoryEngine instance (or None)
         query: Search query text
         org_id: Organization ID for multi-tenancy
+        project_id: Project ID for multi-tenancy
         user_id: Optional user ID filter
+        visibility: Optional visibility filter
         top_k: Maximum number of results
+        include_history: Defaults to False (returns current versions only).
+            When True, retained predecessor versions are also searched.
 
     Returns:
         List of matching semantic entries with label, text, and metadata
@@ -926,6 +931,7 @@ def search_semantic_memory(
         user_id=user_id,
         visibility=visibility,
         top_k=top_k,
+        include_history=include_history,
     )
 
     results = []
@@ -933,6 +939,18 @@ def search_semantic_memory(
         chunk_meta = getattr(chunk, "metadata", {}) or {}
         results.append(
             {
+                "id": getattr(chunk, "id", None),
+                "timestamp": getattr(chunk, "timestamp", None),
+                **{
+                    key: chunk_meta[key]
+                    for key in (
+                        "memory_lineage_id",
+                        "version",
+                        "is_latest",
+                        "previous_version_id",
+                    )
+                    if key in chunk_meta
+                },
                 "label": chunk_meta.get("label", ""),
                 "text": getattr(chunk, "text", getattr(chunk, "content", "")),
                 "source": chunk_meta.get("source", ""),

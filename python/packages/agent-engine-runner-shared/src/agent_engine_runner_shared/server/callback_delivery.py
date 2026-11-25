@@ -8,6 +8,7 @@ from typing import Any, Awaitable, Callable, NamedTuple, Optional
 
 import httpx
 
+from agent_engine_runner_shared.context import bind_log_execution_id
 from agent_engine_runner_shared.server.http_retry import (
     is_retryable_callback_error,
     post_json_with_retries,
@@ -213,6 +214,11 @@ class CallbackDelivery:
         )
 
     async def _redeliver(self, callback_key: _CallbackKey) -> None:
+        # The key, not the context that started the task, names the execution.
+        with bind_log_execution_id(callback_key.execution_id):
+            await self._redeliver_bound(callback_key)
+
+    async def _redeliver_bound(self, callback_key: _CallbackKey) -> None:
         execution_id = callback_key.execution_id
         delay = CALLBACK_POST_BASE_DELAY_S
         try:

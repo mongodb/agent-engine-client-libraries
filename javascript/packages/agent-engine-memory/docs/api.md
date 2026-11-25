@@ -237,7 +237,8 @@ discoverProcedures(args): Promise<Record<string, unknown>[]>;
 
 | Parameter | Type |
 | :------ | :------ |
-| `args` | \{ `metadataFilter?`: `Record`\<`string`, `unknown`\> \| `null`; `query`: `string`; `similarityThreshold?`: `number`; `tags?`: `string`[] \| `null`; `topK?`: `number`; `userId?`: `string` \| `null`; `visibility?`: `string` \| `null`; \} |
+| `args` | \{ `includeHistory?`: `boolean`; `metadataFilter?`: `Record`\<`string`, `unknown`\> \| `null`; `query`: `string`; `similarityThreshold?`: `number`; `tags?`: `string`[] \| `null`; `topK?`: `number`; `userId?`: `string` \| `null`; `visibility?`: `string` \| `null`; \} |
+| `args.includeHistory?` | `boolean` |
 | `args.metadataFilter?` | `Record`\<`string`, `unknown`\> \| `null` |
 | `args.query` | `string` |
 | `args.similarityThreshold?` | `number` |
@@ -715,7 +716,8 @@ searchSemantic(args): Promise<object[]>;
 
 | Parameter | Type |
 | :------ | :------ |
-| `args` | \{ `query`: `string`; `topK?`: `number`; `userId?`: `string` \| `null`; `visibility?`: `string` \| `null`; \} |
+| `args` | \{ `includeHistory?`: `boolean`; `query`: `string`; `topK?`: `number`; `userId?`: `string` \| `null`; `visibility?`: `string` \| `null`; \} |
+| `args.includeHistory?` | `boolean` |
 | `args.query` | `string` |
 | `args.topK?` | `number` |
 | `args.userId?` | `string` \| `null` |
@@ -1223,7 +1225,8 @@ discoverProcedures(args): Promise<Record<string, unknown>[]>;
 
 | Parameter | Type |
 | :------ | :------ |
-| `args` | \{ `metadataFilter?`: `Record`\<`string`, `unknown`\> \| `null`; `query`: `string`; `similarityThreshold?`: `number`; `tags?`: `string`[] \| `null`; `topK?`: `number`; `userId?`: `string` \| `null`; `visibility?`: `string` \| `null`; \} |
+| `args` | \{ `includeHistory?`: `boolean`; `metadataFilter?`: `Record`\<`string`, `unknown`\> \| `null`; `query`: `string`; `similarityThreshold?`: `number`; `tags?`: `string`[] \| `null`; `topK?`: `number`; `userId?`: `string` \| `null`; `visibility?`: `string` \| `null`; \} |
+| `args.includeHistory?` | `boolean` |
 | `args.metadataFilter?` | `Record`\<`string`, `unknown`\> \| `null` |
 | `args.query` | `string` |
 | `args.similarityThreshold?` | `number` |
@@ -1484,7 +1487,8 @@ searchSemantic(args): Promise<object[]>;
 
 | Parameter | Type |
 | :------ | :------ |
-| `args` | \{ `query`: `string`; `topK?`: `number`; `userId?`: `string` \| `null`; `visibility?`: `string` \| `null`; \} |
+| `args` | \{ `includeHistory?`: `boolean`; `query`: `string`; `topK?`: `number`; `userId?`: `string` \| `null`; `visibility?`: `string` \| `null`; \} |
+| `args.includeHistory?` | `boolean` |
 | `args.query` | `string` |
 | `args.topK?` | `number` |
 | `args.userId?` | `string` \| `null` |
@@ -2328,7 +2332,8 @@ discoverProcedures(args): Promise<Record<string, unknown>[]>;
 
 | Parameter | Type |
 | :------ | :------ |
-| `args` | \{ `metadataFilter?`: `Record`\<`string`, `unknown`\> \| `null`; `query`: `string`; `similarityThreshold?`: `number`; `tags?`: `string`[] \| `null`; `topK?`: `number`; `userId?`: `string` \| `null`; `visibility?`: `string` \| `null`; \} |
+| `args` | \{ `includeHistory?`: `boolean`; `metadataFilter?`: `Record`\<`string`, `unknown`\> \| `null`; `query`: `string`; `similarityThreshold?`: `number`; `tags?`: `string`[] \| `null`; `topK?`: `number`; `userId?`: `string` \| `null`; `visibility?`: `string` \| `null`; \} |
+| `args.includeHistory?` | `boolean` |
 | `args.metadataFilter?` | `Record`\<`string`, `unknown`\> \| `null` |
 | `args.query` | `string` |
 | `args.similarityThreshold?` | `number` |
@@ -2417,7 +2422,8 @@ searchSemantic(args): Promise<object[]>;
 
 | Parameter | Type |
 | :------ | :------ |
-| `args` | \{ `query`: `string`; `topK?`: `number`; `userId?`: `string` \| `null`; `visibility?`: `string` \| `null`; \} |
+| `args` | \{ `includeHistory?`: `boolean`; `query`: `string`; `topK?`: `number`; `userId?`: `string` \| `null`; `visibility?`: `string` \| `null`; \} |
+| `args.includeHistory?` | `boolean` |
 | `args.query` | `string` |
 | `args.topK?` | `number` |
 | `args.userId?` | `string` \| `null` |

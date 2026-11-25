@@ -2241,6 +2241,16 @@ describe("SecureToolWrapper.executeTool authorization_required elicitation", () 
     resetHooks();
   });
 
+  const stepNumbers = (fetchMock: ReturnType<typeof vi.fn>): unknown[] =>
+    fetchMock.mock.calls.map(
+      ([, init]) =>
+        (
+          JSON.parse(String((init as RequestInit).body)) as {
+            step_number: unknown;
+          }
+        ).step_number,
+    );
+
   test("fails instead of running the tool when Continue resumes before consent", async () => {
     // On a native resume interrupt() returns the Continue answer instead of
     // pausing; OE still has no token, so it challenges again.
@@ -2249,6 +2259,7 @@ describe("SecureToolWrapper.executeTool authorization_required elicitation", () 
         proceed: false,
         reason: "authorization required",
         status: "suspend",
+        latest_step_number: 5,
         elicitation: {
           elicitation_id: "elic-abc",
           authorization_url:
@@ -2272,9 +2283,13 @@ describe("SecureToolWrapper.executeTool authorization_required elicitation", () 
     expect((err as ToolExecutionError).error).toBe(
       "OAuth authorization is still required after continuation",
     );
-    expect(fetchMock).toHaveBeenCalledTimes(2);
+    // The recheck takes a step after OE's watermark, never the challenged one.
+    expect(stepNumbers(fetchMock)).toEqual([1, 6]);
     expect(mockInterrupt).toHaveBeenCalledTimes(1);
+    // The kind keeps the interrupt ID public through OE, unlike a legacy
+    // reason/context payload.
     expect(mockInterrupt).toHaveBeenCalledWith({
+      kind: "oauth_authorization",
       suspend_reason: "authorization_required",
       suspend_context: {
         authorization_url:
@@ -2321,7 +2336,7 @@ describe("SecureToolWrapper.executeTool authorization_required elicitation", () 
     });
 
     expect(result).toBe('{"repos": ["qualification-repo"]}');
-    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(stepNumbers(fetchMock)).toEqual([1, 2]);
     expect(mockInterrupt).toHaveBeenCalledTimes(1);
   });
 

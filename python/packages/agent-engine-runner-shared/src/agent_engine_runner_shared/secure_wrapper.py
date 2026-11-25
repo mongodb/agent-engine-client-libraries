@@ -468,7 +468,13 @@ def _tool_error_message(error: Exception) -> str:
     return message or _DURABLE_TOOL_FAILURE_FALLBACK
 
 
-def _encode_durable_tool_failure(error: Exception) -> str:
+def encode_tool_failure(error: Exception) -> str:
+    """Encode a tool call's failure as a string a durable record can keep.
+
+    The string holds the failure's kind, its redacted message and its
+    classification fields. ``decode_tool_failure`` rebuilds the same error type
+    from it, in this process or another.
+    """
     # OE persists this record and replays its message to the model.
     payload: dict[str, Any] = {
         "kind": "execution",
@@ -503,7 +509,12 @@ def _encode_durable_tool_failure(error: Exception) -> str:
     )
 
 
-def _decode_durable_tool_failure(message: str, cause: Exception) -> ToolExecutionError:
+def decode_tool_failure(message: str, cause: Optional[Exception] = None) -> ToolExecutionError:
+    """Rebuild the error ``encode_tool_failure`` recorded, with its class and fields.
+
+    A string without the encoding's prefix is OE's own failure message;
+    ``cause`` is the replayed activity failure that carried it, if any.
+    """
     if not message.startswith(_DURABLE_TOOL_FAILURE_PREFIX):
         # Every failure a runner reports is prefixed, so this one is OE's own.
         if (
@@ -1315,7 +1326,7 @@ class SecureToolWrapper:
             except _OAuthAuthorizationRequired as consent:
                 if authorization_attempt:
                     raise _DurableToolActivityFailedError(
-                        _encode_durable_tool_failure(
+                        encode_tool_failure(
                             ToolExecutionError(
                                 "OAuth authorization is still required after continuation"
                             )
@@ -1337,9 +1348,7 @@ class SecureToolWrapper:
                     raise DurableActivityInterrupted(error) from error
                 if not isinstance(error, Exception):
                     raise
-                raise _DurableToolActivityFailedError(
-                    _encode_durable_tool_failure(error)
-                ) from error
+                raise _DurableToolActivityFailedError(encode_tool_failure(error)) from error
             if result is _CALL_INTERRUPTED:
                 result = dict(_INTERRUPTED_WIRE_MARKER)
             elif isinstance(result, dict) and CALL_INTERRUPTED_ARTIFACT_KEY in result:
@@ -1350,9 +1359,7 @@ class SecureToolWrapper:
                 # non-JSON result has the same public failure live and on replay.
                 semantic_input_from_json(result)
             except Exception as error:
-                raise _DurableToolActivityFailedError(
-                    _encode_durable_tool_failure(error)
-                ) from error
+                raise _DurableToolActivityFailedError(encode_tool_failure(error)) from error
             return (
                 _OAuthResourceOutcome(result=result).model_dump(mode="json") if provider else result
             )
@@ -1496,7 +1503,7 @@ class SecureToolWrapper:
                     raise error.__cause__ from None
                 raise PolicyDeniedException(str(error)) from error
             except (ReplayedActivityFailedError, _DurableToolActivityFailedError) as error:
-                raise _decode_durable_tool_failure(str(error), error) from error
+                raise decode_tool_failure(str(error), error) from error
             except WorkflowClientError:
                 raise
 
@@ -1626,17 +1633,17 @@ class SecureToolWrapper:
         """Execute one OE-gated phase, preserving typed OAuth control on the durable route.
 
         Durable callers record consent before pausing outside the activity.
-        Native callers retain their checkpoint hook until the compatibility follow-up.
+        Native callers reauthorize after the checkpoint hook returns; its answer
+        is never the resource result. Their explicit OAuth interrupt retains its
+        public ID so consent cannot answer a later application wait.
         Resource results and ordinary rejections keep their existing semantics.
         """
         effective_is_local = is_local and not provider and not scopes
         effective_local_executor = local_executor if effective_is_local else None
-        # 1. Request approval from OE. On a native resume interrupt() returns the
-        # Continue answer instead of pausing, so the token gate is asked once more;
-        # as on the durable route, a second challenge fails rather than yielding None.
-        continued = False
-        while True:
-            response = request_oe_approval_retryable(
+
+        def approve() -> ToolExecuteResponse:
+            """Ask OE's token gate for this call at the current operational step."""
+            return request_oe_approval_retryable(
                 request_oe_approval,
                 oe_url=self.oe_url,
                 execution_id=self.execution_id,
@@ -1651,14 +1658,14 @@ class SecureToolWrapper:
                 metadata=metadata,
                 custom_headers=self.custom_headers,
             )
-            if not response.elicitation:
-                break
+
+        response = approve()
+
+        if response.elicitation:
             if current_attempt_context() is not None:
                 raise _OAuthAuthorizationRequired(
                     response.elicitation, max(step, response.latest_step_number or step)
                 )
-            if continued:
-                raise ToolExecutionError("OAuth authorization is still required after continuation")
             from agent_engine_runner_shared.hooks import get_suspend_handler
 
             interrupt = get_suspend_handler()
@@ -1668,8 +1675,12 @@ class SecureToolWrapper:
                     "Ensure the framework SDK calls register_suspend_handler() before run()."
                 )
 
+            # A bare reason/context is a legacy tool-review payload: OE strips
+            # its interrupt envelope. Keep OAuth addressable by its native ID
+            # so a consent answer cannot also satisfy a later parent-node wait.
             interrupt(
                 {
+                    "kind": "oauth_authorization",
                     "suspend_reason": "authorization_required",
                     "suspend_context": {
                         "authorization_url": response.elicitation.authorization_url,
@@ -1679,7 +1690,14 @@ class SecureToolWrapper:
                     },
                 }
             )
-            continued = True
+            # On a native resume interrupt() returns the consent answer, which is
+            # never the resource result. Ask the token gate again at a fresh step;
+            # as on the durable route, a second challenge fails before any API call.
+            self.observe_operational_step(max(step, response.latest_step_number or step))
+            step = self.next_operational_step()
+            response = approve()
+            if response.elicitation:
+                raise ToolExecutionError("OAuth authorization is still required after continuation")
 
         if not response.proceed:
             reason = response.reason or "Policy denied"

@@ -102,6 +102,29 @@ describe("AppBoundRuntime", () => {
     expect(calls[0].headers["X-Agent-Engine-Agent-Id"]).toBe("ws-7");
     expect(calls[0].headers["X-Agentic-Agent-Id"]).toBe("ws-7");
   });
+
+  it("routes discoverProcedures through the OE proxy and forwards includeHistory only when enabled", async () => {
+    const { calls } = stubFetch({ memories: [] });
+    const rt = new AppBoundRuntime();
+    await withContext(
+      { oeUrl: "http://oe.test", executionId: "exec-42", userId: "u1" },
+      async () => {
+        await rt.discoverProcedures({ query: "deploy", userId: "u1" });
+        await rt.discoverProcedures({
+          query: "deploy",
+          userId: "u1",
+          includeHistory: true,
+        });
+      },
+    );
+    expect(calls[0].url).toBe("http://oe.test/api/v1/memory/search");
+    expect(
+      "include_history" in (calls[0].body as Record<string, unknown>),
+    ).toBe(false);
+    expect((calls[1].body as Record<string, unknown>).include_history).toBe(
+      true,
+    );
+  });
 });
 
 const CONTEXT_OK = {

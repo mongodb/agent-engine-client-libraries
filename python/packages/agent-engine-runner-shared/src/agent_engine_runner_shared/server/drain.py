@@ -47,6 +47,8 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
+from agent_engine_runner_shared.context import bind_log_execution_id
+
 logger = logging.getLogger(__name__)
 
 __all__ = [
@@ -731,4 +733,7 @@ def register_drain_route(
                 raise HTTPException(status_code=403, detail="workspace mismatch")
         if request.deadline_at_ms > _now_ms() + registry.max_deadline_ms:
             raise HTTPException(status_code=400, detail="deadline exceeds maximum")
-        return registry.apply(request)
+        # Bind-only, not an output scope, because the finalize task created by
+        # apply() inherits it and outlives this request.
+        with bind_log_execution_id(request.execution_id):
+            return registry.apply(request)

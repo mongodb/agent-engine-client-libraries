@@ -5,6 +5,7 @@ import { create } from "@bufbuild/protobuf";
 import { AttemptHeartbeatRequestSchema } from "../generated/workflow/v1/runtime_pb.js";
 import type { AttemptContext } from "../generated/workflow/v1/runtime_pb.js";
 import { WorkflowErrorCode } from "../generated/workflow/v1/common_pb.js";
+import { runWithLogCorrelation } from "../log_correlation.js";
 import { getLogger } from "../logger.js";
 import { heartbeatIntervalMs } from "./attempt.js";
 import { WorkflowClientError, type WorkflowClient } from "./client.js";
@@ -40,7 +41,7 @@ export class AttemptHeartbeat {
       });
     }
     const interval = heartbeatIntervalMs(this.attempt.heartbeatIntervalMs);
-    this.timer = setInterval(() => {
+    const tick = (): void => {
       this.inFlight = this.inFlight.then(async () => {
         if (this.stopped) return;
         try {
@@ -64,7 +65,14 @@ export class AttemptHeartbeat {
           );
         }
       });
-    }, interval);
+    };
+    // The attempt names its own execution. Unbound, the timer would keep
+    // whatever context started it.
+    const executionId = this.attempt.workflowIdentity?.executionId;
+    this.timer = setInterval(
+      executionId ? () => runWithLogCorrelation(executionId, tick) : tick,
+      interval,
+    );
     this.timer.unref();
   }
 

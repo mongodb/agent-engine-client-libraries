@@ -100,6 +100,7 @@ class MemoryRuntime(Protocol):
         user_id: str | None = None,
         visibility: str | None = None,
         top_k: int = 50,
+        include_history: bool = False,
     ) -> list[MemoryChunk]: ...
 
     def search_episodes(
@@ -132,6 +133,7 @@ class MemoryRuntime(Protocol):
         top_k: int = 10,
         similarity_threshold: float = 0.0,
         metadata_filter: dict[str, Any] | None = None,
+        include_history: bool = False,
     ) -> list[dict[str, Any]]: ...
 
 

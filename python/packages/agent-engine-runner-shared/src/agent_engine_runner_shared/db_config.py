@@ -21,8 +21,8 @@ _ENV_VAR = "MDB_AGENTIC_STORE_DB"
 # requires a live MongoClient (to list databases) which is not available when
 # get_store_db_name runs during construction, so it is deferred to the first
 # consumer that has a client and cached process-wide — one list_database_names
-# round trip per base, shared by traces, the checkpointer, and ADK sessions
-# (which use the same base in normal deployments).
+# round trip per base, shared by the checkpointer and ADK sessions (which use
+# the same base in normal deployments).
 _resolved_store_db: dict[str, str] = {}
 
 

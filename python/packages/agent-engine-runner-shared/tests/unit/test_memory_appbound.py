@@ -270,6 +270,70 @@ def test_search_semantic_maps_dicts_to_chunks() -> None:
     assert chunk.metadata["id"] == "doc-1"
 
 
+@pytest.mark.parametrize("include_history", [False, True])
+def test_facade_history_search_reaches_engine_with_identity_and_version_metadata(
+    monkeypatch: pytest.MonkeyPatch, include_history: bool
+) -> None:
+    from agent_engine_sdk_memory import Memory
+
+    from agent_engine_runner_shared.runtime import TenantRuntime
+
+    _set_ambient(monkeypatch, user_id="ambient-user")
+    tenant = object.__new__(TenantRuntime)
+    tenant.org_id = "org"
+    tenant.project_id = "project"
+    engine = MagicMock()
+    tenant._memory_engine = engine
+    timestamp = datetime(2026, 6, 17, tzinfo=timezone.utc)
+    engine.fetch_semantic_memories.return_value = [
+        MemoryChunk(
+            id="version-1",
+            content="Retained fact",
+            source=MemorySource.SEMANTIC,
+            timestamp=timestamp,
+            metadata={"memory_lineage_id": "lineage", "version": 1, "is_latest": False},
+        )
+    ]
+    memory = Memory(runtime=AppBoundRuntime(tenant))
+
+    result = memory.search_semantic(query="fact", top_k=3, include_history=include_history)
+
+    engine.fetch_semantic_memories.assert_called_once_with(
+        query="fact",
+        org_id="org",
+        project_id="project",
+        user_id="ambient-user",
+        visibility=None,
+        top_k=3,
+        include_history=include_history,
+    )
+    assert result[0].id == "version-1"
+    assert result[0].timestamp == timestamp
+    assert result[0].metadata["memory_lineage_id"] == "lineage"
+    assert result[0].metadata["version"] == 1
+    assert result[0].metadata["is_latest"] is False
+
+
+@pytest.mark.parametrize("include_history", [False, True])
+def test_facade_history_search_propagates_engine_failure(
+    monkeypatch: pytest.MonkeyPatch, include_history: bool
+) -> None:
+    from agent_engine_sdk_memory import Memory
+
+    from agent_engine_runner_shared.runtime import TenantRuntime
+
+    _set_ambient(monkeypatch, user_id="ambient-user")
+    tenant = object.__new__(TenantRuntime)
+    tenant.org_id = "org"
+    tenant.project_id = "project"
+    tenant._memory_engine = MagicMock()
+    tenant._memory_engine.fetch_semantic_memories.side_effect = RuntimeError("search unavailable")
+    memory = Memory(runtime=AppBoundRuntime(tenant))
+
+    with pytest.raises(RuntimeError, match="search unavailable"):
+        memory.search_semantic(query="fact", include_history=include_history)
+
+
 def test_search_semantic_missing_fields_still_valid() -> None:
     tenant = MagicMock()
     tenant.search_semantic.return_value = [{"label": "no-content-no-id"}]
@@ -380,7 +444,10 @@ def test_search_taxonomic_definition_only_content() -> None:
 
 def test_discover_procedures_returns_list_unchanged() -> None:
     tenant = MagicMock()
-    payload: list[dict[str, Any]] = [{"procedure": "p1"}, {"procedure": "p2"}]
+    payload: list[dict[str, Any]] = [
+        {"procedure": "p1", "memory_lineage_id": "lineage-1", "version": 2, "is_latest": True},
+        {"procedure": "p2", "memory_lineage_id": "lineage-2", "version": 3, "is_latest": False},
+    ]
     tenant.discover_procedures.return_value = payload
     rt = AppBoundRuntime(tenant)
 
@@ -399,6 +466,51 @@ def test_discover_procedures_returns_list_unchanged() -> None:
     assert kwargs["top_k"] == 7
     assert kwargs["visibility"] == "private"
     assert kwargs["metadata_filter"] == {"k": "v"}
+    assert kwargs["include_history"] is False
+
+
+@pytest.mark.parametrize("include_history", [False, True])
+def test_facade_discover_procedures_history_reaches_engine(
+    monkeypatch: pytest.MonkeyPatch, include_history: bool
+) -> None:
+    from agent_engine_sdk_memory import Memory
+
+    from agent_engine_runner_shared.runtime import TenantRuntime
+
+    _set_ambient(monkeypatch, user_id="ambient-user")
+    tenant = object.__new__(TenantRuntime)
+    tenant.org_id = "org"
+    tenant.project_id = "project"
+    engine = MagicMock()
+    tenant._memory_engine = engine
+    engine.discover_procedures.return_value = [
+        {
+            "id": "proc-v1",
+            "procedure": "deploy",
+            "version": 1,
+            "is_latest": False,
+            "memory_lineage_id": "lineage-1",
+        }
+    ]
+    memory = Memory(runtime=AppBoundRuntime(tenant))
+
+    rows = memory.discover_procedures(query="deploy", top_k=4, include_history=include_history)
+
+    expected_kwargs: dict[str, Any] = dict(
+        query="deploy",
+        org_id="org",
+        user_id="ambient-user",
+        visibility=None,
+        project_id="project",
+        tags=None,
+        top_k=4,
+        similarity_threshold=0.0,
+    )
+    if include_history:
+        expected_kwargs["include_history"] = True
+    engine.discover_procedures.assert_called_once_with(**expected_kwargs)
+    assert rows[0]["memory_lineage_id"] == "lineage-1"
+    assert rows[0]["is_latest"] is False
 
 
 def test_record_turn_user_maps_to_message() -> None:

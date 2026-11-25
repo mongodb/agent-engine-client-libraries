@@ -43,8 +43,8 @@ import { z } from "zod";
 import { LangGraphBaseAgent } from "../src/agent.js";
 import type { DurableSession } from "../src/durable_session.js";
 import {
-  withDurableOAuthTask,
   withDurableToolResultIdentity,
+  withOAuthTask,
 } from "../src/durable_tools.js";
 import { PlatformCheckpointer } from "../src/platform_checkpointer.js";
 import { SecureWrappedLLM } from "../src/secure_llm.js";
@@ -2627,10 +2627,7 @@ describe("durable delegated OAuth consent", () => {
       },
     );
     return lcTool(
-      withDurableToolResultIdentity(
-        withDurableOAuthTask(secure, name),
-        name,
-      ) as never,
+      withDurableToolResultIdentity(withOAuthTask(secure, name), name) as never,
       {
         name,
         description: `${name} tool`,

@@ -247,6 +247,9 @@ class AgentToAgent:
                     if skill:
                         span.set_attribute("a2a.skill", skill)
                     resp, data = self._invoke_with_retry(client, body)
+                    target_agent_name = data.get("target_agent_name", "")
+                    if target_agent_name:
+                        span.set_attribute("a2a.target_agent_name", target_agent_name)
                     if resp.status_code >= 400:
                         # Inside the span so failures record ERROR.
                         resp.raise_for_status()

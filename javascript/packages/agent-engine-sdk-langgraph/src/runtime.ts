@@ -80,7 +80,7 @@ import type { AnyBackendProtocol } from "deepagents";
 import type { BaseCheckpointSaver } from "@langchain/langgraph";
 import { withEmptyBatchGuard } from "./checkpointer.js";
 import {
-  withDurableOAuthTask,
+  withOAuthTask,
   withDurableToolResultIdentity,
 } from "./durable_tools.js";
 import { LangGraphBaseAgent } from "./agent.js";
@@ -234,8 +234,6 @@ export interface AppOptions {
   appName: string;
   appVersion?: string;
   mongodbUri?: string | null;
-  databaseName?: string | null;
-  tracesCollectionName?: string;
   /** @deprecated Ignored. The org is taken from the `ORG_ID` env var, which the platform injects. */
   orgId?: string | null;
 }
@@ -492,12 +490,6 @@ export class App extends BaseApp {
       }),
       ...(options.mongodbUri !== undefined && {
         mongodbUri: options.mongodbUri,
-      }),
-      ...(options.databaseName !== undefined && {
-        databaseName: options.databaseName,
-      }),
-      ...(options.tracesCollectionName !== undefined && {
-        tracesCollectionName: options.tracesCollectionName,
       }),
     };
     this.runtime = new TenantRuntime(runtimeOpts);
@@ -1580,7 +1572,7 @@ export class App extends BaseApp {
         },
       );
       const durableWrapperFunc = withDurableToolResultIdentity(
-        provider ? withDurableOAuthTask(wrapperFunc, toolName) : wrapperFunc,
+        provider ? withOAuthTask(wrapperFunc, toolName) : wrapperFunc,
         toolName,
       );
       // Forward the original tool's Zod schema. Without it, lcTool() builds a

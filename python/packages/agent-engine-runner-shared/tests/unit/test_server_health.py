@@ -32,8 +32,6 @@ class _HealthTestServer(BaseServer):
 @pytest.fixture
 def reset_tracing_flags(monkeypatch):
     """Isolate tracing_setup's exporter-state flags across tests."""
-    monkeypatch.setattr(tracing_setup, "_mongodb_exporter_attached", False)
-    monkeypatch.setattr(tracing_setup, "_mongodb_degraded", False)
     monkeypatch.setattr(tracing_setup, "_platform_exporter", None)
     return monkeypatch
 
@@ -41,40 +39,6 @@ def reset_tracing_flags(monkeypatch):
 def _health_client() -> TestClient:
     server = _HealthTestServer(SimpleNamespace(app_name="test-app"))
     return TestClient(server.create_app())
-
-
-def test_health_reports_degraded_when_trace_store_unreachable(reset_tracing_flags):
-    reset_tracing_flags.setattr(tracing_setup, "_mongodb_degraded", True)
-
-    resp = _health_client().get("/health")
-
-    assert resp.status_code == 200
-    body = resp.json()
-    assert body["status"] == "degraded"
-    assert body["details"]["tracing"] == {
-        "database_exporter": "degraded",
-        "platform_exporter": "disabled",
-    }
-    # Mode-specific details survive alongside the nested tracing detail.
-    assert body["details"]["tools_registered"] == 2
-    assert body["component"] == "test-app"
-    assert body["mode"] == "aer"
-    assert body["version"] == "1.0.0"
-
-
-def test_health_reports_healthy_when_trace_store_attached(reset_tracing_flags):
-    reset_tracing_flags.setattr(tracing_setup, "_mongodb_exporter_attached", True)
-
-    resp = _health_client().get("/health")
-
-    assert resp.status_code == 200
-    body = resp.json()
-    assert body["status"] == "healthy"
-    assert body["details"]["tracing"] == {
-        "database_exporter": "attached",
-        "platform_exporter": "disabled",
-    }
-    assert body["details"]["tools_registered"] == 2
 
 
 def test_health_reports_degraded_when_platform_exporter_failed(reset_tracing_flags):
@@ -87,10 +51,12 @@ def test_health_reports_degraded_when_platform_exporter_failed(reset_tracing_fla
     assert resp.status_code == 200
     body = resp.json()
     assert body["status"] == "degraded"
-    assert body["details"]["tracing"] == {
-        "database_exporter": "disabled",
-        "platform_exporter": "degraded",
-    }
+    assert body["details"]["tracing"] == {"platform_exporter": "degraded"}
+    # Mode-specific details survive alongside the nested tracing detail.
+    assert body["details"]["tools_registered"] == 2
+    assert body["component"] == "test-app"
+    assert body["mode"] == "aer"
+    assert body["version"] == "1.0.0"
 
 
 def test_health_reports_healthy_when_platform_exporter_attached(reset_tracing_flags):
@@ -103,22 +69,16 @@ def test_health_reports_healthy_when_platform_exporter_attached(reset_tracing_fl
     assert resp.status_code == 200
     body = resp.json()
     assert body["status"] == "healthy"
-    assert body["details"]["tracing"] == {
-        "database_exporter": "disabled",
-        "platform_exporter": "attached",
-    }
+    assert body["details"]["tracing"] == {"platform_exporter": "attached"}
 
 
-def test_health_reports_tracing_disabled_when_no_store_configured(reset_tracing_flags):
+def test_health_reports_tracing_disabled_when_oe_url_unset(reset_tracing_flags):
     resp = _health_client().get("/health")
 
     assert resp.status_code == 200
     body = resp.json()
     assert body["status"] == "healthy"
-    assert body["details"]["tracing"] == {
-        "database_exporter": "disabled",
-        "platform_exporter": "disabled",
-    }
+    assert body["details"]["tracing"] == {"platform_exporter": "disabled"}
     assert body["details"]["tools_registered"] == 2
 
 
@@ -137,5 +97,5 @@ def test_health_ok_when_tracing_extra_not_installed(monkeypatch, reset_tracing_f
     assert resp.status_code == 200
     body = resp.json()
     assert body["status"] == "healthy"
-    assert body["details"]["tracing"] == {"database_exporter": "disabled"}
+    assert body["details"]["tracing"] == {"platform_exporter": "disabled"}
     assert body["details"]["tools_registered"] == 2

@@ -61,21 +61,28 @@ load_dotenv()
 # =============================================================================
 
 # MongoDB config - application's own database for policies, claims, etc.
-MONGODB_URI = os.environ.get("MONGODB_URI", "")
+# The deployed secret is INSURANCE_AGENT_MONGODB_URI; MONGODB_URI is the
+# platform default that local dev and the integration harness inject.
+MONGODB_URI = os.environ.get("INSURANCE_AGENT_MONGODB_URI") or os.environ.get("MONGODB_URI", "")
 MONGODB_DATABASE = os.environ.get("MONGODB_DATABASE", "insurance-agent")
-LLM_PROVIDER_ENV_VARS = {
-    "gemini": "GEMINI_API_KEY",
-    "openai": "OPENAI_API_KEY",
-    "anthropic": "ANTHROPIC_API_KEY",
-    "cerebras": "CEREBRAS_API_KEY",
+# LLM_API_KEY is shared across providers; provider-specific names are fallbacks
+# for the integration harness.
+LLM_PROVIDER_ENV_VARS: dict[str, tuple[str, ...]] = {
+    "gemini": ("LLM_API_KEY", "GEMINI_API_KEY"),
+    "openai": ("LLM_API_KEY", "OPENAI_API_KEY"),
+    "anthropic": ("LLM_API_KEY", "ANTHROPIC_API_KEY"),
+    "cerebras": ("LLM_API_KEY", "CEREBRAS_API_KEY"),
 }
-DEFAULT_PROVIDER = "gemini"
+DEFAULT_PROVIDER = "openai"
 DEFAULT_MODELS = {
     "anthropic": "claude-sonnet-5",
     "cerebras": "gpt-oss-120b",
     "gemini": "gemini-3.8-flash",
     "openai": "gpt-5.6-luna",
 }
+# Default to Grove so LLM access needs only LLM_API_KEY; CI sets
+# OPENAI_BASE_URL to its Azure endpoint.
+GROVE_OPENAI_BASE_URL = "https://grove-gateway-prod.azure-api.net/grove-foundry-prod/openai/v1"
 # An OpenAI request occasionally stalls without ever responding. Without a
 # timeout the SDK waits 600 s, longer than a turn should take. The timeout
 # bounds silence between bytes, not the whole response. The platform's tool
@@ -88,9 +95,10 @@ OPENAI_MAX_RETRIES = 0
 
 
 def _llm_provider_api_keys() -> dict[str, str]:
-    return {
-        provider: os.environ.get(env_var, "") for provider, env_var in LLM_PROVIDER_ENV_VARS.items()
-    }
+    keys: dict[str, str] = {}
+    for provider, env_vars in LLM_PROVIDER_ENV_VARS.items():
+        keys[provider] = next((os.environ[name] for name in env_vars if os.environ.get(name)), "")
+    return keys
 
 
 def _selected_llm_provider(
@@ -98,15 +106,18 @@ def _selected_llm_provider(
     api_keys: dict[str, str],
 ) -> str:
     provider = configured_provider.strip().lower()
-    env_var = LLM_PROVIDER_ENV_VARS.get(provider)
-    if env_var is None:
+    env_vars = LLM_PROVIDER_ENV_VARS.get(provider)
+    if env_vars is None:
         supported_providers = ", ".join(LLM_PROVIDER_ENV_VARS)
         raise ValueError(
             f"Unsupported provider {configured_provider!r}. Set DEFAULT_PROVIDER in "
             f"insurance_agent/main.py to one of: {supported_providers}."
         )
     if not api_keys[provider]:
-        raise ValueError(f"This agent is configured to use {provider!r}, but {env_var} is not set.")
+        raise ValueError(
+            f"This agent is configured to use {provider!r}, but none of "
+            f"{', '.join(env_vars)} is set."
+        )
     return provider
 
 
@@ -177,7 +188,10 @@ def _build_runtime_llm(
         _set_default_llm_option(llm_options, "timeout", OPENAI_TIMEOUT_S)
         _set_default_llm_option(llm_options, "max_retries", OPENAI_MAX_RETRIES)
         openai_base_url = _configured_openai_base_url()
-        if openai_base_url and "grove-foundry" in openai_base_url:
+        if not openai_base_url:
+            logger.info("OPENAI_BASE_URL unset - falling back to the Grove OpenAI base URL.")
+            openai_base_url = GROVE_OPENAI_BASE_URL
+        if "grove-foundry" in openai_base_url:
             llm_options["base_url"] = openai_base_url.split("/v1")[0] + "/v1"
             llm_options["default_headers"] = _default_headers_with_grove_api_key(
                 llm_options.get("default_headers"),
@@ -188,13 +202,7 @@ def _build_runtime_llm(
                 model=model_name,
                 **llm_options,
             )
-        if openai_base_url:
-            llm_options["base_url"] = openai_base_url.rstrip("/")
-            return cast(Any, ChatOpenAI)(
-                api_key=api_keys["openai"],
-                model=model_name,
-                **llm_options,
-            )
+        llm_options["base_url"] = openai_base_url.rstrip("/")
         return cast(Any, ChatOpenAI)(
             api_key=api_keys["openai"],
             model=model_name,

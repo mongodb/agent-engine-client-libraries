@@ -29,9 +29,9 @@
  * execution in platform code" guideline.
  */
 
-import { writeFileSync } from "node:fs";
+import { realpathSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { getLogger, setupLogging } from "./logger.js";
 import { runWithCustomerOrigin } from "./context.js";
@@ -546,9 +546,25 @@ export async function runLauncher(): Promise<void> {
 
 // CLI entrypoint guard: only auto-run when invoked as `node launcher.js`,
 // not when imported as a library (e.g., from tests or barrel re-exports).
-const isCliEntry =
-  process.argv[1] !== undefined &&
-  import.meta.url === pathToFileURL(process.argv[1]).href;
+// Real paths are compared because pnpm installs this package behind a
+// symlink: import.meta.url resolves the link, but process.argv[1] keeps it.
+function invokedAsScript(): boolean {
+  const script = process.argv[1];
+  if (script === undefined) {
+    return false;
+  }
+  if (import.meta.url === pathToFileURL(script).href) {
+    return true;
+  }
+  try {
+    return (
+      realpathSync(script) === realpathSync(fileURLToPath(import.meta.url))
+    );
+  } catch {
+    return false;
+  }
+}
+const isCliEntry = invokedAsScript();
 if (isCliEntry) {
   runLauncher().catch((e) => {
     return fatalWithTermination(

@@ -6,13 +6,23 @@
 
 import log4js, { type Logger } from "log4js";
 
+import { getLogOutputScope } from "../log_correlation.js";
 import {
   ACTIVE_CAPTURES,
   EXIT_FLUSH_REGISTERED,
   MAX_BUFFER_BYTES,
+  MAX_PENDING_BYTES,
+  MAX_PENDING_WRITERS,
   ORIGINAL_WRITE_SLOT,
+  RECORD_ATTRIBUTION,
   STDIO_CAPTURE_CATEGORY,
+  TRUNCATION_MARKER,
 } from "./constants.js";
+import {
+  currentLogAttribution,
+  getLogExecutionId,
+  type LogAttribution,
+} from "./layout.js";
 import { truncateUtf8 } from "./serialize.js";
 
 function withinJsonDepth(value: unknown, depth = 0): boolean {
@@ -42,6 +52,27 @@ export function snapshotOriginalWrite(stream: PatchableStream): WriteFn {
   return original;
 }
 
+interface PendingLine {
+  key: string;
+  scope: object | null;
+  attribution: LogAttribution;
+  text: string;
+  size: number;
+}
+
+// Map keys must be primitives to compose, so each scope object gets a number.
+const scopeIds = new WeakMap<object, number>();
+let nextScopeId = 1;
+
+function writerKey(scope: object | null, executionId: string | null): string {
+  let scopeId = 0;
+  if (scope !== null) {
+    scopeId = scopeIds.get(scope) ?? nextScopeId++;
+    scopeIds.set(scope, scopeId);
+  }
+  return JSON.stringify([scopeId, executionId]);
+}
+
 /**
  * Replacement for `process.stdout.write` / `process.stderr.write` that
  * routes writes through a logger.
@@ -49,20 +80,27 @@ export function snapshotOriginalWrite(stream: PatchableStream): WriteFn {
  * Bare `console.log` / `process.stdout.write` calls (and any other code
  * writing directly to the captured stream) are rewritten as log records
  * tagged with `source: "stdout"` (or `"stderr"`) so the layout can mark
- * them as such on the wire. Lines are buffered until newline, with a hard
- * byte cap so a producer writing without `\n` cannot grow the buffer
- * until OOM (see `MAX_BUFFER_BYTES`).
+ * them as such on the wire. Lines are buffered until newline, one pending
+ * line per writer (workload scope + execution) so concurrent executions'
+ * partial writes neither merge nor take each other's IDs. Each pending line
+ * carries the attribution its writer had when the line started. Hard byte
+ * and writer caps stop a producer writing without `\n` from growing the
+ * buffers until OOM (see `MAX_BUFFER_BYTES`, `MAX_PENDING_BYTES` and
+ * `MAX_PENDING_WRITERS`).
  *
  * Unlike the Python `LoggingStream` we do not need an `RLock` — Node's
- * event loop is single-threaded, so concurrent `write()` calls can't
- * interleave bytes mid-line. We also don't reproduce Python's
+ * event loop is single-threaded, so one `write()` call can't interleave
+ * bytes with another. We also don't reproduce Python's
  * `fileno()`/`buffer`/`encoding` delegation: we only patch the `write`
  * method, leaving `process.stdout`'s fd / TTY introspection intact for
  * subprocess piping, progress-bar libs, and grpc-internal logging.
  */
 /** @internal — exported only for tests; not part of the public API. */
 export class LoggingStream {
-  private buffer = "";
+  // Re-inserted on every write, so budget eviction drops the writer that
+  // wrote least recently.
+  private readonly pending = new Map<string, PendingLine>();
+  private pendingBytes = 0;
 
   constructor(
     private readonly logger: Logger,
@@ -83,17 +121,25 @@ export class LoggingStream {
           : String(chunk ?? "");
 
     if (text) {
-      this.buffer += text;
-      let newlineIdx = this.buffer.indexOf("\n");
-      while (newlineIdx !== -1) {
-        const line = this.buffer.slice(0, newlineIdx);
-        this.buffer = this.buffer.slice(newlineIdx + 1);
+      const scope = getLogOutputScope();
+      const key = writerKey(scope, getLogExecutionId());
+      const pending = this.pending.get(key);
+      this.pending.delete(key);
+      this.pendingBytes -= pending?.size ?? 0;
+      // Settle the pending state before emitting: an appender may flush this
+      // stream while a line is emitted.
+      const emits: Array<[string, LogAttribution]> = [];
+      const lines = ((pending?.text ?? "") + text).split("\n");
+      let tail = lines.pop() ?? "";
+      let attribution = pending?.attribution ?? currentLogAttribution();
+      for (const line of lines) {
         // Whitespace-only lines are uninteresting — emitting a JSON
         // record with `message: "   "` adds noise and makes downstream
         // filters work harder. Mirrors the `if line.strip()` filter in
         // the Python LoggingStream; do not "fix" by removing it.
-        if (line.trim()) this.emit(line);
-        newlineIdx = this.buffer.indexOf("\n");
+        if (line.trim()) emits.push([line, attribution]);
+        // Only the line that was pending began under the stored attribution.
+        attribution = currentLogAttribution();
       }
       // Force-emit a truncated record if a producer is writing without
       // newlines — mirrors the exc_traceback truncation pattern. Slice
@@ -101,9 +147,31 @@ export class LoggingStream {
       // Fluent Bit ships AND a partial multi-byte sequence at the cut
       // point is dropped rather than turned into U+FFFD replacement bytes
       // that would push the encoded payload back over the budget.
-      if (Buffer.byteLength(this.buffer, "utf-8") > MAX_BUFFER_BYTES) {
-        this.emit(truncateUtf8(this.buffer, MAX_BUFFER_BYTES));
-        this.buffer = "";
+      let size = Buffer.byteLength(tail, "utf-8");
+      if (size > MAX_BUFFER_BYTES) {
+        emits.push([truncateUtf8(tail, MAX_BUFFER_BYTES), attribution]);
+        tail = "";
+        size = 0;
+      }
+      if (tail) {
+        this.pending.set(key, { key, scope, attribution, text: tail, size });
+        this.pendingBytes += size;
+      }
+      for (const oldest of this.pending.values()) {
+        if (
+          this.pendingBytes <= MAX_PENDING_BYTES &&
+          this.pending.size <= MAX_PENDING_WRITERS
+        ) {
+          break;
+        }
+        this.pending.delete(oldest.key);
+        this.pendingBytes -= oldest.size;
+        if (oldest.text.trim()) {
+          emits.push([oldest.text + TRUNCATION_MARKER, oldest.attribution]);
+        }
+      }
+      for (const [line, lineAttribution] of emits) {
+        this.emit(line, lineAttribution);
       }
     }
 
@@ -115,19 +183,34 @@ export class LoggingStream {
   }
 
   /**
-   * Emit any buffered bytes that never got a trailing newline, then clear the
-   * buffer. Called on process exit so a final `console.log`/`process.stdout.
-   * write` without a `\n` right before shutdown is not lost — mirrors Python's
-   * `LoggingStream.flush()` (which the interpreter invokes when it flushes
-   * `sys.stdout` at shutdown). The same whitespace-only skip as `write()`
-   * applies: a blank tail is not worth a record.
+   * Emit every writer's buffered bytes that never got a trailing newline,
+   * each under its own attribution, then clear them. Called on process exit
+   * so a final `console.log`/`process.stdout.write` without a `\n` right
+   * before shutdown is not lost — mirrors Python's `LoggingStream.flush()`
+   * (which the interpreter invokes when it flushes `sys.stdout` at
+   * shutdown). The same whitespace-only skip as `write()` applies: a blank
+   * tail is not worth a record.
    */
   flush(): void {
-    if (this.buffer.trim()) this.emit(this.buffer);
-    this.buffer = "";
+    this.flushMatching(() => true);
   }
 
-  private emit(line: string): void {
+  flushScope(scope: object): void {
+    this.flushMatching((line) => line.scope === scope);
+  }
+
+  private flushMatching(matches: (line: PendingLine) => boolean): void {
+    const flushed = [...this.pending.values()].filter(matches);
+    for (const line of flushed) {
+      this.pending.delete(line.key);
+      this.pendingBytes -= line.size;
+    }
+    for (const line of flushed) {
+      if (line.text.trim()) this.emit(line.text, line.attribution);
+    }
+  }
+
+  private emit(line: string, attribution: LogAttribution): void {
     let level: "debug" | "info" | "warn" | "error" = this.level;
     if (this.source === "stdout") {
       try {
@@ -162,7 +245,27 @@ export class LoggingStream {
         // Non-JSON output retains the stream's default severity.
       }
     }
-    this.logger[level]({ source: this.source }, line);
+    this.logger[level](
+      { source: this.source, [RECORD_ATTRIBUTION]: attribution },
+      line,
+    );
+  }
+}
+
+type ActiveCaptures = { stdout: LoggingStream; stderr: LoggingStream };
+
+/** Lets a request's partial lines ship when it ends, not at a next newline. */
+export function flushCapturedOutput(scope: object): void {
+  const g = globalThis as unknown as Record<symbol, unknown>;
+  const active = g[ACTIVE_CAPTURES] as ActiveCaptures | undefined;
+  for (const stream of [active?.stdout, active?.stderr]) {
+    // Best-effort: a throwing appender must not fail the request or skip the
+    // other stream.
+    try {
+      stream?.flushScope(scope);
+    } catch {
+      // Dropped, as in Python's `suppress(Exception)`.
+    }
   }
 }
 

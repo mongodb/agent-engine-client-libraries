@@ -99,6 +99,13 @@ explicit `session_id` on episodic search — the core SDK and the app-bound path
 `project` tenancy is a separate axis (see the tenancy-source row) and is applied to every operation,
 search included.
 
+`get_procedure` by name: procedure names are unique per user within a project, so several users
+can hold a procedure of the same name. Without a visibility, it returns the caller's own procedure.
+With `visibility="shared"` or `"org"`, it returns the most recently updated procedure of that name
+from any user; pass `user_id` to choose the owner, or list procedures to see all of them. The name is
+matched within the first page of results, so in a project with many procedures an older match may
+not be found.
+
 Two further app-bound asymmetries to be aware of: `save_procedure(update_existing=True)` is honored
 only in app-bound mode (the `TenantRuntime` does a lookup-then-update). The HTTP backends serve only
 a create route with no update-existing semantics, so the Gateway and OE modes raise
@@ -126,9 +133,9 @@ the format of `formatted_context`; invalid values are rejected locally with
 the server currently re-infers when the explicit value matches its default model
 type, so an explicit `"openai"` is honored verbatim only on servers with an
 OpenAI-family model configured; `"claude"` and `"jinja2"` are always honored.
-`include_memories=True` populates the response's `selected_memories` with the
-post-budget `MemoryChunk` list, so callers can inspect exactly which memories were
-selected. Both options work on the Gateway and OE HTTP modes. App-bound mode raises
+`include_memories=True` returns the post-budget `MemoryChunk` list in the
+response's `selected_memories` instead of a formatted context; `formatted_context`
+is `None`. Both options work on the Gateway and OE HTTP modes. App-bound mode raises
 `MemoryNotSupportedError` when either is set: app-bound `build_context` flattens the
 response to a formatted string, and the per-source path does not thread the options
 through `TenantRuntime` yet.

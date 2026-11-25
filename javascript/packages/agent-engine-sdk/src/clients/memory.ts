@@ -484,6 +484,7 @@ export class MemoryClient {
     userId?: string | null;
     visibility?: string | null;
     topK?: number;
+    includeHistory?: boolean;
     signal?: AbortSignal;
   }): Promise<MemoryChunk[]> {
     const route = this.searchRoute("semantic", {
@@ -493,6 +494,7 @@ export class MemoryClient {
       user_id: params.userId,
       visibility: params.visibility,
       top_k: params.topK ?? 50,
+      ...(params.includeHistory ? { include_history: true } : {}),
     });
     const data = await this.request(
       "POST",
@@ -1067,6 +1069,7 @@ export class MemoryClient {
     topK?: number;
     similarityThreshold?: number;
     metadataFilter?: Record<string, unknown> | null;
+    includeHistory?: boolean;
     signal?: AbortSignal;
   }): Promise<Array<Record<string, unknown>>> {
     const body: Record<string, unknown> = {
@@ -1085,6 +1088,7 @@ export class MemoryClient {
       Object.keys(params.metadataFilter).length > 0
     )
       body["metadata_filter"] = params.metadataFilter;
+    if (params.includeHistory) body["include_history"] = true;
     const route = this.searchRoute("procedural", body);
     const data = await this.request(
       "POST",
@@ -1094,13 +1098,24 @@ export class MemoryClient {
       undefined,
       params.signal,
     );
-    return data.memories.map((m) => ({
-      procedure:
-        (m["metadata"] as Record<string, unknown>)?.["procedure"] ?? "",
-      content: m["content"] ?? "",
-      score: m["similarity_score"] ?? 0.0,
-      ...(m["metadata"] as Record<string, unknown>),
-    }));
+    return data.memories.map((m) => {
+      const rawMeta = m["metadata"];
+      const meta =
+        rawMeta != null &&
+        typeof rawMeta === "object" &&
+        !Array.isArray(rawMeta)
+          ? (rawMeta as Record<string, unknown>)
+          : {};
+      const ts = m["timestamp"] ?? m["created_at"] ?? m["updated_at"];
+      return {
+        ...meta,
+        ...(m["id"] !== undefined ? { id: m["id"] } : {}),
+        ...(ts !== undefined ? { timestamp: ts } : {}),
+        procedure: meta["procedure"] ?? "",
+        content: m["content"] ?? "",
+        score: m["similarity_score"] ?? 0.0,
+      };
+    });
   }
 
   async fetchProceduralMemories(params: {
@@ -1111,6 +1126,7 @@ export class MemoryClient {
     visibility?: string | null;
     tags?: string[] | null;
     topK?: number;
+    includeHistory?: boolean;
     signal?: AbortSignal;
   }): Promise<MemoryChunk[]> {
     const route = this.searchRoute("procedural", {
@@ -1121,6 +1137,7 @@ export class MemoryClient {
       project_id: params.projectId,
       tags: params.tags,
       top_k: params.topK ?? 50,
+      ...(params.includeHistory ? { include_history: true } : {}),
     });
     const data = await this.request(
       "POST",
